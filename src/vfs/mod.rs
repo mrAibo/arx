@@ -4,8 +4,14 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Location {
     Local(PathBuf),
-    Sftp { host: String, path: String },
-    Archive { archive: PathBuf, inner_path: String },
+    Sftp {
+        host: String,
+        path: String,
+    },
+    Archive {
+        archive: PathBuf,
+        inner_path: String,
+    },
 }
 
 impl fmt::Display for Location {
@@ -13,7 +19,10 @@ impl fmt::Display for Location {
         match self {
             Self::Local(path) => write!(f, "file://{}", path.display()),
             Self::Sftp { host, path } => write!(f, "sftp://{host}{path}"),
-            Self::Archive { archive, inner_path } => {
+            Self::Archive {
+                archive,
+                inner_path,
+            } => {
                 write!(f, "archive://{}!/{inner_path}", archive.display())
             }
         }
