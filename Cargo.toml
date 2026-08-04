@@ -2,7 +2,7 @@
 name = "arx"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "A terminal commander for local and remote files, archives, transfers, and jobs"
 license = "MIT"
 repository = "https://github.com/mrAibo/arx"
