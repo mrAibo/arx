@@ -1,11 +1,37 @@
 use std::collections::BTreeSet;
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HostId(String);
+
+impl HostId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HostGroupId(String);
+
+impl HostGroupId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Host {
-    pub id: String,
+    pub id: HostId,
     pub name: String,
     pub ssh_alias: String,
-    pub group_ids: BTreeSet<String>,
+    pub group_ids: BTreeSet<HostGroupId>,
     pub tags: BTreeSet<String>,
     pub favorite: bool,
     pub default_path: Option<String>,
@@ -15,9 +41,9 @@ pub struct Host {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostGroup {
-    pub id: String,
+    pub id: HostGroupId,
     pub name: String,
-    pub parent_id: Option<String>,
+    pub parent_id: Option<HostGroupId>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -29,7 +55,7 @@ pub enum TransferPreference {
 }
 
 impl Host {
-    pub fn belongs_to(&self, group_id: &str) -> bool {
+    pub fn belongs_to(&self, group_id: &HostGroupId) -> bool {
         self.group_ids.contains(group_id)
     }
 }
@@ -40,11 +66,18 @@ mod tests {
 
     #[test]
     fn host_can_belong_to_multiple_groups() {
+        let database = HostGroupId::new("database");
+        let project_a = HostGroupId::new("project-a");
+        let production = HostGroupId::new("production");
         let host = Host {
-            id: "ora-prod-01".into(),
+            id: HostId::new("ora-prod-01"),
             name: "Oracle Production 01".into(),
             ssh_alias: "ora-prod-01".into(),
-            group_ids: BTreeSet::from(["database".into(), "project-a".into(), "production".into()]),
+            group_ids: BTreeSet::from([
+                database.clone(),
+                project_a.clone(),
+                production.clone(),
+            ]),
             tags: BTreeSet::new(),
             favorite: true,
             default_path: Some("/opt/oracle".into()),
@@ -52,8 +85,9 @@ mod tests {
             notes: None,
         };
 
-        assert!(host.belongs_to("database"));
-        assert!(host.belongs_to("project-a"));
-        assert!(host.belongs_to("production"));
+        assert!(host.belongs_to(&database));
+        assert!(host.belongs_to(&project_a));
+        assert!(host.belongs_to(&production));
+        assert_eq!(host.id.as_str(), "ora-prod-01");
     }
 }
