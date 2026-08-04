@@ -2,167 +2,253 @@
 
 ## Purpose
 
-ARX is a terminal commander that treats local filesystems, remote SSH/SFTP filesystems, and archives as locations behind common contracts. Long-running work is performed as jobs. Transfer implementation is selected by a planner rather than by the TUI.
+ARX is a terminal resource commander for local files, remote SSH/SFTP namespaces, archives, transfers, synchronization, saved hosts, asynchronous jobs, and terminal sessions.
 
-## Core rules
+The architecture is intentionally provider-neutral. Local filesystems, SFTP, archives, and future providers are infrastructure implementations behind stable domain contracts. The TUI must not become coupled to any concrete backend or transfer mechanism.
 
-1. The TUI never calls filesystem, SSH, rsync, or archive implementations directly.
-2. `Location` identifies where a resource lives; UI panels operate on locations, not raw local paths.
-3. VFS operations and transfer operations are separate concerns.
-4. Long-running operations execute through the Job Manager.
-5. Prefer mature system tools when they provide stronger behavior than a custom implementation.
-6. Destructive synchronization requires a preview/dry-run stage.
-7. Authentication should reuse OpenSSH configuration, ssh-agent, and known_hosts; ARX does not invent a password vault.
-8. Dependencies are added only when a concrete module needs them.
+The detailed decisions are recorded in `docs/adr/`.
+
+## Non-negotiable rules
+
+1. TUI code never invokes filesystem APIs, SSH/SFTP implementations, rsync, archive programs, or subprocesses directly.
+2. Domain contracts do not depend on Ratatui, Crossterm, process handles, SSH library types, or command-line syntax.
+3. A location identifies a path inside a registered VFS namespace; it does not encode a provider technology enum.
+4. The UI asks for capabilities instead of branching on backend type.
+5. VFS operations and transfer execution are separate concerns.
+6. Transfer requests describe semantics; the planner chooses an executor.
+7. Long-running and cancellable work runs through the Job Manager.
+8. External tools are adapters with centralized argument construction, parsing, cancellation, redaction, and error mapping.
+9. OpenSSH remains authoritative for SSH connection configuration whenever practical.
+10. Persisted configuration is versioned and contains no runtime handles or secrets.
+11. Destructive synchronization always has a preview stage and explicit confirmation.
+12. Expected I/O, network, authentication, process, and capacity failures are typed errors, not panics.
 
 ## Layering
 
 ```text
-TUI components
-      │
-      ▼
-App actions / state
-      │
-      ▼
-Services ───────────────┐
-      │                 │
-      ▼                 ▼
-VFS                Transfer Planner
-      │                 │
-      │                 ▼
-      │             Job Manager
-      │                 │
-      ├──────────┬───────┼──────────┐
-      ▼          ▼       ▼          ▼
-   Local FS    SFTP    rsync     Archives
-                    
-Remote Manager
- ├─ Host inventory
- ├─ Host groups/tags
- ├─ OpenSSH config
- ├─ Connections
- └─ Capability cache
+┌──────────────────────────────────────────────┐
+│ TUI / Presentation                           │
+│ panels, dialogs, menus, jobs, hosts, terminal│
+└──────────────────────┬───────────────────────┘
+                       │ actions / queries
+                       ▼
+┌──────────────────────────────────────────────┐
+│ Application layer                            │
+│ orchestration, policy, confirmation, state   │
+└───────────────┬───────────────┬──────────────┘
+                │               │
+                ▼               ▼
+       ┌──────────────┐   ┌───────────────┐
+       │ VFS domain   │   │ Transfer domain│
+       └──────┬───────┘   └───────┬───────┘
+              │                   │
+              └─────────┬─────────┘
+                        ▼
+                 ┌────────────┐
+                 │ Job Manager│
+                 └─────┬──────┘
+                       │
+      ┌────────────────┼─────────────────────┐
+      ▼                ▼                     ▼
+ Local/provider    Remote/provider      Process/tool adapters
+ adapters          adapters             rsync, ssh, tar, zstd…
 ```
 
-## Location model
+Dependencies point inward. Infrastructure translates external systems into domain contracts.
 
-The public model must support at least:
+## VFS model
+
+The stable location shape is:
 
 ```text
-file:///home/user
-sftp://host/etc
-archive:///tmp/data.tar.zst!/etc
+Location
+├── NamespaceId   opaque registered namespace
+└── VfsPath       provider-native path identity
 ```
 
-A panel should be able to switch between those locations without changing its navigation model.
+Examples of namespace registrations:
 
-## VFS responsibilities
+```text
+local                 -> LocalFs
+host:prod-db-01       -> SftpFs for a saved host
+archive:<runtime-id>  -> ArchiveFs mounted over a container resource
+```
 
-VFS handles filesystem-like operations:
+The namespace registry owns provider instances. Presentation code does not derive behavior from namespace names.
 
-- list
-- stat
-- read/open
-- write/create
-- mkdir
-- rename
-- remove
-- symlink metadata
-- permissions/capabilities where supported
+### Path identity
 
-Initial backends:
+Path identity must not require lossy conversion for display. Local native paths and byte-oriented remote/archive paths are represented separately where needed. Display formatting is a presentation concern.
 
-- LocalFs
-- SftpFs
-- ArchiveFs
+### Capabilities
 
-## Transfer planner
+A provider reports supported operations such as list, read, write, mkdir, rename, remove, metadata, permissions, symlink handling, free-space queries, and server-side copy/move.
 
-The planner receives source, destination, requested semantics, and detected capabilities. It chooses an implementation.
+Archive providers may be read-only or transactionally writable. They are not forced to claim ordinary filesystem mutation semantics.
 
-Typical policy:
+## Provider async boundary
 
-- local → local, simple rename: native
-- local → local, complex directory copy: native or rsync based on policy
-- local ↔ remote, rsync available on both ends: rsync over SSH
-- local ↔ remote, remote rsync unavailable: SFTP streaming
-- archive boundaries: archive backend/streaming
+The namespace registry must hold heterogeneous providers. Provider interfaces therefore need a dyn-compatible asynchronous boundary.
 
-`scp` is a compatibility transfer method, not the primary remote filesystem backend.
+Rust async traits are not assumed to be dynamically dispatchable by themselves. When provider implementation starts, use either an explicit boxed-future boundary or one narrowly scoped compatibility helper. Do not replace the registry with a giant provider enum merely to avoid this boundary.
 
-## Jobs
+Pure domain logic remains synchronous. Tokio belongs at I/O, process, networking, scheduling, and event boundaries.
 
-All long-running operations become jobs. Minimum states:
+## Transfer architecture
 
-- Queued
-- Starting
-- Running
-- Paused (only where the implementation supports it)
-- Cancelling
-- Cancelled
-- Failed
-- Finished
+A `TransferRequest` describes intent and policy:
 
-Jobs emit structured events such as progress, output, warnings, completion, and failure. The TUI consumes those events; it does not parse child-process output itself.
+```text
+source / destination
+operation: copy | move | synchronize
+overwrite policy
+verification policy
+preservation policy
+resume / bandwidth policy (when introduced)
+```
 
-## Remote hosts
+The planner combines the request with VFS capabilities, host capabilities, tool availability, and user preference. It selects an executor using an opaque `ExecutorId`.
 
-ARX host metadata refers to an OpenSSH alias wherever possible. Connection details remain in `~/.ssh/config`.
+Initial executor families:
 
-A host can belong to multiple groups. Groups may be nested for UI organization. Example dimensions include project, role, environment, and location.
+- native local operations
+- rsync adapter
+- SFTP streaming
+- SCP compatibility fallback where useful
+- archive transaction/stream adapter
 
-ARX-specific metadata may include:
+Typical preference:
 
-- favorite
-- groups
-- tags
-- default path
-- transfer preference
-- notes
+```text
+same-filesystem move     -> native rename
+simple local copy        -> native
+large/complex local tree -> native or rsync by policy
+local ↔ remote           -> rsync over SSH when available
+local ↔ remote fallback  -> SFTP streaming
+archive boundary         -> archive transaction/stream
+```
 
-Sensitive credentials must not be stored in ordinary ARX configuration.
+Move is not universally copy + delete. Source deletion is allowed only after destination completion satisfies the requested verification contract.
+
+Synchronization is a separate operation. `rsync --delete` is never implicit.
+
+## Job architecture
+
+The Job Manager is operation-neutral.
+
+```text
+JobId       stable runtime identity
+JobSpec     immutable operation description
+JobRecord   lifecycle + progress + result
+JobCommand  cancel / retry / supported controls
+JobEvent    structured event stream
+```
+
+Minimum lifecycle:
+
+```text
+Queued -> Starting -> Running -> Finished
+                         ├─────> Failed
+                         └─────> Cancelling -> Cancelled
+```
+
+Pause is capability-driven and not a universal state.
+
+Progress may be indeterminate, byte-based, item-based, or phase-based. The TUI receives structured progress and does not parse rsync/SFTP/tool output itself.
+
+Cancellation is translated by each executor into safe implementation-specific behavior. A cancellation must never silently destroy a valid source.
+
+## Remote host model
+
+A saved host has a stable ARX `HostId` and references an OpenSSH alias. Display names are mutable metadata, not identity.
+
+Hosts support many-to-many groups and free-form tags. A host may simultaneously belong to, for example:
+
+```text
+Database
+Project A
+Production
+Hannover
+```
+
+Groups may be nested for presentation. Parent cycles are invalid. Deleting a group never deletes a host.
+
+ARX may store favorites, groups, tags, default path, transfer preference, and notes. Connection secrets do not belong in ordinary ARX configuration.
 
 ## OpenSSH integration
 
-Prefer existing OpenSSH behavior for:
+Prefer existing OpenSSH behavior for aliases, IdentityFile, ProxyJump/ProxyCommand, ssh-agent, known_hosts, and connection multiplexing.
 
-- aliases
-- IdentityFile
-- ProxyJump / ProxyCommand
-- agent authentication
-- known_hosts
-- connection multiplexing
+When OpenSSH-effective configuration is required, prefer `ssh -G <alias>` rather than implementing the entire `ssh_config` language.
 
-When effective OpenSSH configuration is needed, prefer `ssh -G <alias>` over implementing the entire ssh_config language ourselves.
+Native SSH/SFTP code consumes a resolved connection-profile abstraction rather than reading presentation config directly.
 
-## External tools
+## Persistence
 
-Expected adapters include:
+Persisted data is schema-versioned and migrated explicitly. Runtime handles are never serialized.
 
-- rsync
-- ssh
-- tar
-- gzip/pigz
-- bzip2/pbzip2
-- xz
-- zstd
-- zip/unzip
-- 7z/7zz
-- user editor/pager/shell
+Expected logical documents include:
 
-Adapters own command construction, lifecycle, output parsing, error mapping, and capability detection.
+```text
+config      user settings and schema version
+hosts       host/group metadata
+state       optional non-critical session/UI state
+```
+
+Writes that replace durable configuration must be atomic where the platform permits it.
+
+Saved locations are separate entities from hosts, allowing multiple useful paths per machine.
+
+## Error model
+
+Infrastructure maps errors to stable domain categories such as not-found, permission-denied, unsupported, unavailable, authentication, host-key verification, network, timeout, interrupted, no-space, conflict, invalid configuration, external-tool failure, integrity failure, and internal invariant failure.
+
+The UI reacts to structured categories rather than parsing error strings or exit codes.
+
+## External processes
+
+Adapters own:
+
+- executable/argument construction without shell-string concatenation
+- environment filtering
+- process groups and lifecycle
+- stdout/stderr parsing
+- progress conversion
+- cancellation and signal escalation
+- exit-code/error mapping
+- logging redaction
+
+Expected tools include rsync, ssh, tar, gzip/pigz, bzip2/pbzip2, xz, zstd, zip/unzip, 7z/7zz, and the user's editor/pager/shell.
 
 ## Terminal strategy
 
-Phase 1: suspend the TUI and launch the user's local shell or OpenSSH client.
+Phase 1: suspend ARX safely and launch the user's local shell, OpenSSH, editor, pager, or another terminal application.
 
-Phase 2: embedded local/remote PTY component, only after the remote and job layers are stable.
+Phase 2: embedded terminal/PTY support only after VFS, remote connection management, and the Job Manager are stable.
 
-## Safety
+Terminal restoration must survive ordinary errors and panic paths as far as reasonably possible.
+
+## Security and safety
 
 - no silent overwrite
-- no implicit rsync `--delete`
-- cancellation must preserve source data and clean incomplete destinations where safe
-- host-key verification is enabled by default
-- logs must not expose passwords, private keys, or sensitive command arguments
-- remote/network interruption is an expected failure mode and must be testable
+- no implicit destructive synchronization
+- no disabled SSH host-key verification by default
+- no credentials/private keys/tokens in normal logs
+- no shell command interpolation for adapter arguments
+- transactional temporary files use safe permissions
+- cancellation preserves valid source data
+- interrupted networks and disk-full conditions are normal tested failure modes
+- user-visible diagnostics are redacted
+
+## Architecture decision records
+
+Accepted ADRs:
+
+- `0001-core-boundaries.md`
+- `0002-vfs-location-provider.md`
+- `0003-jobs-events-cancellation.md`
+- `0004-transfer-planning-execution.md`
+- `0005-remote-hosts-and-persistence.md`
+- `0006-errors-security-observability.md`
+
+Any future change that reverses one of these foundational decisions should add a superseding ADR rather than silently mutating the contract.
