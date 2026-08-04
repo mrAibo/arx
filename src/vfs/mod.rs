@@ -74,7 +74,7 @@ pub enum Capability {
 pub struct Capabilities(BTreeSet<Capability>);
 
 impl Capabilities {
-    pub fn from_iter(capabilities: impl IntoIterator<Item = Capability>) -> Self {
+    pub fn new(capabilities: impl IntoIterator<Item = Capability>) -> Self {
         Self(capabilities.into_iter().collect())
     }
 
@@ -99,7 +99,7 @@ mod tests {
 
     #[test]
     fn capabilities_are_explicit() {
-        let capabilities = Capabilities::from_iter([Capability::List, Capability::Read]);
+        let capabilities = Capabilities::new([Capability::List, Capability::Read]);
 
         assert!(capabilities.supports(Capability::Read));
         assert!(!capabilities.supports(Capability::Write));
