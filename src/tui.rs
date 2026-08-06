@@ -276,6 +276,22 @@ async fn event_loop(
                                         }
                                     };
                                     if resolved.is_dir() {
+                                        // F7: tmux session attach (before pane borrow)
+                                        if key.code == KeyCode::F(7) && !state.show_terminal {
+                                            let sessions = list_tmux_sessions();
+                                            if sessions.is_empty() {
+                                                state.message =
+                                                    Some("No tmux sessions found".into());
+                                            } else {
+                                                state.command_matches = sessions;
+                                                state.show_command_center = true;
+                                                state.overlay_list_state =
+                                                    ratatui::widgets::ListState::default();
+                                                state.overlay_list_state.select(Some(0));
+                                                continue;
+                                            }
+                                        }
+
                                         let pane = state.active_pane_mut();
                                         pane.location = Location::Local(resolved);
                                         pane.cursor = 0;
@@ -411,6 +427,21 @@ async fn event_loop(
                             KeyCode::Enter => {
                                 let loc = state.bookmarks.get(state.bookmark_cursor).cloned();
                                 if let Some(loc) = loc {
+                                    // F7: tmux session attach (before pane borrow)
+                                    if key.code == KeyCode::F(7) && !state.show_terminal {
+                                        let sessions = list_tmux_sessions();
+                                        if sessions.is_empty() {
+                                            state.message = Some("No tmux sessions found".into());
+                                        } else {
+                                            state.command_matches = sessions;
+                                            state.show_command_center = true;
+                                            state.overlay_list_state =
+                                                ratatui::widgets::ListState::default();
+                                            state.overlay_list_state.select(Some(0));
+                                            continue;
+                                        }
+                                    }
+
                                     let pane = state.active_pane_mut();
                                     pane.location = loc;
                                     pane.cursor = 0;
@@ -453,6 +484,21 @@ async fn event_loop(
                             KeyCode::Enter => {
                                 let host = state.hosts.get(state.host_cursor).cloned();
                                 if let Some(host) = host {
+                                    // F7: tmux session attach (before pane borrow)
+                                    if key.code == KeyCode::F(7) && !state.show_terminal {
+                                        let sessions = list_tmux_sessions();
+                                        if sessions.is_empty() {
+                                            state.message = Some("No tmux sessions found".into());
+                                        } else {
+                                            state.command_matches = sessions;
+                                            state.show_command_center = true;
+                                            state.overlay_list_state =
+                                                ratatui::widgets::ListState::default();
+                                            state.overlay_list_state.select(Some(0));
+                                            continue;
+                                        }
+                                    }
+
                                     let pane = state.active_pane_mut();
                                     let default_path = host.default_path.as_deref().unwrap_or("/");
                                     pane.location = Location::Sftp {
@@ -588,6 +634,20 @@ async fn event_loop(
                                 state.show_hidden,
                                 state.sort_mode,
                             );
+                            continue;
+                        }
+                    }
+
+                    // F7: tmux session attach (before pane borrow)
+                    if key.code == KeyCode::F(7) && !state.show_terminal {
+                        let sessions = list_tmux_sessions();
+                        if sessions.is_empty() {
+                            state.message = Some("No tmux sessions found".into());
+                        } else {
+                            state.command_matches = sessions;
+                            state.show_command_center = true;
+                            state.overlay_list_state = ratatui::widgets::ListState::default();
+                            state.overlay_list_state.select(Some(0));
                             continue;
                         }
                     }
@@ -1012,6 +1072,21 @@ async fn event_loop(
                         }
                         // Alt+Down: go back in directory history
                         KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                            // F7: tmux session attach (before pane borrow)
+                            if key.code == KeyCode::F(7) && !state.show_terminal {
+                                let sessions = list_tmux_sessions();
+                                if sessions.is_empty() {
+                                    state.message = Some("No tmux sessions found".into());
+                                } else {
+                                    state.command_matches = sessions;
+                                    state.show_command_center = true;
+                                    state.overlay_list_state =
+                                        ratatui::widgets::ListState::default();
+                                    state.overlay_list_state.select(Some(0));
+                                    continue;
+                                }
+                            }
+
                             let pane = state.active_pane_mut();
                             if let Some(prev) = pane.dir_history.pop() {
                                 pane.location = prev;
@@ -1544,6 +1619,21 @@ async fn event_loop(
                                 && ('1'..='9').contains(&c) =>
                         {
                             let idx = (c as u8 - b'1') as usize;
+                            // F7: tmux session attach (before pane borrow)
+                            if key.code == KeyCode::F(7) && !state.show_terminal {
+                                let sessions = list_tmux_sessions();
+                                if sessions.is_empty() {
+                                    state.message = Some("No tmux sessions found".into());
+                                } else {
+                                    state.command_matches = sessions;
+                                    state.show_command_center = true;
+                                    state.overlay_list_state =
+                                        ratatui::widgets::ListState::default();
+                                    state.overlay_list_state.select(Some(0));
+                                    continue;
+                                }
+                            }
+
                             let pane = state.active_pane_mut();
                             if idx < pane.tabs.len() + 1 {
                                 if idx != 0 {
@@ -2822,6 +2912,23 @@ fn build_cc_matches(filter: &str, state: &AppState) -> Vec<(String, String)> {
 }
 
 fn navigate_to(state: &mut AppState, target: &str) {
+    if target.starts_with("tmux:") {
+        let session = target.trim_start_matches("tmux:");
+        state.message = Some(format!("Attaching tmux: {session} (Ctrl+B D to detach)"));
+        let _ = std::process::Command::new("tmux")
+            .args(["attach-session", "-t", session])
+            .status();
+        return;
+    }
+    if target.starts_with("screen:") {
+        let session = target.trim_start_matches("screen:");
+        state.message = Some(format!("Attaching screen: {session}"));
+        let _ = std::process::Command::new("screen")
+            .args(["-r", session])
+            .status();
+        return;
+    }
+
     if target.starts_with("sftp://") {
         let h = target.trim_start_matches("sftp://");
         state.active_pane_mut().location = arx::vfs::Location::Sftp {
@@ -2841,4 +2948,21 @@ fn navigate_to(state: &mut AppState, target: &str) {
             .arg(target)
             .spawn();
     }
+}
+
+fn list_tmux_sessions() -> Vec<(String, String)> {
+    let mut sessions = Vec::new();
+    // tmux ls
+    if let Ok(out) = std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        && out.status.success()
+    {
+        for name in String::from_utf8_lossy(&out.stdout).lines() {
+            if !name.is_empty() {
+                sessions.push((format!("tmux: {name}"), format!("tmux:{name}")));
+            }
+        }
+    }
+    sessions
 }
