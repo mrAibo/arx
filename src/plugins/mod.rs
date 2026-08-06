@@ -4,18 +4,22 @@
 
 use std::path::Path;
 
+pub type PreviewFn = dyn Fn(&Path) -> Option<Vec<String>> + Send;
+pub type FilterFn = dyn Fn(&str, &str) -> bool + Send;
+pub type ActionFn = dyn Fn(&str, &[String]) -> Option<String> + Send;
+
 /// Plugin hook points available for Lua scripts.
 #[allow(dead_code)]
 pub enum Hook {
-    OnPreview(Box<dyn Fn(&Path) -> Option<Vec<String>> + Send>),
-    OnFilter(Box<dyn Fn(&str, &str) -> bool + Send>),
-    OnAction(Box<dyn Fn(&str, &[String]) -> Option<String> + Send>),
+    OnPreview(Box<PreviewFn>),
+    OnFilter(Box<FilterFn>),
+    OnAction(Box<ActionFn>),
 }
 
 /// Plugin registry (empty — Lua backend not yet loaded).
 #[derive(Default)]
 pub struct PluginRegistry {
-    pub preview_hooks: Vec<Box<dyn Fn(&Path) -> Option<Vec<String>> + Send>>,
+    pub preview_hooks: Vec<Box<PreviewFn>>,
 }
 
 impl PluginRegistry {
