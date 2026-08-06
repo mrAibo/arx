@@ -51,7 +51,9 @@ async fn list_sftp(host: &Host, remote_path: &str) -> anyhow::Result<Vec<Entry>>
 
     anyhow::ensure!(
         authed,
-        "SSH auth failed — check ~/.ssh/id_* or set SSH_PASSWORD"
+        "SSH auth failed.\n\
+         Try: ssh-agent (SSH_AUTH_SOCK), ~/.ssh/id_*, or SSH_PASSWORD env var.\n\
+         ponytail: full ssh-agent + ~/.ssh/config resolution deferred — russh agent client needs typed Handler"
     );
 
     let channel = client.channel_open_session().await?;
