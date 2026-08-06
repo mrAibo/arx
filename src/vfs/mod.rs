@@ -14,6 +14,58 @@ pub mod webdav;
 
 use std::collections::HashMap;
 
+// ── Error taxonomy ──
+// ponytail: typed error replaces anyhow in VFS layer. anyhow stays in TUI via From impl.
+
+#[derive(Debug)]
+pub enum VfsError {
+    NotFound(String),
+    PermissionDenied(String),
+    Timeout(String),
+    AuthFailed(String),
+    ProtocolError(String),
+    Io(std::io::Error),
+}
+
+impl fmt::Display for VfsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound(msg) => write!(f, "not found: {msg}"),
+            Self::PermissionDenied(msg) => write!(f, "permission denied: {msg}"),
+            Self::Timeout(msg) => write!(f, "timeout: {msg}"),
+            Self::AuthFailed(msg) => write!(f, "auth failed: {msg}"),
+            Self::ProtocolError(msg) => write!(f, "protocol error: {msg}"),
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for VfsError {}
+
+impl From<std::io::Error> for VfsError {
+    fn from(e: std::io::Error) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::NotFound => Self::NotFound(e.to_string()),
+            std::io::ErrorKind::PermissionDenied => Self::PermissionDenied(e.to_string()),
+            std::io::ErrorKind::TimedOut => Self::Timeout(e.to_string()),
+            _ => Self::Io(e),
+        }
+    }
+}
+
+impl From<VfsError> for std::io::Error {
+    fn from(e: VfsError) -> Self {
+        match e {
+            VfsError::Io(io) => io,
+            e => std::io::Error::other(e.to_string()),
+        }
+    }
+}
+
+// anyhow gets From<VfsError> automatically via std::error::Error impl
+
+// ── Provider Registry types ──
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderId {
     Local,
