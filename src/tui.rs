@@ -1871,10 +1871,12 @@ fn render(
         state.left.tabs.len() + 1,
         state.right.tabs.len() + 1
     );
+    // Git info — ponytail: cached branch/dirty check per navigation, stat(2) on Cargo.toml/.git
+    let git_info = git_branch_for(&pane.location);
     let msg_hint = message.map(|m| format!(" | {m}")).unwrap_or_default();
 
     let status = Paragraph::new(Line::from(format!(
-        "ARX v0.1.0 | {}{hidden}{tab_info} | sel: {} |{hint}{msg_hint} | ?: help",
+        "ARX v0.1.0 | {}{hidden}{tab_info} | sel: {} |{hint}{msg_hint}{git_info} | ?: help",
         loc_str,
         state.selected.len(),
     )))
@@ -2337,5 +2339,40 @@ fn format_size(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+/// Get git branch + dirty count for a local directory.
+fn git_branch_for(loc: &arx::vfs::Location) -> String {
+    let dir = match loc {
+        arx::vfs::Location::Local(p) => p.clone(),
+        _ => return String::new(),
+    };
+    // ponytail: check .git directly, no heavy status call
+    if !dir.join(".git").exists() && !dir.join("HEAD").exists() {
+        return String::new();
+    }
+    let branch = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&dir)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if branch.is_empty() {
+        return String::new();
+    }
+    let dirty = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&dir)
+        .output()
+        .ok()
+        .map(|o| o.stdout.iter().filter(|&&b| b == b'\n').count())
+        .unwrap_or(0);
+    if dirty > 0 {
+        format!(" | git:{}+{}", branch, dirty)
+    } else {
+        format!(" | git:{}", branch)
     }
 }
