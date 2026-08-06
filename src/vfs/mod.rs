@@ -43,10 +43,7 @@ impl fmt::Display for VfsError {
             Self::UnsupportedOperation {
                 provider,
                 capability,
-            } => write!(
-                f,
-                "provider {provider:?} does not support {capability:?}"
-            ),
+            } => write!(f, "provider {provider:?} does not support {capability:?}"),
             Self::ReadOnlyProvider(provider) => write!(f, "provider {provider:?} is read-only"),
             Self::Timeout(msg) => write!(f, "timeout: {msg}"),
             Self::AuthFailed(msg) => write!(f, "auth failed: {msg}"),
@@ -186,7 +183,9 @@ impl ProviderRegistry {
     }
 
     pub fn get(&self, id: &ProviderId) -> Option<&dyn VfsProvider> {
-        self.0.get(id).map(|registered| registered.provider.as_ref())
+        self.0
+            .get(id)
+            .map(|registered| registered.provider.as_ref())
     }
 
     pub fn capabilities(&self, id: &ProviderId) -> Option<CapabilitySet> {
