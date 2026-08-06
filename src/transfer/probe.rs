@@ -9,6 +9,7 @@ use super::ExecutorAvailability;
 pub struct LocalToolAvailability {
     pub ssh: bool,
     pub rsync: bool,
+    pub sftp: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -144,7 +145,7 @@ pub fn local_remote_executors(
     ExecutorAvailability {
         native: false,
         rsync: local.ssh && local.rsync && remote.reachable && remote.rsync,
-        sftp: sftp_executor_available,
+        sftp: local.ssh && local.sftp && remote.reachable && sftp_executor_available,
     }
 }
 
@@ -152,6 +153,9 @@ fn detect_local_tools_with(runner: &impl CommandRunner) -> LocalToolAvailability
     LocalToolAvailability {
         ssh: command_succeeds(runner, "ssh", &["-V"]),
         rsync: command_succeeds(runner, "rsync", &["--version"]),
+        // OpenSSH sftp has no portable --version flag. For availability we only
+        // care whether the executable can be spawned; `-h` may exit non-zero.
+        sftp: command_available(runner, "sftp", &["-h"]),
     }
 }
 
@@ -207,6 +211,11 @@ fn command_succeeds(runner: &impl CommandRunner, program: &str, args: &[&str]) -
         .unwrap_or(false)
 }
 
+fn command_available(runner: &impl CommandRunner, program: &str, args: &[&str]) -> bool {
+    let args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+    runner.run(program, &args).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,8 +230,12 @@ mod tests {
 
     impl FakeRunner {
         fn new(outcomes: impl IntoIterator<Item = CommandOutcome>) -> Self {
+            Self::new_results(outcomes.into_iter().map(Ok))
+        }
+
+        fn new_results(outcomes: impl IntoIterator<Item = io::Result<CommandOutcome>>) -> Self {
             Self {
-                outcomes: RefCell::new(outcomes.into_iter().map(Ok).collect()),
+                outcomes: RefCell::new(outcomes.into_iter().collect()),
                 calls: RefCell::new(Vec::new()),
             }
         }
@@ -254,16 +267,29 @@ mod tests {
     };
 
     #[test]
-    fn detects_local_ssh_and_rsync() {
-        let runner = FakeRunner::new([OK, OK]);
+    fn detects_local_transfer_tools() {
+        let runner = FakeRunner::new([OK, OK, MISSING]);
         let tools = detect_local_tools_with(&runner);
         assert_eq!(
             tools,
             LocalToolAvailability {
                 ssh: true,
-                rsync: true
+                rsync: true,
+                // Exit status is irrelevant for `sftp -h`; successful spawn is enough.
+                sftp: true,
             }
         );
+    }
+
+    #[test]
+    fn missing_sftp_executable_is_not_advertised() {
+        let runner = FakeRunner::new_results([
+            Ok(OK),
+            Ok(OK),
+            Err(io::Error::new(io::ErrorKind::NotFound, "sftp missing")),
+        ]);
+        let tools = detect_local_tools_with(&runner);
+        assert!(!tools.sftp);
     }
 
     #[test]
@@ -303,10 +329,11 @@ mod tests {
     }
 
     #[test]
-    fn executor_availability_requires_rsync_on_both_ends() {
+    fn executor_availability_requires_tools_on_both_ends() {
         let local = LocalToolAvailability {
             ssh: true,
             rsync: true,
+            sftp: true,
         };
         let remote = RemoteToolAvailability {
             reachable: true,
@@ -316,6 +343,20 @@ mod tests {
         assert!(!executors.rsync);
         assert!(executors.sftp);
         assert!(!executors.native);
+    }
+
+    #[test]
+    fn sftp_executor_is_not_advertised_without_local_client() {
+        let local = LocalToolAvailability {
+            ssh: true,
+            rsync: false,
+            sftp: false,
+        };
+        let remote = RemoteToolAvailability {
+            reachable: true,
+            rsync: false,
+        };
+        assert!(!local_remote_executors(local, remote, true).sftp);
     }
 
     #[test]
