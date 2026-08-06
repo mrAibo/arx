@@ -8,6 +8,17 @@ use crate::remote::Host;
 use crate::terminal::TermPane;
 use crate::vfs::Location;
 
+/// Command Center channel tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommandCenterChannel {
+    #[default]
+    Files,
+    Hosts,
+    Git,
+    Docker,
+    Actions,
+}
+
 /// MC-style menu entry.
 #[derive(Debug, Clone)]
 pub struct MenuEntry {
@@ -267,6 +278,7 @@ impl Default for AppState {
             rename_input: false,
             rename_pattern: String::new(),
             show_command_center: false,
+            cc_channel: CommandCenterChannel::default(),
             show_tree: false,
             show_context_menu: false,
             context_menu_pos: (0, 0),
