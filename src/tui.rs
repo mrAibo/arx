@@ -50,6 +50,8 @@ async fn event_loop(
     let mut right_entries = load_entries(&state.right.location, state.show_hidden, state.sort_mode);
     let mut left_list = ListState::default();
     let mut right_list = ListState::default();
+    let mut split_left_list = ListState::default();
+    let mut split_right_list = ListState::default();
 
     // Background job notification channel
     let (job_tx, mut job_rx) = mpsc::unbounded_channel::<arx::jobs::JobEvent>();
@@ -108,7 +110,9 @@ async fn event_loop(
             .min(right_filtered.len().saturating_sub(1));
 
         left_list.select(Some(state.left.cursor));
+        split_left_list.select(Some(state.left.split_cursor));
         right_list.select(Some(state.right.cursor));
+        split_right_list.select(Some(state.right.split_cursor));
 
         let msg = state.message.clone();
         terminal.draw(|frame| {
@@ -117,8 +121,10 @@ async fn event_loop(
                 &mut state,
                 &left_filtered,
                 &right_filtered,
-                &mut left_list.clone(),
-                &mut right_list.clone(),
+                &mut left_list,
+                &mut right_list,
+                &mut split_left_list,
+                &mut split_right_list,
                 msg.as_deref(),
             )
         })?;
@@ -613,10 +619,13 @@ async fn event_loop(
                     } else {
                         &right_filtered
                     };
-                    let cursor = if state.active == Pane::Left {
-                        state.left.cursor
-                    } else {
-                        state.right.cursor
+                    let cursor = {
+                        let pane = state.active_pane();
+                        if pane.split && pane.split_active {
+                            pane.split_cursor
+                        } else {
+                            pane.cursor
+                        }
                     };
                     let cmd_prefix = state.cmd_prefix;
 
@@ -661,16 +670,31 @@ async fn event_loop(
 
                     match key.code {
                         KeyCode::Char('q') => state.apply(Action::Quit),
-                        KeyCode::Tab => state.apply(Action::SwitchPane),
+                        KeyCode::Tab => {
+                            let pane = state.active_pane_mut();
+                            if pane.split {
+                                pane.split_active = !pane.split_active;
+                            } else {
+                                state.apply(Action::SwitchPane);
+                            }
+                        }
                         KeyCode::Up | KeyCode::Char('k') => {
-                            if cursor > 0 {
+                            if pane.split && pane.split_active {
+                                if pane.split_cursor > 0 {
+                                    pane.split_cursor -= 1;
+                                }
+                            } else if cursor > 0 {
                                 pane.cursor -= 1;
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j')
                             if !key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
-                            if cursor + 1 < entries.len() {
+                            if pane.split && pane.split_active {
+                                if pane.split_cursor + 1 < entries.len() {
+                                    pane.split_cursor += 1;
+                                }
+                            } else if cursor + 1 < entries.len() {
                                 pane.cursor += 1;
                             }
                         }
@@ -1588,6 +1612,21 @@ async fn event_loop(
                             state.cmd_input = true;
                         }
                         // Ctrl+X S: symlink (MC-style prefix)
+                        KeyCode::Char('\\') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let pane = state.active_pane_mut();
+                            pane.split = !pane.split;
+                            if pane.split {
+                                pane.split_cursor = pane.cursor;
+                            }
+                            state.message = Some(format!(
+                                "Split {}",
+                                if pane.split {
+                                    "ON (Tab toggles)"
+                                } else {
+                                    "OFF"
+                                }
+                            ));
+                        }
                         KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.cmd_prefix = true;
                         }
@@ -1819,6 +1858,7 @@ fn is_archive(name: &str) -> bool {
         || name.ends_with(".zip")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render(
     frame: &mut ratatui::Frame,
     state: &mut AppState,
@@ -1826,6 +1866,8 @@ fn render(
     right_entries: &[&Entry],
     left_list: &mut ListState,
     right_list: &mut ListState,
+    split_left_list: &mut ListState,
+    split_right_list: &mut ListState,
     message: Option<&str>,
 ) {
     let area = frame.area();
@@ -1868,17 +1910,54 @@ fn render(
         (Default::default(), Default::default())
     };
 
-    render_pane(
-        frame,
-        panes[0],
-        &state.left,
-        left_entries,
-        left_list,
-        state.active == Pane::Left,
-        &state.selected,
-        &left_only,
-        state.panel_mode,
-    );
+    if state.left.split {
+        let mid = panes[0].width / 2;
+        let a1 = ratatui::layout::Rect::new(panes[0].x, panes[0].y, mid, panes[0].height);
+        let a2 = ratatui::layout::Rect::new(
+            panes[0].x + mid,
+            panes[0].y,
+            panes[0].width - mid,
+            panes[0].height,
+        );
+        let act1 = state.active == Pane::Left && !state.left.split_active;
+        let act2 = state.active == Pane::Left && state.left.split_active;
+        left_list.select(Some(state.left.cursor));
+        split_left_list.select(Some(state.left.split_cursor));
+        render_pane(
+            frame,
+            a1,
+            &state.left,
+            left_entries,
+            left_list,
+            act1,
+            &state.selected,
+            &left_only,
+            state.panel_mode,
+        );
+        render_pane(
+            frame,
+            a2,
+            &state.left,
+            left_entries,
+            split_left_list,
+            act2,
+            &state.selected,
+            &left_only,
+            state.panel_mode,
+        );
+    } else {
+        render_pane(
+            frame,
+            panes[0],
+            &state.left,
+            left_entries,
+            left_list,
+            state.active == Pane::Left,
+            &state.selected,
+            &left_only,
+            state.panel_mode,
+        );
+    }
     if state.show_terminal {
         if let Some(ref term) = state.term {
             // Render terminal buffer in right pane
@@ -1905,17 +1984,54 @@ fn render(
             );
         }
     } else {
-        render_pane(
-            frame,
-            panes[1],
-            &state.right,
-            right_entries,
-            right_list,
-            state.active == Pane::Right,
-            &state.selected,
-            &right_only,
-            state.panel_mode,
-        );
+        if state.right.split {
+            let mid = panes[1].width / 2;
+            let a1 = ratatui::layout::Rect::new(panes[1].x, panes[1].y, mid, panes[1].height);
+            let a2 = ratatui::layout::Rect::new(
+                panes[1].x + mid,
+                panes[1].y,
+                panes[1].width - mid,
+                panes[1].height,
+            );
+            let act1 = state.active == Pane::Right && !state.right.split_active;
+            let act2 = state.active == Pane::Right && state.right.split_active;
+            right_list.select(Some(state.right.cursor));
+            split_right_list.select(Some(state.right.split_cursor));
+            render_pane(
+                frame,
+                a1,
+                &state.right,
+                right_entries,
+                right_list,
+                act1,
+                &state.selected,
+                &right_only,
+                state.panel_mode,
+            );
+            render_pane(
+                frame,
+                a2,
+                &state.right,
+                right_entries,
+                split_right_list,
+                act2,
+                &state.selected,
+                &right_only,
+                state.panel_mode,
+            );
+        } else {
+            render_pane(
+                frame,
+                panes[1],
+                &state.right,
+                right_entries,
+                right_list,
+                state.active == Pane::Right,
+                &state.selected,
+                &right_only,
+                state.panel_mode,
+            );
+        }
     }
 
     // Help overlay

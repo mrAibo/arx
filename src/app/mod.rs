@@ -75,6 +75,9 @@ pub struct PaneState {
     pub tabs: Vec<(Location, usize)>,
     /// Directory history stack. Push before entering a directory; Alt+Down pops.
     pub dir_history: Vec<Location>,
+    pub split: bool,
+    pub split_cursor: usize,
+    pub split_active: bool,
 }
 
 impl PaneState {
@@ -200,12 +203,18 @@ impl Default for AppState {
                 cursor: 0,
                 tabs: Vec::new(),
                 dir_history: Vec::new(),
+                split: false,
+                split_cursor: 0,
+                split_active: false,
             },
             right: PaneState {
                 location: Location::Local(home),
                 cursor: 0,
                 tabs: Vec::new(),
                 dir_history: Vec::new(),
+                split: false,
+                split_cursor: 0,
+                split_active: false,
             },
             active: Pane::Left,
             selected: BTreeSet::new(),
