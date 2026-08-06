@@ -189,3 +189,141 @@ impl std::fmt::Display for Job {
 pub fn job_token() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
+
+// ── Job Queue / Transfer Manager ──
+// ponytail: simple FIFO queue with N parallel workers + ETA
+
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::time::Instant;
+
+#[derive(Default)]
+pub struct JobQueue {
+    pending: Mutex<VecDeque<Job>>,
+    active: Mutex<Vec<Job>>,
+    max_workers: usize,
+    done: Mutex<Vec<Job>>,
+}
+
+impl JobQueue {
+    pub fn new(max_workers: usize) -> Self {
+        Self {
+            max_workers,
+            ..Default::default()
+        }
+    }
+
+    /// Add a job to the pending queue.
+    pub fn enqueue(&self, job: Job) {
+        self.pending.lock().unwrap().push_back(job);
+    }
+
+    /// Cancel a pending or active job by id. Returns true if found.
+    pub fn cancel(&self, id: &str) -> bool {
+        // Cancel in pending
+        if let Some(job) = self.pending.lock().unwrap().iter().find(|j| j.id == id) {
+            job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        // Cancel in active
+        if let Some(job) = self.active.lock().unwrap().iter().find(|j| j.id == id) {
+            job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// Take up to N pending jobs and promote them to active.
+    /// Returns the jobs that were promoted (caller spawns workers).
+    pub fn promote(&self) -> Vec<Job> {
+        let mut active = self.active.lock().unwrap();
+        let available = self.max_workers.saturating_sub(active.len());
+        if available == 0 {
+            return vec![];
+        }
+        let mut pending = self.pending.lock().unwrap();
+        let mut promoted = Vec::new();
+        for _ in 0..available {
+            if let Some(job) = pending.pop_front() {
+                promoted.push(job.clone());
+                active.push(job);
+            }
+        }
+        promoted
+    }
+
+    /// Move a completed job from active to done.
+    pub fn complete(&self, id: &str) {
+        let mut active = self.active.lock().unwrap();
+        if let Some(pos) = active.iter().position(|j| j.id == id) {
+            let job = active.remove(pos);
+            self.done.lock().unwrap().push(job);
+        }
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.active.lock().unwrap().len()
+    }
+    pub fn pending_count(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+
+    /// Snapshot of all job statuses (for UI).
+    pub fn snapshot(&self) -> Vec<Job> {
+        let mut all = self
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        all.extend(self.active.lock().unwrap().iter().cloned());
+        all.extend(self.done.lock().unwrap().iter().cloned());
+        all
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TransferStats {
+    pub bytes_total: u64,
+    pub bytes_done: u64,
+    pub started: Option<Instant>,
+    pub speed: f64, // bytes/sec
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TransferTask {
+    pub id: String,
+    pub src: String,
+    pub dst: String,
+    pub files: Vec<String>,
+    pub stats: TransferStats,
+    pub cancel: Arc<AtomicBool>,
+}
+
+impl TransferTask {
+    pub fn new(id: &str, src: &str, dst: &str, files: &[String]) -> Self {
+        Self {
+            id: id.to_string(),
+            src: src.to_string(),
+            dst: dst.to_string(),
+            files: files.to_vec(),
+            cancel: job_token(),
+            ..Default::default()
+        }
+    }
+
+    /// ETA in seconds — simple: remaining_bytes / speed.
+    /// ponytail: no EWMA; single-sample speed from TransferStats.
+    pub fn eta_seconds(&self) -> Option<u64> {
+        if self.stats.speed <= 0.0 {
+            return None;
+        }
+        let remaining = self.stats.bytes_total.saturating_sub(self.stats.bytes_done);
+        Some((remaining as f64 / self.stats.speed) as u64)
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.stats.bytes_done >= self.stats.bytes_total && self.stats.bytes_total > 0
+    }
+}
