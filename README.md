@@ -15,7 +15,10 @@ Midnight Commander parity with extra Rust-native features.
 - **bat** integration for syntax-highlighted file preview (Shift+F3)
 - **User menu** with custom scripts (`~/.config/arx/arx.menu`)
 - **Configurable editor** — `arx.toml` > `$EDITOR` > `$VISUAL` > `vi`
-- 6 tests, clippy-clean, MIT licensed
+- **Content diff** across panes (Ctrl+D + Enter runs `diff -u`)
+- **Extension colors** — 30+ file types color-coded in Full mode
+- **F-key shortcut bar** always visible at bottom (MC-style)
+- 10 tests, clippy-clean, MIT licensed
 
 ## Quick start
 
@@ -89,7 +92,17 @@ arx
 |---|---|
 | Ctrl+T | New tab |
 | Ctrl+W | Close tab |
-| Ctrl+← / Ctrl+→ | Switch tab |
+| Ctrl+← / Ctrl+→ | Previous / next tab |
+| Alt+1 … 9 | Jump to tab N |
+
+### Ctrl+X prefix (MC-style)
+
+| Key | Action |
+|---|---|
+| Ctrl+X S | Create symlink (`ln -s`) |
+| Ctrl+X L | Create hard link (`ln`) |
+| Ctrl+X C | chmod |
+| Ctrl+X O | chown |
 
 ### Misc
 
@@ -143,7 +156,12 @@ t  "Disk usage"  df -h
 | Mkdir (F7), rename (Shift+F6) | ✅ |
 | File info (Ctrl+I) | ✅ |
 | Drop to shell (Ctrl+O) | ✅ |
-| Subshell, symlink, chmod, mouse, file search, panel modes | Coming |
+| Symlink, hardlink, chmod, chown | ✅ (Ctrl+X prefix) |
+| Recursive find, mouse | ✅ |
+| Panel modes (Full/Brief) | ✅ (Alt+T) |
+| Extension colors | ✅ |
+| Shortcut bar, full help | ✅ |
+| **MC parity** | ✅ **complete** |
 
 ## Development
 
