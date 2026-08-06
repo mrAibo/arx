@@ -1331,7 +1331,11 @@ async fn event_loop(
                                             .ok();
                                         } else {
                                             let src_loc = Location::Local(src.clone());
-                                            let result = src_loc.copy_files(&src, &dst, &names2);
+                                            let result = src_loc.copy_files(
+                                                &src.to_string_lossy(),
+                                                &dst.to_string_lossy(),
+                                                &names2,
+                                            );
                                             match result {
                                                 Ok(n) => {
                                                     tx.send(arx::jobs::JobEvent::Done {
@@ -1396,7 +1400,11 @@ async fn event_loop(
                                         tx.send(arx::jobs::JobEvent::Running { id: id.clone() })
                                             .ok();
                                         let src_loc = Location::Local(src.clone());
-                                        let result = src_loc.move_files(&src, &dst, &names2);
+                                        let result = src_loc.move_files(
+                                            &src.to_string_lossy(),
+                                            &dst.to_string_lossy(),
+                                            &names2,
+                                        );
                                         match result {
                                             Ok(n) => {
                                                 tx.send(arx::jobs::JobEvent::Done {
@@ -1440,7 +1448,7 @@ async fn event_loop(
                             let active_path = pane_location_path(&state);
                             if let Some(dir) = active_path {
                                 let loc = Location::Local(dir.to_path_buf());
-                                match loc.delete_files(dir, &names) {
+                                match loc.delete_files(&dir.to_string_lossy(), &names) {
                                     Ok(n) => {
                                         state.message = Some(format!("Trashed {n} item(s)"));
                                     }
@@ -3000,7 +3008,7 @@ fn preview_file(path: &std::path::Path) -> Vec<String> {
             .unwrap_or(std::path::Path::new("/"))
             .to_path_buf(),
     );
-    loc.read_head(path, 500)
+    loc.read_head(&path.to_string_lossy(), 500)
         .unwrap_or_else(|e| vec![format!("Error: {e}")])
 }
 
