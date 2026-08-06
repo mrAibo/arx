@@ -30,6 +30,7 @@ pub fn run(config: arx::config::ArxConfig) -> io::Result<()> {
 }
 
 fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) -> io::Result<()> {
+    let editor = config.ui.editor.clone();
     let mut state = AppState {
         show_hidden: config.ui.show_hidden,
         hosts: arx::remote::hosts_config::load_hosts(),
@@ -522,6 +523,33 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                     );
                                 }
                             }
+                        } else if state.show_diff {
+                            // Content diff: diff this file against other pane's same-named file
+                            if let (Location::Local(left_dir), Location::Local(right_dir)) =
+                                (&state.left.location, &state.right.location)
+                            {
+                                let left_path = left_dir.join(&entry.name);
+                                let right_path = right_dir.join(&entry.name);
+                                if left_path.exists() && right_path.exists() {
+                                    let output = std::process::Command::new("diff")
+                                        .args(["--color=never", "-u"])
+                                        .arg(&left_path)
+                                        .arg(&right_path)
+                                        .output()
+                                        .map(|o| {
+                                            let s = String::from_utf8_lossy(&o.stdout).into_owned();
+                                            if s.is_empty() {
+                                                "Files are identical".into()
+                                            } else {
+                                                s
+                                            }
+                                        })
+                                        .unwrap_or_else(|e| format!("diff error: {e}"));
+                                    state.viewer_content =
+                                        output.lines().map(|l| l.to_string()).collect();
+                                    state.viewer_scroll = 0;
+                                }
+                            }
                         }
                     }
                 }
@@ -850,13 +878,15 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                             Location::Local(dir) => dir.join(&entry.name),
                             _ => continue,
                         };
-                        let editor = std::env::var("EDITOR")
-                            .or_else(|_| std::env::var("VISUAL"))
-                            .unwrap_or_else(|_| "vi".into());
+                        let editor_cmd = editor
+                            .clone()
+                            .or_else(|| std::env::var("EDITOR").ok())
+                            .or_else(|| std::env::var("VISUAL").ok())
+                            .unwrap_or_else(|| "vi".into());
                         // Leave raw mode, spawn editor, restore
                         disable_raw_mode()?;
                         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                        let _ = std::process::Command::new(&editor).arg(&path).status();
+                        let _ = std::process::Command::new(&editor_cmd).arg(&path).status();
                         execute!(terminal.backend_mut(), EnterAlternateScreen)?;
                         enable_raw_mode()?;
                         // Refresh after edit

@@ -12,6 +12,9 @@ pub struct UiConfig {
     pub theme: String,
     #[serde(default)]
     pub show_hidden: bool,
+    /// Editor command (overrides $EDITOR/$VISUAL). Example: "hx" or "nano".
+    #[serde(default)]
+    pub editor: Option<String>,
 }
 
 fn default_theme() -> String {
@@ -24,6 +27,7 @@ impl Default for ArxConfig {
             ui: UiConfig {
                 theme: default_theme(),
                 show_hidden: false,
+                editor: None,
             },
         }
     }
