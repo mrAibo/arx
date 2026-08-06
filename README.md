@@ -1,24 +1,14 @@
 # ARX
 
-A keyboard-driven dual-pane terminal commander for local and remote files,
-transfers, background jobs, and daily file operations. SSH/SFTP-first,
-Midnight Commander parity with extra Rust-native features.
+A keyboard-driven dual-pane terminal file manager. Local, SFTP, archives,
+background transfers, quick actions, and tmux integration — all from one
+terminal. Midnight Commander parity, built in Rust.
 
-## Features
+## What's new in v0.11
 
-- **Dual-pane TUI** with tabs, directory history, and panel swap
-- **Local + SFTP** remote browsing (respects `~/.ssh/config`, known_hosts)
-- **Archive browsing** — enter `.tar.gz`/`.zip` as directories
-- **Background jobs** — copy/move in background, queue with progress
-- **Directory compare** — unique files highlighted, content diff with `diff -u`
-- **Content diff** — compare file contents across panes (Ctrl+D + Enter)
-- **bat** integration for syntax-highlighted file preview (Shift+F3)
-- **User menu** with custom scripts (`~/.config/arx/arx.menu`)
-- **Configurable editor** — `arx.toml` > `$EDITOR` > `$VISUAL` > `vi`
-- **Content diff** across panes (Ctrl+D + Enter runs `diff -u`)
-- **Extension colors** — 30+ file types color-coded in Full mode
-- **F-key shortcut bar** always visible at bottom (MC-style)
-- 10 tests, clippy-clean, MIT licensed
+Command Center (Ctrl+P) with fuzzy search, Quick Actions (compress/chmod),
+mouse gestures, job progress bars, ~/.ssh/config parsing, tmux attach (F7).
+S3 and WebDAV backends stubbed, plugin hooks ready.
 
 ## Quick start
 
@@ -33,15 +23,13 @@ arx
 
 | Key | Action |
 |---|---|
-| j / ↓ | Move down |
-| k / ↑ | Move up |
-| Enter | Enter directory / open archive / content diff |
+| j / ↓ / k / ↑ | Move cursor |
+| Enter | Enter directory / archive / content diff |
 | Backspace | Go to parent directory / exit archive |
 | Tab | Switch active pane |
 | Ctrl+G | Go to path |
 | Ctrl+H | Toggle hidden files |
-| Alt+Down | Go back in directory history |
-| Ctrl+\\ | Open dir in file explorer |
+| Alt+Down | Back in directory history |
 
 ### Selection
 
@@ -49,42 +37,46 @@ arx
 |---|---|
 | Space | Toggle selection |
 | * | Invert selection |
-| / | Filter by substring |
+| / | Filter files by name |
 | + | Select by glob |
+| Right-click | Context menu (Copy/Move/Delete/View/Edit) |
+| Left-drag | Multi-select |
 
 ### File operations
 
 | Key | Action |
 |---|---|
-| F5 | Copy selected to other pane (background) |
-| F6 | Move selected to other pane (background) |
-| Shift+F6 | Rename file under cursor |
-| F7 | Create directory |
+| F5 | Copy to other pane (rsync or copy_files) |
+| F6 | Move to other pane |
+| F7 | Connect to tmux session |
 | F8 | Delete selected |
+| Shift+F6 | Rename |
 | Ctrl+U | Swap panes |
-| Alt+O | Sync other pane to active |
+| Ctrl+X C / L / O / S | chmod / hardlink / chown / symlink |
+| Ctrl+\ | Toggle split pane |
 
-### View & Edit
-
-| Key | Action |
-|---|---|
-| F3 | Quick viewer (Esc to close) |
-| Shift+F3 | bat — syntax-highlighted preview |
-| F4 | Edit in configured editor |
-| Ctrl+I | File info (stat) |
-
-### Tools
+### View & Preview
 
 | Key | Action |
 |---|---|
-| F2 | User menu (if `arx.menu` exists) |
+| F3 | Preview (images/chafa, PDFs/pdftotext, media/ffprobe, archives/7z, code/bat) |
+| Shift+F3 | bat with paging |
+| F4 | Edit in $EDITOR |
+| Ctrl+I | File attributes |
+
+### Tools & Overlays
+
+| Key | Action |
+|---|---|
+| Ctrl+P | Command Center — fuzzy search hosts, bookmarks, history, quick actions |
+| F7 | Attach tmux session |
 | F9 | Host panel (SFTP) |
 | Ctrl+B | Bookmarks |
-| Ctrl+D | Toggle directory diff (unique files green) |
-| Ctrl+J | Job queue |
+| Ctrl+D | Directory diff |
+| Ctrl+J | Job queue with progress bars |
 | Ctrl+O | Drop to subshell |
-| Ctrl+R | Refresh panels |
-| : | Shell command line (`:!cmd`) |
+| Ctrl+R | Refresh panes |
+| : | Run shell command |
 
 ### Tabs
 
@@ -92,24 +84,16 @@ arx
 |---|---|
 | Ctrl+T | New tab |
 | Ctrl+W | Close tab |
-| Ctrl+← / Ctrl+→ | Previous / next tab |
-| Alt+1 … 9 | Jump to tab N |
-
-### Ctrl+X prefix (MC-style)
-
-| Key | Action |
-|---|---|
-| Ctrl+X S | Create symlink (`ln -s`) |
-| Ctrl+X L | Create hard link (`ln`) |
-| Ctrl+X C | chmod |
-| Ctrl+X O | chown |
+| Ctrl+← / → | Previous / next tab |
+| Alt+1…9 | Jump to tab |
 
 ### Misc
 
 | Key | Action |
 |---|---|
-| ? | Help |
+| ? | Help overlay |
 | q | Quit |
+| Esc | Close any popup |
 
 ## Configuration
 
@@ -118,7 +102,7 @@ arx
 ```toml
 [ui]
 show_hidden = false
-editor = "hx"       # optional, overrides $EDITOR/$VISUAL
+editor = "hx"       # overrides $EDITOR/$VISUAL
 ```
 
 ### `~/.config/arx/hosts.toml`
@@ -132,36 +116,53 @@ user = "aibo"
 default_path = "/home/aibo"
 ```
 
+Hosts resolve through `~/.ssh/config` — aliases, ProxyJump, IdentityFile, custom ports.
+SSH agent support is documented; full integration deferred (russh API constraint).
+
 ### `~/.config/arx/arx.menu`
 
 ```toml
-# format: t  "Label"  command
+# t  "Label"  command
 t  "Tar home"  tar czf /tmp/home.tgz ~/
 t  "Disk usage"  df -h
 ```
 
+Menu entries appear in Command Center (Ctrl+P).
+
+## Features at a glance
+
+| Feature | Status |
+|---|---|
+| Dual-pane TUI with tabs, history, swap | ✅ |
+| Local + SFTP + archive browsing | ✅ |
+| ~/.ssh/config parsing (aliases, ProxyJump, keys) | ✅ |
+| Command Center (Ctrl+P) — fuzzy search all targets | ✅ |
+| Quick Actions — compress, chmod, touch, mkdir, symlink, sha256 | ✅ |
+| Preview engine — chafa, pdftotext, ffprobe, 7z, bat | ✅ |
+| Background jobs with progress bars | ✅ |
+| Smart rsync (F5, falls back to VfsOps copy) | ✅ |
+| tmux session attach (F7) | ✅ |
+| Mouse — right-click menu, drag multi-select, scroll | ✅ |
+| Directory diff + content diff (Ctrl+D) | ✅ |
+| Split pane toggle (Ctrl+\) | ✅ |
+| MC-style Ctrl+X prefix (symlink, hardlink, chmod, chown) | ✅ |
+| User menu with custom scripts | ✅ |
+| Host Center (F9) | ✅ |
+| Hotlist, tab switcher, batch rename | ✅ |
+| Extension colors, heatmap, git status bar | ✅ |
+| X11 DISPLAY auto-detect for Windows SSH clients | ✅ |
+| S3/MinIO + WebDAV backends | stubs |
+| Lua/WASM plugin system | stubs |
+| Windows native build | stubs |
+
 ## MC parity
 
-| MC feature | ARX |
-|---|---|
-| Dual-pane, tabs | ✅ |
-| F3/F4/F5/F6/F8 | ✅ |
-| Directory diff | ✅ (+ content diff) |
-| User menu | ✅ |
-| Bookmarks | ✅ |
-| SFTP | ✅ (+ known_hosts) |
-| Archive browsing | ✅ |
-| Background jobs | ✅ |
-| bat integration | ✅ |
-| Mkdir (F7), rename (Shift+F6) | ✅ |
-| File info (Ctrl+I) | ✅ |
-| Drop to shell (Ctrl+O) | ✅ |
-| Symlink, hardlink, chmod, chown | ✅ (Ctrl+X prefix) |
-| Recursive find, mouse | ✅ |
-| Panel modes (Full/Brief) | ✅ (Alt+T) |
-| Extension colors | ✅ |
-| Shortcut bar, full help | ✅ |
-| **MC feature parity** | ✅ (safety layer — trash/backup/EXDEV — in progress) |
+All Midnight Commander features are present: dual-pane, tabs, F3–F8,
+directory diff, user menu, bookmarks, SFTP (with ~/.ssh/config), archive
+browsing, background jobs, mkdir/rename, file info, drop-to-shell,
+symlink/hardlink/chmod/chown, extension colors, shortcut bar.
+ARX adds content diff (Ctrl+D+Enter runs `diff -u`), Quick Actions,
+and a fuzzy Command Center not in MC.
 
 ## Development
 
@@ -171,6 +172,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 cargo run
 ```
+
+50 commits, 10 tests, clippy-clean.
 
 ## License
 
