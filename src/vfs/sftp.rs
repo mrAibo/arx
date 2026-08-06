@@ -25,8 +25,12 @@ impl SftpFs {
 
 async fn list_sftp(host: &Host, remote_path: &str) -> anyhow::Result<Vec<Entry>> {
     let config = Arc::new(russh::client::Config::default());
+    let handler = Handler {
+        hostname: host.hostname.clone(),
+        port: host.port,
+    };
 
-    let mut client = russh::client::connect(config, (host.hostname.as_str(), host.port), Handler)
+    let mut client = russh::client::connect(config, (host.hostname.as_str(), host.port), handler)
         .await
         .with_context(|| format!("SSH connect to {}:{}", host.hostname, host.port))?;
 
@@ -108,7 +112,10 @@ fn load_key_pair() -> anyhow::Result<russh::keys::PrivateKeyWithHashAlg> {
     ))
 }
 
-struct Handler;
+struct Handler {
+    hostname: String,
+    port: u16,
+}
 
 impl russh::client::Handler for Handler {
     type Error = anyhow::Error;
@@ -116,9 +123,21 @@ impl russh::client::Handler for Handler {
     #[allow(clippy::manual_async_fn)]
     fn check_server_key(
         &mut self,
-        _server_public_key: &keys::PublicKey,
+        server_public_key: &keys::PublicKey,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
-        // ponytail: accept all on first connect; add known_hosts later
-        async { Ok(true) }
+        let host = self.hostname.clone();
+        let port = self.port;
+        let key = server_public_key.clone();
+        async move {
+            match keys::check_known_hosts(&host, port, &key) {
+                Ok(true) => Ok(true),
+                Ok(false) => Ok(false),
+                Err(_) => {
+                    // Key not in known_hosts — accept on first connect
+                    // ponytail: prompt user or add to known_hosts later
+                    Ok(true)
+                }
+            }
+        }
     }
 }

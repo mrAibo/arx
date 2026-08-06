@@ -18,6 +18,14 @@ pub enum JobStatus {
     Failed,
 }
 
+/// Background thread completion notification.
+#[derive(Debug, Clone)]
+pub enum JobEvent {
+    Running { id: String },
+    Done { id: String, message: String },
+    Failed { id: String, error: String },
+}
+
 impl Job {
     pub fn status_icon(&self) -> &str {
         match self.status {

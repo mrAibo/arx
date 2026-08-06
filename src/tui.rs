@@ -41,7 +41,37 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
     let mut left_list = ListState::default();
     let mut right_list = ListState::default();
 
+    // Background job notification channel
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<arx::jobs::JobEvent>();
+
     while !state.should_quit {
+        // Drain completed/failed job events
+        while let Ok(event) = job_rx.try_recv() {
+            match event {
+                arx::jobs::JobEvent::Running { ref id } => {
+                    if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
+                        job.status = arx::jobs::JobStatus::Running;
+                    }
+                }
+                arx::jobs::JobEvent::Done {
+                    ref id,
+                    ref message,
+                } => {
+                    if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
+                        job.status = arx::jobs::JobStatus::Done;
+                        job.progress = 100;
+                    }
+                    state.message = Some(message.clone());
+                }
+                arx::jobs::JobEvent::Failed { ref id, ref error } => {
+                    if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
+                        job.status = arx::jobs::JobStatus::Failed;
+                    }
+                    state.message = Some(error.clone());
+                }
+            }
+        }
+
         let left_filtered = apply_filter(&left_entries, &state.filter);
         let right_filtered = apply_filter(&right_entries, &state.filter);
         // clamp cursors
@@ -409,11 +439,22 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                 KeyCode::Enter => {
                     if let Some(entry) = entries.get(cursor) {
                         if entry.kind == EntryKind::Directory {
-                            let new_path = match &pane.location {
-                                Location::Local(p) => p.join(&entry.name),
+                            let new_location = match &pane.location {
+                                Location::Local(p) => Location::Local(p.join(&entry.name)),
+                                Location::Sftp { host, path } => {
+                                    let new_path = if path.ends_with('/') {
+                                        format!("{path}{}", entry.name)
+                                    } else {
+                                        format!("{path}/{}", entry.name)
+                                    };
+                                    Location::Sftp {
+                                        host: host.clone(),
+                                        path: new_path,
+                                    }
+                                }
                                 _ => continue,
                             };
-                            pane.location = Location::Local(new_path);
+                            pane.location = new_location;
                             pane.cursor = 0;
                             state.selected.clear();
                             if state.active == Pane::Left {
@@ -477,28 +518,106 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                     right_entries =
                         load_entries(&state.right.location, state.show_hidden, state.sort_mode);
                 }
-                // F5: copy selected (or cursor) from active pane to other pane
+                // F5: copy selected (or cursor) from active pane to other pane — background
                 KeyCode::F(5) => {
                     let names = selection_or_cursor(&state, entries, cursor);
-                    let result = do_op(&state, |src, dst| LocalFs::copy_files(src, dst, &names));
-                    state.message = Some(match result {
-                        Ok(n) => format!("Copied {n} item(s)"),
-                        Err(e) => format!("Copy error: {e}"),
-                    });
+                    if names.is_empty() {
+                        continue;
+                    }
+                    match op_paths(&state) {
+                        Some((src, dst)) => {
+                            let id = format!("copy-{}", state.jobs.len());
+                            let desc = format!("Copy {} → {}", names.join(", "), dst.display());
+                            state.jobs.push(arx::jobs::Job {
+                                id: id.clone(),
+                                description: desc,
+                                source: Location::Local(src.clone()),
+                                destination: Location::Local(dst.clone()),
+                                status: arx::jobs::JobStatus::Pending,
+                                progress: 0,
+                            });
+                            let tx = job_tx.clone();
+                            let names2 = names.clone();
+                            std::thread::spawn(move || {
+                                tx.send(arx::jobs::JobEvent::Running { id: id.clone() })
+                                    .ok();
+                                let result = LocalFs::copy_files(&src, &dst, &names2);
+                                match result {
+                                    Ok(n) => {
+                                        tx.send(arx::jobs::JobEvent::Done {
+                                            id,
+                                            message: format!("Copied {n} item(s)"),
+                                        })
+                                        .ok();
+                                    }
+                                    Err(e) => {
+                                        tx.send(arx::jobs::JobEvent::Failed {
+                                            id,
+                                            error: format!("Copy error: {e}"),
+                                        })
+                                        .ok();
+                                    }
+                                }
+                            });
+                            state.message = Some(format!("Copy queued (job {})", state.jobs.len()));
+                        }
+                        None => {
+                            state.message = Some("Both panes must be local for copy".into());
+                        }
+                    }
                     state.selected.clear();
                     left_entries =
                         load_entries(&state.left.location, state.show_hidden, state.sort_mode);
                     right_entries =
                         load_entries(&state.right.location, state.show_hidden, state.sort_mode);
                 }
-                // F6: move selected (or cursor) from active pane to other pane
+                // F6: move selected (or cursor) from active pane to other pane — background
                 KeyCode::F(6) => {
                     let names = selection_or_cursor(&state, entries, cursor);
-                    let result = do_op(&state, |src, dst| LocalFs::move_files(src, dst, &names));
-                    state.message = Some(match result {
-                        Ok(n) => format!("Moved {n} item(s)"),
-                        Err(e) => format!("Move error: {e}"),
-                    });
+                    if names.is_empty() {
+                        continue;
+                    }
+                    match op_paths(&state) {
+                        Some((src, dst)) => {
+                            let id = format!("move-{}", state.jobs.len());
+                            let desc = format!("Move {} → {}", names.join(", "), dst.display());
+                            state.jobs.push(arx::jobs::Job {
+                                id: id.clone(),
+                                description: desc,
+                                source: Location::Local(src.clone()),
+                                destination: Location::Local(dst.clone()),
+                                status: arx::jobs::JobStatus::Pending,
+                                progress: 0,
+                            });
+                            let tx = job_tx.clone();
+                            let names2 = names.clone();
+                            std::thread::spawn(move || {
+                                tx.send(arx::jobs::JobEvent::Running { id: id.clone() })
+                                    .ok();
+                                let result = LocalFs::move_files(&src, &dst, &names2);
+                                match result {
+                                    Ok(n) => {
+                                        tx.send(arx::jobs::JobEvent::Done {
+                                            id,
+                                            message: format!("Moved {n} item(s)"),
+                                        })
+                                        .ok();
+                                    }
+                                    Err(e) => {
+                                        tx.send(arx::jobs::JobEvent::Failed {
+                                            id,
+                                            error: format!("Move error: {e}"),
+                                        })
+                                        .ok();
+                                    }
+                                }
+                            });
+                            state.message = Some(format!("Move queued (job {})", state.jobs.len()));
+                        }
+                        None => {
+                            state.message = Some("Both panes must be local for move".into());
+                        }
+                    }
                     state.selected.clear();
                     left_entries =
                         load_entries(&state.left.location, state.show_hidden, state.sort_mode);
@@ -769,15 +888,11 @@ fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> V
     }
 }
 
-fn do_op<F>(state: &AppState, op: F) -> io::Result<usize>
-where
-    F: FnOnce(&Path, &Path) -> io::Result<usize>,
-{
-    let src = pane_location_path(state)
-        .ok_or_else(|| io::Error::other("active pane is not a local directory"))?;
-    let dst = other_pane_location_path(state)
-        .ok_or_else(|| io::Error::other("other pane is not a local directory"))?;
-    op(src, dst)
+/// Returns (src_path, dst_path) for active→other pane file operations.
+fn op_paths(state: &AppState) -> Option<(PathBuf, PathBuf)> {
+    let src = pane_location_path(state)?.to_path_buf();
+    let dst = other_pane_location_path(state)?.to_path_buf();
+    Some((src, dst))
 }
 
 fn render(
