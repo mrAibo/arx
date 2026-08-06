@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 pub mod archive;
 pub mod local;
+pub mod s3;
 pub mod sftp;
+pub mod webdav;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Location {
