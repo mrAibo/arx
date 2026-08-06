@@ -165,6 +165,30 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// ── VfsProvider impl (Provider Registry) ──
+
+use crate::vfs::VfsProvider;
+
+pub struct LocalProvider;
+
+impl VfsProvider for LocalProvider {
+    fn list(&self, path: &str) -> std::io::Result<Vec<Entry>> {
+        LocalFs::list(std::path::Path::new(path))
+    }
+    fn read_head(&self, path: &str, lines: usize) -> std::io::Result<Vec<String>> {
+        LocalFs::read_head(std::path::Path::new(path), lines)
+    }
+    fn copy_files(&self, src: &str, dst: &str, names: &[String]) -> std::io::Result<usize> {
+        LocalFs::copy_files(std::path::Path::new(src), std::path::Path::new(dst), names)
+    }
+    fn move_files(&self, src: &str, dst: &str, names: &[String]) -> std::io::Result<usize> {
+        LocalFs::move_files(std::path::Path::new(src), std::path::Path::new(dst), names)
+    }
+    fn delete_files(&self, dir: &str, names: &[String]) -> std::io::Result<usize> {
+        LocalFs::delete_files(std::path::Path::new(dir), names)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

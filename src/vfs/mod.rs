@@ -7,6 +7,89 @@ pub mod s3;
 pub mod sftp;
 pub mod webdav;
 
+// ── Provider Registry (new architecture — phased migration) ──
+// ponytail: add ProviderId + VfsProvider + Registry alongside old Location enum.
+// Old Location dispatch stays working during migration; call sites switch one by one.
+// Once all call sites use registry, delete old Location enum.
+
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderId {
+    Local,
+    Sftp,
+    Archive,
+    S3,
+    WebDAV,
+}
+
+/// Unified location target — replaces Location enum after migration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Target {
+    pub provider: ProviderId,
+    pub path: String,
+}
+
+impl Target {
+    pub fn local(p: &std::path::Path) -> Self {
+        Self {
+            provider: ProviderId::Local,
+            path: p.to_string_lossy().into_owned(),
+        }
+    }
+    pub fn sftp(path: &str) -> Self {
+        Self {
+            provider: ProviderId::Sftp,
+            path: path.to_string(),
+        }
+    }
+    pub fn archive(inner: &str) -> Self {
+        Self {
+            provider: ProviderId::Archive,
+            path: inner.to_string(),
+        }
+    }
+    pub fn resolve(&self, name: &str) -> Self {
+        let p = if self.path.ends_with('/') || self.path.is_empty() {
+            format!("{}{}", self.path, name)
+        } else {
+            format!("{}/{}", self.path, name)
+        };
+        Self {
+            path: p,
+            ..self.clone()
+        }
+    }
+    pub fn parent(&self) -> Option<Self> {
+        let t = self.path.trim_end_matches('/');
+        if t.is_empty() || !t.contains('/') {
+            return None;
+        }
+        Some(Self {
+            path: t.rsplit_once('/').unwrap().0.to_string(),
+            ..self.clone()
+        })
+    }
+}
+
+/// Backend trait — each provider implements this. async deferred to F2.
+pub trait VfsProvider: Send + Sync {
+    fn list(&self, path: &str) -> std::io::Result<Vec<Entry>>;
+    fn read_head(&self, path: &str, lines: usize) -> std::io::Result<Vec<String>>;
+    fn copy_files(&self, src: &str, dst: &str, names: &[String]) -> std::io::Result<usize>;
+    fn move_files(&self, src: &str, dst: &str, names: &[String]) -> std::io::Result<usize>;
+    fn delete_files(&self, dir: &str, names: &[String]) -> std::io::Result<usize>;
+}
+
+pub type ProviderRegistry = HashMap<ProviderId, Box<dyn VfsProvider>>;
+
+/// Build default registry with local backend. SFTP/Archive registered per-connection.
+pub fn default_registry() -> ProviderRegistry {
+    let mut r = ProviderRegistry::new();
+    r.insert(ProviderId::Local, Box::new(local::LocalProvider));
+    r
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Location {
     Local(PathBuf),
