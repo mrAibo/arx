@@ -1634,19 +1634,20 @@ async fn event_loop(
                             state.show_tree = !state.show_tree;
                             state.tree_filter.clear();
                         }
-                        // Type in tree filter (when tree is shown)
-                        KeyCode::Char(c)
-                            if state.show_tree
-                                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            state.tree_filter.push(c);
-                        }
+                        // Type in tree filter (when tree is shown) — Esc/Backspace before Char
+                        #[allow(unreachable_patterns)]
                         KeyCode::Backspace if state.show_tree => {
                             state.tree_filter.pop();
                         }
                         KeyCode::Esc if state.show_tree => {
                             state.show_tree = false;
                             state.tree_filter.clear();
+                        }
+                        KeyCode::Char(c)
+                            if state.show_tree
+                                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            state.tree_filter.push(c);
                         }
                         // Ctrl+X D: toggle directory compare
                         // Alt+T: toggle panel mode (Full ↔ Brief) KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => { state.panel_mode = match state.panel_mode { PanelMode::Full => PanelMode::Brief, PanelMode::Brief => PanelMode::Full, }; }
