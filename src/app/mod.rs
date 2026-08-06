@@ -41,6 +41,8 @@ pub struct AppState {
     pub filter: String,
     /// True while the user is composing the filter (captures typed chars).
     pub filtering: bool,
+    /// One-shot status message; cleared after render.
+    pub message: Option<String>,
 }
 
 impl Default for AppState {
@@ -61,6 +63,7 @@ impl Default for AppState {
             selected: BTreeSet::new(),
             filter: String::new(),
             filtering: false,
+            message: None,
         }
     }
 }
@@ -90,6 +93,13 @@ impl AppState {
         match self.active {
             Pane::Left => &mut self.left,
             Pane::Right => &mut self.right,
+        }
+    }
+
+    pub fn other_pane_mut(&mut self) -> &mut PaneState {
+        match self.active {
+            Pane::Left => &mut self.right,
+            Pane::Right => &mut self.left,
         }
     }
 }

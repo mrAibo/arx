@@ -13,6 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 use std::io;
+use std::path::Path;
 
 pub fn run() -> io::Result<()> {
     enable_raw_mode()?;
@@ -48,6 +49,7 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
         left_list.select(Some(state.left.cursor));
         right_list.select(Some(state.right.cursor));
 
+        let msg = state.message.clone();
         terminal.draw(|frame| {
             render(
                 frame,
@@ -56,8 +58,10 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
                 &right_filtered,
                 &mut left_list.clone(),
                 &mut right_list.clone(),
+                msg.as_deref(),
             )
         })?;
+        state.message = None; // one-shot clear after render
 
         #[allow(clippy::collapsible_if)]
         if let Event::Key(key) = event::read()? {
@@ -130,7 +134,6 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
                             pane.location = Location::Local(new_path);
                             pane.cursor = 0;
                             state.selected.clear();
-                            // reload entries for this pane
                             if state.active == Pane::Left {
                                 left_entries = load_entries(&state.left.location);
                             } else {
@@ -155,9 +158,50 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
                     }
                 }
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // manual refresh
                     left_entries = load_entries(&state.left.location);
                     right_entries = load_entries(&state.right.location);
+                }
+                // F5: copy selected (or cursor) from active pane to other pane
+                KeyCode::F(5) => {
+                    let names = selection_or_cursor(&state, entries, cursor);
+                    let result = do_op(&state, |src, dst| LocalFs::copy_files(src, dst, &names));
+                    state.message = Some(match result {
+                        Ok(n) => format!("Copied {n} item(s)"),
+                        Err(e) => format!("Copy error: {e}"),
+                    });
+                    state.selected.clear();
+                    left_entries = load_entries(&state.left.location);
+                    right_entries = load_entries(&state.right.location);
+                }
+                // F6: move selected (or cursor) from active pane to other pane
+                KeyCode::F(6) => {
+                    let names = selection_or_cursor(&state, entries, cursor);
+                    let result = do_op(&state, |src, dst| LocalFs::move_files(src, dst, &names));
+                    state.message = Some(match result {
+                        Ok(n) => format!("Moved {n} item(s)"),
+                        Err(e) => format!("Move error: {e}"),
+                    });
+                    state.selected.clear();
+                    left_entries = load_entries(&state.left.location);
+                    right_entries = load_entries(&state.right.location);
+                }
+                // F8: delete selected (or cursor) from active pane
+                KeyCode::F(8) => {
+                    let names = selection_or_cursor(&state, entries, cursor);
+                    let active_path = pane_location_path(&state);
+                    if let Some(dir) = active_path {
+                        match LocalFs::delete_files(dir, &names) {
+                            Ok(n) => {
+                                state.message = Some(format!("Deleted {n} item(s)"));
+                            }
+                            Err(e) => {
+                                state.message = Some(format!("Delete error: {e}"));
+                            }
+                        }
+                        state.selected.clear();
+                        left_entries = load_entries(&state.left.location);
+                        right_entries = load_entries(&state.right.location);
+                    }
                 }
                 _ => {}
             }
@@ -185,6 +229,49 @@ fn apply_filter<'a>(entries: &'a [Entry], filter: &str) -> Vec<&'a Entry> {
     }
 }
 
+/// Get the filesystem path for the active pane's location (if Local).
+fn pane_location_path(state: &AppState) -> Option<&Path> {
+    match &state.active_pane().location {
+        Location::Local(p) => Some(p),
+        _ => None,
+    }
+}
+
+/// Get the filesystem path for the OTHER pane's location (if Local).
+fn other_pane_location_path(state: &AppState) -> Option<&Path> {
+    let other = match state.active {
+        Pane::Left => &state.right,
+        Pane::Right => &state.left,
+    };
+    match &other.location {
+        Location::Local(p) => Some(p),
+        _ => None,
+    }
+}
+
+/// Names to operate on: selected set, or the single cursor entry.
+fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> Vec<String> {
+    if !state.selected.is_empty() {
+        state.selected.iter().cloned().collect()
+    } else if let Some(entry) = entries.get(cursor) {
+        vec![entry.name.clone()]
+    } else {
+        vec![]
+    }
+}
+
+/// Execute a two-pane operation (copy/move): src = active pane, dst = other pane.
+fn do_op<F>(state: &AppState, op: F) -> io::Result<usize>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<usize>,
+{
+    let src = pane_location_path(state)
+        .ok_or_else(|| io::Error::other("active pane is not a local directory"))?;
+    let dst = other_pane_location_path(state)
+        .ok_or_else(|| io::Error::other("other pane is not a local directory"))?;
+    op(src, dst)
+}
+
 fn render(
     frame: &mut ratatui::Frame,
     state: &AppState,
@@ -192,6 +279,7 @@ fn render(
     right_entries: &[&Entry],
     left_list: &mut ListState,
     right_list: &mut ListState,
+    message: Option<&str>,
 ) {
     let area = frame.area();
 
@@ -237,9 +325,10 @@ fn render(
     } else {
         String::new()
     };
+    let msg_hint = message.map(|m| format!(" | {m}")).unwrap_or_default();
 
     let status = Paragraph::new(Line::from(format!(
-        "ARX v0.1.0 | {} | sel: {} |{filter_hint} | q: quit | Tab: switch | Space: select | /: filter",
+        "ARX v0.1.0 | {} | sel: {} |{filter_hint}{msg_hint} | q: quit | Tab: switch | Space: sel | /: filter | F5: copy | F6: move | F8: del",
         loc_str,
         state.selected.len(),
     )))
