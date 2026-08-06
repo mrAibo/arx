@@ -1303,15 +1303,7 @@ async fn event_loop(
                                             .arg(&path)
                                             .status();
                                     } else {
-                                        let loc = Location::Local(
-                                            path.parent()
-                                                .unwrap_or(std::path::Path::new("/"))
-                                                .to_path_buf(),
-                                        );
-                                        state.viewer_content =
-                                            loc.read_head(&path, 500).unwrap_or_else(|e| {
-                                                vec![format!("Error reading file: {e}")]
-                                            });
+                                        state.viewer_content = preview_file(&path);
                                         state.viewer_scroll = 0;
                                     }
                                 }
@@ -2490,4 +2482,146 @@ fn handle_job_event(
             *right = load_entries(&state.right.location, state.show_hidden, state.sort_mode);
         }
     }
+}
+
+/// Preview a file using system tools: bat, chafa, pdftotext, ffprobe, 7z.
+/// Falls back to plain head(1) read.
+/// Preview a file using system tools: chafa, pdftotext, ffprobe, 7z, bat.
+fn preview_file(path: &std::path::Path) -> Vec<String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let path_str = path.to_str().unwrap_or("");
+
+    // Images → chafa
+    if matches!(
+        ext.as_str(),
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp"
+    ) && run_cmd(
+        "chafa",
+        &["--symbols", "block", "--size", "80x20", path_str],
+    ) {
+        let mut lines = run_cmd_output(
+            "chafa",
+            &["--symbols", "block", "--size", "80x20", path_str],
+        );
+        lines.insert(0, format!("[Image] {}", path.display()));
+        return lines;
+    }
+
+    // PDF → pdftotext
+    if ext == "pdf" && run_cmd("pdftotext", &["-l", "1", path_str, "-"]) {
+        let mut lines = run_cmd_output("pdftotext", &["-l", "1", path_str, "-"]);
+        lines.insert(
+            0,
+            format!("[PDF] {} — {} lines", path.display(), lines.len() - 1),
+        );
+        return lines;
+    }
+
+    // Media → ffprobe
+    if matches!(
+        ext.as_str(),
+        "mp4" | "mkv" | "avi" | "mov" | "webm" | "mp3" | "flac"
+    ) && run_cmd(
+        "ffprobe",
+        &[
+            "-hide_banner",
+            "-show_entries",
+            "format=duration,size,bit_rate:stream=codec_type,codec_name,width,height",
+            "-of",
+            "default=noprint_wrappers=1",
+            path_str,
+        ],
+    ) {
+        let mut lines = run_cmd_output(
+            "ffprobe",
+            &[
+                "-hide_banner",
+                "-show_entries",
+                "format=duration,size,bit_rate:stream=codec_type,codec_name,width,height",
+                "-of",
+                "default=noprint_wrappers=1",
+                path_str,
+            ],
+        );
+        lines.insert(0, format!("[Media] {}", path.display()));
+        return lines;
+    }
+
+    // Archives
+    if matches!(ext.as_str(), "zip" | "tar" | "gz" | "xz" | "7z" | "rar") {
+        let (cmd, args) = if matches!(ext.as_str(), "7z" | "rar" | "zip") {
+            ("7z", vec!["l", path_str])
+        } else {
+            ("tar", vec!["tvf", path_str])
+        };
+        if run_cmd(cmd, &args) {
+            let mut lines = run_cmd_output(cmd, &args);
+            lines.insert(0, format!("[Archive] {}", path.display()));
+            return lines;
+        }
+    }
+
+    // Code → bat
+    if run_cmd(
+        "bat",
+        &[
+            "--style=plain",
+            "--color=never",
+            "--paging=never",
+            "--line-range=:200",
+            path_str,
+        ],
+    ) {
+        let mut lines = run_cmd_output(
+            "bat",
+            &[
+                "--style=plain",
+                "--color=never",
+                "--paging=never",
+                "--line-range=:200",
+                path_str,
+            ],
+        );
+        let total = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        lines.insert(0, format!("[Code] {} — {} bytes", path.display(), total));
+        return lines;
+    }
+
+    // Fallback
+    let loc = arx::vfs::Location::Local(
+        path.parent()
+            .unwrap_or(std::path::Path::new("/"))
+            .to_path_buf(),
+    );
+    loc.read_head(path, 500)
+        .unwrap_or_else(|e| vec![format!("Error: {e}")])
+}
+
+/// Check if a command runs successfully (exit 0).
+fn run_cmd(cmd: &str, args: &[&str]) -> bool {
+    std::process::Command::new(cmd)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Run a command and return stdout lines.
+fn run_cmd_output(cmd: &str, args: &[&str]) -> Vec<String> {
+    std::process::Command::new(cmd)
+        .args(args)
+        .output()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
 }
