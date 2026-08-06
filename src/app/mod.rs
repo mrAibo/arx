@@ -93,6 +93,11 @@ pub struct AppState {
     pub jobs: Vec<Job>,
     pub show_jobs: bool,
     pub job_cursor: usize,
+    // C1: directory compare
+    pub show_diff: bool,
+    // C2: command input
+    pub cmd_input: bool,
+    pub cmd: String,
 }
 
 impl Default for AppState {
@@ -132,6 +137,9 @@ impl Default for AppState {
             jobs: Vec::new(),
             show_jobs: false,
             job_cursor: 0,
+            show_diff: false,
+            cmd_input: false,
+            cmd: String::new(),
         }
     }
 }

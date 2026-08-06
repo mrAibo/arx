@@ -70,13 +70,14 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
         #[allow(clippy::collapsible_if)]
         if let Event::Key(key) = event::read()? {
             // If composing filter/glob/go-to, keys go to buffer
-            if state.filtering || state.glob_input || state.go_input {
+            if state.filtering || state.glob_input || state.go_input || state.cmd_input {
                 match key.code {
                     KeyCode::Esc => {
                         state.filter.clear();
                         state.filtering = false;
                         state.glob_input = false;
                         state.go_input = false;
+                        state.cmd_input = false;
                     }
                     KeyCode::Enter => {
                         if state.glob_input && !state.filter.is_empty() {
@@ -121,15 +122,51 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                             }
                             state.filter.clear();
                         }
+                        if state.cmd_input {
+                            let command = std::mem::take(&mut state.cmd);
+                            state.cmd_input = false;
+                            if command.is_empty() {
+                                state.message = Some(": command cancelled".into());
+                            } else {
+                                // Run shell command, capture output
+                                let output = std::process::Command::new("sh")
+                                    .arg("-c")
+                                    .arg(&command)
+                                    .output();
+                                state.message = match output {
+                                    Ok(o) => {
+                                        let stdout =
+                                            String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                        let limit = 80;
+                                        if stdout.is_empty() && o.status.success() {
+                                            Some(format!(": {command} — ok"))
+                                        } else if stdout.len() > limit {
+                                            Some(format!(": {} — {}...", command, &stdout[..limit]))
+                                        } else {
+                                            Some(format!(": {} — {}", command, stdout))
+                                        }
+                                    }
+                                    Err(e) => Some(format!(": {command} failed: {e}")),
+                                };
+                            }
+                        }
                         state.filtering = false;
                         state.glob_input = false;
                         state.go_input = false;
                     }
                     KeyCode::Backspace => {
-                        state.filter.pop();
+                        if state.cmd_input {
+                            state.cmd.pop();
+                        } else {
+                            state.filter.pop();
+                        }
                     }
                     KeyCode::Char(c) => {
-                        state.filter.push(c);
+                        if state.cmd_input {
+                            state.cmd.push(c);
+                        } else {
+                            state.filter.push(c);
+                        }
                     }
                     _ => {}
                 }
@@ -528,6 +565,20 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                     state.show_jobs = !state.show_jobs;
                     state.job_cursor = 0;
                 }
+                // Ctrl+X D: toggle directory compare
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.show_diff = !state.show_diff;
+                    state.message = Some(if state.show_diff {
+                        "Diff on — unique files highlighted".into()
+                    } else {
+                        "Diff off".into()
+                    });
+                }
+                // :: command input
+                KeyCode::Char(':') => {
+                    state.cmd.clear();
+                    state.cmd_input = true;
+                }
                 _ => {}
             }
         }
@@ -655,6 +706,24 @@ fn render(
         .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
         .split(chunks[0]);
 
+    // Diff sets: files unique to each pane (only computed when show_diff is on)
+    let (left_only, right_only): (
+        std::collections::BTreeSet<&str>,
+        std::collections::BTreeSet<&str>,
+    ) = if state.show_diff {
+        let left_names: std::collections::BTreeSet<&str> =
+            left_entries.iter().map(|e| e.name.as_str()).collect();
+        let right_names: std::collections::BTreeSet<&str> =
+            right_entries.iter().map(|e| e.name.as_str()).collect();
+        let lo: std::collections::BTreeSet<&str> =
+            left_names.difference(&right_names).copied().collect();
+        let ro: std::collections::BTreeSet<&str> =
+            right_names.difference(&left_names).copied().collect();
+        (lo, ro)
+    } else {
+        (Default::default(), Default::default())
+    };
+
     render_pane(
         frame,
         panes[0],
@@ -663,6 +732,7 @@ fn render(
         left_list,
         state.active == Pane::Left,
         &state.selected,
+        &left_only,
     );
     render_pane(
         frame,
@@ -672,6 +742,7 @@ fn render(
         right_list,
         state.active == Pane::Right,
         &state.selected,
+        &right_only,
     );
 
     // Help overlay
@@ -705,7 +776,9 @@ fn render(
         Location::Local(p) => p.display().to_string(),
         other => other.to_string(),
     };
-    let hint = if state.go_input {
+    let hint = if state.cmd_input {
+        format!(" :{}_", state.cmd)
+    } else if state.go_input {
         format!(" go: {}_", state.filter)
     } else if state.glob_input {
         format!(" glob: {}_", state.filter)
@@ -919,6 +992,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_pane(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
@@ -927,6 +1001,7 @@ fn render_pane(
     list_state: &mut ListState,
     active: bool,
     selected: &std::collections::BTreeSet<String>,
+    unique_set: &std::collections::BTreeSet<&str>,
 ) {
     let border_style = if active {
         Style::default().fg(Color::Cyan)
@@ -950,6 +1025,9 @@ fn render_pane(
             let size_str = e.size.map(format_size).unwrap_or_default();
             let style = if selected.contains(&e.name) {
                 Style::default().fg(Color::Yellow)
+            } else if !unique_set.is_empty() && unique_set.contains(e.name.as_str()) {
+                // ponytail: green for unique entries in diff mode
+                Style::default().fg(Color::Green)
             } else {
                 Style::default()
             };
