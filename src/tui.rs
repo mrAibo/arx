@@ -1098,6 +1098,36 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                         }
                         state.cmd_prefix = false;
                     }
+                    KeyCode::Char('o')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) && cmd_prefix =>
+                    {
+                        // Ctrl+X O: chown
+                        state.cmd = "chown ".into();
+                        state.cmd_input = true;
+                        state.cmd_prefix = false;
+                    }
+                    // Alt+1-9: switch to tab N
+                    KeyCode::Char(c)
+                        if key.modifiers.contains(KeyModifiers::ALT)
+                            && ('1'..='9').contains(&c) =>
+                    {
+                        let idx = (c as u8 - b'1') as usize;
+                        let pane = state.active_pane_mut();
+                        if idx < pane.tabs.len() + 1 {
+                            if idx != 0 {
+                                // ponytail: swap current tab (implicit idx 0) with target tab
+                                // Current is at position 1..N; saved tabs are at 0..N-1; total N+1 entries.
+                                // To go to tab N: if N==0 (current), no-op; else swap current with saved[idx-1]
+                                pane.switch_tab(idx - 1);
+                            }
+                            let n = pane.tabs.len() + 1;
+                            state.message = Some(format!("Tab {}/{n}", idx + 1));
+                            let show = state.show_hidden;
+                            let sort = state.sort_mode;
+                            left_entries = load_entries(&state.left.location, show, sort);
+                            right_entries = load_entries(&state.right.location, show, sort);
+                        }
+                    }
                     // Ctrl+T: new tab in active pane
                     KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         let show_hidden = state.show_hidden;
@@ -1275,7 +1305,11 @@ fn render(
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(area);
 
     let panes = Layout::default()
@@ -1391,38 +1425,100 @@ fn render(
     )))
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(status, chunks[1]);
+
+    // Bottom F-key shortcut bar
+    let shortcuts = Span::styled(
+        "1Help  2Menu  3View  4Edit  5Copy  6RenMov  7Mkdir  8Delete  9Hosts  10Quit",
+        Style::default().fg(Color::Black).bg(Color::DarkGray),
+    );
+    frame.render_widget(Paragraph::new(shortcuts), chunks[2]);
 }
 
 fn render_help(frame: &mut ratatui::Frame, area: Rect) {
-    let popup_area = centered_rect(60, 60, area);
+    let popup_area = centered_rect(68, 90, area);
     frame.render_widget(Clear, popup_area);
 
     let text = vec![
         Line::from(Span::styled("ARX Help", Style::default().fg(Color::Yellow))),
+        Line::from(Span::styled(
+            "F1/? or Esc to close",
+            Style::default().fg(Color::DarkGray),
+        )),
         Line::from(""),
-        Line::from("Navigation"),
-        Line::from("  j/↓ k/↑      Move cursor"),
-        Line::from("  Enter         Enter directory"),
-        Line::from("  Backspace     Go to parent directory"),
-        Line::from("  Tab           Switch active pane"),
-        Line::from("  Ctrl+G        Go to path"),
+        Line::from(Span::styled("Navigation", Style::default().fg(Color::Cyan))),
+        Line::from("  j/↓ k/↑       Move cursor"),
+        Line::from("  Enter          Enter directory / content diff"),
+        Line::from("  Backspace      Parent directory"),
+        Line::from("  Tab            Switch pane (left ↔ right)"),
+        Line::from("  Ctrl+G         Go to path"),
+        Line::from("  Ctrl+U         Swap panes"),
+        Line::from("  Alt+O          Sync other pane to active"),
+        Line::from("  Alt+Down       Go back in directory history"),
+        Line::from("  Alt+/          Recursive file search (find)"),
+        Line::from("  Ctrl+\\        Open in file manager"),
         Line::from(""),
-        Line::from("Selection & Filter"),
-        Line::from("  Space         Toggle selection"),
-        Line::from("  *             Invert selection"),
-        Line::from("  +             Select by glob pattern"),
-        Line::from("  /             Quick filter by name"),
-        Line::from("  Ctrl+H        Toggle hidden (dot) files"),
+        Line::from(Span::styled("Tabs", Style::default().fg(Color::Cyan))),
+        Line::from("  Ctrl+T         New tab"),
+        Line::from("  Ctrl+W         Close tab"),
+        Line::from("  Ctrl+←/→       Previous / next tab"),
+        Line::from("  Alt+1 … 9      Switch to tab N"),
         Line::from(""),
-        Line::from("File Operations"),
-        Line::from("  F5            Copy to other pane"),
-        Line::from("  F6            Move to other pane"),
-        Line::from("  F8            Delete"),
+        Line::from(Span::styled(
+            "Selection & Filter",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from("  Space          Toggle selection"),
+        Line::from("  *              Invert selection"),
+        Line::from("  +              Select by glob pattern"),
+        Line::from("  /              Quick filter by name"),
+        Line::from("  Ctrl+H         Toggle hidden (dot) files"),
+        Line::from("  Alt+T          Toggle panel mode (Full/Brief)"),
         Line::from(""),
-        Line::from("Other"),
-        Line::from("  Ctrl+R        Refresh"),
-        Line::from("  q             Quit"),
-        Line::from("  ?             This help"),
+        Line::from(Span::styled(
+            "File Operations",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from("  F5             Copy to other pane"),
+        Line::from("  F6             Move to other pane"),
+        Line::from("  F7             Create directory"),
+        Line::from("  F8             Delete"),
+        Line::from("  Shift+F6       Rename file"),
+        Line::from("  Ctrl+I         File info (stat)"),
+        Line::from("  Ctrl+Space     Directory size / free space"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "View & Edit",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from("  F3             View file (built-in)"),
+        Line::from("  Shift+F3       View with bat (syntax highlight)"),
+        Line::from("  F4             Edit (configurable editor)"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Ctrl+X Prefix (MC-style)",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from("  Ctrl+X S       Symlink (ln -s)"),
+        Line::from("  Ctrl+X L       Hard link (ln)"),
+        Line::from("  Ctrl+X C       chmod"),
+        Line::from("  Ctrl+X O       chown"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Panels & Tools",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from("  Ctrl+D         Toggle directory diff"),
+        Line::from("  F2             User menu (arx.menu)"),
+        Line::from("  F9             Hosts / SFTP"),
+        Line::from("  Ctrl+B         Bookmarks"),
+        Line::from("  Ctrl+J         Background jobs"),
+        Line::from("  Ctrl+O         Shell (drop to subshell)"),
+        Line::from("  :              Command line"),
+        Line::from(""),
+        Line::from(Span::styled("Other", Style::default().fg(Color::Cyan))),
+        Line::from("  Ctrl+R         Refresh"),
+        Line::from("  q              Quit"),
+        Line::from("  F1 / ?         This help"),
     ];
 
     let help = Paragraph::new(text)
@@ -1684,7 +1780,26 @@ fn render_pane(
                 // ponytail: green for unique entries in diff mode
                 Style::default().fg(Color::Green)
             } else {
-                Style::default()
+                let ext = e.name.rsplit('.').next().unwrap_or("");
+                match ext {
+                    "rs" | "toml" | "lock" => Style::default().fg(Color::LightRed),
+                    "py" => Style::default().fg(Color::Blue),
+                    "sh" | "bash" | "zsh" => Style::default().fg(Color::Green),
+                    "md" | "txt" | "log" => Style::default().fg(Color::White),
+                    "json" | "yaml" | "yml" | "xml" | "html" => Style::default().fg(Color::Yellow),
+                    "js" | "ts" | "jsx" | "tsx" => Style::default().fg(Color::LightYellow),
+                    "c" | "h" | "cpp" | "hpp" => Style::default().fg(Color::LightCyan),
+                    "go" => Style::default().fg(Color::Cyan),
+                    "pdf" | "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" => {
+                        Style::default().fg(Color::Magenta)
+                    }
+                    "mp4" | "mkv" | "avi" | "mov" => Style::default().fg(Color::LightMagenta),
+                    "mp3" | "flac" | "ogg" | "wav" => Style::default().fg(Color::LightBlue),
+                    "zip" | "tar" | "gz" | "xz" | "bz2" | "7z" | "rar" => {
+                        Style::default().fg(Color::Red)
+                    }
+                    _ => Style::default(),
+                }
             };
             let line = Line::from(vec![
                 Span::styled(sel_mark, style),

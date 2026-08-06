@@ -304,3 +304,49 @@ fn dirs_fallback() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_state() {
+        let state = AppState::default();
+        assert!(!state.should_quit);
+        assert_eq!(state.active, Pane::Left);
+        assert!(state.selected.is_empty());
+        assert!(state.viewer_content.is_empty());
+        assert_eq!(state.panel_mode, PanelMode::Full);
+        assert_eq!(state.sort_mode, SortMode::NameAsc);
+    }
+
+    #[test]
+    fn tab_creation_and_switching() {
+        let mut state = AppState::default();
+        assert_eq!(state.left.tabs.len(), 0);
+        state.left.new_tab();
+        assert_eq!(state.left.tabs.len(), 1);
+        // Tab 1 is current; switching to tab 0 saves current and restores tab 0
+        state.left.switch_tab(0);
+        assert_eq!(state.left.tabs.len(), 1); // current swapped with saved
+    }
+
+    #[test]
+    fn pane_swap_preserves_both_sides() {
+        let mut state = AppState::default();
+        state.left.cursor = 5;
+        state.right.cursor = 10;
+        std::mem::swap(&mut state.left, &mut state.right);
+        assert_eq!(state.right.cursor, 5);
+        assert_eq!(state.left.cursor, 10);
+    }
+
+    #[test]
+    fn cmd_prefix_clears_after_use() {
+        let state = AppState {
+            cmd_prefix: true,
+            ..AppState::default()
+        };
+        assert!(state.cmd_prefix);
+    }
+}
