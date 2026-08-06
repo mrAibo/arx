@@ -2,6 +2,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 pub mod local;
+pub mod sftp;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Location {

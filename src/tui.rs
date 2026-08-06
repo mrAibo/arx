@@ -1,5 +1,5 @@
 use arx::app::{Action, AppState, Pane, PaneState};
-use arx::vfs::{Entry, EntryKind, Location, local::LocalFs};
+use arx::vfs::{Entry, EntryKind, Location, local::LocalFs, sftp::SftpFs};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
@@ -295,6 +295,7 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
 fn load_entries(location: &Location, show_hidden: bool) -> Vec<Entry> {
     let mut entries = match location {
         Location::Local(path) => LocalFs::list(path).unwrap_or_default(),
+        Location::Sftp { host, path } => SftpFs::list(host, path).unwrap_or_default(),
         _ => vec![],
     };
     if !show_hidden {

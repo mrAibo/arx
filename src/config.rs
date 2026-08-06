@@ -46,7 +46,7 @@ pub fn load() -> ArxConfig {
 
 // ponytail: single well-known path; add XDG_CONFIG_HOME override when needed
 fn config_path() -> std::path::PathBuf {
-    directories::ProjectDirs::from("", "", "arx")
-        .map(|d| d.config_dir().join("arx.toml"))
+    dirs::config_dir()
+        .map(|d| d.join("arx").join("arx.toml"))
         .unwrap_or_else(|| std::path::PathBuf::from("arx.toml"))
 }

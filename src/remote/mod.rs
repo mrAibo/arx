@@ -5,6 +5,12 @@ pub struct Host {
     pub id: String,
     pub name: String,
     pub ssh_alias: String,
+    /// Resolved hostname for connection (falls back to ssh_alias).
+    pub hostname: String,
+    /// SSH port (default 22).
+    pub port: u16,
+    /// SSH user.
+    pub user: String,
     pub group_ids: BTreeSet<String>,
     pub tags: BTreeSet<String>,
     pub favorite: bool,
@@ -44,6 +50,9 @@ mod tests {
             id: "ora-prod-01".into(),
             name: "Oracle Production 01".into(),
             ssh_alias: "ora-prod-01".into(),
+            hostname: "10.0.0.5".into(),
+            port: 22,
+            user: "oracle".into(),
             group_ids: BTreeSet::from(["database".into(), "project-a".into(), "production".into()]),
             tags: BTreeSet::new(),
             favorite: true,
