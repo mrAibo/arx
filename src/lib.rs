@@ -1,6 +1,7 @@
 pub mod app;
 pub mod config;
 pub mod jobs;
+pub mod journal;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod keyring;
 pub mod plugins;
