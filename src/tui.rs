@@ -1619,6 +1619,13 @@ async fn event_loop(
                             state.job_cursor = 0;
                         }
                         // Ctrl+I: toggle Infrastructure Center
+                        // Ctrl+S: save workspace
+                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            match crate::workspace::save_workspace(state) {
+                                Ok(()) => state.message = Some("Workspace saved".into()),
+                                Err(e) => state.message = Some(format!("Save failed: {e}")),
+                            }
+                        }
                         KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.show_infra = !state.show_infra;
                         }

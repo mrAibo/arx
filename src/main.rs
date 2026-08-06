@@ -1,6 +1,7 @@
 use clap::Parser;
 
 mod tui;
+mod workspace;
 
 /// Terminal commander for local and remote files, archives, transfers, and jobs.
 #[derive(Parser)]
