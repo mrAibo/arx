@@ -1,8 +1,8 @@
 use std::ffi::OsString;
 use std::io;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::vfs::{Location, local::LocalFs};
@@ -32,23 +32,26 @@ pub enum TransferExecutionError {
     },
     #[error("rsync failed for {item} with exit code {code:?}")]
     RsyncFailed { item: String, code: Option<i32> },
+    #[error("transfer worker failed: {0}")]
+    Worker(String),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
 
-/// Execute a previously validated transfer plan.
+/// Execute a previously validated transfer plan without blocking the async TUI.
 ///
-/// This layer owns transfer implementation details. It does not create jobs or
-/// touch TUI state; callers can map `TransferProgress` to Job events.
-pub fn execute_transfer(
+/// Native filesystem work runs on Tokio's blocking pool. External processes use
+/// Tokio process I/O. Remote async executors can therefore plug into the same
+/// contract without `block_on` bridges.
+pub async fn execute_transfer(
     plan: &TransferPlan,
     names: &[String],
-    cancel: &AtomicBool,
+    cancel: Arc<AtomicBool>,
     mut on_progress: impl FnMut(TransferProgress),
 ) -> Result<TransferOutcome, TransferExecutionError> {
     match plan.method {
-        TransferMethod::Native => execute_native(plan, names, cancel, &mut on_progress),
-        TransferMethod::Rsync => execute_rsync(plan, names, cancel, &mut on_progress),
+        TransferMethod::Native => execute_native(plan, names, cancel, &mut on_progress).await,
+        TransferMethod::Rsync => execute_rsync(plan, names, cancel, &mut on_progress).await,
         TransferMethod::Sftp | TransferMethod::Scp => Err(TransferExecutionError::InvalidPlan {
             method: plan.method,
             reason: "executor is not implemented yet".into(),
@@ -56,10 +59,10 @@ pub fn execute_transfer(
     }
 }
 
-fn execute_native(
+async fn execute_native(
     plan: &TransferPlan,
     names: &[String],
-    cancel: &AtomicBool,
+    cancel: Arc<AtomicBool>,
     on_progress: &mut impl FnMut(TransferProgress),
 ) -> Result<TransferOutcome, TransferExecutionError> {
     let (Location::Local(src), Location::Local(dst)) = (&plan.source, &plan.destination) else {
@@ -69,25 +72,32 @@ fn execute_native(
         });
     };
 
+    let src = src.clone();
+    let dst = dst.clone();
+    let intent = plan.intent;
     let total = names.len();
     let mut completed = 0;
+
     for name in names {
-        ensure_not_cancelled(cancel, completed)?;
-        let one = [name.clone()];
-        match plan.intent {
-            TransferIntent::Copy => {
-                LocalFs::copy_files(src, dst, &one)?;
+        ensure_not_cancelled(&cancel, completed)?;
+        let src = src.clone();
+        let dst = dst.clone();
+        let name = name.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let one = [name];
+            match intent {
+                TransferIntent::Copy => LocalFs::copy_files(&src, &dst, &one).map(|_| ()),
+                TransferIntent::Move => LocalFs::move_files(&src, &dst, &one).map(|_| ()),
+                TransferIntent::Synchronize => Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "native synchronization is not implemented",
+                )),
             }
-            TransferIntent::Move => {
-                LocalFs::move_files(src, dst, &one)?;
-            }
-            TransferIntent::Synchronize => {
-                return Err(TransferExecutionError::InvalidPlan {
-                    method: TransferMethod::Native,
-                    reason: "native synchronization is not implemented".into(),
-                });
-            }
-        }
+        })
+        .await
+        .map_err(|error| TransferExecutionError::Worker(error.to_string()))??;
+
         completed += 1;
         on_progress(TransferProgress { completed, total });
     }
@@ -95,10 +105,10 @@ fn execute_native(
     Ok(TransferOutcome { completed, total })
 }
 
-fn execute_rsync(
+async fn execute_rsync(
     plan: &TransferPlan,
     names: &[String],
-    cancel: &AtomicBool,
+    cancel: Arc<AtomicBool>,
     on_progress: &mut impl FnMut(TransferProgress),
 ) -> Result<TransferOutcome, TransferExecutionError> {
     if plan.intent == TransferIntent::Move {
@@ -127,9 +137,9 @@ fn execute_rsync(
     let total = items.len();
     let mut completed = 0;
     for item in items {
-        ensure_not_cancelled(cancel, completed)?;
+        ensure_not_cancelled(&cancel, completed)?;
         let args = build_rsync_args(plan, item)?;
-        run_rsync(&args, cancel, completed, item.unwrap_or("."))?;
+        run_rsync(&args, &cancel, completed, item.unwrap_or(".")).await?;
         completed += 1;
         on_progress(TransferProgress { completed, total });
     }
@@ -197,23 +207,24 @@ fn endpoint_arg(
     }
 }
 
-fn run_rsync(
+async fn run_rsync(
     args: &[OsString],
     cancel: &AtomicBool,
     completed: usize,
     item: &str,
 ) -> Result<(), TransferExecutionError> {
-    let mut child = Command::new("rsync")
+    let mut child = tokio::process::Command::new("rsync")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()?;
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.kill().await;
+            let _ = child.wait().await;
             return Err(TransferExecutionError::Cancelled { completed });
         }
 
@@ -227,7 +238,7 @@ fn run_rsync(
             });
         }
 
-        thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -267,8 +278,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn native_copy_executes_and_reports_progress() {
+    #[tokio::test]
+    async fn native_copy_executes_and_reports_progress() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
         fs::write(src.path().join("a.txt"), b"a").unwrap();
@@ -280,13 +291,16 @@ mod tests {
             intent: TransferIntent::Copy,
             method: TransferMethod::Native,
         };
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut progress = Vec::new();
-        let outcome =
-            execute_transfer(&plan, &["a.txt".into(), "b.txt".into()], &cancel, |event| {
-                progress.push(event)
-            })
-            .unwrap();
+        let outcome = execute_transfer(
+            &plan,
+            &["a.txt".into(), "b.txt".into()],
+            cancel,
+            |event| progress.push(event),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.completed, 2);
         assert_eq!(progress.last().unwrap().completed, 2);
@@ -294,8 +308,8 @@ mod tests {
         assert!(dst.path().join("b.txt").exists());
     }
 
-    #[test]
-    fn native_executor_honors_pre_cancel() {
+    #[tokio::test]
+    async fn native_executor_honors_pre_cancel() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
         fs::write(src.path().join("a.txt"), b"a").unwrap();
@@ -306,8 +320,10 @@ mod tests {
             intent: TransferIntent::Move,
             method: TransferMethod::Native,
         };
-        let cancel = AtomicBool::new(true);
-        let error = execute_transfer(&plan, &["a.txt".into()], &cancel, |_| {}).unwrap_err();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let error = execute_transfer(&plan, &["a.txt".into()], cancel, |_| {})
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -341,34 +357,34 @@ mod tests {
         assert!(rendered.iter().any(|arg| arg.as_ref() == "prod:/dst"));
     }
 
-    #[test]
-    fn remote_to_remote_rsync_is_rejected() {
+    #[tokio::test]
+    async fn remote_to_remote_rsync_is_rejected() {
         let plan = TransferPlan {
             source: sftp("a", "/src"),
             destination: sftp("b", "/dst"),
             intent: TransferIntent::Copy,
             method: TransferMethod::Rsync,
         };
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
 
         assert!(matches!(
-            execute_transfer(&plan, &["x".into()], &cancel, |_| {}),
+            execute_transfer(&plan, &["x".into()], cancel, |_| {}).await,
             Err(TransferExecutionError::InvalidPlan { .. })
         ));
     }
 
-    #[test]
-    fn rsync_move_requires_separate_cleanup_phase() {
+    #[tokio::test]
+    async fn rsync_move_requires_separate_cleanup_phase() {
         let plan = TransferPlan {
             source: local(PathBuf::from("/src")),
             destination: sftp("prod", "/dst"),
             intent: TransferIntent::Move,
             method: TransferMethod::Rsync,
         };
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
 
         assert!(matches!(
-            execute_transfer(&plan, &["x".into()], &cancel, |_| {}),
+            execute_transfer(&plan, &["x".into()], cancel, |_| {}).await,
             Err(TransferExecutionError::InvalidPlan { .. })
         ));
     }
