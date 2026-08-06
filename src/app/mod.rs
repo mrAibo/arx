@@ -141,6 +141,8 @@ pub struct AppState {
     // C2: command input
     pub cmd_input: bool,
     pub cmd: String,
+    /// Ctrl+X prefix for MC-style key combos
+    pub cmd_prefix: bool,
     // C3: user menu
     pub menu: Vec<MenuEntry>,
     pub show_menu: bool,
@@ -191,6 +193,7 @@ impl Default for AppState {
             show_diff: false,
             cmd_input: false,
             cmd: String::new(),
+            cmd_prefix: false,
             menu: Vec::new(),
             show_menu: false,
             menu_cursor: 0,

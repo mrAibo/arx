@@ -415,6 +415,7 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
             } else {
                 state.right.cursor
             };
+            let cmd_prefix = state.cmd_prefix;
             let pane = state.active_pane_mut();
 
             match key.code {
@@ -439,6 +440,13 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                         } else {
                             state.selected.insert(entry.name.clone());
                         }
+                    }
+                }
+                // Alt+/ : recursive file search
+                KeyCode::Char('/') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    if let Location::Local(dir) = &state.active_pane().location {
+                        state.cmd = format!("find {} -name ''", dir.display());
+                        state.cmd_input = true;
                     }
                 }
                 KeyCode::Char('/') => {
@@ -985,6 +993,26 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                 KeyCode::Char(':') => {
                     state.cmd.clear();
                     state.cmd_input = true;
+                }
+                // Ctrl+X S: symlink (MC-style prefix)
+                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.cmd_prefix = true;
+                }
+                KeyCode::Char('s')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) && cmd_prefix =>
+                {
+                    if let Some(entry) = entries.get(cursor) {
+                        state.cmd = format!("ln -s '{}' ", entry.name);
+                        state.cmd_input = true;
+                    }
+                    state.cmd_prefix = false;
+                }
+                KeyCode::Char('c')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) && cmd_prefix =>
+                {
+                    state.cmd = "chmod ".into();
+                    state.cmd_input = true;
+                    state.cmd_prefix = false;
                 }
                 // Ctrl+T: new tab in active pane
                 KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
