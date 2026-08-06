@@ -23,6 +23,37 @@ pub enum Action {
     OpenHosts,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortMode {
+    NameAsc,
+    NameDesc,
+    SizeAsc,
+    SizeDesc,
+    Kind,
+}
+
+impl SortMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::NameAsc => Self::NameDesc,
+            Self::NameDesc => Self::SizeAsc,
+            Self::SizeAsc => Self::SizeDesc,
+            Self::SizeDesc => Self::Kind,
+            Self::Kind => Self::NameAsc,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NameAsc => "name↑",
+            Self::NameDesc => "name↓",
+            Self::SizeAsc => "size↑",
+            Self::SizeDesc => "size↓",
+            Self::Kind => "kind",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PaneState {
     pub location: Location,
@@ -35,28 +66,31 @@ pub struct AppState {
     pub left: PaneState,
     pub right: PaneState,
     pub active: Pane,
-    /// Filenames selected in the active pane's current directory.
     pub selected: BTreeSet<String>,
-    /// Quick-filter text; empty = no filter applied.
     pub filter: String,
-    /// True while the user is composing the filter (captures typed chars).
     pub filtering: bool,
-    /// One-shot status message; cleared after render.
     pub message: Option<String>,
-    /// True while composing a glob pattern for + (select-by-glob).
     pub glob_input: bool,
-    /// True while composing a go-to path (Ctrl+G).
     pub go_input: bool,
-    /// Show help overlay.
     pub show_help: bool,
-    /// Show hidden (dot) files.
     pub show_hidden: bool,
+    // A3: sort order
+    pub sort_mode: SortMode,
+    // A1: file viewer
+    pub viewer_content: Vec<String>,
+    pub viewer_scroll: usize,
+    // A4: bookmarks
+    pub bookmarks: Vec<Location>,
+    pub show_bookmarks: bool,
+    pub bookmark_cursor: usize,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let home = dirs_fallback();
+        // ponytail: hardcoded defaults; load from bookmarks.toml later
+        let bookmarks = vec![Location::Local(home.clone())];
         Self {
             should_quit: false,
             left: PaneState {
@@ -76,6 +110,12 @@ impl Default for AppState {
             go_input: false,
             show_help: false,
             show_hidden: false,
+            sort_mode: SortMode::NameAsc,
+            viewer_content: Vec::new(),
+            viewer_scroll: 0,
+            bookmarks,
+            show_bookmarks: false,
+            bookmark_cursor: 0,
         }
     }
 }
@@ -114,9 +154,24 @@ impl AppState {
             Pane::Right => &mut self.left,
         }
     }
+
+    /// Currently-viewed file path (if viewer is open).
+    pub fn viewer_file_path(&self) -> Option<PathBuf> {
+        match &self.active_pane().location {
+            Location::Local(dir) => {
+                if self.viewer_content.is_empty() {
+                    None
+                } else {
+                    // ponytail: name stored separately; add when needed
+                    Some(dir.clone())
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
-// ponytail: $HOME with / fallback; add proper dirs crate when config moves there
+// ponytail: $HOME with / fallback
 fn dirs_fallback() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)

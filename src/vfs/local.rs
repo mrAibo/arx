@@ -91,6 +91,20 @@ impl LocalFs {
         }
         Ok(count)
     }
+
+    /// Read first N lines of a text file. Returns empty for binary/large files.
+    /// ponytail: 500-line cap; add paging when viewer gets scroll-to-end
+    pub fn read_head(path: &Path, max_lines: usize) -> io::Result<Vec<String>> {
+        use std::io::{BufRead, BufReader};
+        let file = fs::File::open(path)?;
+        let reader = BufReader::new(file);
+        let lines: Vec<String> = reader
+            .lines()
+            .take(max_lines)
+            .filter_map(|l| l.ok())
+            .collect();
+        Ok(lines)
+    }
 }
 
 // ponytail: simple recursive copy; add rsync-based copy for remote operations later

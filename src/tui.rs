@@ -1,4 +1,4 @@
-use arx::app::{Action, AppState, Pane, PaneState};
+use arx::app::{Action, AppState, Pane, PaneState, SortMode};
 use arx::vfs::{Entry, EntryKind, Location, local::LocalFs, sftp::SftpFs};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -34,8 +34,8 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
         show_hidden: config.ui.show_hidden,
         ..AppState::default()
     };
-    let mut left_entries = load_entries(&state.left.location, state.show_hidden);
-    let mut right_entries = load_entries(&state.right.location, state.show_hidden);
+    let mut left_entries = load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+    let mut right_entries = load_entries(&state.right.location, state.show_hidden, state.sort_mode);
     let mut left_list = ListState::default();
     let mut right_list = ListState::default();
 
@@ -105,10 +105,16 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                 pane.location = Location::Local(resolved);
                                 pane.cursor = 0;
                                 state.selected.clear();
-                                left_entries =
-                                    load_entries(&state.left.location, state.show_hidden);
-                                right_entries =
-                                    load_entries(&state.right.location, state.show_hidden);
+                                left_entries = load_entries(
+                                    &state.left.location,
+                                    state.show_hidden,
+                                    state.sort_mode,
+                                );
+                                right_entries = load_entries(
+                                    &state.right.location,
+                                    state.show_hidden,
+                                    state.sort_mode,
+                                );
                             } else {
                                 state.message = Some(format!("Not a directory: {}", state.filter));
                             }
@@ -123,6 +129,75 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                     }
                     KeyCode::Char(c) => {
                         state.filter.push(c);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Viewer mode: takes over until dismissed
+            if !state.viewer_content.is_empty() {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(3) => {
+                        state.viewer_content.clear();
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.viewer_scroll = state.viewer_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let max = state.viewer_content.len().saturating_sub(1);
+                        if state.viewer_scroll < max {
+                            state.viewer_scroll += 1;
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        state.viewer_scroll = state.viewer_scroll.saturating_sub(20);
+                    }
+                    KeyCode::PageDown => {
+                        let max = state.viewer_content.len().saturating_sub(1);
+                        state.viewer_scroll = (state.viewer_scroll + 20).min(max);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Bookmarks mode
+            if state.show_bookmarks {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('b')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        state.show_bookmarks = false;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.bookmark_cursor = state.bookmark_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let max = state.bookmarks.len().saturating_sub(1);
+                        if state.bookmark_cursor < max {
+                            state.bookmark_cursor += 1;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let loc = state.bookmarks.get(state.bookmark_cursor).cloned();
+                        if let Some(loc) = loc {
+                            let pane = state.active_pane_mut();
+                            pane.location = loc;
+                            pane.cursor = 0;
+                            state.selected.clear();
+                            state.show_bookmarks = false;
+                            left_entries = load_entries(
+                                &state.left.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
+                            right_entries = load_entries(
+                                &state.right.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -181,11 +256,17 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                             pane.cursor = 0;
                             state.selected.clear();
                             if state.active == Pane::Left {
-                                left_entries =
-                                    load_entries(&state.left.location, state.show_hidden);
+                                left_entries = load_entries(
+                                    &state.left.location,
+                                    state.show_hidden,
+                                    state.sort_mode,
+                                );
                             } else {
-                                right_entries =
-                                    load_entries(&state.right.location, state.show_hidden);
+                                right_entries = load_entries(
+                                    &state.right.location,
+                                    state.show_hidden,
+                                    state.sort_mode,
+                                );
                             }
                         }
                     }
@@ -198,18 +279,26 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                             pane.cursor = 0;
                             state.selected.clear();
                             if state.active == Pane::Left {
-                                left_entries =
-                                    load_entries(&state.left.location, state.show_hidden);
+                                left_entries = load_entries(
+                                    &state.left.location,
+                                    state.show_hidden,
+                                    state.sort_mode,
+                                );
                             } else {
-                                right_entries =
-                                    load_entries(&state.right.location, state.show_hidden);
+                                right_entries = load_entries(
+                                    &state.right.location,
+                                    state.show_hidden,
+                                    state.sort_mode,
+                                );
                             }
                         }
                     }
                 }
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    left_entries = load_entries(&state.left.location, state.show_hidden);
-                    right_entries = load_entries(&state.right.location, state.show_hidden);
+                    left_entries =
+                        load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+                    right_entries =
+                        load_entries(&state.right.location, state.show_hidden, state.sort_mode);
                 }
                 KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     state.filter.clear();
@@ -222,8 +311,10 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                     } else {
                         "Hidden files hidden".into()
                     });
-                    left_entries = load_entries(&state.left.location, state.show_hidden);
-                    right_entries = load_entries(&state.right.location, state.show_hidden);
+                    left_entries =
+                        load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+                    right_entries =
+                        load_entries(&state.right.location, state.show_hidden, state.sort_mode);
                 }
                 // F5: copy selected (or cursor) from active pane to other pane
                 KeyCode::F(5) => {
@@ -234,8 +325,10 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                         Err(e) => format!("Copy error: {e}"),
                     });
                     state.selected.clear();
-                    left_entries = load_entries(&state.left.location, state.show_hidden);
-                    right_entries = load_entries(&state.right.location, state.show_hidden);
+                    left_entries =
+                        load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+                    right_entries =
+                        load_entries(&state.right.location, state.show_hidden, state.sort_mode);
                 }
                 // F6: move selected (or cursor) from active pane to other pane
                 KeyCode::F(6) => {
@@ -246,8 +339,10 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                         Err(e) => format!("Move error: {e}"),
                     });
                     state.selected.clear();
-                    left_entries = load_entries(&state.left.location, state.show_hidden);
-                    right_entries = load_entries(&state.right.location, state.show_hidden);
+                    left_entries =
+                        load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+                    right_entries =
+                        load_entries(&state.right.location, state.show_hidden, state.sort_mode);
                 }
                 // F8: delete selected (or cursor) from active pane
                 KeyCode::F(8) => {
@@ -263,8 +358,10 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                             }
                         }
                         state.selected.clear();
-                        left_entries = load_entries(&state.left.location, state.show_hidden);
-                        right_entries = load_entries(&state.right.location, state.show_hidden);
+                        left_entries =
+                            load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+                        right_entries =
+                            load_entries(&state.right.location, state.show_hidden, state.sort_mode);
                     }
                 }
                 // *: invert selection on visible entries
@@ -288,6 +385,57 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                     state.filter.clear();
                     state.glob_input = true;
                 }
+                // F2: cycle sort mode
+                KeyCode::F(2) => {
+                    state.sort_mode = state.sort_mode.next();
+                    state.message = Some(format!("Sort: {}", state.sort_mode.label()));
+                    left_entries =
+                        load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+                    right_entries =
+                        load_entries(&state.right.location, state.show_hidden, state.sort_mode);
+                }
+                // F3: view file
+                KeyCode::F(3) => {
+                    if let Some(entry) = entries.get(cursor) {
+                        if entry.kind != EntryKind::Directory {
+                            let path = match &pane.location {
+                                Location::Local(dir) => dir.join(&entry.name),
+                                _ => continue,
+                            };
+                            state.viewer_content = LocalFs::read_head(&path, 500)
+                                .unwrap_or_else(|e| vec![format!("Error reading file: {e}")]);
+                            state.viewer_scroll = 0;
+                        }
+                    }
+                }
+                // F4: edit file in $EDITOR
+                KeyCode::F(4) => {
+                    if let Some(entry) = entries.get(cursor) {
+                        let path = match &pane.location {
+                            Location::Local(dir) => dir.join(&entry.name),
+                            _ => continue,
+                        };
+                        let editor = std::env::var("EDITOR")
+                            .or_else(|_| std::env::var("VISUAL"))
+                            .unwrap_or_else(|_| "vi".into());
+                        // Leave raw mode, spawn editor, restore
+                        disable_raw_mode()?;
+                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                        let _ = std::process::Command::new(&editor).arg(&path).status();
+                        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                        enable_raw_mode()?;
+                        // Refresh after edit
+                        left_entries =
+                            load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+                        right_entries =
+                            load_entries(&state.right.location, state.show_hidden, state.sort_mode);
+                    }
+                }
+                // Ctrl+B: bookmarks
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.show_bookmarks = !state.show_bookmarks;
+                    state.bookmark_cursor = 0;
+                }
                 _ => {}
             }
         }
@@ -295,7 +443,7 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
     Ok(())
 }
 
-fn load_entries(location: &Location, show_hidden: bool) -> Vec<Entry> {
+fn load_entries(location: &Location, show_hidden: bool, sort_mode: SortMode) -> Vec<Entry> {
     let mut entries = match location {
         Location::Local(path) => LocalFs::list(path).unwrap_or_default(),
         Location::Sftp { host, path } => SftpFs::list(host, path).unwrap_or_default(),
@@ -304,7 +452,27 @@ fn load_entries(location: &Location, show_hidden: bool) -> Vec<Entry> {
     if !show_hidden {
         entries.retain(|e| !e.name.starts_with('.'));
     }
+    sort_entries(&mut entries, sort_mode);
     entries
+}
+
+fn sort_entries(entries: &mut [Entry], mode: SortMode) {
+    match mode {
+        SortMode::NameAsc => entries.sort_by_key(|a| a.name.to_lowercase()),
+        SortMode::NameDesc => entries.sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase())),
+        SortMode::SizeAsc => entries.sort_by_key(|a| a.size.unwrap_or(0)),
+        SortMode::SizeDesc => entries.sort_by_key(|b| std::cmp::Reverse(b.size.unwrap_or(0))),
+        SortMode::Kind => entries.sort_by_key(|a| (kind_order(a.kind), a.name.to_lowercase())),
+    }
+}
+
+fn kind_order(k: EntryKind) -> u8 {
+    match k {
+        EntryKind::Directory => 0,
+        EntryKind::Symlink => 1,
+        EntryKind::File => 2,
+        EntryKind::Other => 3,
+    }
 }
 
 fn apply_filter<'a>(entries: &'a [Entry], filter: &str) -> Vec<&'a Entry> {
@@ -403,6 +571,16 @@ fn render(
         render_help(frame, area);
     }
 
+    // Viewer overlay
+    if !state.viewer_content.is_empty() {
+        render_viewer(frame, area, state);
+    }
+
+    // Bookmarks overlay
+    if state.show_bookmarks {
+        render_bookmarks(frame, area, state);
+    }
+
     // Status bar
     let pane = state.active_pane();
     let loc_str = match &pane.location {
@@ -469,6 +647,73 @@ fn render_help(frame: &mut ratatui::Frame, area: Rect) {
         .style(Style::default().fg(Color::White))
         .wrap(Wrap { trim: false });
     frame.render_widget(help, popup_area);
+}
+
+fn render_viewer(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    let popup_area = centered_rect(80, 90, area);
+    frame.render_widget(Clear, popup_area);
+
+    let title = format!(" View ({} lines) ", state.viewer_content.len());
+    let max_scroll = state.viewer_content.len().saturating_sub(1);
+    let visible: Vec<Line> = state
+        .viewer_content
+        .iter()
+        .skip(state.viewer_scroll)
+        .take(popup_area.height.saturating_sub(2) as usize)
+        .map(|l| Line::from(l.as_str()))
+        .collect();
+
+    let scroll_hint = if max_scroll > 0 {
+        format!(
+            " {}/{} | j/k:scroll q/Esc:close ",
+            state.viewer_scroll, max_scroll
+        )
+    } else {
+        " q/Esc:close ".into()
+    };
+
+    let viewer = Paragraph::new(visible)
+        .block(Block::default().borders(Borders::ALL).title(title.as_str()))
+        .style(Style::default().fg(Color::White));
+    frame.render_widget(viewer, popup_area);
+
+    let hint_area = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(popup_area);
+    let hint = Paragraph::new(Line::from(scroll_hint)).style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(hint, hint_area[1]);
+}
+
+fn render_bookmarks(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    let popup_area = centered_rect(60, 70, area);
+    frame.render_widget(Clear, popup_area);
+
+    let items: Vec<ListItem> = state
+        .bookmarks
+        .iter()
+        .enumerate()
+        .map(|(i, loc)| {
+            let prefix = if i == state.bookmark_cursor {
+                "> "
+            } else {
+                "  "
+            };
+            ListItem::new(Line::from(format!("{prefix}{loc}")))
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.bookmark_cursor));
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Bookmarks (Ctrl+B: close, Enter: go) "),
+        )
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
+    frame.render_stateful_widget(list, popup_area, &mut list_state);
 }
 
 /// ponytail: simple centered rect helper; add flexible sizing when needed
