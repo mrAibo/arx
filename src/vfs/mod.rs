@@ -184,6 +184,7 @@ where
     PROVIDER_REGISTRY.with(|cell| f(&mut cell.borrow_mut()))
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for ProviderRegistry {
     fn default() -> Self {
         Self(HashMap::new())

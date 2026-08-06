@@ -1,6 +1,6 @@
 use crate::vfs::Location;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 // ── Progress model v2 ──
 // ponytail: enum replaces u8; Bytes/Items/Phase cover transfer jobs.
@@ -44,12 +44,14 @@ impl Progress {
     }
 }
 
+#[allow(clippy::derivable_impls)]
 impl From<u8> for Progress {
     fn from(p: u8) -> Self {
         Self::Percent(p)
     }
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for Progress {
     fn default() -> Self {
         Self::Indeterminate

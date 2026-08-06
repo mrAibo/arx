@@ -3,6 +3,24 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// ISO 8601 timestamp for trash .trashinfo files.
+fn chrono_now() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    // ponytail: approximate date; good enough for trash timestamps
+    let days_since_epoch = secs / 86400;
+    let year = 1970 + (days_since_epoch / 365) as u32;
+    let day_of_year = (days_since_epoch % 365) as u32;
+    let month = ((day_of_year * 12) / 365).min(11) + 1;
+    let day = day_of_year.saturating_sub((month.saturating_sub(1)) * 365 / 12) + 1;
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}")
+}
+
 /// Local filesystem backend.
 pub struct LocalFs;
 
@@ -90,32 +108,68 @@ impl LocalFs {
     }
 
     /// Move files to trash (~/.local/share/Trash) instead of permanent delete.
+    /// Creates .trashinfo files per Freedesktop spec for restore support.
     pub fn delete_files(dir: &Path, names: &[String]) -> io::Result<usize> {
-        let trash = dirs::data_dir()
-            .map(|d| d.join("Trash").join("files"))
+        let base = dirs::data_dir()
+            .map(|d| d.join("Trash"))
             .unwrap_or_else(|| PathBuf::from("/tmp/arx-trash"));
-        std::fs::create_dir_all(&trash)?;
+        let trash_files = base.join("files");
+        let trash_info = base.join("info");
+        std::fs::create_dir_all(&trash_files)?;
+        std::fs::create_dir_all(&trash_info)?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let deletion_date = chrono_now();
+
         let mut count = 0;
         for name in names {
             let from = dir.join(name);
-            let to = trash.join(name);
-            // ponytail: rename to unique name if collision in trash
-            let to = if to.exists() {
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                to.with_extension(format!(
-                    "{}.{ts}",
-                    to.extension()
-                        .map(|e| e.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                ))
-            } else {
-                to
-            };
+            if !from.exists() {
+                continue;
+            }
+            let basename = from
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| name.clone());
+            let mut to = trash_files.join(&basename);
+            let mut info_file = trash_info.join(format!("{basename}.trashinfo"));
+
+            // ponytail: unique names if collision in trash
+            if to.exists() {
+                let stem = from
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| name.clone());
+                let ext = from
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let unique = format!(
+                    "{stem}.{now}{}",
+                    if ext.is_empty() {
+                        String::new()
+                    } else {
+                        format!(".{ext}")
+                    }
+                );
+                to = trash_files.join(&unique);
+                info_file = trash_info.join(format!("{unique}.trashinfo"));
+            }
+
+            // Write .trashinfo
+            let original = std::fs::canonicalize(&from).unwrap_or_else(|_| from.clone());
+            let info = format!(
+                "[Trash Info]\nPath={}\nDeletionDate={}\n",
+                original.display(),
+                deletion_date
+            );
+            let _ = std::fs::write(&info_file, info);
+
+            // Move to trash
             std::fs::rename(&from, &to).or_else(|e| {
-                // EXDEV: cross-device — copy + delete
                 if e.raw_os_error() == Some(18) {
                     if from.is_dir() {
                         copy_dir_recursive(&from, &to)?;
@@ -129,6 +183,71 @@ impl LocalFs {
                     Err(e)
                 }
             })?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Restore all trashed files to their original locations.
+    /// Returns count of restored files.
+    pub fn restore_all() -> io::Result<usize> {
+        let base = dirs::data_dir()
+            .map(|d| d.join("Trash"))
+            .unwrap_or_else(|| PathBuf::from("/tmp/arx-trash"));
+        let trash_info = base.join("info");
+        let trash_files = base.join("files");
+        if !trash_info.exists() {
+            return Ok(0);
+        }
+
+        let mut count = 0;
+        for entry in std::fs::read_dir(&trash_info)? {
+            let entry = entry?;
+            if entry.path().extension() != Some(std::ffi::OsStr::new("trashinfo")) {
+                continue;
+            }
+            let content = match std::fs::read_to_string(entry.path()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let mut original = None;
+            for line in content.lines() {
+                if let Some(path) = line.strip_prefix("Path=") {
+                    original = Some(PathBuf::from(path));
+                }
+            }
+            let Some(ref orig) = original else {
+                continue;
+            };
+            let basename = entry
+                .path()
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let trashed = trash_files.join(&basename);
+            if !trashed.exists() {
+                continue;
+            }
+
+            if let Some(parent) = orig.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&trashed, orig).or_else(|e| {
+                if e.raw_os_error() == Some(18) {
+                    if trashed.is_dir() {
+                        copy_dir_recursive(&trashed, orig)?;
+                        std::fs::remove_dir_all(&trashed)?;
+                    } else {
+                        std::fs::copy(&trashed, orig)?;
+                        std::fs::remove_file(&trashed)?;
+                    }
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })?;
+            let _ = std::fs::remove_file(entry.path());
             count += 1;
         }
         Ok(count)

@@ -84,6 +84,7 @@ fn flush_entry(
 /// Resolve effective SSH config via `ssh -G` (handles all OpenSSH features).
 /// ponytail: preferred over ARX parser for actual connections.
 /// Returns (hostname, port, user, identity_file_path, proxy_jump).
+#[allow(clippy::type_complexity)]
 pub fn resolve_effective(
     alias: &str,
 ) -> io::Result<(String, u16, String, Option<PathBuf>, Option<String>)> {
