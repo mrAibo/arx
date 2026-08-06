@@ -1,6 +1,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
+pub mod local;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Location {
     Local(PathBuf),
@@ -22,8 +24,26 @@ impl fmt::Display for Location {
             Self::Archive {
                 archive,
                 inner_path,
-            } => {
-                write!(f, "archive://{}!/{inner_path}", archive.display())
+            } => write!(f, "archive://{}!/{inner_path}", archive.display()),
+        }
+    }
+}
+
+impl Location {
+    /// Human-readable short label for a pane title (e.g. the directory name or host).
+    pub fn label(&self) -> String {
+        match self {
+            Self::Local(p) => p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.to_string_lossy().into_owned()),
+            Self::Sftp { host, path } => {
+                let last = path.rsplit('/').next().unwrap_or(path);
+                format!("{host}:{last}")
+            }
+            Self::Archive { inner_path, .. } => {
+                let last = inner_path.rsplit('/').next().unwrap_or(inner_path);
+                last.to_string()
             }
         }
     }
@@ -54,7 +74,6 @@ mod tests {
             host: "db-prod".into(),
             path: "/var/log".into(),
         };
-
         assert_eq!(location.to_string(), "sftp://db-prod/var/log");
     }
 }
