@@ -20,7 +20,7 @@ impl WebDavProvider {
         let url = format!("{}{}", self.config.url.trim_end_matches('/'), path);
         let body = r#"<?xml version="1.0" encoding="utf-8"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/><D:getcontentlength/><D:displayname/></D:prop></D:propfind>"#;
         let resp = reqwest::blocking::Client::new()
-            .request("PROPFIND", &url)
+            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
             .basic_auth(&self.config.user, Some(&self.config.password))
             .header("Depth", depth)
             .header("Content-Type", "application/xml")
