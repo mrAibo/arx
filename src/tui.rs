@@ -83,11 +83,6 @@ async fn event_loop(
                         job.progress = progress.clone();
                     }
                 }
-                arx::jobs::JobEvent::Paused { ref id } => {
-                    if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
-                        job.status = arx::jobs::JobStatus::Paused;
-                    }
-                }
                 arx::jobs::JobEvent::Done {
                     ref id,
                     ref message,
