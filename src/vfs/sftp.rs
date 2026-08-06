@@ -176,3 +176,30 @@ impl russh::client::Handler for Handler {
         }
     }
 }
+
+// ── VfsProvider impl (Provider Registry) ──
+
+use crate::vfs::VfsProvider;
+
+#[derive(Debug)]
+pub struct SftpProvider {
+    pub host: crate::remote::Host,
+}
+
+impl VfsProvider for SftpProvider {
+    fn list(&self, path: &str) -> std::io::Result<Vec<Entry>> {
+        SftpFs::list(&self.host, path).map_err(|e| std::io::Error::other(e.to_string()))
+    }
+    fn read_head(&self, _path: &str, _lines: usize) -> std::io::Result<Vec<String>> {
+        Err(std::io::Error::other("SFTP read_head not supported"))
+    }
+    fn copy_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("SFTP copy via transfer planner"))
+    }
+    fn move_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("SFTP move via transfer planner"))
+    }
+    fn delete_files(&self, _dir: &str, _names: &[String]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("SFTP delete via transfer planner"))
+    }
+}

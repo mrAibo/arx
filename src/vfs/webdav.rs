@@ -4,6 +4,7 @@ use std::io;
 use std::path::Path;
 
 pub struct WebDavFs;
+#[derive(Debug)]
 pub struct WebDavProvider;
 
 impl VfsProvider for WebDavProvider {

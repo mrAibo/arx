@@ -73,7 +73,7 @@ impl Target {
 }
 
 /// Backend trait — each provider implements this. async deferred to F2.
-pub trait VfsProvider: Send + Sync {
+pub trait VfsProvider: Send + Sync + std::fmt::Debug {
     fn list(&self, path: &str) -> std::io::Result<Vec<Entry>>;
     fn read_head(&self, path: &str, lines: usize) -> std::io::Result<Vec<String>>;
     fn copy_files(&self, src: &str, dst: &str, names: &[String]) -> std::io::Result<usize>;
@@ -81,13 +81,85 @@ pub trait VfsProvider: Send + Sync {
     fn delete_files(&self, dir: &str, names: &[String]) -> std::io::Result<usize>;
 }
 
-pub type ProviderRegistry = HashMap<ProviderId, Box<dyn VfsProvider>>;
+#[derive(Debug)]
+pub struct ProviderRegistry(HashMap<ProviderId, Box<dyn VfsProvider>>);
+
+impl ProviderRegistry {
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+    pub fn insert(&mut self, id: ProviderId, provider: Box<dyn VfsProvider>) {
+        self.0.insert(id, provider);
+    }
+    pub fn get(&self, id: &ProviderId) -> Option<&dyn VfsProvider> {
+        self.0.get(id).map(|b| b.as_ref())
+    }
+    pub fn contains_key(&self, id: &ProviderId) -> bool {
+        self.0.contains_key(id)
+    }
+}
 
 /// Build default registry with local backend. SFTP/Archive registered per-connection.
 pub fn default_registry() -> ProviderRegistry {
     let mut r = ProviderRegistry::new();
     r.insert(ProviderId::Local, Box::new(local::LocalProvider));
     r
+}
+
+// ponytail: thread-local bridge during migration. Delete after all call sites
+// use ProviderRegistry directly (Phase 3).
+std::thread_local! {
+    static PROVIDER_REGISTRY: std::cell::RefCell<ProviderRegistry> =
+        std::cell::RefCell::new(ProviderRegistry::new());
+}
+
+// ponytail: one-shot init from AppState::default
+pub fn set_global_registry(r: ProviderRegistry) {
+    PROVIDER_REGISTRY.with(|cell| *cell.borrow_mut() = r);
+}
+
+pub(crate) fn with_registry<F, R>(f: F) -> R
+where
+    F: FnOnce(&ProviderRegistry) -> R,
+{
+    PROVIDER_REGISTRY.with(|cell| f(&cell.borrow()))
+}
+
+pub(crate) fn with_registry_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut ProviderRegistry) -> R,
+{
+    PROVIDER_REGISTRY.with(|cell| f(&mut cell.borrow_mut()))
+}
+
+impl ProviderRegistry {
+    /// Map old Location enum → (ProviderId, path) and dispatch through registry.
+    /// ponytail: bridge; delete when Location enum is replaced by Target.
+    fn map_location(&mut self, loc: &Location) -> (ProviderId, String) {
+        let (pid, path) = match loc {
+            Location::Local(p) => (ProviderId::Local, p.to_string_lossy().into_owned()),
+            Location::Sftp { host, path } => {
+                // ponytail: lazy-register SFTP provider per-host
+                if !self.contains_key(&ProviderId::Sftp) {
+                    let h = crate::remote::Host::from_alias(host);
+                    self.insert(ProviderId::Sftp, Box::new(sftp::SftpProvider { host: h }));
+                }
+                (ProviderId::Sftp, path.clone())
+            }
+            Location::Archive {
+                archive: _,
+                inner_path,
+            } => (ProviderId::Archive, inner_path.clone()),
+        };
+        (pid, path)
+    }
+
+    pub fn list_location(&mut self, loc: &Location) -> std::io::Result<Vec<Entry>> {
+        let (pid, path) = self.map_location(loc);
+        self.get(&pid)
+            .ok_or_else(|| std::io::Error::other("provider not registered"))?
+            .list(&path)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -173,18 +245,7 @@ pub trait VfsOps {
 
 impl VfsOps for Location {
     fn list(&self) -> anyhow::Result<Vec<Entry>> {
-        let result: std::io::Result<Vec<Entry>> = match self {
-            Location::Local(p) => local::LocalFs::list(p),
-            Location::Sftp { host, path } => {
-                let h = crate::remote::Host::from_alias(host);
-                sftp::SftpFs::list(&h, path)
-            }
-            Location::Archive {
-                archive,
-                inner_path,
-            } => archive::ArchiveFs::list(archive, inner_path),
-        };
-        result.map_err(|e| anyhow::anyhow!("{e}"))
+        with_registry_mut(|r| r.list_location(self)).map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     fn read_head(&self, path: &std::path::Path, lines: usize) -> anyhow::Result<Vec<String>> {

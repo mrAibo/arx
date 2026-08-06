@@ -169,6 +169,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
 
 use crate::vfs::VfsProvider;
 
+#[derive(Debug)]
 pub struct LocalProvider;
 
 impl VfsProvider for LocalProvider {

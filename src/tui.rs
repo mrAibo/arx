@@ -1,5 +1,5 @@
 use arx::app::{Action, AppState, Pane, PaneState, PanelMode, SortMode};
-use arx::vfs::{Entry, EntryKind, Location, VfsOps};
+use arx::vfs::{Entry, EntryKind, Location, ProviderRegistry, VfsOps};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
     execute,
@@ -46,6 +46,10 @@ async fn event_loop(
         menu: AppState::load_menu(),
         ..AppState::default()
     };
+    // ponytail: bridge — sync thread-local registry for old Location::list() dispatch
+    let reg = std::mem::replace(&mut state.registry, ProviderRegistry::new());
+    arx::vfs::set_global_registry(reg);
+    state.registry = arx::vfs::default_registry();
     let mut left_entries = load_entries(&state.left.location, state.show_hidden, state.sort_mode);
     let mut right_entries = load_entries(&state.right.location, state.show_hidden, state.sort_mode);
     let mut left_list = ListState::default();

@@ -3,6 +3,7 @@ use crate::vfs::{Entry, VfsProvider};
 use std::io;
 
 pub struct S3Fs;
+#[derive(Debug)]
 pub struct S3Provider;
 
 impl VfsProvider for S3Provider {

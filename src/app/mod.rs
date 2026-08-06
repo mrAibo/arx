@@ -188,6 +188,8 @@ pub struct AppState {
     pub context_menu_pos: (u16, u16),
     pub command_matches: Vec<(String, String)>,
     pub overlay_list_state: ratatui::widgets::ListState,
+    /// Provider registry — phased replacement of match-Location dispatch
+    pub registry: crate::vfs::ProviderRegistry,
 }
 
 impl Default for AppState {
@@ -269,6 +271,7 @@ impl Default for AppState {
             context_menu_pos: (0, 0),
             command_matches: Vec::new(),
             overlay_list_state: ratatui::widgets::ListState::default(),
+            registry: crate::vfs::default_registry(),
         }
     }
 }
