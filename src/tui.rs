@@ -331,6 +331,10 @@ async fn event_loop(
                                         state.command_matches =
                                             build_cc_matches(&state.filter, &state);
                                     }
+                                    if state.show_command_center {
+                                        state.command_matches =
+                                            build_cc_matches(&state.filter, &state);
+                                    }
                                 }
                             }
                             _ => {}
@@ -1746,6 +1750,26 @@ fn render(
     // Viewer overlay
     if !state.viewer_content.is_empty() {
         render_viewer(frame, area, state);
+    }
+
+    // Command Center overlay (Ctrl+P)
+    if state.show_command_center {
+        let h = (state.command_matches.len().max(1) + 3).min(20) as u16;
+        let popup = centered_rect(70, h, area);
+        frame.render_widget(Clear, popup);
+        let items: Vec<ListItem> = state
+            .command_matches
+            .iter()
+            .map(|(l, _)| ListItem::new(l.as_str()))
+            .collect();
+        let list = ratatui::widgets::List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" ARX Command Center — :{}_ ", state.filter)),
+            )
+            .highlight_style(Style::default().fg(Color::Yellow));
+        frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
     }
 
     // Command Center overlay (Ctrl+P)
