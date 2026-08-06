@@ -1606,9 +1606,9 @@ async fn event_loop(
                         // Ctrl+J: jobs panel
                         KeyCode::Delete if state.show_jobs => {
                             if state.job_cursor < state.jobs.len() {
-                                state.jobs.remove(state.job_cursor);
-                                state.job_cursor =
-                                    state.job_cursor.min(state.jobs.len().saturating_sub(1));
+                                let job = &mut state.jobs[state.job_cursor];
+                                job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                                job.status = arx::jobs::JobStatus::Cancelled;
                             }
                         }
                         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
