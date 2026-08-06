@@ -34,7 +34,7 @@ pub async fn run(config: arx::config::ArxConfig) -> io::Result<()> {
     result
 }
 
-#[allow(clippy::collapsible_if)]
+#[allow(clippy::collapsible_if, unreachable_patterns)]
 async fn event_loop(
     terminal: &mut DefaultTerminal,
     config: arx::config::ArxConfig,
@@ -1635,7 +1635,6 @@ async fn event_loop(
                             state.tree_filter.clear();
                         }
                         // Type in tree filter (when tree is shown) — Esc/Backspace before Char
-                        #[allow(unreachable_patterns)]
                         KeyCode::Backspace if state.show_tree => {
                             state.tree_filter.pop();
                         }
