@@ -1,6 +1,5 @@
 use crate::app::AppState;
 use std::fs;
-use std::io;
 
 /// Save workspace to ~/.local/share/arx/workspaces/ as JSON.
 pub fn save_workspace(state: &AppState) -> std::io::Result<()> {
