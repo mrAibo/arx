@@ -446,7 +446,23 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
 fn load_entries(location: &Location, show_hidden: bool, sort_mode: SortMode) -> Vec<Entry> {
     let mut entries = match location {
         Location::Local(path) => LocalFs::list(path).unwrap_or_default(),
-        Location::Sftp { host, path } => SftpFs::list(host, path).unwrap_or_default(),
+        Location::Sftp { host, path } => {
+            let synthetic = arx::remote::Host {
+                id: host.clone(),
+                name: host.clone(),
+                ssh_alias: host.clone(),
+                hostname: host.clone(),
+                port: 22,
+                user: std::env::var("USER").unwrap_or_else(|_| "root".into()),
+                group_ids: Default::default(),
+                tags: Default::default(),
+                favorite: false,
+                default_path: None,
+                transfer_preference: arx::remote::TransferPreference::Auto,
+                notes: None,
+            };
+            SftpFs::list(&synthetic, path).unwrap_or_default()
+        }
         _ => vec![],
     };
     if !show_hidden {

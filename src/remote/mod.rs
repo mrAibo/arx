@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+pub mod hosts_config;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Host {
     pub id: String,
