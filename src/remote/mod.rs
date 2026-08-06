@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 pub mod hosts_config;
 pub mod ssh_config;
+#[cfg(target_os = "linux")]
 pub mod watch;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

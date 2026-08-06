@@ -1,5 +1,5 @@
-/// Remote Watch — sync local changes to remote via inotify + rsync.
-/// ponytail: shells out to inotifywait + rsync. No crate dependency.
+//! Remote Watch — sync local changes to remote via inotify + rsync.
+//! ponytail: shells out to inotifywait + rsync. No crate dependency.
 use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
