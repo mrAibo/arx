@@ -1615,6 +1615,25 @@ async fn event_loop(
                             state.show_jobs = !state.show_jobs;
                             state.job_cursor = 0;
                         }
+                        // Ctrl+T: toggle Smart Tree
+                        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.show_tree = !state.show_tree;
+                            state.tree_filter.clear();
+                        }
+                        // Type in tree filter (when tree is shown)
+                        KeyCode::Char(c)
+                            if state.show_tree
+                                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            state.tree_filter.push(c);
+                        }
+                        KeyCode::Backspace if state.show_tree => {
+                            state.tree_filter.pop();
+                        }
+                        KeyCode::Esc if state.show_tree => {
+                            state.show_tree = false;
+                            state.tree_filter.clear();
+                        }
                         // Ctrl+X D: toggle directory compare
                         // Alt+T: toggle panel mode (Full ↔ Brief) KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => { state.panel_mode = match state.panel_mode { PanelMode::Full => PanelMode::Brief, PanelMode::Brief => PanelMode::Full, }; }
                         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2063,6 +2082,42 @@ fn render(
         render_viewer(frame, area, state);
     }
 
+    // Smart Tree overlay (Ctrl+T)
+    if state.show_tree {
+        let pane = state.active_pane();
+        let cur_dir = match &pane.location {
+            Location::Local(p) => p.display().to_string(),
+            Location::Sftp { host: _, path, .. } => path.clone(),
+            Location::Archive {
+                archive: _,
+                inner_path: _,
+            } => ".".into(),
+        };
+        let tree_out = std::process::Command::new("tree")
+            .args(["-L", "2", "-C", "--noreport", &cur_dir])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|_| "tree not found".into());
+        let tl: Vec<&str> = tree_out
+            .lines()
+            .filter(|l| {
+                state.tree_filter.is_empty()
+                    || l.to_lowercase().contains(&state.tree_filter.to_lowercase())
+            })
+            .collect();
+        let h = (tl.len().max(1) + 3).min(30) as u16;
+        let popup = centered_rect(80, h, area);
+        frame.render_widget(Clear, popup);
+        let items: Vec<ListItem> = tl.iter().map(|l| ListItem::new(*l)).collect();
+        let title = format!(
+            " ARX Smart Tree — :{}_ | Ctrl+T toggle, Esc close ",
+            state.tree_filter
+        );
+        let list = ratatui::widgets::List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .highlight_style(Style::default().fg(Color::Green));
+        frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
+    }
     // Command Center overlay (Ctrl+P)
     if state.show_command_center {
         let h = (state.command_matches.len().max(1) + 3).min(20) as u16;
