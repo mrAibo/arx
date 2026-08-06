@@ -6,6 +6,10 @@ rust-version = "1.88"
 description = "A terminal commander for local and remote files, archives, transfers, and jobs"
 license = "MIT"
 repository = "https://github.com/mrAibo/arx"
+documentation = "https://github.com/mrAibo/arx"
+readme = "README.md"
+keywords = ["tui", "file-manager", "sftp", "rsync", "terminal", "commander"]
+categories = ["command-line-utilities", "filesystem"]
 
 [dependencies]
 ratatui = "0.30.2"
@@ -16,6 +20,8 @@ toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+directories = "6"
 
 [dev-dependencies]
 tempfile = "3"

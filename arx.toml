@@ -1,0 +1,4 @@
+# ARX configuration
+[ui]
+theme = "dark"
+# show_hidden = false
