@@ -186,9 +186,17 @@ pub struct SftpProvider {
     pub host: crate::remote::Host,
 }
 
+#[async_trait::async_trait]
 impl VfsProvider for SftpProvider {
     fn list(&self, path: &str) -> std::io::Result<Vec<Entry>> {
-        SftpFs::list(&self.host, path).map_err(|e| std::io::Error::other(e.to_string()))
+        // ponytail: sync fallback — block_on for backward compat
+        SftpFs::list(&self.host, path)
+    }
+    /// Native async SFTP list — no block_on. F2 goal.
+    async fn list_async(&self, path: &str) -> std::io::Result<Vec<Entry>> {
+        list_sftp(&self.host, path)
+            .await
+            .map_err(|e| std::io::Error::other(format!("SFTP: {e:#}")))
     }
     fn read_head(&self, _path: &str, _lines: usize) -> std::io::Result<Vec<String>> {
         Err(std::io::Error::other("SFTP read_head not supported"))

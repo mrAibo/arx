@@ -73,8 +73,15 @@ impl Target {
 }
 
 /// Backend trait — each provider implements this. async deferred to F2.
+/// ponytail: sync list() kept for backward compat; list_async() is the new path.
+#[async_trait::async_trait]
 pub trait VfsProvider: Send + Sync + std::fmt::Debug {
     fn list(&self, path: &str) -> std::io::Result<Vec<Entry>>;
+    /// Async entry point — providers that can (SFTP, S3, WebDAV) skip block_on.
+    /// Default impl delegates to sync list(); override for native async.
+    async fn list_async(&self, path: &str) -> std::io::Result<Vec<Entry>> {
+        self.list(path)
+    }
     fn read_head(&self, path: &str, lines: usize) -> std::io::Result<Vec<String>>;
     fn copy_files(&self, src: &str, dst: &str, names: &[String]) -> std::io::Result<usize>;
     fn move_files(&self, src: &str, dst: &str, names: &[String]) -> std::io::Result<usize>;
@@ -118,13 +125,6 @@ pub fn set_global_registry(r: ProviderRegistry) {
     PROVIDER_REGISTRY.with(|cell| *cell.borrow_mut() = r);
 }
 
-pub(crate) fn with_registry<F, R>(f: F) -> R
-where
-    F: FnOnce(&ProviderRegistry) -> R,
-{
-    PROVIDER_REGISTRY.with(|cell| f(&cell.borrow()))
-}
-
 pub(crate) fn with_registry_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut ProviderRegistry) -> R,
@@ -159,6 +159,16 @@ impl ProviderRegistry {
         self.get(&pid)
             .ok_or_else(|| std::io::Error::other("provider not registered"))?
             .list(&path)
+    }
+
+    /// Async entry point — delegates to list_async() on the provider.
+    /// ponytail: use this in async contexts; sync list_location() kept for backward compat.
+    pub async fn list_location_async(&mut self, loc: &Location) -> std::io::Result<Vec<Entry>> {
+        let (pid, path) = self.map_location(loc);
+        self.get(&pid)
+            .ok_or_else(|| std::io::Error::other("provider not registered"))?
+            .list_async(&path)
+            .await
     }
 }
 
