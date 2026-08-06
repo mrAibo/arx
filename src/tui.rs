@@ -115,7 +115,43 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
         })?;
         state.message = None; // one-shot clear after render
 
+        // Drain terminal output if active
+        if let Some(ref mut term) = state.term {
+            term.drain();
+        }
+
         match event::read()? {
+            Event::Key(key) if state.show_terminal && state.active == Pane::Right => {
+                use crossterm::event::KeyCode as KC;
+                if let Some(ref mut term) = state.term {
+                    match key.code {
+                        KC::Esc => {
+                            // Toggle back to file browser
+                            state.show_terminal = false;
+                            if let Some(ref mut t) = state.term {
+                                t.kill();
+                            }
+                            state.term = None;
+                            state.message = Some("Terminal closed".into());
+                        }
+                        KC::Enter => term.write("\r\n"),
+                        KC::Backspace => term.write("\x7f"),
+                        KC::Tab => term.write("\t"),
+                        KC::Up => term.write("\x1b[A"),
+                        KC::Down => term.write("\x1b[B"),
+                        KC::Left => term.write("\x1b[D"),
+                        KC::Right => term.write("\x1b[C"),
+                        KC::Home => term.write("\x1b[H"),
+                        KC::End => term.write("\x1b[F"),
+                        KC::Char(c) => {
+                            let mut buf = [0u8; 4];
+                            let s = c.encode_utf8(&mut buf);
+                            term.write(s);
+                        }
+                        _ => {}
+                    }
+                }
+            }
             Event::Mouse(mouse) => {
                 use crossterm::event::MouseEventKind;
                 if let MouseEventKind::Down(_) = mouse.kind {
@@ -483,6 +519,65 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                             pane.cursor += 1;
                         }
                     }
+                    // Ctrl+Space: hash for files, du/df for dirs
+                    KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(entry) = entries.get(cursor) {
+                            match entry.kind {
+                                EntryKind::Directory => {
+                                    if let Location::Local(dir) = &pane.location {
+                                        let p = dir.join(&entry.name);
+                                        let du = std::process::Command::new("du")
+                                            .args(["-sh", &p.to_string_lossy()])
+                                            .output()
+                                            .map(|o| {
+                                                String::from_utf8_lossy(&o.stdout)
+                                                    .trim()
+                                                    .to_string()
+                                            })
+                                            .unwrap_or_default();
+                                        let df = std::process::Command::new("df")
+                                            .args(["-h", &p.to_string_lossy()])
+                                            .output()
+                                            .map(|o| {
+                                                let s = String::from_utf8_lossy(&o.stdout);
+                                                s.lines().last().unwrap_or_default().to_string()
+                                            })
+                                            .unwrap_or_default();
+                                        state.viewer_content = vec![
+                                            format!("Directory: {}", p.display()),
+                                            format!("Size:     {du}"),
+                                            format!("Free:     {df}"),
+                                        ];
+                                        state.viewer_scroll = 0;
+                                    }
+                                }
+                                _ => {
+                                    // File: show sha256 hash
+                                    if let Location::Local(dir) = &pane.location {
+                                        let p = dir.join(&entry.name);
+                                        let hash = std::process::Command::new("sha256sum")
+                                            .arg(&p)
+                                            .output()
+                                            .map(|o| {
+                                                let s = String::from_utf8_lossy(&o.stdout);
+                                                s.split_whitespace()
+                                                    .next()
+                                                    .unwrap_or("?")
+                                                    .to_string()
+                                            })
+                                            .unwrap_or_else(|_| "?".into());
+                                        let size = entry.size.map(format_size).unwrap_or_default();
+                                        state.viewer_content = vec![
+                                            format!("File: {}", p.display()),
+                                            format!("Size: {size}"),
+                                            format!("SHA256: {hash}"),
+                                        ];
+                                        state.viewer_scroll = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     KeyCode::Char(' ') => {
                         if let Some(entry) = entries.get(cursor) {
                             if state.selected.contains(&entry.name) {
@@ -776,6 +871,32 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                             state.message = Some(format!("Opening {}", dir.display()));
                         }
                     }
+                    // Ctrl+Shift+T: toggle terminal in right pane
+                    KeyCode::Char('t')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        if state.show_terminal {
+                            state.show_terminal = false;
+                            if let Some(ref mut t) = state.term {
+                                t.kill();
+                            }
+                            state.term = None;
+                            state.message = Some("Terminal closed".into());
+                        } else if let Location::Local(dir) = &state.right.location {
+                            match arx::terminal::TermPane::spawn(dir) {
+                                Ok(t) => {
+                                    state.term = Some(t);
+                                    state.show_terminal = true;
+                                    state.active = Pane::Right;
+                                    state.message = Some("Terminal started — Esc to close".into());
+                                }
+                                Err(e) => {
+                                    state.message = Some(format!("Terminal error: {e}"));
+                                }
+                            }
+                        }
+                    }
                     // Ctrl+O: drop to subshell, restore on exit
                     KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         disable_raw_mode()?;
@@ -1031,6 +1152,24 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                 state.show_hidden,
                                 state.sort_mode,
                             );
+                        }
+                    }
+                    // Ctrl+C: copy filename to clipboard
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(entry) = entries.get(cursor) {
+                            let name = &entry.name;
+                            if let Location::Local(dir) = &pane.location {
+                                let full = dir.join(name);
+                                let path = full.to_string_lossy();
+                                let _ = std::process::Command::new("sh")
+                                    .arg("-c")
+                                    .arg(format!(
+                                        "echo -n '{}' | xclip -selection clipboard 2>/dev/null || echo -n '{}' | wl-copy 2>/dev/null || printf '%s' '{}'",
+                                        path, path, path
+                                    ))
+                                    .output();
+                            }
+                            state.message = Some(format!("Copied: {name}"));
                         }
                     }
                     // Ctrl+B: bookmarks
@@ -1349,17 +1488,44 @@ fn render(
         &left_only,
         state.panel_mode,
     );
-    render_pane(
-        frame,
-        panes[1],
-        &state.right,
-        right_entries,
-        right_list,
-        state.active == Pane::Right,
-        &state.selected,
-        &right_only,
-        state.panel_mode,
-    );
+    if state.show_terminal {
+        if let Some(ref term) = state.term {
+            // Render terminal buffer in right pane
+            let border_style = if state.active == Pane::Right {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let lines: Vec<Line<'_>> = term
+                .buffer
+                .iter()
+                .skip(term.scroll)
+                .take(panes[1].height.saturating_sub(2) as usize)
+                .map(|s| Line::from(s.as_str()))
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Terminal ")
+                        .border_style(border_style),
+                ),
+                panes[1],
+            );
+        }
+    } else {
+        render_pane(
+            frame,
+            panes[1],
+            &state.right,
+            right_entries,
+            right_list,
+            state.active == Pane::Right,
+            &state.selected,
+            &right_only,
+            state.panel_mode,
+        );
+    }
 
     // Help overlay
     if state.show_help {
@@ -1532,7 +1698,13 @@ fn render_viewer(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let popup_area = centered_rect(80, 90, area);
     frame.render_widget(Clear, popup_area);
 
-    let title = format!(" View ({} lines) ", state.viewer_content.len());
+    let total = state.viewer_content.len();
+    let pct = if total > 0 {
+        ((state.viewer_scroll.min(total.saturating_sub(1)) as f64 / total as f64) * 100.0) as usize
+    } else {
+        0
+    };
+    let title = format!(" View ({} lines, {}%) ", total, pct);
     let max_scroll = state.viewer_content.len().saturating_sub(1);
     let visible: Vec<Line> = state
         .viewer_content

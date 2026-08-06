@@ -5,6 +5,7 @@ use ratatui::layout::Rect;
 
 use crate::jobs::Job;
 use crate::remote::Host;
+use crate::terminal::TermPane;
 use crate::vfs::Location;
 
 /// MC-style menu entry.
@@ -158,6 +159,9 @@ pub struct AppState {
     pub menu: Vec<MenuEntry>,
     pub show_menu: bool,
     pub menu_cursor: usize,
+    // Terminal pane (right side, Ctrl+Shift+T toggle)
+    pub term: Option<TermPane>,
+    pub show_terminal: bool,
 }
 
 impl Default for AppState {
@@ -211,6 +215,8 @@ impl Default for AppState {
             menu: Vec::new(),
             show_menu: false,
             menu_cursor: 0,
+            term: None,
+            show_terminal: false,
         }
     }
 }
