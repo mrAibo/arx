@@ -18,7 +18,11 @@ use std::path::{Path, PathBuf};
 pub fn run(config: arx::config::ArxConfig) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))?;
 
     let result = event_loop(&mut terminal, config);
@@ -100,7 +104,7 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
         terminal.draw(|frame| {
             render(
                 frame,
-                &state,
+                &mut state,
                 &left_filtered,
                 &right_filtered,
                 &mut left_list.clone(),
@@ -110,46 +114,208 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
         })?;
         state.message = None; // one-shot clear after render
 
-        #[allow(clippy::collapsible_if)]
-        if let Event::Key(key) = event::read()? {
-            // If composing filter/glob/go-to, keys go to buffer
-            if state.filtering || state.glob_input || state.go_input || state.cmd_input {
-                match key.code {
-                    KeyCode::Esc => {
-                        state.filter.clear();
-                        state.filtering = false;
-                        state.glob_input = false;
-                        state.go_input = false;
-                        state.cmd_input = false;
+        match event::read()? {
+            Event::Mouse(mouse) => {
+                use crossterm::event::MouseEventKind;
+                if let MouseEventKind::Down(_) = mouse.kind {
+                    let (area, is_left) = if let Some(a) = state.left_area {
+                        if mouse.column >= a.x
+                            && mouse.column < a.x + a.width
+                            && mouse.row > a.y
+                            && mouse.row < a.y + a.height
+                        {
+                            (a, true)
+                        } else if let Some(a) = state.right_area {
+                            (a, false)
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    };
+                    let row = (mouse.row.saturating_sub(area.y + 1)) as usize;
+                    let filt = if is_left {
+                        &left_filtered
+                    } else {
+                        &right_filtered
+                    };
+                    if row < filt.len() {
+                        if is_left {
+                            state.left.cursor = row;
+                        } else {
+                            state.right.cursor = row;
+                        }
+                        state.active = if is_left { Pane::Left } else { Pane::Right };
                     }
-                    KeyCode::Enter => {
-                        if state.glob_input && !state.filter.is_empty() {
-                            let filt = if state.active == Pane::Left {
-                                &left_filtered
-                            } else {
-                                &right_filtered
-                            };
-                            for e in filt {
-                                state.selected.insert(e.name.clone());
-                            }
-                            state.message = Some(format!("Selected {}", state.selected.len()));
+                }
+            }
+            Event::Key(key) => {
+                // If composing filter/glob/go-to, keys go to buffer
+                if state.filtering || state.glob_input || state.go_input || state.cmd_input {
+                    match key.code {
+                        KeyCode::Esc => {
                             state.filter.clear();
-                        } else if state.go_input && !state.filter.is_empty() {
-                            // Navigate to typed path
-                            let target = PathBuf::from(&state.filter);
-                            let resolved = if target.is_absolute() {
-                                target
-                            } else {
-                                match &state.active_pane().location {
-                                    Location::Local(p) => p.join(&target),
-                                    _ => target,
+                            state.filtering = false;
+                            state.glob_input = false;
+                            state.go_input = false;
+                            state.cmd_input = false;
+                        }
+                        KeyCode::Enter => {
+                            if state.glob_input && !state.filter.is_empty() {
+                                let filt = if state.active == Pane::Left {
+                                    &left_filtered
+                                } else {
+                                    &right_filtered
+                                };
+                                for e in filt {
+                                    state.selected.insert(e.name.clone());
                                 }
-                            };
-                            if resolved.is_dir() {
+                                state.message = Some(format!("Selected {}", state.selected.len()));
+                                state.filter.clear();
+                            } else if state.go_input && !state.filter.is_empty() {
+                                // Navigate to typed path
+                                let target = PathBuf::from(&state.filter);
+                                let resolved = if target.is_absolute() {
+                                    target
+                                } else {
+                                    match &state.active_pane().location {
+                                        Location::Local(p) => p.join(&target),
+                                        _ => target,
+                                    }
+                                };
+                                if resolved.is_dir() {
+                                    let pane = state.active_pane_mut();
+                                    pane.location = Location::Local(resolved);
+                                    pane.cursor = 0;
+                                    state.selected.clear();
+                                    left_entries = load_entries(
+                                        &state.left.location,
+                                        state.show_hidden,
+                                        state.sort_mode,
+                                    );
+                                    right_entries = load_entries(
+                                        &state.right.location,
+                                        state.show_hidden,
+                                        state.sort_mode,
+                                    );
+                                } else {
+                                    state.message =
+                                        Some(format!("Not a directory: {}", state.filter));
+                                }
+                                state.filter.clear();
+                            }
+                            if state.cmd_input {
+                                let command = std::mem::take(&mut state.cmd);
+                                state.cmd_input = false;
+                                if command.is_empty() {
+                                    state.message = Some(": command cancelled".into());
+                                } else {
+                                    // Run shell command, capture output
+                                    let output = std::process::Command::new("sh")
+                                        .arg("-c")
+                                        .arg(&command)
+                                        .output();
+                                    state.message = match output {
+                                        Ok(o) => {
+                                            let stdout = String::from_utf8_lossy(&o.stdout)
+                                                .trim()
+                                                .to_string();
+                                            let limit = 80;
+                                            if stdout.is_empty() && o.status.success() {
+                                                Some(format!(": {command} — ok"))
+                                            } else if stdout.len() > limit {
+                                                Some(format!(
+                                                    ": {} — {}...",
+                                                    command,
+                                                    &stdout[..limit]
+                                                ))
+                                            } else {
+                                                Some(format!(": {} — {}", command, stdout))
+                                            }
+                                        }
+                                        Err(e) => Some(format!(": {command} failed: {e}")),
+                                    };
+                                }
+                            }
+                            state.filtering = false;
+                            state.glob_input = false;
+                            state.go_input = false;
+                        }
+                        KeyCode::Backspace => {
+                            if state.cmd_input {
+                                state.cmd.pop();
+                            } else {
+                                state.filter.pop();
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            if state.cmd_input {
+                                state.cmd.push(c);
+                            } else {
+                                state.filter.push(c);
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Viewer mode: takes over until dismissed
+                if !state.viewer_content.is_empty() {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(3) => {
+                            state.viewer_content.clear();
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            state.viewer_scroll = state.viewer_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j')
+                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            let max = state.viewer_content.len().saturating_sub(1);
+                            if state.viewer_scroll < max {
+                                state.viewer_scroll += 1;
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            state.viewer_scroll = state.viewer_scroll.saturating_sub(20);
+                        }
+                        KeyCode::PageDown => {
+                            let max = state.viewer_content.len().saturating_sub(1);
+                            state.viewer_scroll = (state.viewer_scroll + 20).min(max);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Bookmarks mode
+                if state.show_bookmarks {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('b')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            state.show_bookmarks = false;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            state.bookmark_cursor = state.bookmark_cursor.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j')
+                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            let max = state.bookmarks.len().saturating_sub(1);
+                            if state.bookmark_cursor < max {
+                                state.bookmark_cursor += 1;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let loc = state.bookmarks.get(state.bookmark_cursor).cloned();
+                            if let Some(loc) = loc {
                                 let pane = state.active_pane_mut();
-                                pane.location = Location::Local(resolved);
+                                pane.location = loc;
                                 pane.cursor = 0;
                                 state.selected.clear();
+                                state.show_bookmarks = false;
                                 left_entries = load_entries(
                                     &state.left.location,
                                     state.show_hidden,
@@ -160,361 +326,221 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                     state.show_hidden,
                                     state.sort_mode,
                                 );
-                            } else {
-                                state.message = Some(format!("Not a directory: {}", state.filter));
                             }
-                            state.filter.clear();
                         }
-                        if state.cmd_input {
-                            let command = std::mem::take(&mut state.cmd);
-                            state.cmd_input = false;
-                            if command.is_empty() {
-                                state.message = Some(": command cancelled".into());
-                            } else {
-                                // Run shell command, capture output
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Hosts panel: F9
+                if state.show_hosts {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::F(9) => {
+                            state.show_hosts = false;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            state.host_cursor = state.host_cursor.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j')
+                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            let max = state.hosts.len().saturating_sub(1);
+                            if state.host_cursor < max {
+                                state.host_cursor += 1;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let host = state.hosts.get(state.host_cursor).cloned();
+                            if let Some(host) = host {
+                                let pane = state.active_pane_mut();
+                                let default_path = host.default_path.as_deref().unwrap_or("/");
+                                pane.location = Location::Sftp {
+                                    host: host.id.clone(),
+                                    path: default_path.into(),
+                                };
+                                pane.cursor = 0;
+                                state.selected.clear();
+                                state.show_hosts = false;
+                                left_entries = load_entries(
+                                    &state.left.location,
+                                    state.show_hidden,
+                                    state.sort_mode,
+                                );
+                                right_entries = load_entries(
+                                    &state.right.location,
+                                    state.show_hidden,
+                                    state.sort_mode,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Jobs panel: Ctrl+J
+                if state.show_jobs {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('j')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            state.show_jobs = false;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            state.job_cursor = state.job_cursor.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j')
+                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            let max = state.jobs.len().saturating_sub(1);
+                            if state.job_cursor < max {
+                                state.job_cursor += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // User menu: F2
+                if state.show_menu {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::F(2) => {
+                            state.show_menu = false;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            state.menu_cursor = state.menu_cursor.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j')
+                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            let max = state.menu.len().saturating_sub(1);
+                            if state.menu_cursor < max {
+                                state.menu_cursor += 1;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let Some(entry) = state.menu.get(state.menu_cursor) {
+                                let cmd = entry.command.clone();
+                                state.show_menu = false;
+                                // Run menu command, show output
                                 let output = std::process::Command::new("sh")
                                     .arg("-c")
-                                    .arg(&command)
+                                    .arg(&cmd)
                                     .output();
                                 state.message = match output {
                                     Ok(o) => {
-                                        let stdout =
+                                        let out =
                                             String::from_utf8_lossy(&o.stdout).trim().to_string();
-                                        let limit = 80;
-                                        if stdout.is_empty() && o.status.success() {
-                                            Some(format!(": {command} — ok"))
-                                        } else if stdout.len() > limit {
-                                            Some(format!(": {} — {}...", command, &stdout[..limit]))
+                                        if out.is_empty() && o.status.success() {
+                                            Some(format!("menu: {} — ok", entry.label))
+                                        } else if out.len() > 80 {
+                                            Some(format!(
+                                                "menu: {} — {}...",
+                                                entry.label,
+                                                &out[..80]
+                                            ))
                                         } else {
-                                            Some(format!(": {} — {}", command, stdout))
+                                            Some(format!("menu: {} — {out}", entry.label))
                                         }
                                     }
-                                    Err(e) => Some(format!(": {command} failed: {e}")),
+                                    Err(e) => Some(format!("menu: {} failed: {e}", entry.label)),
                                 };
                             }
                         }
-                        state.filtering = false;
-                        state.glob_input = false;
-                        state.go_input = false;
+                        _ => {}
                     }
-                    KeyCode::Backspace => {
-                        if state.cmd_input {
-                            state.cmd.pop();
-                        } else {
-                            state.filter.pop();
-                        }
-                    }
-                    KeyCode::Char(c) => {
-                        if state.cmd_input {
-                            state.cmd.push(c);
-                        } else {
-                            state.filter.push(c);
-                        }
-                    }
-                    _ => {}
+                    continue;
                 }
-                continue;
-            }
 
-            // Viewer mode: takes over until dismissed
-            if !state.viewer_content.is_empty() {
+                let entries = if state.active == Pane::Left {
+                    &left_filtered
+                } else {
+                    &right_filtered
+                };
+                let cursor = if state.active == Pane::Left {
+                    state.left.cursor
+                } else {
+                    state.right.cursor
+                };
+                let cmd_prefix = state.cmd_prefix;
+                let pane = state.active_pane_mut();
+
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(3) => {
-                        state.viewer_content.clear();
-                    }
+                    KeyCode::Char('q') => state.apply(Action::Quit),
+                    KeyCode::Tab => state.apply(Action::SwitchPane),
                     KeyCode::Up | KeyCode::Char('k') => {
-                        state.viewer_scroll = state.viewer_scroll.saturating_sub(1);
+                        if cursor > 0 {
+                            pane.cursor -= 1;
+                        }
                     }
                     KeyCode::Down | KeyCode::Char('j')
                         if !key.modifiers.contains(KeyModifiers::CONTROL) =>
                     {
-                        let max = state.viewer_content.len().saturating_sub(1);
-                        if state.viewer_scroll < max {
-                            state.viewer_scroll += 1;
+                        if cursor + 1 < entries.len() {
+                            pane.cursor += 1;
                         }
                     }
-                    KeyCode::PageUp => {
-                        state.viewer_scroll = state.viewer_scroll.saturating_sub(20);
-                    }
-                    KeyCode::PageDown => {
-                        let max = state.viewer_content.len().saturating_sub(1);
-                        state.viewer_scroll = (state.viewer_scroll + 20).min(max);
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-
-            // Bookmarks mode
-            if state.show_bookmarks {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('b')
-                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        state.show_bookmarks = false;
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        state.bookmark_cursor = state.bookmark_cursor.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j')
-                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        let max = state.bookmarks.len().saturating_sub(1);
-                        if state.bookmark_cursor < max {
-                            state.bookmark_cursor += 1;
-                        }
-                    }
-                    KeyCode::Enter => {
-                        let loc = state.bookmarks.get(state.bookmark_cursor).cloned();
-                        if let Some(loc) = loc {
-                            let pane = state.active_pane_mut();
-                            pane.location = loc;
-                            pane.cursor = 0;
-                            state.selected.clear();
-                            state.show_bookmarks = false;
-                            left_entries = load_entries(
-                                &state.left.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
-                            right_entries = load_entries(
-                                &state.right.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-
-            // Hosts panel: F9
-            if state.show_hosts {
-                match key.code {
-                    KeyCode::Esc | KeyCode::F(9) => {
-                        state.show_hosts = false;
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        state.host_cursor = state.host_cursor.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j')
-                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        let max = state.hosts.len().saturating_sub(1);
-                        if state.host_cursor < max {
-                            state.host_cursor += 1;
-                        }
-                    }
-                    KeyCode::Enter => {
-                        let host = state.hosts.get(state.host_cursor).cloned();
-                        if let Some(host) = host {
-                            let pane = state.active_pane_mut();
-                            let default_path = host.default_path.as_deref().unwrap_or("/");
-                            pane.location = Location::Sftp {
-                                host: host.id.clone(),
-                                path: default_path.into(),
-                            };
-                            pane.cursor = 0;
-                            state.selected.clear();
-                            state.show_hosts = false;
-                            left_entries = load_entries(
-                                &state.left.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
-                            right_entries = load_entries(
-                                &state.right.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-
-            // Jobs panel: Ctrl+J
-            if state.show_jobs {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('j')
-                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        state.show_jobs = false;
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        state.job_cursor = state.job_cursor.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j')
-                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        let max = state.jobs.len().saturating_sub(1);
-                        if state.job_cursor < max {
-                            state.job_cursor += 1;
-                        }
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-
-            // User menu: F2
-            if state.show_menu {
-                match key.code {
-                    KeyCode::Esc | KeyCode::F(2) => {
-                        state.show_menu = false;
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        state.menu_cursor = state.menu_cursor.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j')
-                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        let max = state.menu.len().saturating_sub(1);
-                        if state.menu_cursor < max {
-                            state.menu_cursor += 1;
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if let Some(entry) = state.menu.get(state.menu_cursor) {
-                            let cmd = entry.command.clone();
-                            state.show_menu = false;
-                            // Run menu command, show output
-                            let output = std::process::Command::new("sh")
-                                .arg("-c")
-                                .arg(&cmd)
-                                .output();
-                            state.message = match output {
-                                Ok(o) => {
-                                    let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                                    if out.is_empty() && o.status.success() {
-                                        Some(format!("menu: {} — ok", entry.label))
-                                    } else if out.len() > 80 {
-                                        Some(format!("menu: {} — {}...", entry.label, &out[..80]))
-                                    } else {
-                                        Some(format!("menu: {} — {out}", entry.label))
-                                    }
-                                }
-                                Err(e) => Some(format!("menu: {} failed: {e}", entry.label)),
-                            };
-                        }
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-
-            let entries = if state.active == Pane::Left {
-                &left_filtered
-            } else {
-                &right_filtered
-            };
-            let cursor = if state.active == Pane::Left {
-                state.left.cursor
-            } else {
-                state.right.cursor
-            };
-            let cmd_prefix = state.cmd_prefix;
-            let pane = state.active_pane_mut();
-
-            match key.code {
-                KeyCode::Char('q') => state.apply(Action::Quit),
-                KeyCode::Tab => state.apply(Action::SwitchPane),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if cursor > 0 {
-                        pane.cursor -= 1;
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j')
-                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    if cursor + 1 < entries.len() {
-                        pane.cursor += 1;
-                    }
-                }
-                KeyCode::Char(' ') => {
-                    if let Some(entry) = entries.get(cursor) {
-                        if state.selected.contains(&entry.name) {
-                            state.selected.remove(&entry.name);
-                        } else {
-                            state.selected.insert(entry.name.clone());
-                        }
-                    }
-                }
-                // Alt+/ : recursive file search
-                KeyCode::Char('/') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    if let Location::Local(dir) = &state.active_pane().location {
-                        state.cmd = format!("find {} -name ''", dir.display());
-                        state.cmd_input = true;
-                    }
-                }
-                KeyCode::Char('/') => {
-                    state.filter.clear();
-                    state.filtering = true;
-                }
-                KeyCode::Char('?') => {
-                    state.show_help = !state.show_help;
-                }
-                KeyCode::Enter => {
-                    if let Some(entry) = entries.get(cursor) {
-                        if entry.kind == EntryKind::Directory {
-                            let old_location = pane.location.clone();
-                            let new_location = match &pane.location {
-                                Location::Local(p) => Location::Local(p.join(&entry.name)),
-                                Location::Sftp { host, path } => {
-                                    let new_path = if path.ends_with('/') {
-                                        format!("{path}{}", entry.name)
-                                    } else {
-                                        format!("{path}/{}", entry.name)
-                                    };
-                                    Location::Sftp {
-                                        host: host.clone(),
-                                        path: new_path,
-                                    }
-                                }
-                                Location::Archive {
-                                    archive,
-                                    inner_path,
-                                } => {
-                                    let new_path = if inner_path.is_empty() {
-                                        entry.name.clone()
-                                    } else if inner_path.ends_with('/') {
-                                        format!("{inner_path}{}", entry.name)
-                                    } else {
-                                        format!("{inner_path}/{}", entry.name)
-                                    };
-                                    Location::Archive {
-                                        archive: archive.clone(),
-                                        inner_path: new_path,
-                                    }
-                                }
-                            };
-                            pane.dir_history.push(old_location);
-                            pane.location = new_location;
-                            pane.cursor = 0;
-                            state.selected.clear();
-                            if state.active == Pane::Left {
-                                left_entries = load_entries(
-                                    &state.left.location,
-                                    state.show_hidden,
-                                    state.sort_mode,
-                                );
+                    KeyCode::Char(' ') => {
+                        if let Some(entry) = entries.get(cursor) {
+                            if state.selected.contains(&entry.name) {
+                                state.selected.remove(&entry.name);
                             } else {
-                                right_entries = load_entries(
-                                    &state.right.location,
-                                    state.show_hidden,
-                                    state.sort_mode,
-                                );
+                                state.selected.insert(entry.name.clone());
                             }
-                        } else if is_archive(&entry.name) {
-                            // Open archive file
-                            if let Location::Local(dir) = &pane.location {
-                                let archive_path = dir.join(&entry.name);
-                                pane.location = Location::Archive {
-                                    archive: archive_path,
-                                    inner_path: String::new(),
+                        }
+                    }
+                    // Alt+/ : recursive file search
+                    KeyCode::Char('/') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        if let Location::Local(dir) = &state.active_pane().location {
+                            state.cmd = format!("find {} -name ''", dir.display());
+                            state.cmd_input = true;
+                        }
+                    }
+                    KeyCode::Char('/') => {
+                        state.filter.clear();
+                        state.filtering = true;
+                    }
+                    KeyCode::Char('?') => {
+                        state.show_help = !state.show_help;
+                    }
+                    KeyCode::Enter => {
+                        if let Some(entry) = entries.get(cursor) {
+                            if entry.kind == EntryKind::Directory {
+                                let old_location = pane.location.clone();
+                                let new_location = match &pane.location {
+                                    Location::Local(p) => Location::Local(p.join(&entry.name)),
+                                    Location::Sftp { host, path } => {
+                                        let new_path = if path.ends_with('/') {
+                                            format!("{path}{}", entry.name)
+                                        } else {
+                                            format!("{path}/{}", entry.name)
+                                        };
+                                        Location::Sftp {
+                                            host: host.clone(),
+                                            path: new_path,
+                                        }
+                                    }
+                                    Location::Archive {
+                                        archive,
+                                        inner_path,
+                                    } => {
+                                        let new_path = if inner_path.is_empty() {
+                                            entry.name.clone()
+                                        } else if inner_path.ends_with('/') {
+                                            format!("{inner_path}{}", entry.name)
+                                        } else {
+                                            format!("{inner_path}/{}", entry.name)
+                                        };
+                                        Location::Archive {
+                                            archive: archive.clone(),
+                                            inner_path: new_path,
+                                        }
+                                    }
                                 };
+                                pane.dir_history.push(old_location);
+                                pane.location = new_location;
                                 pane.cursor = 0;
                                 state.selected.clear();
                                 if state.active == Pane::Left {
@@ -530,345 +556,298 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                         state.sort_mode,
                                     );
                                 }
+                            } else if is_archive(&entry.name) {
+                                // Open archive file
+                                if let Location::Local(dir) = &pane.location {
+                                    let archive_path = dir.join(&entry.name);
+                                    pane.location = Location::Archive {
+                                        archive: archive_path,
+                                        inner_path: String::new(),
+                                    };
+                                    pane.cursor = 0;
+                                    state.selected.clear();
+                                    if state.active == Pane::Left {
+                                        left_entries = load_entries(
+                                            &state.left.location,
+                                            state.show_hidden,
+                                            state.sort_mode,
+                                        );
+                                    } else {
+                                        right_entries = load_entries(
+                                            &state.right.location,
+                                            state.show_hidden,
+                                            state.sort_mode,
+                                        );
+                                    }
+                                }
+                            } else if state.show_diff {
+                                // Content diff: diff this file against other pane's same-named file
+                                if let (Location::Local(left_dir), Location::Local(right_dir)) =
+                                    (&state.left.location, &state.right.location)
+                                {
+                                    let left_path = left_dir.join(&entry.name);
+                                    let right_path = right_dir.join(&entry.name);
+                                    if left_path.exists() && right_path.exists() {
+                                        let output = std::process::Command::new("diff")
+                                            .args(["--color=never", "-u"])
+                                            .arg(&left_path)
+                                            .arg(&right_path)
+                                            .output()
+                                            .map(|o| {
+                                                let s =
+                                                    String::from_utf8_lossy(&o.stdout).into_owned();
+                                                if s.is_empty() {
+                                                    "Files are identical".into()
+                                                } else {
+                                                    s
+                                                }
+                                            })
+                                            .unwrap_or_else(|e| format!("diff error: {e}"));
+                                        state.viewer_content =
+                                            output.lines().map(|l| l.to_string()).collect();
+                                        state.viewer_scroll = 0;
+                                    }
+                                }
                             }
-                        } else if state.show_diff {
-                            // Content diff: diff this file against other pane's same-named file
-                            if let (Location::Local(left_dir), Location::Local(right_dir)) =
-                                (&state.left.location, &state.right.location)
-                            {
-                                let left_path = left_dir.join(&entry.name);
-                                let right_path = right_dir.join(&entry.name);
-                                if left_path.exists() && right_path.exists() {
-                                    let output = std::process::Command::new("diff")
-                                        .args(["--color=never", "-u"])
-                                        .arg(&left_path)
-                                        .arg(&right_path)
-                                        .output()
-                                        .map(|o| {
-                                            let s = String::from_utf8_lossy(&o.stdout).into_owned();
-                                            if s.is_empty() {
-                                                "Files are identical".into()
-                                            } else {
-                                                s
-                                            }
-                                        })
-                                        .unwrap_or_else(|e| format!("diff error: {e}"));
-                                    state.viewer_content =
-                                        output.lines().map(|l| l.to_string()).collect();
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        let go_back = match &pane.location {
+                            Location::Local(p) => {
+                                let parent = LocalFs::parent(p);
+                                if parent != *p {
+                                    Some(Location::Local(parent))
+                                } else {
+                                    None
+                                }
+                            }
+                            Location::Sftp { host, path } => {
+                                // Go to parent directory
+                                if path == "/" {
+                                    None
+                                } else {
+                                    let parent = path
+                                        .rsplit_once('/')
+                                        .map(|(p, _)| p.to_string())
+                                        .unwrap_or_else(|| "/".to_string());
+                                    Some(Location::Sftp {
+                                        host: host.clone(),
+                                        path: parent,
+                                    })
+                                }
+                            }
+                            Location::Archive {
+                                archive,
+                                inner_path,
+                            } => {
+                                if inner_path.is_empty() {
+                                    archive.parent().map(|p| Location::Local(p.to_path_buf()))
+                                } else {
+                                    // Go up one level
+                                    let parent = inner_path
+                                        .rsplit_once('/')
+                                        .map(|(p, _)| p.to_string())
+                                        .unwrap_or_default();
+                                    Some(Location::Archive {
+                                        archive: archive.clone(),
+                                        inner_path: parent,
+                                    })
+                                }
+                            }
+                        };
+                        if let Some(new_loc) = go_back {
+                            pane.location = new_loc;
+                            pane.cursor = 0;
+                            state.selected.clear();
+                            if state.active == Pane::Left {
+                                left_entries = load_entries(
+                                    &state.left.location,
+                                    state.show_hidden,
+                                    state.sort_mode,
+                                );
+                            } else {
+                                right_entries = load_entries(
+                                    &state.right.location,
+                                    state.show_hidden,
+                                    state.sort_mode,
+                                );
+                            }
+                        }
+                    }
+                    KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        left_entries =
+                            load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+                        right_entries =
+                            load_entries(&state.right.location, state.show_hidden, state.sort_mode);
+                    }
+                    // Ctrl+U: swap panes
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        std::mem::swap(&mut state.left, &mut state.right);
+                        state.message = Some("Swapped".into());
+                        left_entries =
+                            load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+                        right_entries =
+                            load_entries(&state.right.location, state.show_hidden, state.sort_mode);
+                    }
+                    // F7: create directory
+                    KeyCode::F(7) => {
+                        state.cmd = "mkdir ".into();
+                        state.cmd_input = true;
+                    }
+                    // Shift+F6: rename file under cursor
+                    KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if let Some(entry) = entries.get(cursor) {
+                            state.cmd = format!("mv '{}' ", entry.name);
+                            state.cmd_input = true;
+                        }
+                    }
+                    // Ctrl+I: file info (stat)
+                    KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(entry) = entries.get(cursor) {
+                            if let Location::Local(dir) = &pane.location {
+                                let path = dir.join(&entry.name);
+                                if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                                    let k = match entry.kind {
+                                        EntryKind::Directory => "d",
+                                        EntryKind::Symlink => "l",
+                                        _ => "-",
+                                    };
+                                    let mode = format!(
+                                        "{k}r--r--r-- {}",
+                                        if meta.permissions().readonly() {
+                                            "ro"
+                                        } else {
+                                            "rw"
+                                        }
+                                    );
+                                    let size = entry.size.map(format_size).unwrap_or_default();
+                                    let info = vec![
+                                        format!("Name:      {}", entry.name),
+                                        format!("Path:      {}", path.display()),
+                                        format!("Type:      {:?}", entry.kind),
+                                        format!("Size:      {size}"),
+                                        format!("Mode:      {mode}"),
+                                    ];
+                                    state.viewer_content = info;
                                     state.viewer_scroll = 0;
                                 }
                             }
                         }
                     }
-                }
-                KeyCode::Backspace => {
-                    let go_back = match &pane.location {
-                        Location::Local(p) => {
-                            let parent = LocalFs::parent(p);
-                            if parent != *p {
-                                Some(Location::Local(parent))
-                            } else {
-                                None
-                            }
-                        }
-                        Location::Sftp { host, path } => {
-                            // Go to parent directory
-                            if path == "/" {
-                                None
-                            } else {
-                                let parent = path
-                                    .rsplit_once('/')
-                                    .map(|(p, _)| p.to_string())
-                                    .unwrap_or_else(|| "/".to_string());
-                                Some(Location::Sftp {
-                                    host: host.clone(),
-                                    path: parent,
-                                })
-                            }
-                        }
-                        Location::Archive {
-                            archive,
-                            inner_path,
-                        } => {
-                            if inner_path.is_empty() {
-                                archive.parent().map(|p| Location::Local(p.to_path_buf()))
-                            } else {
-                                // Go up one level
-                                let parent = inner_path
-                                    .rsplit_once('/')
-                                    .map(|(p, _)| p.to_string())
-                                    .unwrap_or_default();
-                                Some(Location::Archive {
-                                    archive: archive.clone(),
-                                    inner_path: parent,
-                                })
-                            }
-                        }
-                    };
-                    if let Some(new_loc) = go_back {
-                        pane.location = new_loc;
-                        pane.cursor = 0;
-                        state.selected.clear();
-                        if state.active == Pane::Left {
-                            left_entries = load_entries(
-                                &state.left.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
-                        } else {
-                            right_entries = load_entries(
-                                &state.right.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
-                        }
+                    // Alt+O: sync other pane to active pane
+                    KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        let src = state.active_pane().location.clone();
+                        let dst = state.other_pane_mut();
+                        dst.location = src;
+                        dst.cursor = 0;
+                        state.message = Some("Directory synced".into());
+                        left_entries =
+                            load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+                        right_entries =
+                            load_entries(&state.right.location, state.show_hidden, state.sort_mode);
                     }
-                }
-                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    left_entries =
-                        load_entries(&state.left.location, state.show_hidden, state.sort_mode);
-                    right_entries =
-                        load_entries(&state.right.location, state.show_hidden, state.sort_mode);
-                }
-                // Ctrl+U: swap panes
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    std::mem::swap(&mut state.left, &mut state.right);
-                    state.message = Some("Swapped".into());
-                    left_entries =
-                        load_entries(&state.left.location, state.show_hidden, state.sort_mode);
-                    right_entries =
-                        load_entries(&state.right.location, state.show_hidden, state.sort_mode);
-                }
-                // F7: create directory
-                KeyCode::F(7) => {
-                    state.cmd = "mkdir ".into();
-                    state.cmd_input = true;
-                }
-                // Shift+F6: rename file under cursor
-                KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    if let Some(entry) = entries.get(cursor) {
-                        state.cmd = format!("mv '{}' ", entry.name);
-                        state.cmd_input = true;
-                    }
-                }
-                // Ctrl+I: file info (stat)
-                KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(entry) = entries.get(cursor) {
-                        if let Location::Local(dir) = &pane.location {
-                            let path = dir.join(&entry.name);
-                            if let Ok(meta) = std::fs::symlink_metadata(&path) {
-                                let k = match entry.kind {
-                                    EntryKind::Directory => "d",
-                                    EntryKind::Symlink => "l",
-                                    _ => "-",
-                                };
-                                let mode = format!(
-                                    "{k}r--r--r-- {}",
-                                    if meta.permissions().readonly() {
-                                        "ro"
-                                    } else {
-                                        "rw"
-                                    }
+                    // Alt+Down: go back in directory history
+                    KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                        let pane = state.active_pane_mut();
+                        if let Some(prev) = pane.dir_history.pop() {
+                            pane.location = prev;
+                            pane.cursor = 0;
+                            state.message = Some("History back".into());
+                            if state.active == Pane::Left {
+                                left_entries = load_entries(
+                                    &state.left.location,
+                                    state.show_hidden,
+                                    state.sort_mode,
                                 );
-                                let size = entry.size.map(format_size).unwrap_or_default();
-                                let info = vec![
-                                    format!("Name:      {}", entry.name),
-                                    format!("Path:      {}", path.display()),
-                                    format!("Type:      {:?}", entry.kind),
-                                    format!("Size:      {size}"),
-                                    format!("Mode:      {mode}"),
-                                ];
-                                state.viewer_content = info;
-                                state.viewer_scroll = 0;
+                            } else {
+                                right_entries = load_entries(
+                                    &state.right.location,
+                                    state.show_hidden,
+                                    state.sort_mode,
+                                );
                             }
                         }
                     }
-                }
-                // Alt+O: sync other pane to active pane
-                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    let src = state.active_pane().location.clone();
-                    let dst = state.other_pane_mut();
-                    dst.location = src;
-                    dst.cursor = 0;
-                    state.message = Some("Directory synced".into());
-                    left_entries =
-                        load_entries(&state.left.location, state.show_hidden, state.sort_mode);
-                    right_entries =
-                        load_entries(&state.right.location, state.show_hidden, state.sort_mode);
-                }
-                // Alt+Down: go back in directory history
-                KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-                    let pane = state.active_pane_mut();
-                    if let Some(prev) = pane.dir_history.pop() {
-                        pane.location = prev;
-                        pane.cursor = 0;
-                        state.message = Some("History back".into());
-                        if state.active == Pane::Left {
-                            left_entries = load_entries(
-                                &state.left.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
+                    // Ctrl+\\: open active directory in file explorer
+                    KeyCode::Char('\\') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Location::Local(dir) = &state.active_pane().location {
+                            let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+                            state.message = Some(format!("Opening {}", dir.display()));
+                        }
+                    }
+                    // Ctrl+O: drop to subshell, restore on exit
+                    KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        disable_raw_mode()?;
+                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                        let _ = std::process::Command::new(
+                            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+                        )
+                        .status();
+                        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                        enable_raw_mode()?;
+                    }
+                    KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.filter.clear();
+                        state.go_input = true;
+                    }
+                    KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.show_hidden = !state.show_hidden;
+                        state.message = Some(if state.show_hidden {
+                            "Hidden files shown".into()
                         } else {
-                            right_entries = load_entries(
-                                &state.right.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
+                            "Hidden files hidden".into()
+                        });
+                        left_entries =
+                            load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+                        right_entries =
+                            load_entries(&state.right.location, state.show_hidden, state.sort_mode);
+                    }
+                    // F5: copy selected (or cursor) from active pane to other pane — background
+                    KeyCode::F(5) => {
+                        let names = selection_or_cursor(&state, entries, cursor);
+                        if names.is_empty() {
+                            continue;
                         }
-                    }
-                }
-                // Ctrl+\\: open active directory in file explorer
-                KeyCode::Char('\\') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Location::Local(dir) = &state.active_pane().location {
-                        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
-                        state.message = Some(format!("Opening {}", dir.display()));
-                    }
-                }
-                // Ctrl+O: drop to subshell, restore on exit
-                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    disable_raw_mode()?;
-                    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                    let _ = std::process::Command::new(
-                        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
-                    )
-                    .status();
-                    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-                    enable_raw_mode()?;
-                }
-                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    state.filter.clear();
-                    state.go_input = true;
-                }
-                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    state.show_hidden = !state.show_hidden;
-                    state.message = Some(if state.show_hidden {
-                        "Hidden files shown".into()
-                    } else {
-                        "Hidden files hidden".into()
-                    });
-                    left_entries =
-                        load_entries(&state.left.location, state.show_hidden, state.sort_mode);
-                    right_entries =
-                        load_entries(&state.right.location, state.show_hidden, state.sort_mode);
-                }
-                // F5: copy selected (or cursor) from active pane to other pane — background
-                KeyCode::F(5) => {
-                    let names = selection_or_cursor(&state, entries, cursor);
-                    if names.is_empty() {
-                        continue;
-                    }
-                    match op_paths(&state) {
-                        Some((src, dst)) => {
-                            let id = format!("copy-{}", state.jobs.len());
-                            let desc = format!("Copy {} → {}", names.join(", "), dst.display());
-                            state.jobs.push(arx::jobs::Job {
-                                id: id.clone(),
-                                description: desc,
-                                source: Location::Local(src.clone()),
-                                destination: Location::Local(dst.clone()),
-                                status: arx::jobs::JobStatus::Pending,
-                                progress: 0,
-                            });
-                            let tx = job_tx.clone();
-                            let names2 = names.clone();
-                            std::thread::spawn(move || {
-                                tx.send(arx::jobs::JobEvent::Running { id: id.clone() })
-                                    .ok();
-                                let result = LocalFs::copy_files(&src, &dst, &names2);
-                                match result {
-                                    Ok(n) => {
-                                        tx.send(arx::jobs::JobEvent::Done {
-                                            id,
-                                            message: format!("Copied {n} item(s)"),
-                                        })
+                        match op_paths(&state) {
+                            Some((src, dst)) => {
+                                let id = format!("copy-{}", state.jobs.len());
+                                let desc = format!("Copy {} → {}", names.join(", "), dst.display());
+                                state.jobs.push(arx::jobs::Job {
+                                    id: id.clone(),
+                                    description: desc,
+                                    source: Location::Local(src.clone()),
+                                    destination: Location::Local(dst.clone()),
+                                    status: arx::jobs::JobStatus::Pending,
+                                    progress: 0,
+                                });
+                                let tx = job_tx.clone();
+                                let names2 = names.clone();
+                                std::thread::spawn(move || {
+                                    tx.send(arx::jobs::JobEvent::Running { id: id.clone() })
                                         .ok();
+                                    let result = LocalFs::copy_files(&src, &dst, &names2);
+                                    match result {
+                                        Ok(n) => {
+                                            tx.send(arx::jobs::JobEvent::Done {
+                                                id,
+                                                message: format!("Copied {n} item(s)"),
+                                            })
+                                            .ok();
+                                        }
+                                        Err(e) => {
+                                            tx.send(arx::jobs::JobEvent::Failed {
+                                                id,
+                                                error: format!("Copy error: {e}"),
+                                            })
+                                            .ok();
+                                        }
                                     }
-                                    Err(e) => {
-                                        tx.send(arx::jobs::JobEvent::Failed {
-                                            id,
-                                            error: format!("Copy error: {e}"),
-                                        })
-                                        .ok();
-                                    }
-                                }
-                            });
-                            state.message = Some(format!("Copy queued (job {})", state.jobs.len()));
-                        }
-                        None => {
-                            state.message = Some("Both panes must be local for copy".into());
-                        }
-                    }
-                    state.selected.clear();
-                    left_entries =
-                        load_entries(&state.left.location, state.show_hidden, state.sort_mode);
-                    right_entries =
-                        load_entries(&state.right.location, state.show_hidden, state.sort_mode);
-                }
-                // F6: move selected (or cursor) from active pane to other pane — background
-                KeyCode::F(6) => {
-                    let names = selection_or_cursor(&state, entries, cursor);
-                    if names.is_empty() {
-                        continue;
-                    }
-                    match op_paths(&state) {
-                        Some((src, dst)) => {
-                            let id = format!("move-{}", state.jobs.len());
-                            let desc = format!("Move {} → {}", names.join(", "), dst.display());
-                            state.jobs.push(arx::jobs::Job {
-                                id: id.clone(),
-                                description: desc,
-                                source: Location::Local(src.clone()),
-                                destination: Location::Local(dst.clone()),
-                                status: arx::jobs::JobStatus::Pending,
-                                progress: 0,
-                            });
-                            let tx = job_tx.clone();
-                            let names2 = names.clone();
-                            std::thread::spawn(move || {
-                                tx.send(arx::jobs::JobEvent::Running { id: id.clone() })
-                                    .ok();
-                                let result = LocalFs::move_files(&src, &dst, &names2);
-                                match result {
-                                    Ok(n) => {
-                                        tx.send(arx::jobs::JobEvent::Done {
-                                            id,
-                                            message: format!("Moved {n} item(s)"),
-                                        })
-                                        .ok();
-                                    }
-                                    Err(e) => {
-                                        tx.send(arx::jobs::JobEvent::Failed {
-                                            id,
-                                            error: format!("Move error: {e}"),
-                                        })
-                                        .ok();
-                                    }
-                                }
-                            });
-                            state.message = Some(format!("Move queued (job {})", state.jobs.len()));
-                        }
-                        None => {
-                            state.message = Some("Both panes must be local for move".into());
-                        }
-                    }
-                    state.selected.clear();
-                    left_entries =
-                        load_entries(&state.left.location, state.show_hidden, state.sort_mode);
-                    right_entries =
-                        load_entries(&state.right.location, state.show_hidden, state.sort_mode);
-                }
-                // F8: delete selected (or cursor) from active pane
-                KeyCode::F(8) => {
-                    let names = selection_or_cursor(&state, entries, cursor);
-                    let active_path = pane_location_path(&state);
-                    if let Some(dir) = active_path {
-                        match LocalFs::delete_files(dir, &names) {
-                            Ok(n) => {
-                                state.message = Some(format!("Deleted {n} item(s)"));
+                                });
+                                state.message =
+                                    Some(format!("Copy queued (job {})", state.jobs.len()));
                             }
-                            Err(e) => {
-                                state.message = Some(format!("Delete error: {e}"));
+                            None => {
+                                state.message = Some("Both panes must be local for copy".into());
                             }
                         }
                         state.selected.clear();
@@ -877,188 +856,297 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                         right_entries =
                             load_entries(&state.right.location, state.show_hidden, state.sort_mode);
                     }
-                }
-                // *: invert selection on visible entries
-                KeyCode::Char('*') => {
-                    let filt = if state.active == Pane::Left {
-                        &left_filtered
-                    } else {
-                        &right_filtered
-                    };
-                    for e in filt {
-                        if state.selected.contains(&e.name) {
-                            state.selected.remove(&e.name);
-                        } else {
-                            state.selected.insert(e.name.clone());
+                    // F6: move selected (or cursor) from active pane to other pane — background
+                    KeyCode::F(6) => {
+                        let names = selection_or_cursor(&state, entries, cursor);
+                        if names.is_empty() {
+                            continue;
                         }
-                    }
-                    state.message = Some(format!("Selected {}", state.selected.len()));
-                }
-                // +: enter glob-select mode (uses filter buffer)
-                KeyCode::Char('+') => {
-                    state.filter.clear();
-                    state.glob_input = true;
-                }
-                // F2: user menu (if loaded), otherwise cycle sort
-                KeyCode::F(2) => {
-                    if !state.menu.is_empty() {
-                        state.show_menu = !state.show_menu;
-                        state.menu_cursor = 0;
-                    } else {
-                        state.sort_mode = state.sort_mode.next();
-                        state.message = Some(format!("Sort: {}", state.sort_mode.label()));
+                        match op_paths(&state) {
+                            Some((src, dst)) => {
+                                let id = format!("move-{}", state.jobs.len());
+                                let desc = format!("Move {} → {}", names.join(", "), dst.display());
+                                state.jobs.push(arx::jobs::Job {
+                                    id: id.clone(),
+                                    description: desc,
+                                    source: Location::Local(src.clone()),
+                                    destination: Location::Local(dst.clone()),
+                                    status: arx::jobs::JobStatus::Pending,
+                                    progress: 0,
+                                });
+                                let tx = job_tx.clone();
+                                let names2 = names.clone();
+                                std::thread::spawn(move || {
+                                    tx.send(arx::jobs::JobEvent::Running { id: id.clone() })
+                                        .ok();
+                                    let result = LocalFs::move_files(&src, &dst, &names2);
+                                    match result {
+                                        Ok(n) => {
+                                            tx.send(arx::jobs::JobEvent::Done {
+                                                id,
+                                                message: format!("Moved {n} item(s)"),
+                                            })
+                                            .ok();
+                                        }
+                                        Err(e) => {
+                                            tx.send(arx::jobs::JobEvent::Failed {
+                                                id,
+                                                error: format!("Move error: {e}"),
+                                            })
+                                            .ok();
+                                        }
+                                    }
+                                });
+                                state.message =
+                                    Some(format!("Move queued (job {})", state.jobs.len()));
+                            }
+                            None => {
+                                state.message = Some("Both panes must be local for move".into());
+                            }
+                        }
+                        state.selected.clear();
                         left_entries =
                             load_entries(&state.left.location, state.show_hidden, state.sort_mode);
                         right_entries =
                             load_entries(&state.right.location, state.show_hidden, state.sort_mode);
                     }
-                }
-                // F3: view file
-                KeyCode::F(3) => {
-                    if let Some(entry) = entries.get(cursor) {
-                        if entry.kind != EntryKind::Directory {
+                    // F8: delete selected (or cursor) from active pane
+                    KeyCode::F(8) => {
+                        let names = selection_or_cursor(&state, entries, cursor);
+                        let active_path = pane_location_path(&state);
+                        if let Some(dir) = active_path {
+                            match LocalFs::delete_files(dir, &names) {
+                                Ok(n) => {
+                                    state.message = Some(format!("Deleted {n} item(s)"));
+                                }
+                                Err(e) => {
+                                    state.message = Some(format!("Delete error: {e}"));
+                                }
+                            }
+                            state.selected.clear();
+                            left_entries = load_entries(
+                                &state.left.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
+                            right_entries = load_entries(
+                                &state.right.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
+                        }
+                    }
+                    // *: invert selection on visible entries
+                    KeyCode::Char('*') => {
+                        let filt = if state.active == Pane::Left {
+                            &left_filtered
+                        } else {
+                            &right_filtered
+                        };
+                        for e in filt {
+                            if state.selected.contains(&e.name) {
+                                state.selected.remove(&e.name);
+                            } else {
+                                state.selected.insert(e.name.clone());
+                            }
+                        }
+                        state.message = Some(format!("Selected {}", state.selected.len()));
+                    }
+                    // +: enter glob-select mode (uses filter buffer)
+                    KeyCode::Char('+') => {
+                        state.filter.clear();
+                        state.glob_input = true;
+                    }
+                    // F2: user menu (if loaded), otherwise cycle sort
+                    KeyCode::F(2) => {
+                        if !state.menu.is_empty() {
+                            state.show_menu = !state.show_menu;
+                            state.menu_cursor = 0;
+                        } else {
+                            state.sort_mode = state.sort_mode.next();
+                            state.message = Some(format!("Sort: {}", state.sort_mode.label()));
+                            left_entries = load_entries(
+                                &state.left.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
+                            right_entries = load_entries(
+                                &state.right.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
+                        }
+                    }
+                    // F3: view file
+                    KeyCode::F(3) => {
+                        if let Some(entry) = entries.get(cursor) {
+                            if entry.kind != EntryKind::Directory {
+                                let path = match &pane.location {
+                                    Location::Local(dir) => dir.join(&entry.name),
+                                    _ => continue,
+                                };
+                                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                    // ponytail: use bat for syntax-highlighted paging
+                                    let _ = std::process::Command::new("bat")
+                                        .arg("--paging=always")
+                                        .arg(&path)
+                                        .status();
+                                } else {
+                                    state.viewer_content = LocalFs::read_head(&path, 500)
+                                        .unwrap_or_else(|e| {
+                                            vec![format!("Error reading file: {e}")]
+                                        });
+                                    state.viewer_scroll = 0;
+                                }
+                            }
+                        }
+                    }
+                    // F4: edit file in $EDITOR
+                    KeyCode::F(4) => {
+                        if let Some(entry) = entries.get(cursor) {
                             let path = match &pane.location {
                                 Location::Local(dir) => dir.join(&entry.name),
                                 _ => continue,
                             };
-                            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                // ponytail: use bat for syntax-highlighted paging
-                                let _ = std::process::Command::new("bat")
-                                    .arg("--paging=always")
-                                    .arg(&path)
-                                    .status();
-                            } else {
-                                state.viewer_content = LocalFs::read_head(&path, 500)
-                                    .unwrap_or_else(|e| vec![format!("Error reading file: {e}")]);
-                                state.viewer_scroll = 0;
-                            }
+                            let editor_cmd = editor
+                                .clone()
+                                .or_else(|| std::env::var("EDITOR").ok())
+                                .or_else(|| std::env::var("VISUAL").ok())
+                                .unwrap_or_else(|| "vi".into());
+                            // Leave raw mode, spawn editor, restore
+                            disable_raw_mode()?;
+                            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                            let _ = std::process::Command::new(&editor_cmd).arg(&path).status();
+                            execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                            enable_raw_mode()?;
+                            // Refresh after edit
+                            left_entries = load_entries(
+                                &state.left.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
+                            right_entries = load_entries(
+                                &state.right.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
                         }
                     }
-                }
-                // F4: edit file in $EDITOR
-                KeyCode::F(4) => {
-                    if let Some(entry) = entries.get(cursor) {
-                        let path = match &pane.location {
-                            Location::Local(dir) => dir.join(&entry.name),
-                            _ => continue,
-                        };
-                        let editor_cmd = editor
-                            .clone()
-                            .or_else(|| std::env::var("EDITOR").ok())
-                            .or_else(|| std::env::var("VISUAL").ok())
-                            .unwrap_or_else(|| "vi".into());
-                        // Leave raw mode, spawn editor, restore
-                        disable_raw_mode()?;
-                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                        let _ = std::process::Command::new(&editor_cmd).arg(&path).status();
-                        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-                        enable_raw_mode()?;
-                        // Refresh after edit
-                        left_entries =
-                            load_entries(&state.left.location, state.show_hidden, state.sort_mode);
-                        right_entries =
-                            load_entries(&state.right.location, state.show_hidden, state.sort_mode);
+                    // Ctrl+B: bookmarks
+                    KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.show_bookmarks = !state.show_bookmarks;
+                        state.bookmark_cursor = 0;
                     }
-                }
-                // Ctrl+B: bookmarks
-                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    state.show_bookmarks = !state.show_bookmarks;
-                    state.bookmark_cursor = 0;
-                }
-                // F9: host panel
-                KeyCode::F(9) => {
-                    if !state.hosts.is_empty() {
-                        state.show_hosts = !state.show_hosts;
-                        state.host_cursor = 0;
-                    } else {
-                        state.message =
-                            Some("No hosts configured — add ~/.config/arx/hosts.toml".into());
+                    // F9: host panel
+                    KeyCode::F(9) => {
+                        if !state.hosts.is_empty() {
+                            state.show_hosts = !state.show_hosts;
+                            state.host_cursor = 0;
+                        } else {
+                            state.message =
+                                Some("No hosts configured — add ~/.config/arx/hosts.toml".into());
+                        }
                     }
-                }
-                // Ctrl+J: jobs panel
-                KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    state.show_jobs = !state.show_jobs;
-                    state.job_cursor = 0;
-                }
-                // Ctrl+X D: toggle directory compare
-                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    state.show_diff = !state.show_diff;
-                    state.message = Some(if state.show_diff {
-                        "Diff on — unique files highlighted".into()
-                    } else {
-                        "Diff off".into()
-                    });
-                }
-                // :: command input
-                KeyCode::Char(':') => {
-                    state.cmd.clear();
-                    state.cmd_input = true;
-                }
-                // Ctrl+X S: symlink (MC-style prefix)
-                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    state.cmd_prefix = true;
-                }
-                KeyCode::Char('s')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) && cmd_prefix =>
-                {
-                    if let Some(entry) = entries.get(cursor) {
-                        state.cmd = format!("ln -s '{}' ", entry.name);
+                    // Ctrl+J: jobs panel
+                    KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.show_jobs = !state.show_jobs;
+                        state.job_cursor = 0;
+                    }
+                    // Ctrl+X D: toggle directory compare
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.show_diff = !state.show_diff;
+                        state.message = Some(if state.show_diff {
+                            "Diff on — unique files highlighted".into()
+                        } else {
+                            "Diff off".into()
+                        });
+                    }
+                    // :: command input
+                    KeyCode::Char(':') => {
+                        state.cmd.clear();
                         state.cmd_input = true;
                     }
-                    state.cmd_prefix = false;
-                }
-                KeyCode::Char('c')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) && cmd_prefix =>
-                {
-                    state.cmd = "chmod ".into();
-                    state.cmd_input = true;
-                    state.cmd_prefix = false;
-                }
-                // Ctrl+T: new tab in active pane
-                KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let show_hidden = state.show_hidden;
-                    let sort_mode = state.sort_mode;
-                    state.active_pane_mut().new_tab();
-                    let tabs = state.active_pane().tabs.len() + 1;
-                    left_entries = load_entries(&state.left.location, show_hidden, sort_mode);
-                    right_entries = load_entries(&state.right.location, show_hidden, sort_mode);
-                    state.message = Some(format!("Tab {tabs}/{tabs}"));
-                }
-                // Ctrl+W: close tab in active pane
-                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let show_hidden = state.show_hidden;
-                    let sort_mode = state.sort_mode;
-                    state.active_pane_mut().close_tab();
-                    let tabs = state.active_pane().tabs.len() + 1;
-                    left_entries = load_entries(&state.left.location, show_hidden, sort_mode);
-                    right_entries = load_entries(&state.right.location, show_hidden, sort_mode);
-                    state.message = Some(format!("Tab {}/{}", tabs.min(1), tabs));
-                }
-                // Ctrl+Left: previous tab
-                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let show_hidden = state.show_hidden;
-                    let sort_mode = state.sort_mode;
-                    let tabs_len = state.active_pane().tabs.len();
-                    if tabs_len > 0 {
-                        state.active_pane_mut().switch_tab(tabs_len - 1);
+                    // Ctrl+X S: symlink (MC-style prefix)
+                    KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.cmd_prefix = true;
+                    }
+                    KeyCode::Char('s')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) && cmd_prefix =>
+                    {
+                        if let Some(entry) = entries.get(cursor) {
+                            state.cmd = format!("ln -s '{}' ", entry.name);
+                            state.cmd_input = true;
+                        }
+                        state.cmd_prefix = false;
+                    }
+                    KeyCode::Char('c')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) && cmd_prefix =>
+                    {
+                        state.cmd = "chmod ".into();
+                        state.cmd_input = true;
+                        state.cmd_prefix = false;
+                    }
+                    KeyCode::Char('l')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) && cmd_prefix =>
+                    {
+                        // Ctrl+X L: hard link
+                        if let Some(entry) = entries.get(cursor) {
+                            state.cmd = format!("ln '{}' ", entry.name);
+                            state.cmd_input = true;
+                        }
+                        state.cmd_prefix = false;
+                    }
+                    // Ctrl+T: new tab in active pane
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let show_hidden = state.show_hidden;
+                        let sort_mode = state.sort_mode;
+                        state.active_pane_mut().new_tab();
+                        let tabs = state.active_pane().tabs.len() + 1;
                         left_entries = load_entries(&state.left.location, show_hidden, sort_mode);
                         right_entries = load_entries(&state.right.location, show_hidden, sort_mode);
-                        state.message = Some("Tab ←".into());
+                        state.message = Some(format!("Tab {tabs}/{tabs}"));
                     }
-                }
-                // Ctrl+Right: next tab
-                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let show_hidden = state.show_hidden;
-                    let sort_mode = state.sort_mode;
-                    if state.active_pane().tabs.len() >= 2 {
-                        state.active_pane_mut().switch_tab(0);
+                    // Ctrl+W: close tab in active pane
+                    KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let show_hidden = state.show_hidden;
+                        let sort_mode = state.sort_mode;
+                        state.active_pane_mut().close_tab();
+                        let tabs = state.active_pane().tabs.len() + 1;
                         left_entries = load_entries(&state.left.location, show_hidden, sort_mode);
                         right_entries = load_entries(&state.right.location, show_hidden, sort_mode);
-                        state.message = Some("Tab →".into());
+                        state.message = Some(format!("Tab {}/{}", tabs.min(1), tabs));
                     }
+                    // Ctrl+Left: previous tab
+                    KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let show_hidden = state.show_hidden;
+                        let sort_mode = state.sort_mode;
+                        let tabs_len = state.active_pane().tabs.len();
+                        if tabs_len > 0 {
+                            state.active_pane_mut().switch_tab(tabs_len - 1);
+                            left_entries =
+                                load_entries(&state.left.location, show_hidden, sort_mode);
+                            right_entries =
+                                load_entries(&state.right.location, show_hidden, sort_mode);
+                            state.message = Some("Tab ←".into());
+                        }
+                    }
+                    // Ctrl+Right: next tab
+                    KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let show_hidden = state.show_hidden;
+                        let sort_mode = state.sort_mode;
+                        if state.active_pane().tabs.len() >= 2 {
+                            state.active_pane_mut().switch_tab(0);
+                            left_entries =
+                                load_entries(&state.left.location, show_hidden, sort_mode);
+                            right_entries =
+                                load_entries(&state.right.location, show_hidden, sort_mode);
+                            state.message = Some("Tab →".into());
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            _ => {}
         }
     }
     Ok(())
@@ -1174,7 +1262,7 @@ fn is_archive(name: &str) -> bool {
 
 fn render(
     frame: &mut ratatui::Frame,
-    state: &AppState,
+    state: &mut AppState,
     left_entries: &[&Entry],
     right_entries: &[&Entry],
     left_list: &mut ListState,
@@ -1192,6 +1280,9 @@ fn render(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
         .split(chunks[0]);
+
+    state.left_area = Some(panes[0]);
+    state.right_area = Some(panes[1]);
 
     // Diff sets: files unique to each pane (only computed when show_diff is on)
     let (left_only, right_only): (

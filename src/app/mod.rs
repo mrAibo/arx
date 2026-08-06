@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use ratatui::layout::Rect;
+
 use crate::jobs::Job;
 use crate::remote::Host;
 use crate::vfs::Location;
@@ -124,6 +126,8 @@ pub struct AppState {
     // A1: file viewer
     pub viewer_content: Vec<String>,
     pub viewer_scroll: usize,
+    pub left_area: Option<Rect>,
+    pub right_area: Option<Rect>,
     // A4: bookmarks
     pub bookmarks: Vec<Location>,
     pub show_bookmarks: bool,
@@ -181,6 +185,8 @@ impl Default for AppState {
             sort_mode: SortMode::NameAsc,
             viewer_content: Vec::new(),
             viewer_scroll: 0,
+            left_area: None,
+            right_area: None,
             bookmarks,
             show_bookmarks: false,
             bookmark_cursor: 0,
