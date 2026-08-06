@@ -204,7 +204,10 @@ fn detect_remote_tools_with(
 }
 
 fn command_succeeds(runner: &impl CommandRunner, program: &str, args: &[&str]) -> bool {
-    let args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+    let args = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
     runner
         .run(program, &args)
         .map(|outcome| outcome.success)
@@ -212,7 +215,10 @@ fn command_succeeds(runner: &impl CommandRunner, program: &str, args: &[&str]) -
 }
 
 fn command_available(runner: &impl CommandRunner, program: &str, args: &[&str]) -> bool {
-    let args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+    let args = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
     runner.run(program, &args).is_ok()
 }
 
