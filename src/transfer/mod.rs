@@ -1,3 +1,4 @@
+pub mod executor;
 pub mod probe;
 
 use crate::vfs::{Capability, CapabilitySet, Location, ProviderId};
