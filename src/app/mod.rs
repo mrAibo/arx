@@ -178,6 +178,9 @@ pub struct AppState {
     pub tab_switcher_cursor: usize,
     pub rename_input: bool,
     pub rename_pattern: String,
+    pub show_command_center: bool,
+    pub command_matches: Vec<(String, String)>,
+    pub overlay_list_state: ratatui::widgets::ListState,
 }
 
 impl Default for AppState {
@@ -246,6 +249,9 @@ impl Default for AppState {
             tab_switcher_cursor: 0,
             rename_input: false,
             rename_pattern: String::new(),
+            show_command_center: false,
+            command_matches: Vec::new(),
+            overlay_list_state: ratatui::widgets::ListState::default(),
         }
     }
 }

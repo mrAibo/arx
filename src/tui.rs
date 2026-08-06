@@ -327,6 +327,10 @@ async fn event_loop(
                                     state.cmd.push(c);
                                 } else {
                                     state.filter.push(c);
+                                    if state.show_command_center {
+                                        state.command_matches =
+                                            build_cc_matches(&state.filter, &state);
+                                    }
                                 }
                             }
                             _ => {}
@@ -542,6 +546,30 @@ async fn event_loop(
                         state.right.cursor
                     };
                     let cmd_prefix = state.cmd_prefix;
+
+                    if state.show_command_center && key.code == KeyCode::Enter {
+                        let idx = state.overlay_list_state.selected().unwrap_or(0);
+                        let idx = idx.min(state.command_matches.len().saturating_sub(1));
+                        if let Some((_, target)) = state.command_matches.get(idx) {
+                            let target = target.clone();
+                            navigate_to(&mut state, &target);
+                            state.show_command_center = false;
+                            state.filtering = false;
+                            state.filter.clear();
+                            left_entries = load_entries(
+                                &state.left.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
+                            right_entries = load_entries(
+                                &state.right.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
+                            continue;
+                        }
+                    }
+
                     let pane = state.active_pane_mut();
 
                     match key.code {
@@ -1720,6 +1748,26 @@ fn render(
         render_viewer(frame, area, state);
     }
 
+    // Command Center overlay (Ctrl+P)
+    if state.show_command_center {
+        let h = (state.command_matches.len().max(1) + 3).min(20) as u16;
+        let popup = centered_rect(70, h, area);
+        frame.render_widget(Clear, popup);
+        let items: Vec<ListItem> = state
+            .command_matches
+            .iter()
+            .map(|(l, _)| ListItem::new(l.as_str()))
+            .collect();
+        let list = ratatui::widgets::List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" ARX Command Center — :{}_ ", state.filter)),
+            )
+            .highlight_style(Style::default().fg(Color::Yellow));
+        frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
+    }
+
     // Bookmarks overlay
     if state.show_bookmarks {
         render_bookmarks(frame, area, state);
@@ -2624,4 +2672,57 @@ fn run_cmd_output(cmd: &str, args: &[&str]) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn build_cc_matches(filter: &str, state: &AppState) -> Vec<(String, String)> {
+    let q = filter.to_lowercase();
+    let mut m = Vec::new();
+    for h in arx::remote::hosts_config::load_hosts() {
+        let l = format!("Host: {}", h.name);
+        if l.to_lowercase().contains(&q) || h.hostname.to_lowercase().contains(&q) {
+            m.push((l, format!("sftp://{}", h.hostname)));
+        }
+    }
+    for loc in &state.bookmarks {
+        let l = loc.to_string();
+        if l.to_lowercase().contains(&q) {
+            m.push((format!("Bookmark: {}", l), l));
+        }
+    }
+    for d in &state.dir_history {
+        let l = d.to_string_lossy().to_string();
+        if l.to_lowercase().contains(&q) {
+            m.push((format!("History: {}", l), l));
+        }
+    }
+    for e in &state.menu {
+        if e.label.to_lowercase().contains(&q) {
+            m.push((format!("Cmd: {}", e.label), e.command.clone()));
+        }
+    }
+    m.sort_by_key(|(l, _)| l.to_lowercase());
+    m.truncate(50);
+    m
+}
+
+fn navigate_to(state: &mut AppState, target: &str) {
+    if target.starts_with("sftp://") {
+        let h = target.trim_start_matches("sftp://");
+        state.active_pane_mut().location = arx::vfs::Location::Sftp {
+            host: h.into(),
+            path: "/".into(),
+        };
+    } else if target.starts_with('/') || target.starts_with('~') {
+        let p = std::path::PathBuf::from(
+            target.replace('~', &std::env::var("HOME").unwrap_or_default()),
+        );
+        if p.is_dir() {
+            state.active_pane_mut().location = arx::vfs::Location::Local(p);
+        }
+    } else {
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(target)
+            .spawn();
+    }
 }
