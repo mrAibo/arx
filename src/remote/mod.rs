@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 pub mod hosts_config;
+pub mod ssh_config;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Host {

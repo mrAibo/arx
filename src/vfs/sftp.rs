@@ -24,25 +24,44 @@ impl SftpFs {
 }
 
 async fn list_sftp(host: &Host, remote_path: &str) -> anyhow::Result<Vec<Entry>> {
-    let config = Arc::new(russh::client::Config::default());
-    let handler = Handler {
-        hostname: host.hostname.clone(),
-        port: host.port,
+    // Resolve through ~/.ssh/config
+    let (resolved_host, resolved_port, resolved_user, _key_path, _proxy) =
+        crate::remote::ssh_config::resolve_alias(&host.ssh_alias);
+    let hostname = if resolved_host != host.ssh_alias {
+        resolved_host
+    } else {
+        host.hostname.clone()
+    };
+    let port = if resolved_port != 22 {
+        resolved_port
+    } else {
+        host.port
+    };
+    let user = if resolved_user != std::env::var("USER").unwrap_or_default() {
+        resolved_user
+    } else {
+        host.user.clone()
     };
 
-    let mut client = russh::client::connect(config, (host.hostname.as_str(), host.port), handler)
+    let config = Arc::new(russh::client::Config::default());
+    let handler = Handler {
+        hostname: hostname.clone(),
+        port,
+    };
+
+    let mut client = russh::client::connect(config, (hostname.as_str(), port), handler)
         .await
-        .with_context(|| format!("SSH connect to {}:{}", host.hostname, host.port))?;
+        .with_context(|| format!("SSH connect to {hostname}:{port}"))?;
 
     // Try key auth, fall back to password
     let authed = if let Ok(key_pair) = load_key_pair() {
         matches!(
-            client.authenticate_publickey(&host.user, key_pair).await,
+            client.authenticate_publickey(&user, key_pair).await,
             Ok(russh::client::AuthResult::Success)
         )
     } else if let Ok(pw) = std::env::var("SSH_PASSWORD") {
         matches!(
-            client.authenticate_password(&host.user, &pw).await,
+            client.authenticate_password(&user, &pw).await,
             Ok(russh::client::AuthResult::Success)
         )
     } else {
