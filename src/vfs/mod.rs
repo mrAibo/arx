@@ -2,10 +2,13 @@ use std::fmt;
 use std::path::PathBuf;
 
 pub mod archive;
+pub mod capabilities;
 pub mod local;
 pub mod s3;
 pub mod sftp;
 pub mod webdav;
+
+pub use capabilities::{Capability, CapabilitySet};
 
 // ── Provider Registry (new architecture — phased migration) ──
 // ponytail: add ProviderId + VfsProvider + Registry alongside old Location enum.
@@ -21,6 +24,11 @@ use std::collections::HashMap;
 pub enum VfsError {
     NotFound(String),
     PermissionDenied(String),
+    UnsupportedOperation {
+        provider: ProviderId,
+        capability: Capability,
+    },
+    ReadOnlyProvider(ProviderId),
     Timeout(String),
     AuthFailed(String),
     ProtocolError(String),
@@ -32,6 +40,14 @@ impl fmt::Display for VfsError {
         match self {
             Self::NotFound(msg) => write!(f, "not found: {msg}"),
             Self::PermissionDenied(msg) => write!(f, "permission denied: {msg}"),
+            Self::UnsupportedOperation {
+                provider,
+                capability,
+            } => write!(
+                f,
+                "provider {provider:?} does not support {capability:?}"
+            ),
+            Self::ReadOnlyProvider(provider) => write!(f, "provider {provider:?} is read-only"),
             Self::Timeout(msg) => write!(f, "timeout: {msg}"),
             Self::AuthFailed(msg) => write!(f, "auth failed: {msg}"),
             Self::ProtocolError(msg) => write!(f, "protocol error: {msg}"),
@@ -141,18 +157,58 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
 }
 
 #[derive(Debug)]
-pub struct ProviderRegistry(HashMap<ProviderId, Box<dyn VfsProvider>>);
+struct RegisteredProvider {
+    provider: Box<dyn VfsProvider>,
+    capabilities: CapabilitySet,
+}
+
+#[derive(Debug)]
+pub struct ProviderRegistry(HashMap<ProviderId, RegisteredProvider>);
 
 impl ProviderRegistry {
     pub fn new() -> Self {
         Self(HashMap::new())
     }
-    pub fn insert(&mut self, id: ProviderId, provider: Box<dyn VfsProvider>) {
-        self.0.insert(id, provider);
+
+    pub fn insert(
+        &mut self,
+        id: ProviderId,
+        provider: Box<dyn VfsProvider>,
+        capabilities: CapabilitySet,
+    ) {
+        self.0.insert(
+            id,
+            RegisteredProvider {
+                provider,
+                capabilities,
+            },
+        );
     }
+
     pub fn get(&self, id: &ProviderId) -> Option<&dyn VfsProvider> {
-        self.0.get(id).map(|b| b.as_ref())
+        self.0.get(id).map(|registered| registered.provider.as_ref())
     }
+
+    pub fn capabilities(&self, id: &ProviderId) -> Option<CapabilitySet> {
+        self.0.get(id).map(|registered| registered.capabilities)
+    }
+
+    pub fn supports(&self, id: &ProviderId, capability: Capability) -> bool {
+        self.capabilities(id)
+            .is_some_and(|capabilities| capabilities.supports(capability))
+    }
+
+    pub fn require(&self, id: &ProviderId, capability: Capability) -> Result<(), VfsError> {
+        if self.supports(id, capability) {
+            Ok(())
+        } else {
+            Err(VfsError::UnsupportedOperation {
+                provider: *id,
+                capability,
+            })
+        }
+    }
+
     pub fn contains_key(&self, id: &ProviderId) -> bool {
         self.0.contains_key(id)
     }
@@ -161,7 +217,11 @@ impl ProviderRegistry {
 /// Build default registry with local backend. SFTP/Archive registered per-connection.
 pub fn default_registry() -> ProviderRegistry {
     let mut r = ProviderRegistry::new();
-    r.insert(ProviderId::Local, Box::new(local::LocalProvider));
+    r.insert(
+        ProviderId::Local,
+        Box::new(local::LocalProvider),
+        capabilities::LOCAL_CAPABILITIES,
+    );
     r
 }
 
@@ -201,7 +261,11 @@ impl ProviderRegistry {
                 // ponytail: lazy-register SFTP provider per-host
                 if !self.contains_key(&ProviderId::Sftp) {
                     let h = crate::remote::Host::from_alias(host);
-                    self.insert(ProviderId::Sftp, Box::new(sftp::SftpProvider { host: h }));
+                    self.insert(
+                        ProviderId::Sftp,
+                        Box::new(sftp::SftpProvider { host: h }),
+                        capabilities::SFTP_CAPABILITIES,
+                    );
                 }
                 (ProviderId::Sftp, path.clone())
             }
@@ -365,5 +429,28 @@ mod tests {
             path: "/var/log".into(),
         };
         assert_eq!(location.to_string(), "sftp://db-prod/var/log");
+    }
+
+    #[test]
+    fn default_registry_reports_local_capabilities() {
+        let registry = default_registry();
+        assert!(registry.supports(&ProviderId::Local, Capability::List));
+        assert!(registry.supports(&ProviderId::Local, Capability::Move));
+        assert!(!registry.supports(&ProviderId::Local, Capability::ServerSideCopy));
+    }
+
+    #[test]
+    fn require_returns_typed_unsupported_operation() {
+        let registry = default_registry();
+        let error = registry
+            .require(&ProviderId::Local, Capability::ServerSideCopy)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            VfsError::UnsupportedOperation {
+                provider: ProviderId::Local,
+                capability: Capability::ServerSideCopy
+            }
+        ));
     }
 }
