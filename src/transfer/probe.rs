@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::ExecutorAvailability;
@@ -49,7 +49,7 @@ impl RemoteCapabilityCache {
 
     pub fn get(&mut self, alias: &str) -> Option<RemoteToolAvailability> {
         let cached = self.entries.get(alias).copied()?;
-        if cached.observed_at.elapsed() <= self.ttl {
+        if cached.observed_at.elapsed() < self.ttl {
             Some(cached.value)
         } else {
             self.entries.remove(alias);
@@ -107,7 +107,12 @@ struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
     fn run(&self, program: &str, args: &[String]) -> io::Result<CommandOutcome> {
-        let status = Command::new(program).args(args).status()?;
+        let status = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
         Ok(CommandOutcome {
             success: status.success(),
             code: status.code(),
