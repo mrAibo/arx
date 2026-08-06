@@ -155,6 +155,40 @@ Menu entries appear in Command Center (Ctrl+P).
 | Lua/WASM plugin system | stubs |
 | Windows native build | stubs |
 
+## Architecture
+
+```
+arx/
+├── src/
+│   ├── main.rs          # entry point, DISPLAY auto-detect
+│   ├── tui.rs           # ratatui event loop, all keybindings, rendering
+│   ├── app/mod.rs       # AppState, PaneState, Job queue
+│   ├── vfs/
+│   │   ├── mod.rs       # VfsOps trait + Entry/Location types
+│   │   ├── local.rs     # std::fs backend
+│   │   ├── sftp.rs      # russh SFTP (resolves ~/.ssh/config)
+│   │   ├── archive.rs   # tar.gz/zip as directories
+│   │   ├── s3.rs        # S3/MinIO stub
+│   │   └── webdav.rs    # WebDAV stub
+│   ├── remote/
+│   │   ├── mod.rs       # Host type, host-key TOFU
+│   │   ├── hosts_config.rs  # hosts.toml parser
+│   │   └── ssh_config.rs    # ~/.ssh/config parser
+│   ├── jobs/mod.rs      # Job, JobEvent, progress tracking
+│   ├── plugins/mod.rs   # Plugin hook stubs (Lua/WASM)
+│   ├── config.rs        # arx.toml loader
+│   ├── terminal.rs      # PTY + subshell
+│   └── transfer.rs      # copy/move logic
+└── tests/               # 10 integration tests
+```
+
+**Key trait:** `VfsOps` — unified interface for local, SFTP, archive, and future S3/WebDAV.
+Backends implement `list()`, `read_head()`, `copy_files()`, `move_files()`, `delete_files()`.
+Adding a new backend = one `impl VfsOps for MyFs` block, no changes to tui.rs.
+
+**Event loop:** `tokio::select!` — keyboard events, background job completions, and PTY output
+on one async loop. Job progress updates arrive via `tokio::sync::mpsc`.
+
 ## MC parity
 
 All Midnight Commander features are present: dual-pane, tabs, F3–F8,
