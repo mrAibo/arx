@@ -1,6 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+pub mod archive;
 pub mod local;
 pub mod sftp;
 

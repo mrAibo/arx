@@ -1,5 +1,5 @@
 use arx::app::{Action, AppState, Pane, PaneState, SortMode};
-use arx::vfs::{Entry, EntryKind, Location, local::LocalFs, sftp::SftpFs};
+use arx::vfs::{Entry, EntryKind, Location, archive::ArchiveFs, local::LocalFs, sftp::SftpFs};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
@@ -452,7 +452,22 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                         path: new_path,
                                     }
                                 }
-                                _ => continue,
+                                Location::Archive {
+                                    archive,
+                                    inner_path,
+                                } => {
+                                    let new_path = if inner_path.is_empty() {
+                                        entry.name.clone()
+                                    } else if inner_path.ends_with('/') {
+                                        format!("{inner_path}{}", entry.name)
+                                    } else {
+                                        format!("{inner_path}/{}", entry.name)
+                                    };
+                                    Location::Archive {
+                                        archive: archive.clone(),
+                                        inner_path: new_path,
+                                    }
+                                }
                             };
                             pane.location = new_location;
                             pane.cursor = 0;
@@ -470,29 +485,79 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                     state.sort_mode,
                                 );
                             }
+                        } else if is_archive(&entry.name) {
+                            // Open archive file
+                            if let Location::Local(dir) = &pane.location {
+                                let archive_path = dir.join(&entry.name);
+                                pane.location = Location::Archive {
+                                    archive: archive_path,
+                                    inner_path: String::new(),
+                                };
+                                pane.cursor = 0;
+                                state.selected.clear();
+                                if state.active == Pane::Left {
+                                    left_entries = load_entries(
+                                        &state.left.location,
+                                        state.show_hidden,
+                                        state.sort_mode,
+                                    );
+                                } else {
+                                    right_entries = load_entries(
+                                        &state.right.location,
+                                        state.show_hidden,
+                                        state.sort_mode,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
                 KeyCode::Backspace => {
-                    if let Location::Local(p) = &pane.location {
-                        let parent = LocalFs::parent(p);
-                        if parent != *p {
-                            pane.location = Location::Local(parent);
-                            pane.cursor = 0;
-                            state.selected.clear();
-                            if state.active == Pane::Left {
-                                left_entries = load_entries(
-                                    &state.left.location,
-                                    state.show_hidden,
-                                    state.sort_mode,
-                                );
+                    let go_back = match &pane.location {
+                        Location::Local(p) => {
+                            let parent = LocalFs::parent(p);
+                            if parent != *p {
+                                Some(Location::Local(parent))
                             } else {
-                                right_entries = load_entries(
-                                    &state.right.location,
-                                    state.show_hidden,
-                                    state.sort_mode,
-                                );
+                                None
                             }
+                        }
+                        Location::Archive {
+                            archive,
+                            inner_path,
+                        } => {
+                            if inner_path.is_empty() {
+                                archive.parent().map(|p| Location::Local(p.to_path_buf()))
+                            } else {
+                                // Go up one level
+                                let parent = inner_path
+                                    .rsplit_once('/')
+                                    .map(|(p, _)| p.to_string())
+                                    .unwrap_or_default();
+                                Some(Location::Archive {
+                                    archive: archive.clone(),
+                                    inner_path: parent,
+                                })
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(new_loc) = go_back {
+                        pane.location = new_loc;
+                        pane.cursor = 0;
+                        state.selected.clear();
+                        if state.active == Pane::Left {
+                            left_entries = load_entries(
+                                &state.left.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
+                        } else {
+                            right_entries = load_entries(
+                                &state.right.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
                         }
                     }
                 }
@@ -820,7 +885,10 @@ fn load_entries(location: &Location, show_hidden: bool, sort_mode: SortMode) -> 
             };
             SftpFs::list(&synthetic, path).unwrap_or_default()
         }
-        _ => vec![],
+        Location::Archive {
+            archive,
+            inner_path,
+        } => ArchiveFs::list(archive, inner_path).unwrap_or_default(),
     };
     if !show_hidden {
         entries.retain(|e| !e.name.starts_with('.'));
@@ -893,6 +961,16 @@ fn op_paths(state: &AppState) -> Option<(PathBuf, PathBuf)> {
     let src = pane_location_path(state)?.to_path_buf();
     let dst = other_pane_location_path(state)?.to_path_buf();
     Some((src, dst))
+}
+
+/// Check if a filename looks like an archive (tar, tgz, zip).
+fn is_archive(name: &str) -> bool {
+    name.ends_with(".tar")
+        || name.ends_with(".tar.gz")
+        || name.ends_with(".tgz")
+        || name.ends_with(".tar.bz2")
+        || name.ends_with(".tar.xz")
+        || name.ends_with(".zip")
 }
 
 fn render(
