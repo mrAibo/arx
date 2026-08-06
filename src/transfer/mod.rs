@@ -1,3 +1,4 @@
+pub mod executor;
 pub mod probe;
 
 use crate::vfs::{Capability, CapabilitySet, Location, ProviderId};
@@ -123,7 +124,10 @@ impl TransferPlanner {
             return match request.intent {
                 TransferIntent::Copy if request.executors.rsync => Ok(TransferMethod::Rsync),
                 TransferIntent::Copy if request.executors.sftp => Ok(TransferMethod::Sftp),
-                TransferIntent::Move if request.executors.sftp => Ok(TransferMethod::Sftp),
+                // Cross-backend move must become copy -> verify -> delete-source.
+                // Until that transaction exists, refusing the plan is safer than
+                // silently degrading Move into Copy.
+                TransferIntent::Move => Err(Self::unsupported(request)),
                 TransferIntent::Synchronize if request.executors.rsync => Ok(TransferMethod::Rsync),
                 _ => Err(Self::unsupported(request)),
             };
@@ -230,8 +234,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_move_does_not_use_rsync() {
-        let mut request = TransferRequest {
+    fn remote_move_is_rejected_until_transactional_cleanup_exists() {
+        let request = TransferRequest {
             source: local("/src"),
             destination: sftp("prod", "/dst"),
             source_provider: ProviderId::Local,
@@ -242,17 +246,19 @@ mod tests {
             executors: ExecutorAvailability {
                 native: false,
                 rsync: true,
-                sftp: false,
+                sftp: true,
             },
             delete_extraneous: false,
         };
 
-        assert!(TransferPlanner::plan(request.clone()).is_err());
-        request.executors.sftp = true;
-        assert_eq!(
-            TransferPlanner::plan(request).unwrap().method,
-            TransferMethod::Sftp
-        );
+        assert!(matches!(
+            TransferPlanner::plan(request),
+            Err(TransferPlanError::Unsupported {
+                source: ProviderId::Local,
+                destination: ProviderId::Sftp,
+                intent: TransferIntent::Move
+            })
+        ));
     }
 
     #[test]
