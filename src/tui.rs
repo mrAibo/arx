@@ -1407,6 +1407,13 @@ async fn event_loop(
                             }
                         }
                         // Ctrl+J: jobs panel
+                        KeyCode::Delete if state.show_jobs => {
+                            if state.job_cursor < state.jobs.len() {
+                                state.jobs.remove(state.job_cursor);
+                                state.job_cursor =
+                                    state.job_cursor.min(state.jobs.len().saturating_sub(1));
+                            }
+                        }
                         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.show_jobs = !state.show_jobs;
                             state.job_cursor = 0;
@@ -1763,11 +1770,10 @@ fn render(
             .map(|(l, _)| ListItem::new(l.as_str()))
             .collect();
         let list = ratatui::widgets::List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" ARX Command Center — :{}_ ", state.filter)),
-            )
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " ARX Command Center — :{}_ | bat chafa pdftotext ffprobe 7z ",
+                state.filter
+            )))
             .highlight_style(Style::default().fg(Color::Yellow));
         frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
     }
@@ -1783,11 +1789,10 @@ fn render(
             .map(|(l, _)| ListItem::new(l.as_str()))
             .collect();
         let list = ratatui::widgets::List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" ARX Command Center — :{}_ ", state.filter)),
-            )
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " ARX Command Center — :{}_ | bat chafa pdftotext ffprobe 7z ",
+                state.filter
+            )))
             .highlight_style(Style::default().fg(Color::Yellow));
         frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
     }
