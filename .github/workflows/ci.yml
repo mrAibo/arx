@@ -2,11 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main, fix/ci-p0-hardening]
+    branches: [main]
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,20 +16,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'push' && github.ref_name || github.head_ref }}
-
-      - name: Apply one-shot borrow fix
-        if: github.ref_name == 'fix/ci-p0-hardening' || github.head_ref == 'fix/ci-p0-hardening'
-        run: |
-          python scripts/apply_ci_borrow_fix.py
-          if ! git diff --quiet -- src/tui.rs; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add src/tui.rs
-            git commit -m 'fix(tui): handle tree Backspace before pane borrow'
-            git push origin HEAD:fix/ci-p0-hardening
-          fi
 
       # Pin the quality toolchain so a new stable Clippy release cannot turn
       # an unchanged commit red overnight. Bump intentionally in a dedicated PR.
