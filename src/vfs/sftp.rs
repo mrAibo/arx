@@ -3,7 +3,6 @@ use crate::remote::Host;
 use anyhow::Context;
 use std::collections::BTreeSet;
 use std::io;
-use tokio::runtime::Handle;
 
 /// SFTP filesystem backend.
 pub struct SftpFs;
@@ -12,10 +11,22 @@ impl SftpFs {
     pub fn list(host: &Host, remote_path: &str) -> io::Result<Vec<Entry>> {
         let host = host.clone();
         let path = remote_path.to_string();
-        let handle = Handle::try_current().map_err(|_| io::Error::other("no tokio runtime"))?;
-        handle
-            .block_on(async move { list_sftp(&host, &path).await })
-            .map_err(|error| io::Error::other(format!("SFTP: {error:#}")))
+
+        // Transitional sync bridge for legacy Location::list() call sites.
+        // Never call Handle::block_on() from the async TUI runtime: Tokio
+        // rejects nested blocking and can panic. Keep the legacy API isolated
+        // on its own runtime thread until directory loading is async end-to-end.
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| io::Error::other(format!("SFTP runtime: {error}")))?;
+            runtime
+                .block_on(list_sftp(&host, &path))
+                .map_err(|error| io::Error::other(format!("SFTP: {error:#}")))
+        })
+        .join()
+        .map_err(|_| io::Error::other("SFTP worker thread panicked"))?
     }
 }
 
@@ -78,8 +89,6 @@ pub struct SftpProvider {
 #[async_trait::async_trait]
 impl VfsProvider for SftpProvider {
     fn list(&self, path: &str) -> std::io::Result<Vec<Entry>> {
-        // Transitional sync bridge for legacy call sites. New async call sites
-        // must use list_async() so SFTP never blocks the TUI runtime thread.
         SftpFs::list(&self.host, path)
     }
 
