@@ -100,26 +100,43 @@ async fn upload_file(
         let _ = connection.session.remove_file(temp.clone()).await;
         return Err(error);
     }
-    remote.flush().await?;
-    remote.shutdown().await?;
+    if let Err(error) = remote.flush().await {
+        let _ = connection.session.remove_file(temp.clone()).await;
+        return Err(error.into());
+    }
+    if let Err(error) = remote.shutdown().await {
+        let _ = connection.session.remove_file(temp.clone()).await;
+        return Err(error.into());
+    }
 
-    let staged = connection
-        .session
-        .metadata(temp.clone())
-        .await
-        .map_err(|error| sftp_failure(name, error))?;
+    let staged = match connection.session.metadata(temp.clone()).await {
+        Ok(staged) => staged,
+        Err(error) => {
+            let _ = connection.session.remove_file(temp.clone()).await;
+            return Err(sftp_failure(name, error));
+        }
+    };
     if staged.len() != local_meta.len() {
         let _ = connection.session.remove_file(temp.clone()).await;
         return Err(invalid("SFTP upload verification failed: staged size differs"));
     }
 
-    let had_target = remote_exists(&connection.session, &target).await?;
+    let had_target = match remote_exists(&connection.session, &target).await {
+        Ok(exists) => exists,
+        Err(error) => {
+            let _ = connection.session.remove_file(temp.clone()).await;
+            return Err(error);
+        }
+    };
     if had_target {
-        connection
+        if let Err(error) = connection
             .session
             .rename(target.clone(), backup.clone())
             .await
-            .map_err(|error| sftp_failure(name, error))?;
+        {
+            let _ = connection.session.remove_file(temp.clone()).await;
+            return Err(sftp_failure(name, error));
+        }
     }
 
     if let Err(error) = connection.session.rename(temp.clone(), target.clone()).await {
@@ -167,18 +184,39 @@ async fn download_file(
         let _ = tokio::fs::remove_file(&temp).await;
         return Err(error);
     }
-    local.flush().await?;
-    local.sync_all().await?;
+    if let Err(error) = local.flush().await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(error.into());
+    }
+    if let Err(error) = local.sync_all().await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(error.into());
+    }
 
-    let staged = tokio::fs::metadata(&temp).await?;
+    let staged = match tokio::fs::metadata(&temp).await {
+        Ok(staged) => staged,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(error.into());
+        }
+    };
     if staged.len() != remote_meta.len() {
         let _ = tokio::fs::remove_file(&temp).await;
         return Err(invalid("SFTP download verification failed: staged size differs"));
     }
 
-    let had_target = local_exists(&target).await?;
+    let had_target = match local_exists(&target).await {
+        Ok(exists) => exists,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(error);
+        }
+    };
     if had_target {
-        tokio::fs::rename(&target, &backup).await?;
+        if let Err(error) = tokio::fs::rename(&target, &backup).await {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(error.into());
+        }
     }
 
     if let Err(error) = tokio::fs::rename(&temp, &target).await {
