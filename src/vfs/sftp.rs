@@ -59,7 +59,7 @@ async fn list_sftp(host: &Host, remote_path: &str) -> anyhow::Result<Vec<Entry>>
             client.authenticate_publickey(&user, key_pair).await,
             Ok(russh::client::AuthResult::Success)
         )
-    } else if let Some(pw) = crate::keyring::get_password(&hostname, &user) {
+    } else if let Some(pw) = get_keyring_password(&hostname, &user) {
         matches!(
             client.authenticate_password(&user, &pw).await,
             Ok(russh::client::AuthResult::Success)
@@ -215,4 +215,14 @@ impl VfsProvider for SftpProvider {
     fn delete_files(&self, _dir: &str, _names: &[String]) -> std::io::Result<usize> {
         Err(std::io::Error::other("SFTP delete via transfer planner"))
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn get_keyring_password(host: &str, user: &str) -> Option<String> {
+    crate::keyring::get_password(host, user)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn get_keyring_password(_host: &str, _user: &str) -> Option<String> {
+    None
 }
