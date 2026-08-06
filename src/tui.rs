@@ -34,7 +34,7 @@ pub async fn run(config: arx::config::ArxConfig) -> io::Result<()> {
     result
 }
 
-#[allow(clippy::collapsible_if, unreachable_patterns)]
+#[allow(clippy::collapsible_if)]
 async fn event_loop(
     terminal: &mut DefaultTerminal,
     config: arx::config::ArxConfig,
@@ -928,6 +928,11 @@ async fn event_loop(
                             }
                         }
                         KeyCode::Backspace => {
+                            // Tree filter: pop last char
+                            if state.show_tree {
+                                state.tree_filter.pop();
+                                continue;
+                            }
                             let go_back = match &pane.location {
                                 Location::Local(p) => {
                                     let parent = p
@@ -1634,10 +1639,7 @@ async fn event_loop(
                             state.show_tree = !state.show_tree;
                             state.tree_filter.clear();
                         }
-                        // Type in tree filter (when tree is shown) — Esc/Backspace before Char
-                        KeyCode::Backspace if state.show_tree => {
-                            state.tree_filter.pop();
-                        }
+                        // Type in tree filter (when tree is shown) — Esc to close
                         KeyCode::Esc if state.show_tree => {
                             state.show_tree = false;
                             state.tree_filter.clear();
