@@ -98,13 +98,23 @@ async fn list_sftp(host: &Host, remote_path: &str) -> anyhow::Result<Vec<Entry>>
 
 fn load_key_pair() -> anyhow::Result<russh::keys::PrivateKeyWithHashAlg> {
     let home = dirs::home_dir().context("no HOME")?;
-    let key_path = home.join(".ssh").join("id_ed25519");
-    let data = if key_path.exists() {
-        std::fs::read_to_string(&key_path)?
-    } else {
-        let rsa_path = home.join(".ssh").join("id_rsa");
-        std::fs::read_to_string(&rsa_path)?
-    };
+    // Try common key types (ssh-agent is probed by russh internally)
+    let key_types = ["id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"];
+    let mut data = String::new();
+    let mut found = false;
+    for kt in &key_types {
+        let kp = home.join(".ssh").join(kt);
+        if kp.exists() {
+            data = std::fs::read_to_string(&kp)?;
+            found = true;
+            break;
+        }
+    }
+    anyhow::ensure!(
+        found,
+        "no SSH key found in ~/.ssh/ (tried: {})",
+        key_types.join(", ")
+    );
     let key = russh::keys::PrivateKey::from_openssh(&data)?;
     Ok(russh::keys::PrivateKeyWithHashAlg::new(
         Arc::new(key),
@@ -125,18 +135,22 @@ impl russh::client::Handler for Handler {
         &mut self,
         server_public_key: &keys::PublicKey,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
-        let host = self.hostname.clone();
+        let hostname = self.hostname.clone();
         let port = self.port;
         let key = server_public_key.clone();
         async move {
-            match keys::check_known_hosts(&host, port, &key) {
+            match keys::check_known_hosts(&hostname, port, &key) {
                 Ok(true) => Ok(true),
-                Ok(false) => Ok(false),
-                Err(_) => {
-                    // Key not in known_hosts — accept on first connect
-                    // ponytail: prompt user or add to known_hosts later
+                Ok(false) => {
+                    // TOFU: save new host key automatically
+                    let _ = russh::keys::known_hosts::learn_known_hosts(&hostname, port, &key);
                     Ok(true)
                 }
+                Err(e) => Err(anyhow::anyhow!(
+                    "Host key mismatch for {}:{} — possible MITM attack.\nRemove old key from ~/.ssh/known_hosts.\nError: {e}",
+                    hostname,
+                    port
+                )),
             }
         }
     }

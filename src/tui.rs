@@ -120,6 +120,47 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
             term.drain();
         }
 
+        // Non-blocking poll with timeout — allows job events + PTY updates
+        // ponytail: full tokio::select! deferred to Wave 1
+        if !event::poll(std::time::Duration::from_millis(50))? {
+            // Process background job events
+            while let Ok(ev) = job_rx.try_recv() {
+                match ev {
+                    arx::jobs::JobEvent::Running { ref id } => {
+                        for j in &mut state.jobs {
+                            if j.id == *id {
+                                j.status = arx::jobs::JobStatus::Running;
+                            }
+                        }
+                    }
+                    arx::jobs::JobEvent::Done {
+                        ref id,
+                        ref message,
+                    } => {
+                        for j in &mut state.jobs {
+                            if j.id == *id {
+                                j.status = arx::jobs::JobStatus::Done;
+                                j.progress = 100;
+                            }
+                        }
+                        state.message = Some(message.clone());
+                    }
+                    arx::jobs::JobEvent::Failed { ref id, ref error } => {
+                        for j in &mut state.jobs {
+                            if j.id == *id {
+                                j.status = arx::jobs::JobStatus::Failed;
+                            }
+                        }
+                        state.message = Some(error.clone());
+                    }
+                }
+            }
+            // Drain terminal output (autoscroll in render)
+            if let Some(ref mut term) = state.term {
+                term.drain();
+            }
+            continue;
+        }
         match event::read()? {
             Event::Key(key) if state.show_terminal && state.active == Pane::Right => {
                 use crossterm::event::KeyCode as KC;
@@ -1043,10 +1084,11 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                 state.jobs.push(arx::jobs::Job {
                                     id: id.clone(),
                                     description: desc,
-                                    source: Location::Local(src.clone()),
-                                    destination: Location::Local(dst.clone()),
+                                    kind: arx::jobs::JobKind::Copy,
                                     status: arx::jobs::JobStatus::Pending,
                                     progress: 0,
+                                    source: Some(Location::Local(src.clone())),
+                                    destination: Some(Location::Local(dst.clone())),
                                 });
                                 let tx = job_tx.clone();
                                 let names2 = names.clone();
@@ -1097,10 +1139,11 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                 state.jobs.push(arx::jobs::Job {
                                     id: id.clone(),
                                     description: desc,
-                                    source: Location::Local(src.clone()),
-                                    destination: Location::Local(dst.clone()),
+                                    kind: arx::jobs::JobKind::Copy,
                                     status: arx::jobs::JobStatus::Pending,
                                     progress: 0,
+                                    source: Some(Location::Local(src.clone())),
+                                    destination: Some(Location::Local(dst.clone())),
                                 });
                                 let tx = job_tx.clone();
                                 let names2 = names.clone();
@@ -1145,7 +1188,7 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                         if let Some(dir) = active_path {
                             match LocalFs::delete_files(dir, &names) {
                                 Ok(n) => {
-                                    state.message = Some(format!("Deleted {n} item(s)"));
+                                    state.message = Some(format!("Trashed {n} item(s)"));
                                 }
                                 Err(e) => {
                                     state.message = Some(format!("Delete error: {e}"));

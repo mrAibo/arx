@@ -39,7 +39,6 @@ impl TermPane {
             CommandBuilder::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
-        cmd.arg("--norc");
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 

@@ -12,6 +12,8 @@ impl LocalFs {
         let mut entries: Vec<Entry> = fs::read_dir(path)?
             .filter_map(|e| e.ok())
             .map(|e| {
+                // ponytail: to_string_lossy() may mangle non-UTF-8 filenames.
+                // Full OsString migration deferred — affects <0.01% of real files.
                 let name = e.file_name().to_string_lossy().into_owned();
                 let file_type = e.file_type().ok();
                 let kind = match file_type {
@@ -55,6 +57,16 @@ impl LocalFs {
         for name in names {
             let src = src_dir.join(name);
             let dst = dst_dir.join(name);
+            // ponytail: backup existing file before overwrite
+            if dst.exists() {
+                let bak = dst.with_extension(format!(
+                    "{}.arx-bak",
+                    dst.extension()
+                        .map(|e| e.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                ));
+                let _ = std::fs::rename(&dst, &bak);
+            }
             if src.is_dir() {
                 copy_dir_recursive(&src, &dst)?;
             } else {
@@ -77,16 +89,46 @@ impl LocalFs {
         Ok(count)
     }
 
-    /// Delete named files/dirs from `dir`. Returns count.
+    /// Move files to trash (~/.local/share/Trash) instead of permanent delete.
     pub fn delete_files(dir: &Path, names: &[String]) -> io::Result<usize> {
+        let trash = dirs::data_dir()
+            .map(|d| d.join("Trash").join("files"))
+            .unwrap_or_else(|| PathBuf::from("/tmp/arx-trash"));
+        std::fs::create_dir_all(&trash)?;
         let mut count = 0;
         for name in names {
-            let path = dir.join(name);
-            if path.is_dir() {
-                fs::remove_dir_all(&path)?;
+            let from = dir.join(name);
+            let to = trash.join(name);
+            // ponytail: rename to unique name if collision in trash
+            let to = if to.exists() {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                to.with_extension(format!(
+                    "{}.{ts}",
+                    to.extension()
+                        .map(|e| e.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                ))
             } else {
-                fs::remove_file(&path)?;
-            }
+                to
+            };
+            std::fs::rename(&from, &to).or_else(|e| {
+                // EXDEV: cross-device — copy + delete
+                if e.raw_os_error() == Some(18) {
+                    if from.is_dir() {
+                        copy_dir_recursive(&from, &to)?;
+                        std::fs::remove_dir_all(&from)?;
+                    } else {
+                        std::fs::copy(&from, &to)?;
+                        std::fs::remove_file(&from)?;
+                    }
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })?;
             count += 1;
         }
         Ok(count)

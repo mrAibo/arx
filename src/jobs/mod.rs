@@ -4,10 +4,25 @@ use crate::vfs::Location;
 pub struct Job {
     pub id: String,
     pub description: String,
-    pub source: Location,
-    pub destination: Location,
+    pub kind: JobKind,
     pub status: JobStatus,
     pub progress: u8, // 0-100 percent
+    /// Optional source/destination for transfer jobs
+    pub source: Option<Location>,
+    pub destination: Option<Location>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobKind {
+    Copy,
+    Move,
+    Delete,
+    Search,
+    Archive,
+    Rsync,
+    Checksum,
+    RemoteCommand,
+    Custom(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
