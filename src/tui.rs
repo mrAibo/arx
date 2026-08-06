@@ -44,7 +44,11 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
     // Background job notification channel
     let (job_tx, job_rx) = std::sync::mpsc::channel::<arx::jobs::JobEvent>();
 
-    while !state.should_quit {
+    loop {
+        if state.should_quit {
+            break;
+        }
+        let mut refresh_entries = false;
         // Drain completed/failed job events
         while let Ok(event) = job_rx.try_recv() {
             match event {
@@ -62,14 +66,21 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                         job.progress = 100;
                     }
                     state.message = Some(message.clone());
+                    refresh_entries = true;
                 }
                 arx::jobs::JobEvent::Failed { ref id, ref error } => {
                     if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
                         job.status = arx::jobs::JobStatus::Failed;
                     }
                     state.message = Some(error.clone());
+                    refresh_entries = true;
                 }
             }
+        }
+
+        if refresh_entries {
+            left_entries = load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+            right_entries = load_entries(&state.right.location, state.show_hidden, state.sort_mode);
         }
 
         let left_filtered = apply_filter(&left_entries, &state.filter);
@@ -522,6 +533,21 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                 None
                             }
                         }
+                        Location::Sftp { host, path } => {
+                            // Go to parent directory
+                            if path == "/" {
+                                None
+                            } else {
+                                let parent = path
+                                    .rsplit_once('/')
+                                    .map(|(p, _)| p.to_string())
+                                    .unwrap_or_else(|| "/".to_string());
+                                Some(Location::Sftp {
+                                    host: host.clone(),
+                                    path: parent,
+                                })
+                            }
+                        }
                         Location::Archive {
                             archive,
                             inner_path,
@@ -540,7 +566,6 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                 })
                             }
                         }
-                        _ => None,
                     };
                     if let Some(new_loc) = go_back {
                         pane.location = new_loc;
