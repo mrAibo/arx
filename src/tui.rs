@@ -989,9 +989,19 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                             }
                         }
                     }
+                    // Alt+`: tab switcher
+                    KeyCode::Char('`') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        state.show_tab_switcher = !state.show_tab_switcher;
+                        state.tab_switcher_cursor = 0;
+                    }
                     // Alt+H: directory history
                     KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::ALT) => {
                         state.show_history = !state.show_history;
+                    }
+                    // Ctrl+\: hotlist
+                    KeyCode::Char('\\') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.show_hotlist = !state.show_hotlist;
+                        state.hotlist_cursor = 0;
                     }
                     // Ctrl+O: drop to subshell, restore on exit
                     KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1673,6 +1683,93 @@ fn render(
         );
     }
 
+    // Hotlist overlay
+    if state.show_hotlist {
+        let hl = arx::app::AppState::load_hotlist();
+        let h = (hl.len() + 2).min(20) as u16;
+        let popup = centered_rect(60, h, area);
+        frame.render_widget(Clear, popup);
+        let items: Vec<ListItem> = if hl.is_empty() {
+            vec![ListItem::new("(empty - create ~/.config/arx/hotlist)")]
+        } else {
+            hl.iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let pre = if i == state.hotlist_cursor {
+                        "> "
+                    } else {
+                        "  "
+                    };
+                    ListItem::new(format!("{pre}{}", p.display()))
+                })
+                .collect()
+        };
+        frame.render_widget(
+            List::new(items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Hotlist (Ctrl+\\) ")
+                    .border_style(Style::default().fg(Color::Magenta)),
+            ),
+            popup,
+        );
+    }
+    // Tab switcher overlay
+    if state.show_tab_switcher {
+        let mut items: Vec<ListItem> = vec![ListItem::new("── Left pane ──")];
+        for (i, tab) in state.left.tabs.iter().enumerate() {
+            let idx = items.len();
+            let pre = if idx == state.tab_switcher_cursor {
+                "> "
+            } else {
+                "  "
+            };
+            let loc = match &tab.0 {
+                Location::Local(p) => p.display().to_string(),
+                o => o.to_string(),
+            };
+            items.push(ListItem::new(format!("{pre}L{i}: {loc}")));
+        }
+        items.push(ListItem::new("── Right pane ──"));
+        for (i, tab) in state.right.tabs.iter().enumerate() {
+            let idx = items.len();
+            let pre = if idx == state.tab_switcher_cursor {
+                "> "
+            } else {
+                "  "
+            };
+            let loc = match &tab.0 {
+                Location::Local(p) => p.display().to_string(),
+                o => o.to_string(),
+            };
+            items.push(ListItem::new(format!("{pre}R{i}: {loc}")));
+        }
+        let h = (items.len() + 2) as u16;
+        let popup = centered_rect(60, h, area);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            List::new(items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Tabs (Alt+`) ")
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+            popup,
+        );
+    }
+    // Rename input bar
+    if state.rename_input {
+        frame.render_widget(
+            Paragraph::new(format!(" Rename: {}_", state.rename_pattern))
+                .style(Style::default().fg(Color::Yellow).bg(Color::DarkGray)),
+            Rect {
+                x: area.x,
+                y: area.y + area.height.saturating_sub(2),
+                width: area.width,
+                height: 1,
+            },
+        );
+    }
     // File search bar (/)
     if state.file_search {
         frame.render_widget(

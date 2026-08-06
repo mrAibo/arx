@@ -172,6 +172,12 @@ pub struct AppState {
     pub search_index: usize,
     // Panel ratio (default 50/50)
     pub panel_ratio: u16,
+    pub show_hotlist: bool,
+    pub hotlist_cursor: usize,
+    pub show_tab_switcher: bool,
+    pub tab_switcher_cursor: usize,
+    pub rename_input: bool,
+    pub rename_pattern: String,
 }
 
 impl Default for AppState {
@@ -234,6 +240,12 @@ impl Default for AppState {
             search_matches: Vec::new(),
             search_index: 0,
             panel_ratio: 50,
+            show_hotlist: false,
+            hotlist_cursor: 0,
+            show_tab_switcher: false,
+            tab_switcher_cursor: 0,
+            rename_input: false,
+            rename_pattern: String::new(),
         }
     }
 }
@@ -274,6 +286,18 @@ impl AppState {
     }
 
     /// Load user menu from ~/.config/arx/arx.menu.
+    pub fn load_hotlist() -> Vec<PathBuf> {
+        let path = dirs::config_dir()
+            .map(|d| d.join("arx").join("hotlist"))
+            .unwrap_or_else(|| PathBuf::from("hotlist"));
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .map(PathBuf::from)
+            .collect()
+    }
+
     pub fn load_menu() -> Vec<MenuEntry> {
         let path = dirs::config_dir()
             .map(|d| d.join("arx").join("arx.menu"))
