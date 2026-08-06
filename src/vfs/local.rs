@@ -70,12 +70,13 @@ impl LocalFs {
     }
 
     /// Copy named files/dirs from `src_dir` to `dst_dir`. Returns count of successful copies.
+    /// ponytail: atomic overwrite with mandatory backup + rollback on failure.
     pub fn copy_files(src_dir: &Path, dst_dir: &Path, names: &[String]) -> io::Result<usize> {
         let mut count = 0;
         for name in names {
             let src = src_dir.join(name);
             let dst = dst_dir.join(name);
-            // ponytail: backup existing file before overwrite
+
             if dst.exists() {
                 let bak = dst.with_extension(format!(
                     "{}.arx-bak",
@@ -83,9 +84,28 @@ impl LocalFs {
                         .map(|e| e.to_string_lossy().to_string())
                         .unwrap_or_default()
                 ));
-                let _ = std::fs::rename(&dst, &bak);
-            }
-            if src.is_dir() {
+                if bak.exists() {
+                    let _ = fs::remove_file(&bak);
+                }
+                fs::rename(&dst, &bak).map_err(|e| {
+                    io::Error::other(format!("backup failed: {dst:?} → {bak:?}: {e}"))
+                })?;
+                // Rollback on failure
+                if let Err(e) = (|| -> io::Result<()> {
+                    if src.is_dir() {
+                        copy_dir_recursive(&src, &dst)?;
+                    } else {
+                        fs::copy(&src, &dst)?;
+                    }
+                    Ok(())
+                })() {
+                    // Restore backup
+                    if bak.exists() && !dst.exists() {
+                        let _ = fs::rename(&bak, &dst);
+                    }
+                    return Err(e);
+                }
+            } else if src.is_dir() {
                 copy_dir_recursive(&src, &dst)?;
             } else {
                 fs::copy(&src, &dst)?;
@@ -95,13 +115,27 @@ impl LocalFs {
         Ok(count)
     }
 
-    /// Move (rename) named files/dirs from `src_dir` to `dst_dir`. Returns count.
+    /// Move (rename) named files/dirs with EXDEV fallback (cross-device copy+delete).
     pub fn move_files(src_dir: &Path, dst_dir: &Path, names: &[String]) -> io::Result<usize> {
         let mut count = 0;
         for name in names {
             let src = src_dir.join(name);
             let dst = dst_dir.join(name);
-            fs::rename(&src, &dst)?;
+            fs::rename(&src, &dst).or_else(|e| {
+                // EXDEV: cross-device — copy + delete original
+                if e.raw_os_error() == Some(18) {
+                    if src.is_dir() {
+                        copy_dir_recursive(&src, &dst)?;
+                        fs::remove_dir_all(&src)?;
+                    } else {
+                        fs::copy(&src, &dst)?;
+                        fs::remove_file(&src)?;
+                    }
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })?;
             count += 1;
         }
         Ok(count)
