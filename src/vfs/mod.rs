@@ -77,6 +77,12 @@ pub trait VfsOps {
         dst_dir: &std::path::Path,
         names: &[String],
     ) -> std::io::Result<usize>;
+    fn move_files(
+        &self,
+        src_dir: &std::path::Path,
+        dst_dir: &std::path::Path,
+        names: &[String],
+    ) -> std::io::Result<usize>;
     fn delete_files(&self, dir: &std::path::Path, names: &[String]) -> std::io::Result<usize>;
 }
 
@@ -116,6 +122,21 @@ impl VfsOps for Location {
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "copy only supported for Local",
+            )),
+        }
+    }
+
+    fn move_files(
+        &self,
+        src_dir: &std::path::Path,
+        dst_dir: &std::path::Path,
+        names: &[String],
+    ) -> std::io::Result<usize> {
+        match self {
+            Location::Local(_) => local::LocalFs::move_files(src_dir, dst_dir, names),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "move only supported for Local",
             )),
         }
     }

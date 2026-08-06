@@ -1,5 +1,5 @@
 use arx::app::{Action, AppState, Pane, PaneState, PanelMode, SortMode};
-use arx::vfs::{Entry, EntryKind, Location, archive::ArchiveFs, local::LocalFs, sftp::SftpFs};
+use arx::vfs::{Entry, EntryKind, Location, VfsOps};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
@@ -660,8 +660,8 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                     {
                         if let Location::Local(dir) = &pane.location {
                             let dir_c = dir.clone();
-                            let entries =
-                                arx::vfs::local::LocalFs::list(&dir_c).unwrap_or_default();
+                            let _dir_loc = Location::Local(dir_c.clone());
+                            let entries = _dir_loc.list().unwrap_or_default();
                             let mut lines = vec!["Directory sizes:".into()];
                             for e in &entries {
                                 if e.kind == EntryKind::Directory {
@@ -789,7 +789,10 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                     KeyCode::Backspace => {
                         let go_back = match &pane.location {
                             Location::Local(p) => {
-                                let parent = LocalFs::parent(p);
+                                let parent = p
+                                    .parent()
+                                    .map(|p| p.to_path_buf())
+                                    .unwrap_or_else(|| p.to_path_buf());
                                 if parent != *p {
                                     Some(Location::Local(parent))
                                 } else {
@@ -974,6 +977,7 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                         if let Location::Local(dir) = &state.active_pane().location {
                             let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
                             let dir_c = dir.clone();
+                            let _dir_loc = Location::Local(dir_c.clone());
                             state.message = Some(format!("Opening {}", dir_c.display()));
                             state.dir_history.push(dir_c);
                             if state.dir_history.len() > 20 {
@@ -1095,7 +1099,8 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                 std::thread::spawn(move || {
                                     tx.send(arx::jobs::JobEvent::Running { id: id.clone() })
                                         .ok();
-                                    let result = LocalFs::copy_files(&src, &dst, &names2);
+                                    let src_loc = Location::Local(src.clone());
+                                    let result = src_loc.copy_files(&src, &dst, &names2);
                                     match result {
                                         Ok(n) => {
                                             tx.send(arx::jobs::JobEvent::Done {
@@ -1150,7 +1155,8 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                 std::thread::spawn(move || {
                                     tx.send(arx::jobs::JobEvent::Running { id: id.clone() })
                                         .ok();
-                                    let result = LocalFs::move_files(&src, &dst, &names2);
+                                    let src_loc = Location::Local(src.clone());
+                                    let result = src_loc.move_files(&src, &dst, &names2);
                                     match result {
                                         Ok(n) => {
                                             tx.send(arx::jobs::JobEvent::Done {
@@ -1186,7 +1192,8 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                         let names = selection_or_cursor(&state, entries, cursor);
                         let active_path = pane_location_path(&state);
                         if let Some(dir) = active_path {
-                            match LocalFs::delete_files(dir, &names) {
+                            let loc = Location::Local(dir.to_path_buf());
+                            match loc.delete_files(dir, &names) {
                                 Ok(n) => {
                                     state.message = Some(format!("Trashed {n} item(s)"));
                                 }
@@ -1263,8 +1270,13 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                         .arg(&path)
                                         .status();
                                 } else {
-                                    state.viewer_content = LocalFs::read_head(&path, 500)
-                                        .unwrap_or_else(|e| {
+                                    let loc = Location::Local(
+                                        path.parent()
+                                            .unwrap_or(std::path::Path::new("/"))
+                                            .to_path_buf(),
+                                    );
+                                    state.viewer_content =
+                                        loc.read_head(&path, 500).unwrap_or_else(|e| {
                                             vec![format!("Error reading file: {e}")]
                                         });
                                     state.viewer_scroll = 0;
@@ -1473,30 +1485,8 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
 }
 
 fn load_entries(location: &Location, show_hidden: bool, sort_mode: SortMode) -> Vec<Entry> {
-    let mut entries = match location {
-        Location::Local(path) => LocalFs::list(path).unwrap_or_default(),
-        Location::Sftp { host, path } => {
-            let synthetic = arx::remote::Host {
-                id: host.clone(),
-                name: host.clone(),
-                ssh_alias: host.clone(),
-                hostname: host.clone(),
-                port: 22,
-                user: std::env::var("USER").unwrap_or_else(|_| "root".into()),
-                group_ids: Default::default(),
-                tags: Default::default(),
-                favorite: false,
-                default_path: None,
-                transfer_preference: arx::remote::TransferPreference::Auto,
-                notes: None,
-            };
-            SftpFs::list(&synthetic, path).unwrap_or_default()
-        }
-        Location::Archive {
-            archive,
-            inner_path,
-        } => ArchiveFs::list(archive, inner_path).unwrap_or_default(),
-    };
+    // ponytail: VfsOps trait dispatch handles all backends
+    let mut entries = location.list().unwrap_or_default();
     if !show_hidden {
         entries.retain(|e| !e.name.starts_with('.'));
     }
@@ -1527,10 +1517,20 @@ fn apply_filter<'a>(entries: &'a [Entry], filter: &str) -> Vec<&'a Entry> {
     if filter.is_empty() {
         entries.iter().collect()
     } else {
-        let lower = filter.to_lowercase();
+        let (name_filter, size_min, size_max) = parse_filter(filter);
         entries
             .iter()
-            .filter(|e| e.name.to_lowercase().contains(&lower))
+            .filter(|e| {
+                if !name_filter.is_empty() && !e.name.to_lowercase().contains(&name_filter) {
+                    return false;
+                }
+                match (size_min, size_max) {
+                    (Some(min), Some(max)) => e.size.is_some_and(|s| s >= min && s <= max),
+                    (Some(min), None) => e.size.is_some_and(|s| s >= min),
+                    (None, Some(max)) => e.size.is_some_and(|s| s <= max),
+                    (None, None) => true,
+                }
+            })
             .collect()
     }
 }
@@ -2375,4 +2375,47 @@ fn git_branch_for(loc: &arx::vfs::Location) -> String {
     } else {
         format!(" | git:{}", branch)
     }
+}
+
+/// Parse filter string for size:>1G, size:<100M modifiers.
+fn parse_filter(raw: &str) -> (String, Option<u64>, Option<u64>) {
+    let mut name_part = String::new();
+    let mut min_size: Option<u64> = None;
+    let mut max_size: Option<u64> = None;
+    for word in raw.split_whitespace() {
+        if let Some(val) = word.strip_prefix("size:>") {
+            if let Ok(bytes) = parse_size(val) {
+                min_size = Some(bytes);
+            }
+        } else if let Some(val) = word.strip_prefix("size:<") {
+            if let Ok(bytes) = parse_size(val) {
+                max_size = Some(bytes);
+            }
+        } else if let Some(val) = word.strip_prefix("size:") {
+            if let Ok(bytes) = parse_size(val) {
+                min_size = Some(bytes);
+                max_size = Some(bytes);
+            }
+        } else {
+            if !name_part.is_empty() {
+                name_part.push(' ');
+            }
+            name_part.push_str(word);
+        }
+    }
+    (name_part.to_lowercase(), min_size, max_size)
+}
+
+fn parse_size(s: &str) -> Result<u64, ()> {
+    let s = s.trim();
+    let (num_str, mult) = if s.ends_with('G') || s.ends_with('g') {
+        (&s[..s.len() - 1], 1_073_741_824)
+    } else if s.ends_with('M') || s.ends_with('m') {
+        (&s[..s.len() - 1], 1_048_576)
+    } else if s.ends_with('K') || s.ends_with('k') {
+        (&s[..s.len() - 1], 1024)
+    } else {
+        (s, 1)
+    };
+    num_str.parse::<u64>().map(|n| n * mult).map_err(|_| ())
 }
