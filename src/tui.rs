@@ -95,6 +95,9 @@ async fn event_loop(
                     refresh_entries = true;
                 }
                 arx::jobs::JobEvent::Failed { ref id, ref error } => {
+                    let _ = std::process::Command::new("notify-send")
+                        .args(["ARX", &format!("Job {} failed: {}", id, error)])
+                        .spawn();
                     if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
                         job.status = arx::jobs::JobStatus::Failed;
                     }
@@ -1615,6 +1618,10 @@ async fn event_loop(
                             state.show_jobs = !state.show_jobs;
                             state.job_cursor = 0;
                         }
+                        // Ctrl+I: toggle Infrastructure Center
+                        KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.show_infra = !state.show_infra;
+                        }
                         // Ctrl+T: toggle Smart Tree
                         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.show_tree = !state.show_tree;
@@ -2082,6 +2089,53 @@ fn render(
         render_viewer(frame, area, state);
     }
 
+    // Infrastructure Center overlay (Ctrl+I)
+    if state.show_infra {
+        // ponytail: parse ssh config for host list + quick reachability check
+        let hosts = arx::remote::ssh_config::parse_ssh_config();
+        let mut lines: Vec<String> = Vec::new();
+        for (alias, entry) in hosts.iter().take(30) {
+            let status = if std::process::Command::new("ssh")
+                .args([
+                    "-o",
+                    "ConnectTimeout=2",
+                    "-o",
+                    "BatchMode=yes",
+                    &format!(
+                        "{}@{}",
+                        entry.user.as_deref().unwrap_or("root"),
+                        entry.hostname.as_deref().unwrap_or(alias)
+                    ),
+                ])
+                .arg("echo ok 2>/dev/null")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                "✓"
+            } else {
+                "✗"
+            };
+            lines.push(format!(
+                "{} {} ({})",
+                status,
+                alias,
+                entry.hostname.as_deref().unwrap_or("?")
+            ));
+        }
+        let h = (lines.len().max(1) + 3).min(30) as u16;
+        let popup = centered_rect(80, h, area);
+        frame.render_widget(Clear, popup);
+        let items: Vec<ListItem> = lines.iter().map(|l| ListItem::new(l.as_str())).collect();
+        let list = ratatui::widgets::List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Infrastructure Center — Ctrl+I toggle "),
+            )
+            .highlight_style(Style::default().fg(Color::Cyan));
+        frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
+    }
     // Smart Tree overlay (Ctrl+T)
     if state.show_tree {
         let pane = state.active_pane();
