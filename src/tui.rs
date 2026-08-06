@@ -68,14 +68,24 @@ async fn event_loop(
         // Drain completed/failed job events
         while let Ok(event) = job_rx.try_recv() {
             match event {
+                arx::jobs::JobEvent::Paused { ref id } => {
+                    if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
+                        job.status = arx::jobs::JobStatus::Paused;
+                    }
+                }
                 arx::jobs::JobEvent::Running { ref id } => {
                     if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
                         job.status = arx::jobs::JobStatus::Running;
                     }
                 }
-                arx::jobs::JobEvent::Progress { ref id, percent } => {
+                arx::jobs::JobEvent::Progress { ref id, progress } => {
                     if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
-                        job.progress = percent;
+                        job.progress = progress.clone();
+                    }
+                }
+                arx::jobs::JobEvent::Paused { ref id } => {
+                    if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
+                        job.status = arx::jobs::JobStatus::Paused;
                     }
                 }
                 arx::jobs::JobEvent::Done {
@@ -84,7 +94,7 @@ async fn event_loop(
                 } => {
                     if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
                         job.status = arx::jobs::JobStatus::Done;
-                        job.progress = 100;
+                        job.progress = arx::jobs::Progress::Percent(100);
                     }
                     state.message = Some(message.clone());
                     refresh_entries = true;
@@ -1266,7 +1276,8 @@ async fn event_loop(
                                         description: desc,
                                         kind: arx::jobs::JobKind::Copy,
                                         status: arx::jobs::JobStatus::Pending,
-                                        progress: 0,
+                                        progress: arx::jobs::Progress::default(),
+                                        cancel: arx::jobs::job_token(),
                                         source: Some(Location::Local(src.clone())),
                                         destination: Some(Location::Local(dst.clone())),
                                     });
@@ -1289,7 +1300,7 @@ async fn event_loop(
                                                 let pct = (i + 1) as u8 * 100 / total.max(1);
                                                 tx.send(arx::jobs::JobEvent::Progress {
                                                     id: id.clone(),
-                                                    percent: pct,
+                                                    progress: arx::jobs::Progress::Percent(pct),
                                                 })
                                                 .ok();
                                                 if src_path.is_dir() {
@@ -1390,7 +1401,8 @@ async fn event_loop(
                                         description: desc,
                                         kind: arx::jobs::JobKind::Copy,
                                         status: arx::jobs::JobStatus::Pending,
-                                        progress: 0,
+                                        progress: arx::jobs::Progress::default(),
+                                        cancel: arx::jobs::job_token(),
                                         source: Some(Location::Local(src.clone())),
                                         destination: Some(Location::Local(dst.clone())),
                                     });
@@ -2530,7 +2542,7 @@ fn render_jobs(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
             .map(|(i, j)| {
                 let prefix = if i == state.job_cursor { "> " } else { "  " };
                 let bar = if j.status == arx::jobs::JobStatus::Running {
-                    let filled = j.progress as usize / 5; // 0-20 chars
+                    let filled = j.progress.percent().unwrap_or(0) as usize / 5; // 0-20 chars
                     let empty = 20 - filled;
                     format!(
                         " [{}{}] {}%",
@@ -2865,20 +2877,25 @@ fn handle_job_event(
     right: &mut Vec<Entry>,
 ) {
     match ev {
+        arx::jobs::JobEvent::Paused { id } => {
+            if let Some(job) = state.jobs.iter_mut().find(|j| j.id == id) {
+                job.status = arx::jobs::JobStatus::Paused;
+            }
+        }
         arx::jobs::JobEvent::Running { id } => {
             if let Some(job) = state.jobs.iter_mut().find(|j| j.id == id) {
                 job.status = arx::jobs::JobStatus::Running;
             }
         }
-        arx::jobs::JobEvent::Progress { id, percent } => {
+        arx::jobs::JobEvent::Progress { id, progress } => {
             if let Some(job) = state.jobs.iter_mut().find(|j| j.id == id) {
-                job.progress = percent;
+                job.progress = progress;
             }
         }
         arx::jobs::JobEvent::Done { id, message } => {
             if let Some(job) = state.jobs.iter_mut().find(|j| j.id == id) {
                 job.status = arx::jobs::JobStatus::Done;
-                job.progress = 100;
+                job.progress = arx::jobs::Progress::Percent(100);
             }
             state.message = Some(message);
             *left = load_entries(&state.left.location, state.show_hidden, state.sort_mode);
