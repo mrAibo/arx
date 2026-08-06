@@ -2,6 +2,7 @@
 //! ponytail: line-by-line parser, no crate dependency. Supports Host/HostName/User/Port/IdentityFile/ProxyJump.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default)]
@@ -80,9 +81,59 @@ fn flush_entry(
     }
 }
 
-/// Resolve an SSH alias through ~/.ssh/config.
-/// Returns (hostname, port, user, key_path, proxy_jump).
+/// Resolve effective SSH config via `ssh -G` (handles all OpenSSH features).
+/// ponytail: preferred over ARX parser for actual connections.
+/// Returns (hostname, port, user, identity_file_path, proxy_jump).
+pub fn resolve_effective(
+    alias: &str,
+) -> io::Result<(String, u16, String, Option<PathBuf>, Option<String>)> {
+    let output = std::process::Command::new("ssh")
+        .args(["-G", alias])
+        .output()
+        .map_err(|e| io::Error::other(format!("ssh -G {alias}: {e}")))?;
+
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "ssh -G {alias} exited {}",
+            output.status
+        )));
+    }
+
+    let out = String::from_utf8_lossy(&output.stdout);
+    let mut hostname = alias.to_string();
+    let mut port = 22u16;
+    let mut user = std::env::var("USER").unwrap_or_else(|_| "root".into());
+    let mut identity_file: Option<PathBuf> = None;
+    let mut proxy_jump: Option<String> = None;
+
+    for line in out.lines() {
+        let line = line.trim();
+        if let Some((k, v)) = line.split_once(char::is_whitespace) {
+            match k.to_lowercase().as_str() {
+                "hostname" => hostname = v.to_string(),
+                "port" => {
+                    if let Ok(p) = v.parse() {
+                        port = p;
+                    }
+                }
+                "user" => user = v.to_string(),
+                "identityfile" => identity_file = Some(PathBuf::from(v)),
+                "proxyjump" => proxy_jump = Some(v.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    Ok((hostname, port, user, identity_file, proxy_jump))
+}
+
+/// Resolve via ARX parser (fast, for discovery/listing). Falls back to ssh -G on failure.
 pub fn resolve_alias(alias: &str) -> (String, u16, String, Option<PathBuf>, Option<String>) {
+    // Try ssh -G first for accurate config
+    if let Ok(effective) = resolve_effective(alias) {
+        return effective;
+    }
+    // Fall back to ARX parser
     let config = parse_ssh_config();
     let alias_lower = alias.to_lowercase();
     let user = std::env::var("USER").unwrap_or_else(|_| "root".into());
