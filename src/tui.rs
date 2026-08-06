@@ -678,6 +678,12 @@ async fn event_loop(
                         }
                     }
 
+                    // Handle tree-filter Backspace before borrowing the active pane.
+                    if key.code == KeyCode::Backspace && state.show_tree {
+                        state.tree_filter.pop();
+                        continue;
+                    }
+
                     let pane = state.active_pane_mut();
 
                     match key.code {
@@ -928,11 +934,6 @@ async fn event_loop(
                             }
                         }
                         KeyCode::Backspace => {
-                            // Tree filter: pop last char
-                            if state.show_tree {
-                                state.tree_filter.pop();
-                                continue;
-                            }
                             let go_back = match &pane.location {
                                 Location::Local(p) => {
                                     let parent = p
