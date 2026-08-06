@@ -2909,8 +2909,100 @@ fn handle_job_event(
 
 /// Preview a file using system tools: bat, chafa, pdftotext, ffprobe, 7z.
 /// Falls back to plain head(1) read.
-/// Preview a file using system tools: chafa, pdftotext, ffprobe, 7z, bat.
+/// Terminal image backend capability.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ImageBackend {
+    Kitty,  // kitty icat protocol
+    Sixel,  // sixel (mlterm, xterm -ti 340)
+    Iterm2, // iTerm2 imgcat
+    Chafa,  // fallback: chafa ASCII blocks
+    None,   // no image support
+}
+
+/// Detect what image backend the terminal supports.
+fn detect_image_backend() -> ImageBackend {
+    // Kitty protocol check
+    if std::env::var("KITTY_WINDOW_ID").is_ok() {
+        return ImageBackend::Kitty;
+    }
+    if std::env::var("ITERM_SESSION_ID").is_ok() {
+        return ImageBackend::Iterm2;
+    }
+    if std::env::var("TERM").is_ok_and(|t| t.contains("sixel")) {
+        return ImageBackend::Sixel;
+    }
+    // Chafa fallback
+    if std::process::Command::new("chafa")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return ImageBackend::Chafa;
+    }
+    ImageBackend::None
+}
+
+/// Render an image to terminal escape sequences (returns lines to display).
+fn render_image(path_str: &str, backend: ImageBackend) -> Vec<String> {
+    match backend {
+        ImageBackend::Kitty => {
+            // kitty icat — print directly to terminal
+            // ponytail: icat writes to tty, we just note it
+            let _ = std::process::Command::new("kitten")
+                .args(["icat", "--place", "80x20@0x0", path_str])
+                .status();
+            vec![format!("[Image/Kitty] {}", path_str)]
+        }
+        ImageBackend::Sixel => {
+            // img2sixel / convert to sixel
+            // convert to sixel
+            #[allow(clippy::collapsible_if)]
+            if let Ok(out) = std::process::Command::new("convert")
+                .args([path_str, "-geometry", "640x480", "sixel:-"])
+                .output()
+            {
+                if out.status.success() {
+                    return vec![
+                        format!("[Image/Sixel] {}", path_str),
+                        String::from_utf8_lossy(&out.stdout).to_string(),
+                    ];
+                }
+            }
+            vec![format!("[Image/Sixel] {} — convert failed", path_str)]
+        }
+        ImageBackend::Iterm2 => {
+            let _ = std::process::Command::new("imgcat")
+                .args(["--width", "80%", path_str])
+                .status();
+            vec![format!("[Image/iTerm2] {}", path_str)]
+        }
+        ImageBackend::Chafa | ImageBackend::None => {
+            // Fallback: chafa block characters
+            #[allow(clippy::collapsible_if)]
+            if backend == ImageBackend::Chafa {
+                if let Ok(out) = std::process::Command::new("chafa")
+                    .args(["--symbols", "block", "--size", "80x20", path_str])
+                    .output()
+                {
+                    if out.status.success() {
+                        let mut lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                            .lines()
+                            .map(|l| l.to_string())
+                            .collect();
+                        lines.insert(0, format!("[Image/Chafa] {}", path_str));
+                        return lines;
+                    }
+                }
+            }
+            vec![format!("[Image] {} (no renderer available)", path_str)]
+        }
+    }
+}
+
 fn preview_file(path: &std::path::Path) -> Vec<String> {
+    static IMAGE_BACKEND: std::sync::OnceLock<ImageBackend> = std::sync::OnceLock::new();
+    let backend = IMAGE_BACKEND.get_or_init(detect_image_backend);
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -2918,20 +3010,12 @@ fn preview_file(path: &std::path::Path) -> Vec<String> {
         .to_lowercase();
     let path_str = path.to_str().unwrap_or("");
 
-    // Images → chafa
+    // Images → native terminal renderer (kitty/sixel/iterm2/chafa)
     if matches!(
         ext.as_str(),
         "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp"
-    ) && run_cmd(
-        "chafa",
-        &["--symbols", "block", "--size", "80x20", path_str],
     ) {
-        let mut lines = run_cmd_output(
-            "chafa",
-            &["--symbols", "block", "--size", "80x20", path_str],
-        );
-        lines.insert(0, format!("[Image] {}", path.display()));
-        return lines;
+        return render_image(path_str, *backend);
     }
 
     // PDF → pdftotext
