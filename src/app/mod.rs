@@ -176,6 +176,7 @@ pub struct AppState {
     pub hotlist_cursor: usize,
     pub show_tab_switcher: bool,
     pub tab_switcher_cursor: usize,
+    pub split: bool, // Ctrl+\ split pane vertically
     pub rename_input: bool,
     pub rename_pattern: String,
     pub show_command_center: bool,
@@ -250,6 +251,7 @@ impl Default for AppState {
             hotlist_cursor: 0,
             show_tab_switcher: false,
             tab_switcher_cursor: 0,
+            split: false,
             rename_input: false,
             rename_pattern: String::new(),
             show_command_center: false,
