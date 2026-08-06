@@ -631,6 +631,51 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                     right_entries =
                         load_entries(&state.right.location, state.show_hidden, state.sort_mode);
                 }
+                // F7: create directory
+                KeyCode::F(7) => {
+                    state.cmd = "mkdir ".into();
+                    state.cmd_input = true;
+                }
+                // Shift+F6: rename file under cursor
+                KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    if let Some(entry) = entries.get(cursor) {
+                        state.cmd = format!("mv '{}' ", entry.name);
+                        state.cmd_input = true;
+                    }
+                }
+                // Ctrl+I: file info (stat)
+                KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(entry) = entries.get(cursor) {
+                        if let Location::Local(dir) = &pane.location {
+                            let path = dir.join(&entry.name);
+                            if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                                let k = match entry.kind {
+                                    EntryKind::Directory => "d",
+                                    EntryKind::Symlink => "l",
+                                    _ => "-",
+                                };
+                                let mode = format!(
+                                    "{k}r--r--r-- {}",
+                                    if meta.permissions().readonly() {
+                                        "ro"
+                                    } else {
+                                        "rw"
+                                    }
+                                );
+                                let size = entry.size.map(format_size).unwrap_or_default();
+                                let info = vec![
+                                    format!("Name:      {}", entry.name),
+                                    format!("Path:      {}", path.display()),
+                                    format!("Type:      {:?}", entry.kind),
+                                    format!("Size:      {size}"),
+                                    format!("Mode:      {mode}"),
+                                ];
+                                state.viewer_content = info;
+                                state.viewer_scroll = 0;
+                            }
+                        }
+                    }
+                }
                 // Alt+O: sync other pane to active pane
                 KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::ALT) => {
                     let src = state.active_pane().location.clone();
@@ -671,6 +716,17 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                         let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
                         state.message = Some(format!("Opening {}", dir.display()));
                     }
+                }
+                // Ctrl+O: drop to subshell, restore on exit
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    disable_raw_mode()?;
+                    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                    let _ = std::process::Command::new(
+                        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+                    )
+                    .status();
+                    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                    enable_raw_mode()?;
                 }
                 KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     state.filter.clear();
