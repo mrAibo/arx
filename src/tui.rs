@@ -450,6 +450,7 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                 KeyCode::Enter => {
                     if let Some(entry) = entries.get(cursor) {
                         if entry.kind == EntryKind::Directory {
+                            let old_location = pane.location.clone();
                             let new_location = match &pane.location {
                                 Location::Local(p) => Location::Local(p.join(&entry.name)),
                                 Location::Sftp { host, path } => {
@@ -480,6 +481,7 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                     }
                                 }
                             };
+                            pane.dir_history.push(old_location);
                             pane.location = new_location;
                             pane.cursor = 0;
                             state.selected.clear();
@@ -591,6 +593,56 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                         load_entries(&state.left.location, state.show_hidden, state.sort_mode);
                     right_entries =
                         load_entries(&state.right.location, state.show_hidden, state.sort_mode);
+                }
+                // Ctrl+U: swap panes
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    std::mem::swap(&mut state.left, &mut state.right);
+                    state.message = Some("Swapped".into());
+                    left_entries =
+                        load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+                    right_entries =
+                        load_entries(&state.right.location, state.show_hidden, state.sort_mode);
+                }
+                // Alt+O: sync other pane to active pane
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    let src = state.active_pane().location.clone();
+                    let dst = state.other_pane_mut();
+                    dst.location = src;
+                    dst.cursor = 0;
+                    state.message = Some("Directory synced".into());
+                    left_entries =
+                        load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+                    right_entries =
+                        load_entries(&state.right.location, state.show_hidden, state.sort_mode);
+                }
+                // Alt+Down: go back in directory history
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                    let pane = state.active_pane_mut();
+                    if let Some(prev) = pane.dir_history.pop() {
+                        pane.location = prev;
+                        pane.cursor = 0;
+                        state.message = Some("History back".into());
+                        if state.active == Pane::Left {
+                            left_entries = load_entries(
+                                &state.left.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
+                        } else {
+                            right_entries = load_entries(
+                                &state.right.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
+                        }
+                    }
+                }
+                // Ctrl+\\: open active directory in file explorer
+                KeyCode::Char('\\') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Location::Local(dir) = &state.active_pane().location {
+                        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+                        state.message = Some(format!("Opening {}", dir.display()));
+                    }
                 }
                 KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     state.filter.clear();
@@ -777,9 +829,17 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                 Location::Local(dir) => dir.join(&entry.name),
                                 _ => continue,
                             };
-                            state.viewer_content = LocalFs::read_head(&path, 500)
-                                .unwrap_or_else(|e| vec![format!("Error reading file: {e}")]);
-                            state.viewer_scroll = 0;
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                // ponytail: use bat for syntax-highlighted paging
+                                let _ = std::process::Command::new("bat")
+                                    .arg("--paging=always")
+                                    .arg(&path)
+                                    .status();
+                            } else {
+                                state.viewer_content = LocalFs::read_head(&path, 500)
+                                    .unwrap_or_else(|e| vec![format!("Error reading file: {e}")]);
+                                state.viewer_scroll = 0;
+                            }
                         }
                     }
                 }

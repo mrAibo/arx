@@ -70,6 +70,8 @@ pub struct PaneState {
     /// Saved tabs: (location, cursor). Current tab is separate in location/cursor above.
     /// Index 0..n-1 for saved tabs; switching swaps current ↔ saved[idx].
     pub tabs: Vec<(Location, usize)>,
+    /// Directory history stack. Push before entering a directory; Alt+Down pops.
+    pub dir_history: Vec<Location>,
 }
 
 impl PaneState {
@@ -157,11 +159,13 @@ impl Default for AppState {
                 location: Location::Local(cwd),
                 cursor: 0,
                 tabs: Vec::new(),
+                dir_history: Vec::new(),
             },
             right: PaneState {
                 location: Location::Local(home),
                 cursor: 0,
                 tabs: Vec::new(),
+                dir_history: Vec::new(),
             },
             active: Pane::Left,
             selected: BTreeSet::new(),

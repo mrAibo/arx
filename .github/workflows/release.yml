@@ -10,32 +10,25 @@ permissions:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release
 
       - name: Package
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf /tmp/arx-${{ matrix.target }}.tar.gz arx
+          cd target/release
+          tar czf /tmp/arx-x86_64-unknown-linux-gnu.tar.gz arx
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          files: /tmp/arx-${{ matrix.target }}.tar.gz
+          files: /tmp/arx-x86_64-unknown-linux-gnu.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
