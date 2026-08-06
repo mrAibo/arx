@@ -183,6 +183,7 @@ pub struct AppState {
     pub rename_input: bool,
     pub rename_pattern: String,
     pub show_command_center: bool,
+    pub cc_channel: CommandCenterChannel,
     pub show_tree: bool,
     pub show_context_menu: bool,
     pub context_menu_pos: (u16, u16),
