@@ -65,15 +65,30 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
 
         #[allow(clippy::collapsible_if)]
         if let Event::Key(key) = event::read()? {
-            // If composing filter, keys go to filter buffer
-            if state.filtering {
+            // If composing filter or glob, keys go to buffer
+            if state.filtering || state.glob_input {
                 match key.code {
                     KeyCode::Esc => {
                         state.filter.clear();
                         state.filtering = false;
+                        state.glob_input = false;
                     }
                     KeyCode::Enter => {
+                        if state.glob_input && !state.filter.is_empty() {
+                            // Select all filtered entries matching the glob
+                            let filt = if state.active == Pane::Left {
+                                &left_filtered
+                            } else {
+                                &right_filtered
+                            };
+                            for e in filt {
+                                state.selected.insert(e.name.clone());
+                            }
+                            state.message = Some(format!("Selected {}", state.selected.len()));
+                            state.filter.clear();
+                        }
                         state.filtering = false;
+                        state.glob_input = false;
                     }
                     KeyCode::Backspace => {
                         state.filter.pop();
@@ -203,6 +218,27 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
                         right_entries = load_entries(&state.right.location);
                     }
                 }
+                // *: invert selection on visible entries
+                KeyCode::Char('*') => {
+                    let filt = if state.active == Pane::Left {
+                        &left_filtered
+                    } else {
+                        &right_filtered
+                    };
+                    for e in filt {
+                        if state.selected.contains(&e.name) {
+                            state.selected.remove(&e.name);
+                        } else {
+                            state.selected.insert(e.name.clone());
+                        }
+                    }
+                    state.message = Some(format!("Selected {}", state.selected.len()));
+                }
+                // +: enter glob-select mode (uses filter buffer)
+                KeyCode::Char('+') => {
+                    state.filter.clear();
+                    state.glob_input = true;
+                }
                 _ => {}
             }
         }
@@ -318,7 +354,9 @@ fn render(
         Location::Local(p) => p.display().to_string(),
         other => other.to_string(),
     };
-    let filter_hint = if state.filtering {
+    let filter_hint = if state.glob_input {
+        format!(" glob: {}_", state.filter)
+    } else if state.filtering {
         format!(" filter: {}_", state.filter)
     } else if !state.filter.is_empty() {
         format!(" filter: {}", state.filter)

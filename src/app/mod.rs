@@ -43,6 +43,8 @@ pub struct AppState {
     pub filtering: bool,
     /// One-shot status message; cleared after render.
     pub message: Option<String>,
+    /// True while composing a glob pattern for + (select-by-glob).
+    pub glob_input: bool,
 }
 
 impl Default for AppState {
@@ -64,6 +66,7 @@ impl Default for AppState {
             filter: String::new(),
             filtering: false,
             message: None,
+            glob_input: false,
         }
     }
 }
