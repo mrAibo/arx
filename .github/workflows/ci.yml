@@ -20,7 +20,7 @@ jobs:
           ref: ${{ github.event_name == 'push' && github.ref_name || github.head_ref }}
 
       - name: Apply one-shot borrow fix
-        if: github.event_name == 'push' && github.ref_name == 'fix/ci-p0-hardening'
+        if: github.ref_name == 'fix/ci-p0-hardening' || github.head_ref == 'fix/ci-p0-hardening'
         run: |
           python scripts/apply_ci_borrow_fix.py
           if ! git diff --quiet -- src/tui.rs; then
