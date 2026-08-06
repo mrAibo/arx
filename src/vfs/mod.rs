@@ -66,6 +66,71 @@ pub struct Entry {
     pub size: Option<u64>,
 }
 
+/// Abstract VFS operations — backend-agnostic interface.
+/// ponytail: trait object dispatch; full provider registry deferred to Wave 2.
+pub trait VfsOps {
+    fn list(&self) -> anyhow::Result<Vec<Entry>>;
+    fn read_head(&self, path: &std::path::Path, lines: usize) -> anyhow::Result<Vec<String>>;
+    fn copy_files(
+        &self,
+        src_dir: &std::path::Path,
+        dst_dir: &std::path::Path,
+        names: &[String],
+    ) -> std::io::Result<usize>;
+    fn delete_files(&self, dir: &std::path::Path, names: &[String]) -> std::io::Result<usize>;
+}
+
+impl VfsOps for Location {
+    fn list(&self) -> anyhow::Result<Vec<Entry>> {
+        let result: std::io::Result<Vec<Entry>> = match self {
+            Location::Local(p) => local::LocalFs::list(p),
+            Location::Sftp { host, path } => {
+                let h = crate::remote::Host::from_alias(host);
+                sftp::SftpFs::list(&h, path)
+            }
+            Location::Archive {
+                archive,
+                inner_path,
+            } => archive::ArchiveFs::list(archive, inner_path),
+        };
+        result.map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    fn read_head(&self, path: &std::path::Path, lines: usize) -> anyhow::Result<Vec<String>> {
+        match self {
+            Location::Local(_) => {
+                local::LocalFs::read_head(path, lines).map_err(|e| anyhow::anyhow!("{e}"))
+            }
+            _ => Err(anyhow::anyhow!("read_head only supported for Local paths")),
+        }
+    }
+
+    fn copy_files(
+        &self,
+        src_dir: &std::path::Path,
+        dst_dir: &std::path::Path,
+        names: &[String],
+    ) -> std::io::Result<usize> {
+        match self {
+            Location::Local(_) => local::LocalFs::copy_files(src_dir, dst_dir, names),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "copy only supported for Local",
+            )),
+        }
+    }
+
+    fn delete_files(&self, dir: &std::path::Path, names: &[String]) -> std::io::Result<usize> {
+        match self {
+            Location::Local(_) => local::LocalFs::delete_files(dir, names),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "delete only supported for Local",
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

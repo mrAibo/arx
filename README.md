@@ -161,7 +161,7 @@ t  "Disk usage"  df -h
 | Panel modes (Full/Brief) | ✅ (Alt+T) |
 | Extension colors | ✅ |
 | Shortcut bar, full help | ✅ |
-| **MC parity** | ✅ **complete** |
+| **MC feature parity** | ✅ (safety layer — trash/backup/EXDEV — in progress) |
 
 ## Development
 
