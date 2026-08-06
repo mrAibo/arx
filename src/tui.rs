@@ -33,6 +33,7 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
     let mut state = AppState {
         show_hidden: config.ui.show_hidden,
         hosts: arx::remote::hosts_config::load_hosts(),
+        menu: AppState::load_menu(),
         ..AppState::default()
     };
     let mut left_entries = load_entries(&state.left.location, state.show_hidden, state.sort_mode);
@@ -316,6 +317,52 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                 continue;
             }
 
+            // User menu: F2
+            if state.show_menu {
+                match key.code {
+                    KeyCode::Esc | KeyCode::F(2) => {
+                        state.show_menu = false;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.menu_cursor = state.menu_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j')
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        let max = state.menu.len().saturating_sub(1);
+                        if state.menu_cursor < max {
+                            state.menu_cursor += 1;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(entry) = state.menu.get(state.menu_cursor) {
+                            let cmd = entry.command.clone();
+                            state.show_menu = false;
+                            // Run menu command, show output
+                            let output = std::process::Command::new("sh")
+                                .arg("-c")
+                                .arg(&cmd)
+                                .output();
+                            state.message = match output {
+                                Ok(o) => {
+                                    let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                    if out.is_empty() && o.status.success() {
+                                        Some(format!("menu: {} — ok", entry.label))
+                                    } else if out.len() > 80 {
+                                        Some(format!("menu: {} — {}...", entry.label, &out[..80]))
+                                    } else {
+                                        Some(format!("menu: {} — {out}", entry.label))
+                                    }
+                                }
+                                Err(e) => Some(format!("menu: {} failed: {e}", entry.label)),
+                            };
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             let entries = if state.active == Pane::Left {
                 &left_filtered
             } else {
@@ -499,14 +546,19 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                     state.filter.clear();
                     state.glob_input = true;
                 }
-                // F2: cycle sort mode
+                // F2: user menu (if loaded), otherwise cycle sort
                 KeyCode::F(2) => {
-                    state.sort_mode = state.sort_mode.next();
-                    state.message = Some(format!("Sort: {}", state.sort_mode.label()));
-                    left_entries =
-                        load_entries(&state.left.location, state.show_hidden, state.sort_mode);
-                    right_entries =
-                        load_entries(&state.right.location, state.show_hidden, state.sort_mode);
+                    if !state.menu.is_empty() {
+                        state.show_menu = !state.show_menu;
+                        state.menu_cursor = 0;
+                    } else {
+                        state.sort_mode = state.sort_mode.next();
+                        state.message = Some(format!("Sort: {}", state.sort_mode.label()));
+                        left_entries =
+                            load_entries(&state.left.location, state.show_hidden, state.sort_mode);
+                        right_entries =
+                            load_entries(&state.right.location, state.show_hidden, state.sort_mode);
+                    }
                 }
                 // F3: view file
                 KeyCode::F(3) => {
@@ -578,6 +630,49 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                 KeyCode::Char(':') => {
                     state.cmd.clear();
                     state.cmd_input = true;
+                }
+                // Ctrl+T: new tab in active pane
+                KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let show_hidden = state.show_hidden;
+                    let sort_mode = state.sort_mode;
+                    state.active_pane_mut().new_tab();
+                    let tabs = state.active_pane().tabs.len() + 1;
+                    left_entries = load_entries(&state.left.location, show_hidden, sort_mode);
+                    right_entries = load_entries(&state.right.location, show_hidden, sort_mode);
+                    state.message = Some(format!("Tab {tabs}/{tabs}"));
+                }
+                // Ctrl+W: close tab in active pane
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let show_hidden = state.show_hidden;
+                    let sort_mode = state.sort_mode;
+                    state.active_pane_mut().close_tab();
+                    let tabs = state.active_pane().tabs.len() + 1;
+                    left_entries = load_entries(&state.left.location, show_hidden, sort_mode);
+                    right_entries = load_entries(&state.right.location, show_hidden, sort_mode);
+                    state.message = Some(format!("Tab {}/{}", tabs.min(1), tabs));
+                }
+                // Ctrl+Left: previous tab
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let show_hidden = state.show_hidden;
+                    let sort_mode = state.sort_mode;
+                    let tabs_len = state.active_pane().tabs.len();
+                    if tabs_len > 0 {
+                        state.active_pane_mut().switch_tab(tabs_len - 1);
+                        left_entries = load_entries(&state.left.location, show_hidden, sort_mode);
+                        right_entries = load_entries(&state.right.location, show_hidden, sort_mode);
+                        state.message = Some("Tab ←".into());
+                    }
+                }
+                // Ctrl+Right: next tab
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let show_hidden = state.show_hidden;
+                    let sort_mode = state.sort_mode;
+                    if state.active_pane().tabs.len() >= 2 {
+                        state.active_pane_mut().switch_tab(0);
+                        left_entries = load_entries(&state.left.location, show_hidden, sort_mode);
+                        right_entries = load_entries(&state.right.location, show_hidden, sort_mode);
+                        state.message = Some("Tab →".into());
+                    }
                 }
                 _ => {}
             }
@@ -770,6 +865,11 @@ fn render(
         render_jobs(frame, area, state);
     }
 
+    // User menu overlay
+    if state.show_menu {
+        render_menu(frame, area, state);
+    }
+
     // Status bar
     let pane = state.active_pane();
     let loc_str = match &pane.location {
@@ -790,10 +890,15 @@ fn render(
         String::new()
     };
     let hidden = if state.show_hidden { " [dot]" } else { "" };
+    let tab_info = format!(
+        " | LT:{} RT:{}",
+        state.left.tabs.len() + 1,
+        state.right.tabs.len() + 1
+    );
     let msg_hint = message.map(|m| format!(" | {m}")).unwrap_or_default();
 
     let status = Paragraph::new(Line::from(format!(
-        "ARX v0.1.0 | {}{hidden} | sel: {} |{hint}{msg_hint} | ?: help",
+        "ARX v0.1.0 | {}{hidden}{tab_info} | sel: {} |{hint}{msg_hint} | ?: help",
         loc_str,
         state.selected.len(),
     )))
@@ -966,6 +1071,33 @@ fn render_jobs(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Jobs (Ctrl+J: close) "),
+        )
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
+    frame.render_stateful_widget(list, popup_area, &mut list_state);
+}
+
+fn render_menu(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    let popup_area = centered_rect(60, 70, area);
+    frame.render_widget(Clear, popup_area);
+
+    let items: Vec<ListItem> = state
+        .menu
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let prefix = if i == state.menu_cursor { "> " } else { "  " };
+            ListItem::new(Line::from(format!("{prefix}{}", m.label)))
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.menu_cursor));
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" User Menu (F2: close, Enter: run) "),
         )
         .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
     frame.render_stateful_widget(list, popup_area, &mut list_state);

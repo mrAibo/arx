@@ -5,6 +5,13 @@ use crate::jobs::Job;
 use crate::remote::Host;
 use crate::vfs::Location;
 
+/// MC-style menu entry.
+#[derive(Debug, Clone)]
+pub struct MenuEntry {
+    pub label: String,
+    pub command: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     Left,
@@ -60,6 +67,40 @@ impl SortMode {
 pub struct PaneState {
     pub location: Location,
     pub cursor: usize,
+    /// Saved tabs: (location, cursor). Current tab is separate in location/cursor above.
+    /// Index 0..n-1 for saved tabs; switching swaps current ↔ saved[idx].
+    pub tabs: Vec<(Location, usize)>,
+}
+
+impl PaneState {
+    /// Open a new tab. Saves current location/cursor in tabs vec.
+    pub fn new_tab(&mut self) {
+        self.tabs.push((self.location.clone(), self.cursor));
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/"));
+        self.location = Location::Local(home);
+        self.cursor = 0;
+    }
+
+    /// Close active tab. Falls back to last saved tab.
+    pub fn close_tab(&mut self) {
+        if let Some((loc, cur)) = self.tabs.pop() {
+            self.location = loc;
+            self.cursor = cur;
+        }
+    }
+
+    /// Switch to tab at index. Swaps current state with saved[idx].
+    pub fn switch_tab(&mut self, idx: usize) {
+        if idx < self.tabs.len() {
+            let saved = (self.location.clone(), self.cursor);
+            let target = self.tabs[idx].clone();
+            self.tabs[idx] = saved;
+            self.location = target.0;
+            self.cursor = target.1;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -98,6 +139,10 @@ pub struct AppState {
     // C2: command input
     pub cmd_input: bool,
     pub cmd: String,
+    // C3: user menu
+    pub menu: Vec<MenuEntry>,
+    pub show_menu: bool,
+    pub menu_cursor: usize,
 }
 
 impl Default for AppState {
@@ -111,10 +156,12 @@ impl Default for AppState {
             left: PaneState {
                 location: Location::Local(cwd),
                 cursor: 0,
+                tabs: Vec::new(),
             },
             right: PaneState {
                 location: Location::Local(home),
                 cursor: 0,
+                tabs: Vec::new(),
             },
             active: Pane::Left,
             selected: BTreeSet::new(),
@@ -140,6 +187,9 @@ impl Default for AppState {
             show_diff: false,
             cmd_input: false,
             cmd: String::new(),
+            menu: Vec::new(),
+            show_menu: false,
+            menu_cursor: 0,
         }
     }
 }
@@ -177,6 +227,38 @@ impl AppState {
             Pane::Left => &mut self.right,
             Pane::Right => &mut self.left,
         }
+    }
+
+    /// Load user menu from ~/.config/arx/arx.menu.
+    pub fn load_menu() -> Vec<MenuEntry> {
+        let path = dirs::config_dir()
+            .map(|d| d.join("arx").join("arx.menu"))
+            .unwrap_or_else(|| PathBuf::from("arx.menu"));
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut entries = Vec::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            // Skip comments and empty lines
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            // Format: t  "Label"  command
+            // ponytail: simple parser; add proper tokenizer when needed
+            #[allow(clippy::collapsible_if)]
+            if let Some(rest) = trimmed.strip_prefix("t  \"") {
+                if let Some((label, cmd)) = rest.split_once("\"  ") {
+                    entries.push(MenuEntry {
+                        label: label.to_string(),
+                        command: cmd.to_string(),
+                    });
+                }
+            }
+        }
+        entries
     }
 
     /// Currently-viewed file path (if viewer is open).
