@@ -32,6 +32,7 @@ pub fn run(config: arx::config::ArxConfig) -> io::Result<()> {
 fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) -> io::Result<()> {
     let mut state = AppState {
         show_hidden: config.ui.show_hidden,
+        hosts: arx::remote::hosts_config::load_hosts(),
         ..AppState::default()
     };
     let mut left_entries = load_entries(&state.left.location, state.show_hidden, state.sort_mode);
@@ -144,7 +145,9 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                     KeyCode::Up | KeyCode::Char('k') => {
                         state.viewer_scroll = state.viewer_scroll.saturating_sub(1);
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    KeyCode::Down | KeyCode::Char('j')
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
                         let max = state.viewer_content.len().saturating_sub(1);
                         if state.viewer_scroll < max {
                             state.viewer_scroll += 1;
@@ -173,7 +176,9 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                     KeyCode::Up | KeyCode::Char('k') => {
                         state.bookmark_cursor = state.bookmark_cursor.saturating_sub(1);
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    KeyCode::Down | KeyCode::Char('j')
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
                         let max = state.bookmarks.len().saturating_sub(1);
                         if state.bookmark_cursor < max {
                             state.bookmark_cursor += 1;
@@ -204,6 +209,76 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                 continue;
             }
 
+            // Hosts panel: F9
+            if state.show_hosts {
+                match key.code {
+                    KeyCode::Esc | KeyCode::F(9) => {
+                        state.show_hosts = false;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.host_cursor = state.host_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j')
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        let max = state.hosts.len().saturating_sub(1);
+                        if state.host_cursor < max {
+                            state.host_cursor += 1;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let host = state.hosts.get(state.host_cursor).cloned();
+                        if let Some(host) = host {
+                            let pane = state.active_pane_mut();
+                            let default_path = host.default_path.as_deref().unwrap_or("/");
+                            pane.location = Location::Sftp {
+                                host: host.id.clone(),
+                                path: default_path.into(),
+                            };
+                            pane.cursor = 0;
+                            state.selected.clear();
+                            state.show_hosts = false;
+                            left_entries = load_entries(
+                                &state.left.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
+                            right_entries = load_entries(
+                                &state.right.location,
+                                state.show_hidden,
+                                state.sort_mode,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            // Jobs panel: Ctrl+J
+            if state.show_jobs {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('j')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        state.show_jobs = false;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.job_cursor = state.job_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j')
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        let max = state.jobs.len().saturating_sub(1);
+                        if state.job_cursor < max {
+                            state.job_cursor += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             let entries = if state.active == Pane::Left {
                 &left_filtered
             } else {
@@ -224,7 +299,9 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                         pane.cursor -= 1;
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down | KeyCode::Char('j')
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     if cursor + 1 < entries.len() {
                         pane.cursor += 1;
                     }
@@ -436,6 +513,21 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                     state.show_bookmarks = !state.show_bookmarks;
                     state.bookmark_cursor = 0;
                 }
+                // F9: host panel
+                KeyCode::F(9) => {
+                    if !state.hosts.is_empty() {
+                        state.show_hosts = !state.show_hosts;
+                        state.host_cursor = 0;
+                    } else {
+                        state.message =
+                            Some("No hosts configured — add ~/.config/arx/hosts.toml".into());
+                    }
+                }
+                // Ctrl+J: jobs panel
+                KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.show_jobs = !state.show_jobs;
+                    state.job_cursor = 0;
+                }
                 _ => {}
             }
         }
@@ -597,6 +689,16 @@ fn render(
         render_bookmarks(frame, area, state);
     }
 
+    // Hosts overlay
+    if state.show_hosts {
+        render_hosts(frame, area, state);
+    }
+
+    // Jobs overlay
+    if state.show_jobs {
+        render_jobs(frame, area, state);
+    }
+
     // Status bar
     let pane = state.active_pane();
     let loc_str = match &pane.location {
@@ -727,6 +829,70 @@ fn render_bookmarks(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Bookmarks (Ctrl+B: close, Enter: go) "),
+        )
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
+    frame.render_stateful_widget(list, popup_area, &mut list_state);
+}
+
+fn render_hosts(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    if state.hosts.is_empty() {
+        return;
+    }
+    let popup_area = centered_rect(60, 70, area);
+    frame.render_widget(Clear, popup_area);
+
+    let items: Vec<ListItem> = state
+        .hosts
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let prefix = if i == state.host_cursor { "> " } else { "  " };
+            let line = format!("{prefix}{} ({})", h.name, h.hostname);
+            ListItem::new(Line::from(line))
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.host_cursor));
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Hosts (F9: close, Enter: open) "),
+        )
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
+    frame.render_stateful_widget(list, popup_area, &mut list_state);
+}
+
+fn render_jobs(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    let popup_area = centered_rect(70, 70, area);
+    frame.render_widget(Clear, popup_area);
+
+    let items: Vec<ListItem> = if state.jobs.is_empty() {
+        vec![ListItem::new(Line::from(
+            "  No jobs yet — start a copy/move to see it here.",
+        ))]
+    } else {
+        state
+            .jobs
+            .iter()
+            .enumerate()
+            .map(|(i, j)| {
+                let prefix = if i == state.job_cursor { "> " } else { "  " };
+                ListItem::new(Line::from(format!("{prefix}{j}")))
+            })
+            .collect()
+    };
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.job_cursor));
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Jobs (Ctrl+J: close) "),
         )
         .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
     frame.render_stateful_widget(list, popup_area, &mut list_state);

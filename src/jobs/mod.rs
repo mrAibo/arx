@@ -1,50 +1,41 @@
 use crate::vfs::Location;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JobState {
-    Queued,
-    Starting,
-    Running,
-    Cancelling,
-    Cancelled,
-    Failed,
-    Finished,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JobKind {
-    Copy,
-    Move,
-    Sync,
-    Archive,
-    Search,
-    RemoteCommand,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Progress {
-    pub completed_bytes: u64,
-    pub total_bytes: Option<u64>,
-    pub bytes_per_second: Option<f64>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Job {
-    pub id: u64,
-    pub kind: JobKind,
-    pub state: JobState,
+    pub id: String,
+    pub description: String,
     pub source: Location,
-    pub destination: Option<Location>,
-    pub progress: Option<Progress>,
+    pub destination: Location,
+    pub status: JobStatus,
+    pub progress: u8, // 0-100 percent
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum JobEvent {
-    Started(u64),
-    Progress(u64, Progress),
-    Output(u64, String),
-    Warning(u64, String),
-    Finished(u64),
-    Failed(u64, String),
-    Cancelled(u64),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Pending,
+    Running,
+    Done,
+    Failed,
+}
+
+impl Job {
+    pub fn status_icon(&self) -> &str {
+        match self.status {
+            JobStatus::Pending => "⏳",
+            JobStatus::Running => "⚡",
+            JobStatus::Done => "✅",
+            JobStatus::Failed => "❌",
+        }
+    }
+}
+
+impl std::fmt::Display for Job {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pct = if self.status == JobStatus::Running {
+            format!("{}%", self.progress)
+        } else {
+            String::new()
+        };
+        write!(f, "{} {} {}", self.status_icon(), self.description, pct)
+    }
 }

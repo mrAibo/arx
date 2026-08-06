@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use crate::jobs::Job;
+use crate::remote::Host;
 use crate::vfs::Location;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +85,14 @@ pub struct AppState {
     pub bookmarks: Vec<Location>,
     pub show_bookmarks: bool,
     pub bookmark_cursor: usize,
+    // B3: host panel
+    pub hosts: Vec<Host>,
+    pub show_hosts: bool,
+    pub host_cursor: usize,
+    // B4: job queue
+    pub jobs: Vec<Job>,
+    pub show_jobs: bool,
+    pub job_cursor: usize,
 }
 
 impl Default for AppState {
@@ -116,6 +126,12 @@ impl Default for AppState {
             bookmarks,
             show_bookmarks: false,
             bookmark_cursor: 0,
+            hosts: Vec::new(),
+            show_hosts: false,
+            host_cursor: 0,
+            jobs: Vec::new(),
+            show_jobs: false,
+            job_cursor: 0,
         }
     }
 }
