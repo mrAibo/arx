@@ -1146,25 +1146,74 @@ async fn event_loop(
                                     });
                                     let tx = job_tx.clone();
                                     let names2 = names.clone();
+                                    let use_rsync = std::process::Command::new("rsync")
+                                        .arg("--version")
+                                        .output()
+                                        .map(|o| o.status.success())
+                                        .unwrap_or(false);
                                     tokio::task::spawn_blocking(move || {
                                         tx.send(arx::jobs::JobEvent::Running { id: id.clone() })
                                             .ok();
-                                        let src_loc = Location::Local(src.clone());
-                                        let result = src_loc.copy_files(&src, &dst, &names2);
-                                        match result {
-                                            Ok(n) => {
-                                                tx.send(arx::jobs::JobEvent::Done {
-                                                    id,
-                                                    message: format!("Copied {n} item(s)"),
-                                                })
-                                                .ok();
+                                        if use_rsync {
+                                            // ponytail: rsync -avh --progress for each selected file
+                                            let mut ok = 0u64;
+                                            for name in &names2 {
+                                                let src_path = src.join(name);
+                                                if src_path.is_dir() {
+                                                    let status =
+                                                        std::process::Command::new("rsync")
+                                                            .args([
+                                                                "-avh",
+                                                                "--progress",
+                                                                src_path.to_str().unwrap_or(""),
+                                                                dst.to_str().unwrap_or(""),
+                                                            ])
+                                                            .status();
+                                                    if status.map(|s| s.success()).unwrap_or(false)
+                                                    {
+                                                        ok += 1;
+                                                    }
+                                                } else if let Ok(status) =
+                                                    std::process::Command::new("rsync")
+                                                        .args([
+                                                            "-avh",
+                                                            "--progress",
+                                                            src_path.to_str().unwrap_or(""),
+                                                            dst.to_str().unwrap_or(""),
+                                                        ])
+                                                        .status()
+                                                {
+                                                    if status.success() {
+                                                        ok += 1;
+                                                    }
+                                                }
                                             }
-                                            Err(e) => {
-                                                tx.send(arx::jobs::JobEvent::Failed {
-                                                    id,
-                                                    error: format!("Copy error: {e}"),
-                                                })
-                                                .ok();
+                                            tx.send(arx::jobs::JobEvent::Done {
+                                                id,
+                                                message: format!(
+                                                    "rsync: {ok}/{} file(s)",
+                                                    names2.len()
+                                                ),
+                                            })
+                                            .ok();
+                                        } else {
+                                            let src_loc = Location::Local(src.clone());
+                                            let result = src_loc.copy_files(&src, &dst, &names2);
+                                            match result {
+                                                Ok(n) => {
+                                                    tx.send(arx::jobs::JobEvent::Done {
+                                                        id,
+                                                        message: format!("Copied {n} item(s)"),
+                                                    })
+                                                    .ok();
+                                                }
+                                                Err(e) => {
+                                                    tx.send(arx::jobs::JobEvent::Failed {
+                                                        id,
+                                                        error: format!("Copy error: {e}"),
+                                                    })
+                                                    .ok();
+                                                }
                                             }
                                         }
                                     });
