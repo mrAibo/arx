@@ -1,7 +1,7 @@
 use arx::app::{Action, AppState, Pane, PaneState, PanelMode, SortMode};
 use arx::vfs::{Entry, EntryKind, Location, VfsOps};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -177,49 +177,67 @@ async fn event_loop(
                     }
                 }
                 Event::Mouse(mouse) => {
-                    use crossterm::event::MouseEventKind;
+                    // Compute pane + row once for all mouse events
+                    let (area, is_left) = if let Some(a) = state.left_area {
+                        if mouse.column >= a.x
+                            && mouse.column < a.x + a.width
+                            && mouse.row > a.y
+                            && mouse.row < a.y + a.height
+                        {
+                            (a, true)
+                        } else if let Some(a) = state.right_area {
+                            (a, false)
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    };
+                    let row = (mouse.row.saturating_sub(area.y + 1)) as usize;
+
                     match mouse.kind {
                         MouseEventKind::ScrollDown if !state.viewer_content.is_empty() => {
-                            let max = state.viewer_content.len().saturating_sub(1);
-                            if state.viewer_scroll < max {
-                                state.viewer_scroll += 1;
-                            }
+                            state.viewer_scroll = (state.viewer_scroll + 1)
+                                .min(state.viewer_content.len().saturating_sub(1));
                         }
                         MouseEventKind::ScrollUp if !state.viewer_content.is_empty() => {
                             state.viewer_scroll = state.viewer_scroll.saturating_sub(1);
                         }
-                        _ => {}
-                    }
-                    if let MouseEventKind::Down(_) = mouse.kind {
-                        let (area, is_left) = if let Some(a) = state.left_area {
-                            if mouse.column >= a.x
-                                && mouse.column < a.x + a.width
-                                && mouse.row > a.y
-                                && mouse.row < a.y + a.height
-                            {
-                                (a, true)
-                            } else if let Some(a) = state.right_area {
-                                (a, false)
-                            } else {
-                                continue;
-                            }
-                        } else {
-                            continue;
-                        };
-                        let row = (mouse.row.saturating_sub(area.y + 1)) as usize;
-                        let filt = if is_left {
-                            &left_filtered
-                        } else {
-                            &right_filtered
-                        };
-                        if row < filt.len() {
-                            if is_left {
-                                state.left.cursor = row;
-                            } else {
-                                state.right.cursor = row;
-                            }
-                            state.active = if is_left { Pane::Left } else { Pane::Right };
+                        MouseEventKind::Down(MouseButton::Right) => {
+                            state.show_context_menu = !state.show_context_menu;
+                            state.context_menu_pos = (mouse.column, mouse.row);
                         }
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            let filt = if is_left {
+                                &left_filtered
+                            } else {
+                                &right_filtered
+                            };
+                            if row < filt.len() {
+                                let name = &filt[row].name;
+                                if state.selected.contains(name) {
+                                    state.selected.remove(name);
+                                } else {
+                                    state.selected.insert(name.clone());
+                                }
+                            }
+                        }
+                        MouseEventKind::Down(_) => {
+                            let filt = if is_left {
+                                &left_filtered
+                            } else {
+                                &right_filtered
+                            };
+                            if row < filt.len() {
+                                if is_left {
+                                    state.left.cursor = row;
+                                } else {
+                                    state.right.cursor = row;
+                                }
+                                state.active = if is_left { Pane::Left } else { Pane::Right };
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Event::Key(key) => {
@@ -1844,6 +1862,26 @@ fn render(
             )))
             .highlight_style(Style::default().fg(Color::Yellow));
         frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
+    }
+
+    // Context menu (right-click)
+    if state.show_context_menu {
+        let popup = centered_rect(18, 7, area);
+        frame.render_widget(Clear, popup);
+        let items: Vec<ListItem> = [
+            "Copy   F5",
+            "Move   F6",
+            "Delete F8",
+            "View   F3",
+            "Edit   F4",
+        ]
+        .iter()
+        .map(|s| ListItem::new(*s))
+        .collect();
+        let list = ratatui::widgets::List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(" Menu "))
+            .highlight_style(Style::default().fg(Color::Yellow));
+        frame.render_widget(list, popup);
     }
 
     // Bookmarks overlay

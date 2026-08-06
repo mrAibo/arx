@@ -180,6 +180,8 @@ pub struct AppState {
     pub rename_pattern: String,
     pub show_command_center: bool,
     pub show_tree: bool,
+    pub show_context_menu: bool,
+    pub context_menu_pos: (u16, u16),
     pub command_matches: Vec<(String, String)>,
     pub overlay_list_state: ratatui::widgets::ListState,
 }
@@ -252,6 +254,8 @@ impl Default for AppState {
             rename_pattern: String::new(),
             show_command_center: false,
             show_tree: false,
+            show_context_menu: false,
+            context_menu_pos: (0, 0),
             command_matches: Vec::new(),
             overlay_list_state: ratatui::widgets::ListState::default(),
         }
