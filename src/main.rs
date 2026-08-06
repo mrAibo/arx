@@ -11,8 +11,9 @@ struct Cli {
     config: Option<std::path::PathBuf>,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let _cli = Cli::parse();
     let config = arx::config::load();
-    tui::run(config).expect("TUI exited with error");
+    tui::run(config).await.expect("TUI exited with error");
 }
