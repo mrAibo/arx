@@ -107,6 +107,12 @@ impl PaneState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PanelMode {
+    Full,  // name + size + time (default)
+    Brief, // filenames in columns
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub should_quit: bool,
@@ -123,6 +129,7 @@ pub struct AppState {
     pub show_hidden: bool,
     // A3: sort order
     pub sort_mode: SortMode,
+    pub panel_mode: PanelMode,
     // A1: file viewer
     pub viewer_content: Vec<String>,
     pub viewer_scroll: usize,
@@ -183,6 +190,7 @@ impl Default for AppState {
             show_help: false,
             show_hidden: false,
             sort_mode: SortMode::NameAsc,
+            panel_mode: PanelMode::Full,
             viewer_content: Vec::new(),
             viewer_scroll: 0,
             left_area: None,

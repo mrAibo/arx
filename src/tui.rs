@@ -1,4 +1,4 @@
-use arx::app::{Action, AppState, Pane, PaneState, SortMode};
+use arx::app::{Action, AppState, Pane, PaneState, PanelMode, SortMode};
 use arx::vfs::{Entry, EntryKind, Location, archive::ArchiveFs, local::LocalFs, sftp::SftpFs};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -33,6 +33,7 @@ pub fn run(config: arx::config::ArxConfig) -> io::Result<()> {
     result
 }
 
+#[allow(clippy::collapsible_if)]
 fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) -> io::Result<()> {
     let editor = config.ui.editor.clone();
     let mut state = AppState {
@@ -1053,6 +1054,7 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                         state.job_cursor = 0;
                     }
                     // Ctrl+X D: toggle directory compare
+                    // Alt+T: toggle panel mode (Full ↔ Brief) KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => { state.panel_mode = match state.panel_mode { PanelMode::Full => PanelMode::Brief, PanelMode::Brief => PanelMode::Full, }; }
                     KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         state.show_diff = !state.show_diff;
                         state.message = Some(if state.show_diff {
@@ -1311,6 +1313,7 @@ fn render(
         state.active == Pane::Left,
         &state.selected,
         &left_only,
+        state.panel_mode,
     );
     render_pane(
         frame,
@@ -1321,6 +1324,7 @@ fn render(
         state.active == Pane::Right,
         &state.selected,
         &right_only,
+        state.panel_mode,
     );
 
     // Help overlay
@@ -1617,12 +1621,48 @@ fn render_pane(
     active: bool,
     selected: &std::collections::BTreeSet<String>,
     unique_set: &std::collections::BTreeSet<&str>,
+    panel_mode: PanelMode,
 ) {
     let border_style = if active {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
     };
+
+    let title = format!(" {} ", pane.location.label());
+
+    if panel_mode == PanelMode::Brief {
+        // ponytail: brief mode — filenames in columns, no list state
+        let names: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                let icon = match e.kind {
+                    EntryKind::Directory => "📁 ",
+                    EntryKind::Symlink => "🔗 ",
+                    _ => "📄 ",
+                };
+                let sel_mark = if selected.contains(&e.name) {
+                    "* "
+                } else {
+                    "  "
+                };
+                format!("{sel_mark}{icon}{}", e.name)
+            })
+            .collect();
+        let text = names.join("  ");
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(title)
+                        .border_style(border_style),
+                )
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
 
     let items: Vec<ListItem> = entries
         .iter()
@@ -1660,6 +1700,39 @@ fn render_pane(
         .collect();
 
     let title = format!(" {} ", pane.location.label());
+
+    if panel_mode == PanelMode::Brief {
+        let names: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                let icon = match e.kind {
+                    EntryKind::Directory => "📁 ",
+                    EntryKind::Symlink => "🔗 ",
+                    _ => "📄 ",
+                };
+                let sel_mark = if selected.contains(&e.name) {
+                    "* "
+                } else {
+                    "  "
+                };
+                format!("{sel_mark}{icon}{}", e.name)
+            })
+            .collect();
+        let text = names.join("  ");
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(title)
+                        .border_style(border_style),
+                )
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
+
     let list = List::new(items)
         .block(
             Block::default()
