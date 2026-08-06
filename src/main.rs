@@ -13,8 +13,6 @@ struct Cli {
 
 fn main() {
     let _cli = Cli::parse();
-    // ponytail: config path from CLI not yet wired — default path only
-    let _config = arx::config::load();
-
-    tui::run().expect("TUI exited with error");
+    let config = arx::config::load();
+    tui::run(config).expect("TUI exited with error");
 }

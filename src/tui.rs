@@ -15,13 +15,13 @@ use ratatui::{
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub fn run() -> io::Result<()> {
+pub fn run(config: arx::config::ArxConfig) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))?;
 
-    let result = event_loop(&mut terminal);
+    let result = event_loop(&mut terminal, config);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -29,8 +29,11 @@ pub fn run() -> io::Result<()> {
     result
 }
 
-fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
-    let mut state = AppState::default();
+fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) -> io::Result<()> {
+    let mut state = AppState {
+        show_hidden: config.ui.show_hidden,
+        ..AppState::default()
+    };
     let mut left_entries = load_entries(&state.left.location, state.show_hidden);
     let mut right_entries = load_entries(&state.right.location, state.show_hidden);
     let mut left_list = ListState::default();

@@ -35,7 +35,7 @@ pub fn load() -> ArxConfig {
         match std::fs::read_to_string(&path) {
             Ok(content) => toml::from_str(&content).unwrap_or_default(),
             Err(e) => {
-                tracing::warn!("cannot read config {}: {e}", path.display());
+                eprintln!("arx: cannot read config {}: {e}", path.display());
                 ArxConfig::default()
             }
         }
