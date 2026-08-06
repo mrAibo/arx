@@ -44,6 +44,7 @@ pub fn start_watch(local: &Path, remote_host: &str, remote_path: &str) -> io::Re
                 .args(["-avz", "--delete", &local.to_string_lossy(), &target])
                 .status();
         }
+        let _ = child.wait();
     });
 
     Ok(())

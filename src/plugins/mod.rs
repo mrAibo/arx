@@ -15,6 +15,12 @@ pub struct PluginRegistry {
     lua: mlua::Lua,
 }
 
+impl Default for PluginRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PluginRegistry {
     pub fn new() -> Self {
         Self {
@@ -53,7 +59,7 @@ impl PluginRegistry {
     pub fn eval(&self, code: &str) -> Result<String, String> {
         self.lua
             .load(code)
-            .eval::<mlua::String>()
+            .eval::<mlua::LuaString>()
             .map(|s| s.to_string_lossy())
             .map_err(|e| format!("{e}"))
     }

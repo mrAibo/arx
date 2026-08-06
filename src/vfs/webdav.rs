@@ -27,7 +27,7 @@ impl WebDavProvider {
             .body(body)
             .send()
             .map_err(|e| io::Error::other(format!("WebDAV: {e}")))?;
-        resp.text().map_err(|e| io::Error::other(e))
+        resp.text().map_err(io::Error::other)
     }
 }
 
@@ -47,15 +47,14 @@ impl VfsProvider for WebDavProvider {
             let is_dir = resp.contains("<D:collection/>") || resp.contains("<D:collection />");
             let name = href
                 .split('/')
-                .filter(|s| !s.is_empty())
-                .last()
+                .rfind(|s| !s.is_empty())
                 .unwrap_or(&href)
                 .to_string();
             if name.is_empty() {
                 continue;
             }
             entries.push(Entry {
-                name: if is_dir { name } else { name },
+                name,
                 kind: if is_dir {
                     EntryKind::Directory
                 } else {
@@ -74,7 +73,7 @@ impl VfsProvider for WebDavProvider {
             .basic_auth(&self.config.user, Some(&self.config.password))
             .send()
             .map_err(|e| io::Error::other(format!("WebDAV GET: {e}")))?;
-        let body = resp.text().map_err(|e| io::Error::other(e))?;
+        let body = resp.text().map_err(io::Error::other)?;
         Ok(body.lines().take(lines).map(|s| s.to_string()).collect())
     }
 
