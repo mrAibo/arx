@@ -7,13 +7,13 @@ use crossterm::{
 };
 use ratatui::{
     DefaultTerminal,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub fn run() -> io::Result<()> {
     enable_raw_mode()?;
@@ -31,8 +31,8 @@ pub fn run() -> io::Result<()> {
 
 fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
     let mut state = AppState::default();
-    let mut left_entries = load_entries(&state.left.location);
-    let mut right_entries = load_entries(&state.right.location);
+    let mut left_entries = load_entries(&state.left.location, state.show_hidden);
+    let mut right_entries = load_entries(&state.right.location, state.show_hidden);
     let mut left_list = ListState::default();
     let mut right_list = ListState::default();
 
@@ -65,17 +65,17 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
 
         #[allow(clippy::collapsible_if)]
         if let Event::Key(key) = event::read()? {
-            // If composing filter or glob, keys go to buffer
-            if state.filtering || state.glob_input {
+            // If composing filter/glob/go-to, keys go to buffer
+            if state.filtering || state.glob_input || state.go_input {
                 match key.code {
                     KeyCode::Esc => {
                         state.filter.clear();
                         state.filtering = false;
                         state.glob_input = false;
+                        state.go_input = false;
                     }
                     KeyCode::Enter => {
                         if state.glob_input && !state.filter.is_empty() {
-                            // Select all filtered entries matching the glob
                             let filt = if state.active == Pane::Left {
                                 &left_filtered
                             } else {
@@ -86,9 +86,34 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
                             }
                             state.message = Some(format!("Selected {}", state.selected.len()));
                             state.filter.clear();
+                        } else if state.go_input && !state.filter.is_empty() {
+                            // Navigate to typed path
+                            let target = PathBuf::from(&state.filter);
+                            let resolved = if target.is_absolute() {
+                                target
+                            } else {
+                                match &state.active_pane().location {
+                                    Location::Local(p) => p.join(&target),
+                                    _ => target,
+                                }
+                            };
+                            if resolved.is_dir() {
+                                let pane = state.active_pane_mut();
+                                pane.location = Location::Local(resolved);
+                                pane.cursor = 0;
+                                state.selected.clear();
+                                left_entries =
+                                    load_entries(&state.left.location, state.show_hidden);
+                                right_entries =
+                                    load_entries(&state.right.location, state.show_hidden);
+                            } else {
+                                state.message = Some(format!("Not a directory: {}", state.filter));
+                            }
+                            state.filter.clear();
                         }
                         state.filtering = false;
                         state.glob_input = false;
+                        state.go_input = false;
                     }
                     KeyCode::Backspace => {
                         state.filter.pop();
@@ -139,6 +164,9 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
                     state.filter.clear();
                     state.filtering = true;
                 }
+                KeyCode::Char('?') => {
+                    state.show_help = !state.show_help;
+                }
                 KeyCode::Enter => {
                     if let Some(entry) = entries.get(cursor) {
                         if entry.kind == EntryKind::Directory {
@@ -150,9 +178,11 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
                             pane.cursor = 0;
                             state.selected.clear();
                             if state.active == Pane::Left {
-                                left_entries = load_entries(&state.left.location);
+                                left_entries =
+                                    load_entries(&state.left.location, state.show_hidden);
                             } else {
-                                right_entries = load_entries(&state.right.location);
+                                right_entries =
+                                    load_entries(&state.right.location, state.show_hidden);
                             }
                         }
                     }
@@ -165,16 +195,32 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
                             pane.cursor = 0;
                             state.selected.clear();
                             if state.active == Pane::Left {
-                                left_entries = load_entries(&state.left.location);
+                                left_entries =
+                                    load_entries(&state.left.location, state.show_hidden);
                             } else {
-                                right_entries = load_entries(&state.right.location);
+                                right_entries =
+                                    load_entries(&state.right.location, state.show_hidden);
                             }
                         }
                     }
                 }
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    left_entries = load_entries(&state.left.location);
-                    right_entries = load_entries(&state.right.location);
+                    left_entries = load_entries(&state.left.location, state.show_hidden);
+                    right_entries = load_entries(&state.right.location, state.show_hidden);
+                }
+                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.filter.clear();
+                    state.go_input = true;
+                }
+                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.show_hidden = !state.show_hidden;
+                    state.message = Some(if state.show_hidden {
+                        "Hidden files shown".into()
+                    } else {
+                        "Hidden files hidden".into()
+                    });
+                    left_entries = load_entries(&state.left.location, state.show_hidden);
+                    right_entries = load_entries(&state.right.location, state.show_hidden);
                 }
                 // F5: copy selected (or cursor) from active pane to other pane
                 KeyCode::F(5) => {
@@ -185,8 +231,8 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
                         Err(e) => format!("Copy error: {e}"),
                     });
                     state.selected.clear();
-                    left_entries = load_entries(&state.left.location);
-                    right_entries = load_entries(&state.right.location);
+                    left_entries = load_entries(&state.left.location, state.show_hidden);
+                    right_entries = load_entries(&state.right.location, state.show_hidden);
                 }
                 // F6: move selected (or cursor) from active pane to other pane
                 KeyCode::F(6) => {
@@ -197,8 +243,8 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
                         Err(e) => format!("Move error: {e}"),
                     });
                     state.selected.clear();
-                    left_entries = load_entries(&state.left.location);
-                    right_entries = load_entries(&state.right.location);
+                    left_entries = load_entries(&state.left.location, state.show_hidden);
+                    right_entries = load_entries(&state.right.location, state.show_hidden);
                 }
                 // F8: delete selected (or cursor) from active pane
                 KeyCode::F(8) => {
@@ -214,8 +260,8 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
                             }
                         }
                         state.selected.clear();
-                        left_entries = load_entries(&state.left.location);
-                        right_entries = load_entries(&state.right.location);
+                        left_entries = load_entries(&state.left.location, state.show_hidden);
+                        right_entries = load_entries(&state.right.location, state.show_hidden);
                     }
                 }
                 // *: invert selection on visible entries
@@ -246,11 +292,15 @@ fn event_loop(terminal: &mut DefaultTerminal) -> io::Result<()> {
     Ok(())
 }
 
-fn load_entries(location: &Location) -> Vec<Entry> {
-    match location {
+fn load_entries(location: &Location, show_hidden: bool) -> Vec<Entry> {
+    let mut entries = match location {
         Location::Local(path) => LocalFs::list(path).unwrap_or_default(),
         _ => vec![],
+    };
+    if !show_hidden {
+        entries.retain(|e| !e.name.starts_with('.'));
     }
+    entries
 }
 
 fn apply_filter<'a>(entries: &'a [Entry], filter: &str) -> Vec<&'a Entry> {
@@ -265,7 +315,6 @@ fn apply_filter<'a>(entries: &'a [Entry], filter: &str) -> Vec<&'a Entry> {
     }
 }
 
-/// Get the filesystem path for the active pane's location (if Local).
 fn pane_location_path(state: &AppState) -> Option<&Path> {
     match &state.active_pane().location {
         Location::Local(p) => Some(p),
@@ -273,7 +322,6 @@ fn pane_location_path(state: &AppState) -> Option<&Path> {
     }
 }
 
-/// Get the filesystem path for the OTHER pane's location (if Local).
 fn other_pane_location_path(state: &AppState) -> Option<&Path> {
     let other = match state.active {
         Pane::Left => &state.right,
@@ -285,7 +333,6 @@ fn other_pane_location_path(state: &AppState) -> Option<&Path> {
     }
 }
 
-/// Names to operate on: selected set, or the single cursor entry.
 fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> Vec<String> {
     if !state.selected.is_empty() {
         state.selected.iter().cloned().collect()
@@ -296,7 +343,6 @@ fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> V
     }
 }
 
-/// Execute a two-pane operation (copy/move): src = active pane, dst = other pane.
 fn do_op<F>(state: &AppState, op: F) -> io::Result<usize>
 where
     F: FnOnce(&Path, &Path) -> io::Result<usize>,
@@ -348,13 +394,20 @@ fn render(
         &state.selected,
     );
 
+    // Help overlay
+    if state.show_help {
+        render_help(frame, area);
+    }
+
     // Status bar
     let pane = state.active_pane();
     let loc_str = match &pane.location {
         Location::Local(p) => p.display().to_string(),
         other => other.to_string(),
     };
-    let filter_hint = if state.glob_input {
+    let hint = if state.go_input {
+        format!(" go: {}_", state.filter)
+    } else if state.glob_input {
         format!(" glob: {}_", state.filter)
     } else if state.filtering {
         format!(" filter: {}_", state.filter)
@@ -363,15 +416,76 @@ fn render(
     } else {
         String::new()
     };
+    let hidden = if state.show_hidden { " [dot]" } else { "" };
     let msg_hint = message.map(|m| format!(" | {m}")).unwrap_or_default();
 
     let status = Paragraph::new(Line::from(format!(
-        "ARX v0.1.0 | {} | sel: {} |{filter_hint}{msg_hint} | q: quit | Tab: switch | Space: sel | /: filter | F5: copy | F6: move | F8: del",
+        "ARX v0.1.0 | {}{hidden} | sel: {} |{hint}{msg_hint} | ?: help",
         loc_str,
         state.selected.len(),
     )))
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(status, chunks[1]);
+}
+
+fn render_help(frame: &mut ratatui::Frame, area: Rect) {
+    let popup_area = centered_rect(60, 60, area);
+    frame.render_widget(Clear, popup_area);
+
+    let text = vec![
+        Line::from(Span::styled("ARX Help", Style::default().fg(Color::Yellow))),
+        Line::from(""),
+        Line::from("Navigation"),
+        Line::from("  j/↓ k/↑      Move cursor"),
+        Line::from("  Enter         Enter directory"),
+        Line::from("  Backspace     Go to parent directory"),
+        Line::from("  Tab           Switch active pane"),
+        Line::from("  Ctrl+G        Go to path"),
+        Line::from(""),
+        Line::from("Selection & Filter"),
+        Line::from("  Space         Toggle selection"),
+        Line::from("  *             Invert selection"),
+        Line::from("  +             Select by glob pattern"),
+        Line::from("  /             Quick filter by name"),
+        Line::from("  Ctrl+H        Toggle hidden (dot) files"),
+        Line::from(""),
+        Line::from("File Operations"),
+        Line::from("  F5            Copy to other pane"),
+        Line::from("  F6            Move to other pane"),
+        Line::from("  F8            Delete"),
+        Line::from(""),
+        Line::from("Other"),
+        Line::from("  Ctrl+R        Refresh"),
+        Line::from("  q             Quit"),
+        Line::from("  ?             This help"),
+    ];
+
+    let help = Paragraph::new(text)
+        .block(Block::default().borders(Borders::ALL).title(" Help "))
+        .style(Style::default().fg(Color::White))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(help, popup_area);
+}
+
+/// ponytail: simple centered rect helper; add flexible sizing when needed
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }
 
 fn render_pane(

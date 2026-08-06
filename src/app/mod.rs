@@ -45,6 +45,12 @@ pub struct AppState {
     pub message: Option<String>,
     /// True while composing a glob pattern for + (select-by-glob).
     pub glob_input: bool,
+    /// True while composing a go-to path (Ctrl+G).
+    pub go_input: bool,
+    /// Show help overlay.
+    pub show_help: bool,
+    /// Show hidden (dot) files.
+    pub show_hidden: bool,
 }
 
 impl Default for AppState {
@@ -67,6 +73,9 @@ impl Default for AppState {
             filtering: false,
             message: None,
             glob_input: false,
+            go_input: false,
+            show_help: false,
+            show_hidden: false,
         }
     }
 }
