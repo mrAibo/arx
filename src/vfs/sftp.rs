@@ -53,10 +53,15 @@ async fn list_sftp(host: &Host, remote_path: &str) -> anyhow::Result<Vec<Entry>>
         .await
         .with_context(|| format!("SSH connect to {hostname}:{port}"))?;
 
-    // Try key auth, fall back to password
+    // Try key auth, fall back to keyring, then env var
     let authed = if let Ok(key_pair) = load_key_pair() {
         matches!(
             client.authenticate_publickey(&user, key_pair).await,
+            Ok(russh::client::AuthResult::Success)
+        )
+    } else if let Some(pw) = crate::keyring::get_password(&hostname, &user) {
+        matches!(
+            client.authenticate_password(&user, &pw).await,
             Ok(russh::client::AuthResult::Success)
         )
     } else if let Ok(pw) = std::env::var("SSH_PASSWORD") {
@@ -71,7 +76,7 @@ async fn list_sftp(host: &Host, remote_path: &str) -> anyhow::Result<Vec<Entry>>
     anyhow::ensure!(
         authed,
         "SSH auth failed.\n\
-         Try: ssh-agent (SSH_AUTH_SOCK), ~/.ssh/id_*, or SSH_PASSWORD env var.\n\
+         Try: ssh-agent (SSH_AUTH_SOCK), ~/.ssh/id_*, OS keyring (arx-ssh), or SSH_PASSWORD env var.\n\
          ponytail: full ssh-agent + ~/.ssh/config resolution deferred — russh agent client needs typed Handler"
     );
 

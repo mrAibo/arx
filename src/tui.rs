@@ -1621,7 +1621,7 @@ async fn event_loop(
                         // Ctrl+I: toggle Infrastructure Center
                         // Ctrl+S: save workspace
                         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            match crate::workspace::save_workspace(state) {
+                            match crate::workspace::save_workspace(&state) {
                                 Ok(()) => state.message = Some("Workspace saved".into()),
                                 Err(e) => state.message = Some(format!("Save failed: {e}")),
                             }

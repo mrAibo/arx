@@ -25,6 +25,7 @@ russh-sftp = "2.1"
 async-trait = "0.1"
 anyhow = "1"
 portable-pty = "0.8"
+keyring = "4.1.6"
 
 [dev-dependencies]
 tempfile = "3"

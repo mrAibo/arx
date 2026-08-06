@@ -1,6 +1,7 @@
 pub mod app;
 pub mod config;
 pub mod jobs;
+pub mod keyring;
 pub mod plugins;
 pub mod remote;
 pub mod terminal;
