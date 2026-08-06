@@ -37,6 +37,7 @@ pub enum JobStatus {
 #[derive(Debug, Clone)]
 pub enum JobEvent {
     Running { id: String },
+    Progress { id: String, percent: u8 },
     Done { id: String, message: String },
     Failed { id: String, error: String },
 }

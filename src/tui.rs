@@ -67,6 +67,11 @@ async fn event_loop(
                         job.status = arx::jobs::JobStatus::Running;
                     }
                 }
+                arx::jobs::JobEvent::Progress { ref id, percent } => {
+                    if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
+                        job.progress = percent;
+                    }
+                }
                 arx::jobs::JobEvent::Done {
                     ref id,
                     ref message,
@@ -1250,8 +1255,15 @@ async fn event_loop(
                                         if use_rsync {
                                             // ponytail: rsync -avh --progress for each selected file
                                             let mut ok = 0u64;
-                                            for name in &names2 {
+                                            let total = names2.len() as u8;
+                                            for (i, name) in names2.iter().enumerate() {
                                                 let src_path = src.join(name);
+                                                let pct = (i + 1) as u8 * 100 / total.max(1);
+                                                tx.send(arx::jobs::JobEvent::Progress {
+                                                    id: id.clone(),
+                                                    percent: pct,
+                                                })
+                                                .ok();
                                                 if src_path.is_dir() {
                                                     let status =
                                                         std::process::Command::new("rsync")
@@ -2389,7 +2401,19 @@ fn render_jobs(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
             .enumerate()
             .map(|(i, j)| {
                 let prefix = if i == state.job_cursor { "> " } else { "  " };
-                ListItem::new(Line::from(format!("{prefix}{j}")))
+                let bar = if j.status == arx::jobs::JobStatus::Running {
+                    let filled = j.progress as usize / 5; // 0-20 chars
+                    let empty = 20 - filled;
+                    format!(
+                        " [{}{}] {}%",
+                        "=".repeat(filled),
+                        " ".repeat(empty),
+                        j.progress
+                    )
+                } else {
+                    String::new()
+                };
+                ListItem::new(Line::from(format!("{prefix}{j} {bar}")))
             })
             .collect()
     };
@@ -2716,6 +2740,11 @@ fn handle_job_event(
         arx::jobs::JobEvent::Running { id } => {
             if let Some(job) = state.jobs.iter_mut().find(|j| j.id == id) {
                 job.status = arx::jobs::JobStatus::Running;
+            }
+        }
+        arx::jobs::JobEvent::Progress { id, percent } => {
+            if let Some(job) = state.jobs.iter_mut().find(|j| j.id == id) {
+                job.progress = percent;
             }
         }
         arx::jobs::JobEvent::Done { id, message } => {
