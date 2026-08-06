@@ -162,6 +162,16 @@ pub struct AppState {
     // Terminal pane (right side, Ctrl+Shift+T toggle)
     pub term: Option<TermPane>,
     pub show_terminal: bool,
+    // Directory history (Alt+H)
+    pub dir_history: Vec<PathBuf>,
+    pub show_history: bool,
+    // Vim-style file search (/)
+    pub file_search: bool,
+    pub search_query: String,
+    pub search_matches: Vec<usize>,
+    pub search_index: usize,
+    // Panel ratio (default 50/50)
+    pub panel_ratio: u16,
 }
 
 impl Default for AppState {
@@ -217,6 +227,13 @@ impl Default for AppState {
             menu_cursor: 0,
             term: None,
             show_terminal: false,
+            dir_history: Vec::new(),
+            show_history: false,
+            file_search: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_index: 0,
+            panel_ratio: 50,
         }
     }
 }

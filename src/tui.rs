@@ -154,6 +154,18 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
             }
             Event::Mouse(mouse) => {
                 use crossterm::event::MouseEventKind;
+                match mouse.kind {
+                    MouseEventKind::ScrollDown if !state.viewer_content.is_empty() => {
+                        let max = state.viewer_content.len().saturating_sub(1);
+                        if state.viewer_scroll < max {
+                            state.viewer_scroll += 1;
+                        }
+                    }
+                    MouseEventKind::ScrollUp if !state.viewer_content.is_empty() => {
+                        state.viewer_scroll = state.viewer_scroll.saturating_sub(1);
+                    }
+                    _ => {}
+                }
                 if let MouseEventKind::Down(_) = mouse.kind {
                     let (area, is_left) = if let Some(a) = state.left_area {
                         if mouse.column >= a.x
@@ -601,6 +613,32 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                     KeyCode::Char('?') => {
                         state.show_help = !state.show_help;
                     }
+                    KeyCode::Enter
+                        if key.modifiers.contains(KeyModifiers::ALT)
+                            && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        if let Location::Local(dir) = &pane.location {
+                            let dir_c = dir.clone();
+                            let entries =
+                                arx::vfs::local::LocalFs::list(&dir_c).unwrap_or_default();
+                            let mut lines = vec!["Directory sizes:".into()];
+                            for e in &entries {
+                                if e.kind == EntryKind::Directory {
+                                    let p = dir_c.join(&e.name);
+                                    let size = std::process::Command::new("du")
+                                        .args(["-sh", &p.to_string_lossy()])
+                                        .output()
+                                        .map(|o| {
+                                            String::from_utf8_lossy(&o.stdout).trim().to_string()
+                                        })
+                                        .unwrap_or_else(|_| "?".into());
+                                    lines.push(format!("  {}  {}", size, e.name));
+                                }
+                            }
+                            state.viewer_content = lines;
+                            state.viewer_scroll = 0;
+                        }
+                    }
                     KeyCode::Enter => {
                         if let Some(entry) = entries.get(cursor) {
                             if entry.kind == EntryKind::Directory {
@@ -797,6 +835,32 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                             state.cmd_input = true;
                         }
                     }
+                    // Ctrl+A: file attributes (permissions/owner)
+                    KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(entry) = entries.get(cursor) {
+                            if let Location::Local(dir) = &pane.location {
+                                let p = dir.join(&entry.name);
+                                let stat_out = std::process::Command::new("stat")
+                                    .args(["-c", "%a %A %U:%G %s", &p.to_string_lossy()])
+                                    .output()
+                                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                                    .unwrap_or_default();
+                                let parts: Vec<&str> = stat_out.splitn(4, ' ').collect();
+                                let (octal, symbolic, owner, size_str) = if parts.len() >= 4 {
+                                    (parts[0], parts[1], parts[2], parts[3])
+                                } else {
+                                    ("?", "?", "?", "?")
+                                };
+                                state.viewer_content = vec![
+                                    format!("File: {}", p.display()),
+                                    format!("Permissions: {symbolic} ({octal})"),
+                                    format!("Owner:Group: {owner}"),
+                                    format!("Size:     {size_str} bytes"),
+                                ];
+                                state.viewer_scroll = 0;
+                            }
+                        }
+                    }
                     // Ctrl+I: file info (stat)
                     KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if let Some(entry) = entries.get(cursor) {
@@ -868,10 +932,38 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                     KeyCode::Char('\\') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if let Location::Local(dir) = &state.active_pane().location {
                             let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
-                            state.message = Some(format!("Opening {}", dir.display()));
+                            let dir_c = dir.clone();
+                            state.message = Some(format!("Opening {}", dir_c.display()));
+                            state.dir_history.push(dir_c);
+                            if state.dir_history.len() > 20 {
+                                state.dir_history.remove(0);
+                            }
                         }
                     }
-                    // Ctrl+Shift+T: toggle terminal in right pane
+                    // Ctrl+Shift+Left/Right: resize panel ratio
+                    KeyCode::Left
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        state.panel_ratio = state.panel_ratio.saturating_sub(5).max(10);
+                        state.message = Some(format!(
+                            "Panel: {}/{}",
+                            state.panel_ratio,
+                            100 - state.panel_ratio
+                        ));
+                    }
+                    KeyCode::Right
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        state.panel_ratio = (state.panel_ratio + 5).min(90);
+                        state.message = Some(format!(
+                            "Panel: {}/{}",
+                            state.panel_ratio,
+                            100 - state.panel_ratio
+                        ));
+                    }
+                    // Ctrl+Shift:T: toggle terminal in right pane
                     KeyCode::Char('t')
                         if key.modifiers.contains(KeyModifiers::CONTROL)
                             && key.modifiers.contains(KeyModifiers::SHIFT) =>
@@ -896,6 +988,10 @@ fn event_loop(terminal: &mut DefaultTerminal, config: arx::config::ArxConfig) ->
                                 }
                             }
                         }
+                    }
+                    // Alt+H: directory history
+                    KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        state.show_history = !state.show_history;
                     }
                     // Ctrl+O: drop to subshell, restore on exit
                     KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1453,7 +1549,10 @@ fn render(
 
     let panes = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .constraints([
+            Constraint::Ratio(state.panel_ratio as u32, 100),
+            Constraint::Ratio(100 - state.panel_ratio as u32, 100),
+        ])
         .split(chunks[0]);
 
     state.left_area = Some(panes[0]);
@@ -1540,6 +1639,56 @@ fn render(
     // Bookmarks overlay
     if state.show_bookmarks {
         render_bookmarks(frame, area, state);
+    }
+
+    // Directory history overlay (Alt+H)
+    if state.show_history {
+        let h = (state.dir_history.len() + 2).min(20) as u16;
+        let popup = centered_rect(60, h, area);
+        frame.render_widget(Clear, popup);
+        let mut items: Vec<ListItem> = state
+            .dir_history
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(i, p)| {
+                ListItem::new(format!(
+                    "{:2}  {}",
+                    state.dir_history.len() - i,
+                    p.display()
+                ))
+            })
+            .collect();
+        if items.is_empty() {
+            items.push(ListItem::new("(empty)"));
+        }
+        frame.render_widget(
+            List::new(items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Directory History (Alt+H) ")
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+            popup,
+        );
+    }
+
+    // File search bar (/)
+    if state.file_search {
+        frame.render_widget(
+            Paragraph::new(format!(
+                " /{}_  ({})",
+                state.search_query,
+                state.search_matches.len()
+            ))
+            .style(Style::default().fg(Color::Yellow).bg(Color::DarkGray)),
+            Rect {
+                x: area.x,
+                y: area.y + area.height.saturating_sub(2),
+                width: area.width,
+                height: 1,
+            },
+        );
     }
 
     // Hosts overlay
