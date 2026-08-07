@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::vfs::{Location, local::LocalFs};
 
 use super::{TransferIntent, TransferMethod, TransferPlan};
+use crate::transfer::sftp_copy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferProgress {
@@ -52,9 +53,12 @@ pub async fn execute_transfer(
     match plan.method {
         TransferMethod::Native => execute_native(plan, names, cancel, &mut on_progress).await,
         TransferMethod::Rsync => execute_rsync(plan, names, cancel, &mut on_progress).await,
-        TransferMethod::Sftp | TransferMethod::Scp => Err(TransferExecutionError::InvalidPlan {
+        TransferMethod::Sftp => {
+            sftp_copy::execute_sftp_copy(plan, names, cancel, &mut on_progress).await
+        }
+        TransferMethod::Scp => Err(TransferExecutionError::InvalidPlan {
             method: plan.method,
-            reason: "executor is not implemented yet".into(),
+            reason: "SCP executor is not implemented".into(),
         }),
     }
 }
