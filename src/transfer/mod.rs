@@ -1,5 +1,7 @@
 pub mod executor;
 pub mod probe;
+#[allow(dead_code)]
+pub mod sftp_copy;
 
 use crate::vfs::{Capability, CapabilitySet, Location, ProviderId};
 
