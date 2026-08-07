@@ -10,8 +10,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::remote::openssh_sftp::OpenSshSftpConnection;
 use crate::vfs::Location;
 
-use super::executor::{TransferExecutionError, TransferOutcome, TransferProgress};
-use super::{TransferIntent, TransferMethod, TransferPlan};
+use crate::transfer::executor::{TransferExecutionError, TransferOutcome, TransferProgress};
+use crate::transfer::{TransferIntent, TransferMethod, TransferPlan};
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -142,15 +142,14 @@ async fn upload_file(
             return Err(error);
         }
     };
-    if had_target {
-        if let Err(error) = connection
+    if had_target
+        && let Err(error) = connection
             .session
             .rename(target.clone(), backup.clone())
             .await
-        {
-            let _ = connection.session.remove_file(temp.clone()).await;
-            return Err(sftp_failure(name, error));
-        }
+    {
+        let _ = connection.session.remove_file(temp.clone()).await;
+        return Err(sftp_failure(name, error));
     }
 
     if let Err(error) = connection
@@ -234,11 +233,9 @@ async fn download_file(
             return Err(error);
         }
     };
-    if had_target {
-        if let Err(error) = tokio::fs::rename(&target, &backup).await {
-            let _ = tokio::fs::remove_file(&temp).await;
-            return Err(error.into());
-        }
+    if had_target && let Err(error) = tokio::fs::rename(&target, &backup).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(error.into());
     }
 
     if let Err(error) = tokio::fs::rename(&temp, &target).await {

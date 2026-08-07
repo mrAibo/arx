@@ -8,9 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::vfs::{Location, local::LocalFs};
 
 use super::{TransferIntent, TransferMethod, TransferPlan};
-
-#[path = "sftp_copy.rs"]
-mod sftp_copy;
+use crate::transfer::sftp_copy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferProgress {
