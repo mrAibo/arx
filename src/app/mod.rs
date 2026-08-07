@@ -321,6 +321,13 @@ impl AppState {
         }
     }
 
+    pub fn other_pane(&self) -> &PaneState {
+        match self.active {
+            Pane::Left => &self.right,
+            Pane::Right => &self.left,
+        }
+    }
+
     pub fn other_pane_mut(&mut self) -> &mut PaneState {
         match self.active {
             Pane::Left => &mut self.right,

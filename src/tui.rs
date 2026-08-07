@@ -1264,119 +1264,107 @@ async fn event_loop(
                                 state.sort_mode,
                             );
                         }
-                        // F5: copy selected (or cursor) from active pane to other pane — background
+                        // F5: copy — Detection → Planner → Executor
                         KeyCode::F(5) => {
                             let names = selection_or_cursor(&state, entries, cursor);
                             if names.is_empty() {
                                 continue;
                             }
-                            match op_paths(&state) {
-                                Some((src, dst)) => {
-                                    let id = format!("copy-{}", state.jobs.len());
-                                    let desc =
-                                        format!("Copy {} → {}", names.join(", "), dst.display());
-                                    state.jobs.push(arx::jobs::Job {
-                                        id: id.clone(),
-                                        description: desc,
-                                        kind: arx::jobs::JobKind::Copy,
-                                        status: arx::jobs::JobStatus::Pending,
-                                        progress: arx::jobs::Progress::default(),
-                                        cancel: arx::jobs::job_token(),
-                                        source: Some(Location::Local(src.clone())),
-                                        destination: Some(Location::Local(dst.clone())),
-                                    });
-                                    let tx = job_tx.clone();
-                                    let names2 = names.clone();
-                                    let use_rsync = std::process::Command::new("rsync")
-                                        .arg("--version")
-                                        .output()
-                                        .map(|o| o.status.success())
-                                        .unwrap_or(false);
-                                    tokio::task::spawn_blocking(move || {
-                                        tx.send(arx::jobs::JobEvent::Running { id: id.clone() })
-                                            .ok();
-                                        if use_rsync {
-                                            // ponytail: rsync -avh --progress for each selected file
-                                            let mut ok = 0u64;
-                                            let total = names2.len() as u8;
-                                            for (i, name) in names2.iter().enumerate() {
-                                                let src_path = src.join(name);
-                                                let pct = (i + 1) as u8 * 100 / total.max(1);
-                                                tx.send(arx::jobs::JobEvent::Progress {
-                                                    id: id.clone(),
-                                                    progress: arx::jobs::Progress::Percent(pct),
-                                                })
-                                                .ok();
-                                                if src_path.is_dir() {
-                                                    let status =
-                                                        std::process::Command::new("rsync")
-                                                            .args([
-                                                                "-avh",
-                                                                "--progress",
-                                                                src_path.to_str().unwrap_or(""),
-                                                                dst.to_str().unwrap_or(""),
-                                                            ])
-                                                            .status();
-                                                    if status.map(|s| s.success()).unwrap_or(false)
-                                                    {
-                                                        ok += 1;
-                                                    }
-                                                } else if let Ok(status) =
-                                                    std::process::Command::new("rsync")
-                                                        .args([
-                                                            "-avh",
-                                                            "--progress",
-                                                            src_path.to_str().unwrap_or(""),
-                                                            dst.to_str().unwrap_or(""),
-                                                        ])
-                                                        .status()
-                                                {
-                                                    if status.success() {
-                                                        ok += 1;
-                                                    }
-                                                }
-                                            }
-                                            tx.send(arx::jobs::JobEvent::Done {
-                                                id,
-                                                message: format!(
-                                                    "rsync: {ok}/{} file(s)",
-                                                    names2.len()
-                                                ),
-                                            })
-                                            .ok();
-                                        } else {
-                                            let src_loc = Location::Local(src.clone());
-                                            let result = src_loc.copy_files(
-                                                &src.to_string_lossy(),
-                                                &dst.to_string_lossy(),
-                                                &names2,
-                                            );
-                                            match result {
-                                                Ok(n) => {
-                                                    tx.send(arx::jobs::JobEvent::Done {
-                                                        id,
-                                                        message: format!("Copied {n} item(s)"),
-                                                    })
-                                                    .ok();
-                                                }
-                                                Err(e) => {
-                                                    tx.send(arx::jobs::JobEvent::Failed {
-                                                        id,
-                                                        error: format!("Copy error: {e}"),
-                                                    })
-                                                    .ok();
-                                                }
-                                            }
-                                        }
-                                    });
-                                    state.message =
-                                        Some(format!("Copy queued (job {})", state.jobs.len()));
+                            let src_loc = state.active_pane().location.clone();
+                            let dst_loc = state.other_pane().location.clone();
+                            let src_provider = src_loc.provider_id();
+                            let dst_provider = dst_loc.provider_id();
+                            let src_caps = state
+                                .registry
+                                .capabilities(&src_provider)
+                                .unwrap_or_default();
+                            let dst_caps = state
+                                .registry
+                                .capabilities(&dst_provider)
+                                .unwrap_or_default();
+                            let executors = arx::transfer::probe::local_executors(
+                                arx::transfer::probe::detect_local_tools(),
+                            );
+                            let request = arx::transfer::TransferRequest {
+                                source: src_loc.clone(),
+                                destination: dst_loc.clone(),
+                                source_provider: src_provider,
+                                destination_provider: dst_provider,
+                                source_capabilities: src_caps,
+                                destination_capabilities: dst_caps,
+                                intent: arx::transfer::TransferIntent::Copy,
+                                executors,
+                                delete_extraneous: false,
+                            };
+                            let plan = match arx::transfer::TransferPlanner::plan(request) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    state.message = Some(e.to_string());
+                                    continue;
                                 }
-                                None => {
-                                    state.message =
-                                        Some("Both panes must be local for copy".into());
+                            };
+                            let id = format!("copy-{}", state.jobs.len());
+                            let desc = format!("Copy {} → {}", names.join(", "), dst_loc.label());
+                            state.jobs.push(arx::jobs::Job {
+                                id: id.clone(),
+                                description: desc,
+                                kind: arx::jobs::JobKind::Copy,
+                                status: arx::jobs::JobStatus::Pending,
+                                progress: arx::jobs::Progress::default(),
+                                cancel: arx::jobs::job_token(),
+                                source: Some(src_loc.clone()),
+                                destination: Some(dst_loc.clone()),
+                            });
+                            let tx = job_tx.clone();
+                            let names2 = names.clone();
+                            let plan2 = plan.clone();
+                            let job_id = id.clone();
+                            tokio::spawn(async move {
+                                if tx
+                                    .send(arx::jobs::JobEvent::Running { id: job_id.clone() })
+                                    .is_err()
+                                {
+                                    return;
                                 }
-                            }
+                                let cancel =
+                                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let tx2 = tx.clone();
+                                let jid = job_id.clone();
+                                let result = arx::transfer::executor::execute_transfer(
+                                    &plan2,
+                                    &names2,
+                                    cancel,
+                                    |p| {
+                                        let pct = p.completed.saturating_mul(100) / p.total.max(1);
+                                        tx2.send(arx::jobs::JobEvent::Progress {
+                                            id: jid.clone(),
+                                            progress: arx::jobs::Progress::Percent(pct as u8),
+                                        })
+                                        .ok();
+                                    },
+                                )
+                                .await;
+                                match result {
+                                    Ok(outcome) => {
+                                        tx.send(arx::jobs::JobEvent::Done {
+                                            id: job_id,
+                                            message: format!(
+                                                "Copied {} item(s)",
+                                                outcome.completed
+                                            ),
+                                        })
+                                        .ok();
+                                    }
+                                    Err(e) => {
+                                        tx.send(arx::jobs::JobEvent::Failed {
+                                            id: job_id,
+                                            error: e.to_string(),
+                                        })
+                                        .ok();
+                                    }
+                                }
+                            });
+                            state.message = Some(format!("Copy queued (job {})", state.jobs.len()));
                             state.selected.clear();
                             left_entries = load_entries(
                                 &state.left.location,
@@ -1389,63 +1377,104 @@ async fn event_loop(
                                 state.sort_mode,
                             );
                         }
-                        // F6: move selected (or cursor) from active pane to other pane — background
+                        // F6: move — Detection → Planner → Executor
                         KeyCode::F(6) => {
                             let names = selection_or_cursor(&state, entries, cursor);
                             if names.is_empty() {
                                 continue;
                             }
-                            match op_paths(&state) {
-                                Some((src, dst)) => {
-                                    let id = format!("move-{}", state.jobs.len());
-                                    let desc =
-                                        format!("Move {} → {}", names.join(", "), dst.display());
-                                    state.jobs.push(arx::jobs::Job {
-                                        id: id.clone(),
-                                        description: desc,
-                                        kind: arx::jobs::JobKind::Copy,
-                                        status: arx::jobs::JobStatus::Pending,
-                                        progress: arx::jobs::Progress::default(),
-                                        cancel: arx::jobs::job_token(),
-                                        source: Some(Location::Local(src.clone())),
-                                        destination: Some(Location::Local(dst.clone())),
-                                    });
-                                    let tx = job_tx.clone();
-                                    let names2 = names.clone();
-                                    tokio::task::spawn_blocking(move || {
-                                        tx.send(arx::jobs::JobEvent::Running { id: id.clone() })
-                                            .ok();
-                                        let src_loc = Location::Local(src.clone());
-                                        let result = src_loc.move_files(
-                                            &src.to_string_lossy(),
-                                            &dst.to_string_lossy(),
-                                            &names2,
-                                        );
-                                        match result {
-                                            Ok(n) => {
-                                                tx.send(arx::jobs::JobEvent::Done {
-                                                    id,
-                                                    message: format!("Moved {n} item(s)"),
-                                                })
-                                                .ok();
-                                            }
-                                            Err(e) => {
-                                                tx.send(arx::jobs::JobEvent::Failed {
-                                                    id,
-                                                    error: format!("Move error: {e}"),
-                                                })
-                                                .ok();
-                                            }
-                                        }
-                                    });
-                                    state.message =
-                                        Some(format!("Move queued (job {})", state.jobs.len()));
+                            let src_loc = state.active_pane().location.clone();
+                            let dst_loc = state.other_pane().location.clone();
+                            let src_provider = src_loc.provider_id();
+                            let dst_provider = dst_loc.provider_id();
+                            let src_caps = state
+                                .registry
+                                .capabilities(&src_provider)
+                                .unwrap_or_default();
+                            let dst_caps = state
+                                .registry
+                                .capabilities(&dst_provider)
+                                .unwrap_or_default();
+                            let executors = arx::transfer::probe::local_executors(
+                                arx::transfer::probe::detect_local_tools(),
+                            );
+                            let request = arx::transfer::TransferRequest {
+                                source: src_loc.clone(),
+                                destination: dst_loc.clone(),
+                                source_provider: src_provider,
+                                destination_provider: dst_provider,
+                                source_capabilities: src_caps,
+                                destination_capabilities: dst_caps,
+                                intent: arx::transfer::TransferIntent::Move,
+                                executors,
+                                delete_extraneous: false,
+                            };
+                            let plan = match arx::transfer::TransferPlanner::plan(request) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    state.message = Some(e.to_string());
+                                    continue;
                                 }
-                                None => {
-                                    state.message =
-                                        Some("Both panes must be local for move".into());
+                            };
+                            let id = format!("move-{}", state.jobs.len());
+                            let desc = format!("Move {} → {}", names.join(", "), dst_loc.label());
+                            state.jobs.push(arx::jobs::Job {
+                                id: id.clone(),
+                                description: desc,
+                                kind: arx::jobs::JobKind::Copy, // ponytail: reused Copy kind for UI
+                                status: arx::jobs::JobStatus::Pending,
+                                progress: arx::jobs::Progress::default(),
+                                cancel: arx::jobs::job_token(),
+                                source: Some(src_loc.clone()),
+                                destination: Some(dst_loc.clone()),
+                            });
+                            let tx = job_tx.clone();
+                            let names2 = names.clone();
+                            let plan2 = plan.clone();
+                            let job_id = id.clone();
+                            tokio::spawn(async move {
+                                if tx
+                                    .send(arx::jobs::JobEvent::Running { id: job_id.clone() })
+                                    .is_err()
+                                {
+                                    return;
                                 }
-                            }
+                                let cancel =
+                                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let tx2 = tx.clone();
+                                let jid = job_id.clone();
+                                let result = arx::transfer::executor::execute_transfer(
+                                    &plan2,
+                                    &names2,
+                                    cancel,
+                                    |p| {
+                                        let pct = p.completed.saturating_mul(100) / p.total.max(1);
+                                        tx2.send(arx::jobs::JobEvent::Progress {
+                                            id: jid.clone(),
+                                            progress: arx::jobs::Progress::Percent(pct as u8),
+                                        })
+                                        .ok();
+                                    },
+                                )
+                                .await;
+                                match result {
+                                    Ok(outcome) => {
+                                        tx.send(arx::jobs::JobEvent::Done {
+                                            id: job_id,
+                                            message: format!("Moved {} item(s)", outcome.completed),
+                                        })
+                                        .ok();
+                                    }
+                                    Err(e) => {
+                                        tx.send(arx::jobs::JobEvent::Failed {
+                                            id: job_id,
+                                            error: e.to_string(),
+                                        })
+                                        .ok();
+                                    }
+                                }
+                            });
+                            state.message = Some(format!("Move queued (job {})", state.jobs.len()));
                             state.selected.clear();
                             left_entries = load_entries(
                                 &state.left.location,
@@ -1875,17 +1904,6 @@ fn pane_location_path(state: &AppState) -> Option<&Path> {
     }
 }
 
-fn other_pane_location_path(state: &AppState) -> Option<&Path> {
-    let other = match state.active {
-        Pane::Left => &state.right,
-        Pane::Right => &state.left,
-    };
-    match &other.location {
-        Location::Local(p) => Some(p),
-        _ => None,
-    }
-}
-
 fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> Vec<String> {
     if !state.selected.is_empty() {
         state.selected.iter().cloned().collect()
@@ -1894,13 +1912,6 @@ fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> V
     } else {
         vec![]
     }
-}
-
-/// Returns (src_path, dst_path) for active→other pane file operations.
-fn op_paths(state: &AppState) -> Option<(PathBuf, PathBuf)> {
-    let src = pane_location_path(state)?.to_path_buf();
-    let dst = other_pane_location_path(state)?.to_path_buf();
-    Some((src, dst))
 }
 
 /// Check if a filename looks like an archive (tar, tgz, zip).

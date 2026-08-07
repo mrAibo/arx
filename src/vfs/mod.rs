@@ -321,6 +321,15 @@ impl fmt::Display for Location {
 }
 
 impl Location {
+    /// Which provider this location is served by.
+    pub fn provider_id(&self) -> ProviderId {
+        match self {
+            Self::Local(_) => ProviderId::Local,
+            Self::Sftp { .. } => ProviderId::Sftp,
+            Self::Archive { .. } => ProviderId::Archive,
+        }
+    }
+
     /// Human-readable short label for a pane title (e.g. the directory name or host).
     pub fn label(&self) -> String {
         match self {
