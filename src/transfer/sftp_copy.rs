@@ -22,16 +22,26 @@ pub(crate) async fn execute_sftp_copy(
     on_progress: &mut impl FnMut(TransferProgress),
 ) -> Result<TransferOutcome, TransferExecutionError> {
     if plan.intent != TransferIntent::Copy {
-        return Err(invalid("SFTP Move requires a separate copy/verify/delete-source transaction"));
+        return Err(invalid(
+            "SFTP Move requires a separate copy/verify/delete-source transaction",
+        ));
     }
 
     let (host, direction) = match (&plan.source, &plan.destination) {
-        (Location::Local(src), Location::Sftp { host, path }) => {
-            (host.as_str(), Direction::Upload { src, remote_dir: path })
-        }
-        (Location::Sftp { host, path }, Location::Local(dst)) => {
-            (host.as_str(), Direction::Download { remote_dir: path, dst })
-        }
+        (Location::Local(src), Location::Sftp { host, path }) => (
+            host.as_str(),
+            Direction::Upload {
+                src,
+                remote_dir: path,
+            },
+        ),
+        (Location::Sftp { host, path }, Location::Local(dst)) => (
+            host.as_str(),
+            Direction::Download {
+                remote_dir: path,
+                dst,
+            },
+        ),
         _ => {
             return Err(invalid(
                 "SFTP copy requires exactly one local and one SFTP endpoint",
@@ -81,7 +91,9 @@ async fn upload_file(
     let local_path = src_dir.join(name);
     let local_meta = tokio::fs::metadata(&local_path).await?;
     if !local_meta.is_file() {
-        return Err(invalid("SFTP fallback currently supports regular files only"));
+        return Err(invalid(
+            "SFTP fallback currently supports regular files only",
+        ));
     }
 
     let target = remote_join(remote_dir, name);
@@ -118,7 +130,9 @@ async fn upload_file(
     };
     if staged.len() != local_meta.len() {
         let _ = connection.session.remove_file(temp.clone()).await;
-        return Err(invalid("SFTP upload verification failed: staged size differs"));
+        return Err(invalid(
+            "SFTP upload verification failed: staged size differs",
+        ));
     }
 
     let had_target = match remote_exists(&connection.session, &target).await {
@@ -139,7 +153,11 @@ async fn upload_file(
         }
     }
 
-    if let Err(error) = connection.session.rename(temp.clone(), target.clone()).await {
+    if let Err(error) = connection
+        .session
+        .rename(temp.clone(), target.clone())
+        .await
+    {
         let _ = connection.session.remove_file(temp).await;
         if had_target {
             let _ = connection.session.rename(backup, target).await;
@@ -165,7 +183,9 @@ async fn download_file(
         .await
         .map_err(|error| sftp_failure(name, error))?;
     if !remote_meta.is_regular() {
-        return Err(invalid("SFTP fallback currently supports regular files only"));
+        return Err(invalid(
+            "SFTP fallback currently supports regular files only",
+        ));
     }
 
     let token = operation_token();
@@ -202,7 +222,9 @@ async fn download_file(
     };
     if staged.len() != remote_meta.len() {
         let _ = tokio::fs::remove_file(&temp).await;
-        return Err(invalid("SFTP download verification failed: staged size differs"));
+        return Err(invalid(
+            "SFTP download verification failed: staged size differs",
+        ));
     }
 
     let had_target = match local_exists(&target).await {
@@ -272,7 +294,9 @@ async fn local_exists(path: &Path) -> Result<bool, TransferExecutionError> {
 
 fn validate_name(name: &str) -> Result<(), TransferExecutionError> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
-        return Err(invalid("transfer item must be a single safe path component"));
+        return Err(invalid(
+            "transfer item must be a single safe path component",
+        ));
     }
     Ok(())
 }
@@ -303,10 +327,7 @@ fn operation_token() -> u128 {
         .as_nanos()
 }
 
-fn check_cancelled(
-    cancel: &AtomicBool,
-    completed: usize,
-) -> Result<(), TransferExecutionError> {
+fn check_cancelled(cancel: &AtomicBool, completed: usize) -> Result<(), TransferExecutionError> {
     if cancel.load(Ordering::Relaxed) {
         Err(TransferExecutionError::Cancelled { completed })
     } else {

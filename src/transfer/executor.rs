@@ -299,12 +299,9 @@ mod tests {
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let mut progress = Vec::new();
-        let outcome = execute_transfer(
-            &plan,
-            &["a.txt".into(), "b.txt".into()],
-            cancel,
-            |event| progress.push(event),
-        )
+        let outcome = execute_transfer(&plan, &["a.txt".into(), "b.txt".into()], cancel, |event| {
+            progress.push(event)
+        })
         .await
         .unwrap();
 

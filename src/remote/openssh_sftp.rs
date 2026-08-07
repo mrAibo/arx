@@ -109,10 +109,7 @@ impl AsyncWrite for SshSubsystemStream {
         Pin::new(&mut self.stdin).poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.stdin).poll_flush(cx)
     }
 
