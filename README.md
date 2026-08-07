@@ -6,10 +6,11 @@ terminal. Midnight Commander parity, built in Rust.
 
 ## What's new in v0.14
 
-Transfer Stack — Detection → Planner → Executor replaces old F5/F6 logic.
-Transactional SFTP file copy with staged temp files, backup, and rollback.
-Native copy/move, rsync, and SFTP streaming selected by the planner based
-on detected capabilities. 42 tests, clippy-clean.
+Transfer Stack replaces the old F5/F6 handlers. When you hit copy or move,
+ARX probes what tools are available, picks the best method (native, rsync,
+or SFTP streaming), and runs the transfer through the job manager. SFTP
+copies are transactional: temp file, backup existing, commit, rollback on
+failure. 42 tests, clippy-clean.
 
 ## Quick start
 
@@ -47,8 +48,8 @@ arx
 
 || Key | Action |
 ||---|---|
-|| F5 | Copy — planner selects native/rsync/SFTP |
-|| F6 | Move — planner selects native/rsync/SFTP |
+|| F5 | Copy — planner picks native/rsync/SFTP |
+|| F6 | Move — planner picks native/rsync/SFTP |
 || F7 | Connect to tmux session |
 || F8 | Delete selected |
 || Shift+F6 | Rename |
@@ -60,7 +61,7 @@ arx
 
 || Key | Action |
 ||---|---|
-|| F3 | Preview (images/chafa, PDFs/pdftotext, media/ffprobe, archives/7z, code/bat) |
+|| F3 | Preview (chafa for images, pdftotext, ffprobe, 7z, bat) |
 || Shift+F3 | bat with paging |
 || F4 | Edit in $EDITOR |
 || Ctrl+I | File attributes |
@@ -193,23 +194,23 @@ arx/
 **VFS:** `VfsOps` trait + `Location` enum + `ProviderId` + `CapabilitySet`.
 Backends implement `list()`, `read_head()`, `copy_files()`, `move_files()`, `delete_files()`.
 
-**Transfer Stack:** When F5/F6 is pressed, the TUI builds a `TransferRequest`
-(source/dest `Location`, `ProviderId`, `CapabilitySet`, `ExecutorAvailability`).
-The `TransferPlanner` picks a method (Native / rsync / SFTP), and the matching
-executor runs the transfer through the Job Manager. Progress, cancellation, and
-errors are delivered via `tokio::sync::mpsc`.
+**Transfer Stack:** F5/F6 builds a `TransferRequest` (source and destination
+locations, provider IDs, capability sets, what executors are available).
+The planner picks a method — Native, rsync, or SFTP — and the executor runs
+it through the job manager. Progress, cancellation, and errors come back
+through `tokio::sync::mpsc`.
 
-**Event loop:** `tokio::select!` — keyboard events, background job completions,
-and PTY output on one async loop.
+**Event loop:** `tokio::select!` multiplexes keyboard events, job
+completions, and PTY output in one async loop.
 
 ## MC parity
 
 All Midnight Commander features are present: dual-pane, tabs, F3–F8,
-directory diff, user menu, bookmarks, SFTP (with ~/.ssh/config), archive
+directory diff, user menu, bookmarks, SFTP (via ~/.ssh/config), archive
 browsing, background jobs, mkdir/rename, file info, drop-to-shell,
 symlink/hardlink/chmod/chown, extension colors, shortcut bar.
-ARX adds content diff (Ctrl+D+Enter runs `diff -u`), Quick Actions,
-and a fuzzy Command Center not in MC.
+ARX adds a few things MC doesn't have: content diff (Ctrl+D+Enter runs
+`diff -u`), Quick Actions, and a fuzzy Command Center.
 
 ## Development
 

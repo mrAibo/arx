@@ -1,22 +1,22 @@
 # ARX Architecture
 
-## Purpose
+## What it does
 
-ARX is a terminal commander that treats local filesystems, remote SSH/SFTP
-filesystems, and archives as locations behind common contracts. Long-running
-work is performed as jobs. Transfer implementation is selected by a planner
-rather than by the TUI. **This architecture is now fully implemented.**
+ARX is a terminal commander. It treats local filesystems, remote SSH/SFTP
+connections, and archives as locations behind a common API. Long work runs
+as background jobs. The TUI never touches filesystems or SSH directly — it
+goes through the planner, which picks the right executor for each transfer.
 
-## Core rules
+## Rules we follow
 
-1. The TUI never calls filesystem, SSH, rsync, or archive implementations directly.
-2. `Location` identifies where a resource lives; UI panels operate on locations, not raw local paths.
-3. VFS operations and transfer operations are separate concerns.
-4. Long-running operations execute through the Job Manager.
-5. Prefer mature system tools when they provide stronger behavior than a custom implementation.
-6. Destructive synchronization requires a preview/dry-run stage.
-7. Authentication should reuse OpenSSH configuration, ssh-agent, and known_hosts; ARX does not invent a password vault.
-8. Dependencies are added only when a concrete module needs them.
+1. The TUI never calls filesystem, SSH, rsync, or archive code directly.
+2. `Location` tells you where something lives; panels work with locations, not raw paths.
+3. VFS (listing, reading, stat) and transfers (copy, move, sync) are separate layers.
+4. Anything that takes time runs through the Job Manager.
+5. When a system tool does the job better than custom code, use the system tool.
+6. Destructive syncs need a preview before they run.
+7. Authentication reuses OpenSSH config, ssh-agent, and known_hosts. ARX doesn't invent its own password vault.
+8. Dependencies get added only when a concrete module needs them.
 
 ## Layering
 
@@ -49,17 +49,17 @@ Remote Manager
 
 ## Location model
 
+A panel can switch between these without changing how navigation works:
+
 ```text
 file:///home/user
 sftp://host/etc
 archive:///tmp/data.tar.zst!/etc
 ```
 
-A panel switches between those locations without changing its navigation model.
-
 ### ProviderId
 
-Each `Location` variant maps to a `ProviderId` (added to `Location` via `provider_id()`):
+Every `Location` variant maps to a `ProviderId`:
 
 | Location | ProviderId |
 |----------|-----------|
@@ -67,29 +67,21 @@ Each `Location` variant maps to a `ProviderId` (added to `Location` via `provide
 | `Sftp { host, path }` | `Sftp` |
 | `Archive { ... }` | `Archive` |
 
-`ProviderRegistry` tracks registered capability sets per provider. The TUI
-queries the registry for source/destination capabilities when building a
-`TransferRequest`.
+The `ProviderRegistry` knows what capabilities each provider has. When you
+hit F5 or F6, the TUI asks the registry for source and destination
+capabilities and passes them into the transfer request.
 
-## VFS responsibilities
+## What VFS does
 
-VFS handles filesystem-like operations:
+VFS handles filesystem operations: list, stat, read, write, mkdir, rename,
+remove, symlink metadata, permissions.
 
-- list
-- stat
-- read/open
-- write/create
-- mkdir
-- rename
-- remove
-- symlink metadata
-- permissions/capabilities where supported
+Backends: LocalFs, SftpFs, ArchiveFs. S3 and WebDAV are stubbed — ready for
+someone to implement them.
 
-Backends: LocalFs, SftpFs, ArchiveFs. S3 and WebDAV are stubbed.
+## Transfer planner
 
-## Transfer planner (implemented)
-
-When F5 (copy) or F6 (move) is pressed, the TUI builds a `TransferRequest`:
+When you press F5 (copy) or F6 (move), the TUI builds a `TransferRequest`:
 
 ```text
 TransferRequest {
@@ -100,89 +92,83 @@ TransferRequest {
     source_capabilities: CapabilitySet,
     destination_capabilities: CapabilitySet,
     intent: TransferIntent (Copy | Move | Synchronize),
-    executors: ExecutorAvailability (native/rsync/sftp booleans),
+    executors: ExecutorAvailability (which of native/rsync/sftp are usable),
     delete_extraneous: bool,
 }
 ```
 
-`TransferPlanner::plan()` chooses a `TransferMethod`:
+`TransferPlanner::plan()` picks a method:
 
-- **Native** — local ↔ local when both providers support the intent
-- **Rsync** — available externally and remote tool detection confirms it
-- **SFTP** — remote rsync unavailable, falls back to 64 KiB streaming SFTP with transactional staging
-- **SCP** — compatibility fallback (stubbed, returns "not implemented")
+- **Native** — local to local, when both providers support the operation
+- **Rsync** — the tool is available and remote detection confirms it
+- **SFTP** — remote rsync isn't available, so we stream over SFTP with transactional staging
+- **SCP** — compatibility fallback, stubbed for now
 
-The resulting `TransferPlan` is handed to `execute_transfer()`, which
-dispatches to the matching executor. Each executor reports progress events
-back to the Job Manager via `tokio::sync::mpsc`.
+The resulting `TransferPlan` goes to `execute_transfer()`, which dispatches
+to the right executor. Each executor sends progress events back through
+`tokio::sync::mpsc`.
 
 ### Transactional SFTP copy
 
-SFTP file copy uses a three-phase commit:
+SFTP copies use three phases so we don't leave broken files behind:
 
 1. **Stage** — upload/download to `.arx-part-<id>` temp file
-2. **Backup** — if destination exists, rename to `.arx-bak-<id>`
-3. **Commit** — rename temp to destination; on failure, restore backup
+2. **Backup** — if the destination already exists, rename it to `.arx-bak-<id>`
+3. **Commit** — rename temp to destination; if that fails, restore the backup
 
-Streaming uses 64 KiB buffers. File name validation rejects `..`, `/`, `NUL`.
+Streaming uses 64 KiB buffers. File names get validated: `..`, `/`, and
+`NUL` are rejected.
 
 ## Jobs
 
-All long-running operations become jobs. Minimum states:
+Any operation that takes time becomes a job. States: Queued, Starting,
+Running, Paused (only when the executor supports it), Cancelling,
+Cancelled, Failed, Finished.
 
-- Queued
-- Starting
-- Running
-- Paused (only where the implementation supports it)
-- Cancelling
-- Cancelled
-- Failed
-- Finished
-
-Jobs emit structured events: progress, completion, failure. The TUI consumes
-those events; it does not parse child-process output itself.
+Jobs emit structured events — progress, completion, failure. The TUI reads
+those events. It doesn't parse child process output itself.
 
 ## Remote hosts
 
-ARX host metadata refers to an OpenSSH alias wherever possible. Connection
-details remain in `~/.ssh/config`.
+ARX host metadata points at an OpenSSH alias whenever possible. Connection
+details stay in `~/.ssh/config`.
 
-ARX-specific metadata may include: favorite, groups, tags, default path,
-transfer preference, notes. Sensitive credentials must not be stored in
-ordinary ARX configuration.
+Per-host metadata can include: favorite, groups, tags, default path,
+transfer preference, notes. Credentials don't go in ARX config.
 
 ## OpenSSH integration
 
-Prefer existing OpenSSH behavior for: aliases, IdentityFile, ProxyJump /
-ProxyCommand, agent authentication, known_hosts, connection multiplexing.
+We lean on existing OpenSSH behavior for: aliases, IdentityFile, ProxyJump,
+agent auth, known_hosts, connection multiplexing.
 
-When effective OpenSSH configuration is needed, prefer `ssh -G <alias>` over
-implementing the entire ssh_config language ourselves.
+When we need to know what SSH would do for a given alias, we run `ssh -G
+<alias>` instead of parsing `ssh_config` ourselves.
 
-### OpenSSH → SFTP transport
+### OpenSSH to SFTP transport
 
-`OpenSshSftpConnection` wraps a system `ssh` subprocess into a `russh-sftp`
-client session. This reuses the user's OpenSSH binary, agent, and config
-without ARX needing its own SSH implementation.
+`OpenSshSftpConnection` wraps a system `ssh` subprocess into a
+`russh-sftp` client session. This means ARX gets SFTP through the user's
+actual OpenSSH binary, their agent, and their config — without needing its
+own SSH implementation.
 
 ## External tools
 
-Expected adapters: rsync, ssh, tar, gzip/pigz, bzip2/pbzip2, xz, zstd,
-zip/unzip, 7z/7zz, user editor/pager/shell.
+Adapters exist for: rsync, ssh, tar, gzip/pigz, bzip2/pbzip2, xz, zstd,
+zip/unzip, 7z/7zz, and the user's editor/pager/shell.
 
-Adapters own command construction, lifecycle, output parsing, error mapping,
-and capability detection.
+Each adapter owns its own command construction, lifecycle, output parsing,
+error mapping, and capability detection.
 
 ## Safety
 
-- no silent overwrite — SFTP uses staging + backup + rollback
-- no implicit rsync `--delete`
-- cancellation must preserve source data and clean incomplete destinations where safe
-- host-key verification is enabled by default (via system OpenSSH)
-- logs must not expose passwords, private keys, or sensitive command arguments
-- remote/network interruption is an expected failure mode and must be testable
+- SFTP copies stage to a temp file first. No silent overwrites.
+- Rsync never runs with `--delete` unless explicitly asked.
+- Cancelling a transfer leaves source files untouched and cleans up partial destinations.
+- Host key verification is on by default (through system OpenSSH).
+- Logs don't leak passwords, private keys, or sensitive command arguments.
+- Remote disconnects are an expected failure mode, not a crash.
 
-## File tree (implemented modules)
+## File tree (what's actually implemented)
 
 ```
 src/transfer/
@@ -209,6 +195,7 @@ src/vfs/
 
 ## Testing
 
-42 tests across the transfer planner, executors, VFS, and SFTP transactional copy.
-CI runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
-and `cargo test --all-features` on ubuntu-latest.
+42 tests cover the transfer planner, executors, VFS, and SFTP transactional
+copy. CI runs `cargo fmt --check`, `cargo clippy --all-targets
+--all-features -- -D warnings`, and `cargo test --all-features` on
+ubuntu-latest.
