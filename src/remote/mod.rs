@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 pub mod hosts_config;
+pub mod openssh_sftp;
 pub mod ssh_config;
 #[cfg(target_os = "linux")]
 pub mod watch;
