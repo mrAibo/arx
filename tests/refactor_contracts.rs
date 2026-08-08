@@ -163,3 +163,12 @@ fn sync_preview_ui_does_not_contain_an_execution_shortcut_yet() {
         "execution was enabled before the sync executor safety gate was introduced"
     );
 }
+
+#[test]
+fn tui_jobs_are_render_snapshots_not_a_second_lifecycle_store() {
+    let tui = include_str!("../src/tui.rs");
+    assert!(tui.contains("let job_manager = arx::jobs::JobManager::new()"));
+    assert!(!tui.contains("state.jobs.push("));
+    assert!(!tui.contains("job.status = arx::jobs::JobStatus"));
+    assert!(!tui.contains("job.cancel.store("));
+}

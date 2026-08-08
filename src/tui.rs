@@ -71,7 +71,8 @@ async fn event_loop(
     let mut split_right_list = ListState::default();
     let mut key_router = KeyRouter::default();
     let (effect_dispatcher, mut effect_rx) = EffectDispatcher::channel();
-    // Background job notification channel
+    // JobManager is the runtime source of truth. AppState.jobs is only a render snapshot.
+    let job_manager = arx::jobs::JobManager::new();
     let (job_tx, mut job_rx) = mpsc::unbounded_channel::<arx::jobs::JobEvent>();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
 
@@ -149,14 +150,15 @@ async fn event_loop(
                 continue;
             }
             Some(ev) = job_rx.recv() => {
-                // Background job completed — update state and refresh
-                if let arx::jobs::JobEvent::Failed { id, error } = &ev {
+        // The manager already accepted this transition before publishing it.
+        state.jobs = job_manager.snapshot();
+        if let arx::jobs::JobEvent::Failed { id, error, .. } = &ev {
                     let body = format!("Job {id} failed: {error}");
                     tokio::spawn(async move {
                         DesktopService::notify("ARX", &body).await;
                     });
                 }
-                let refresh_panes = handle_job_event(ev, &mut state);
+                let refresh_panes = handle_job_event(&ev, &mut state);
                 if refresh_panes {
                     schedule_pane_load(&pane_loader, &mut state, Pane::Left);
                     schedule_pane_load(&pane_loader, &mut state, Pane::Right);
@@ -1133,28 +1135,26 @@ async fn event_loop(
                                     continue;
                                 }
                             };
-                            let id = format!("copy-{}", state.jobs.len());
-                            let desc = format!("Copy {} → {}", names.join(", "), dst_loc.label());
-                            let cancel = arx::jobs::job_token();
-                            state.jobs.push(arx::jobs::Job {
-                                id: id.clone(),
-                                description: desc,
-                                kind: arx::jobs::JobKind::Copy,
-                                status: arx::jobs::JobStatus::Pending,
-                                progress: arx::jobs::Progress::default(),
-                                cancel: cancel.clone(),
-                                source: Some(src_loc.clone()),
-                                destination: Some(dst_loc.clone()),
-                            });
+                            let job = job_manager.create_job(
+                                "copy",
+                                arx::jobs::JobKind::Copy,
+                                format!("Copy {} → {}", names.join(", "), dst_loc.label()),
+                                Some(src_loc.clone()),
+                                Some(dst_loc.clone()),
+                            );
+                            let id = job.id.clone();
+                            let cancel = job.cancel.clone();
+                            state.jobs = job_manager.snapshot();
+                            let jobs = job_manager.clone();
                             let tx = job_tx.clone();
                             let names2 = names.clone();
                             let plan2 = plan.clone();
                             let job_id = id.clone();
                             tokio::spawn(async move {
-                                if tx
-                                    .send(arx::jobs::JobEvent::Running { id: job_id.clone() })
-                                    .is_err()
-                                {
+                                if !jobs.publish_event(
+                                    &tx,
+                                    arx::jobs::JobEvent::Running { id: job_id.clone() },
+                                ) {
                                     return;
                                 }
                                 let tx2 = tx.clone();
@@ -1165,46 +1165,59 @@ async fn event_loop(
                                     cancel,
                                     |p| {
                                         let pct = p.completed.saturating_mul(100) / p.total.max(1);
-                                        tx2.send(arx::jobs::JobEvent::Progress {
-                                            id: jid.clone(),
-                                            progress: arx::jobs::Progress::Percent(pct as u8),
-                                        })
-                                        .ok();
+                                        let _ = jobs.publish_event(
+                                            &tx2,
+                                            arx::jobs::JobEvent::Progress {
+                                                id: jid.clone(),
+                                                progress: arx::jobs::Progress::Percent(pct as u8)
+                                                    .into(),
+                                            },
+                                        );
                                     },
                                 )
                                 .await;
                                 match result {
                                     Ok(outcome) => {
-                                        tx.send(arx::jobs::JobEvent::Done {
-                                            id: job_id,
-                                            message: format!(
-                                                "Copied {} item(s)",
-                                                outcome.completed
-                                            ),
-                                        })
-                                        .ok();
+                                        let _ = jobs.publish_event(
+        &tx,
+        arx::jobs::JobEvent::Completed {
+            id: job_id,
+            result: arx::jobs::JobResult::generic(
+                format!("Copied {} item(s)", outcome.completed),
+                outcome.completed,
+            ),
+        },
+    );
                                     }
                                     Err(
                                         arx::transfer::executor::TransferExecutionError::Cancelled {
                                             completed,
                                         },
                                     ) => {
-                                        tx.send(arx::jobs::JobEvent::Cancelled {
-                                            id: job_id,
-                                            completed,
-                                        })
-                                        .ok();
+                                        let _ = jobs.publish_event(
+        &tx,
+        arx::jobs::JobEvent::Cancelled {
+            id: job_id,
+            result: arx::jobs::JobResult::generic(
+                format!("Cancelled after {completed} item(s)"),
+                completed,
+            ),
+        },
+    );
                                     }
                                     Err(e) => {
-                                        tx.send(arx::jobs::JobEvent::Failed {
-                                            id: job_id,
-                                            error: e.to_string(),
-                                        })
-                                        .ok();
+                                        let _ = jobs.publish_event(
+        &tx,
+        arx::jobs::JobEvent::Failed {
+            id: job_id,
+            error: e.to_string(),
+            result: None,
+        },
+    );
                                     }
                                 }
                             });
-                            state.message = Some(format!("Copy queued (job {})", state.jobs.len()));
+                            state.message = Some(format!("Copy queued ({id})"));
                             state.selected.clear();
                         }
                         // F6: move — Detection → Planner → Executor
@@ -1246,28 +1259,26 @@ async fn event_loop(
                                     continue;
                                 }
                             };
-                            let id = format!("move-{}", state.jobs.len());
-                            let desc = format!("Move {} → {}", names.join(", "), dst_loc.label());
-                            let cancel = arx::jobs::job_token();
-                            state.jobs.push(arx::jobs::Job {
-                                id: id.clone(),
-                                description: desc,
-                                kind: arx::jobs::JobKind::Move,
-                                status: arx::jobs::JobStatus::Pending,
-                                progress: arx::jobs::Progress::default(),
-                                cancel: cancel.clone(),
-                                source: Some(src_loc.clone()),
-                                destination: Some(dst_loc.clone()),
-                            });
+                            let job = job_manager.create_job(
+                                "move",
+                                arx::jobs::JobKind::Move,
+                                format!("Move {} → {}", names.join(", "), dst_loc.label()),
+                                Some(src_loc.clone()),
+                                Some(dst_loc.clone()),
+                            );
+                            let id = job.id.clone();
+                            let cancel = job.cancel.clone();
+                            state.jobs = job_manager.snapshot();
+                            let jobs = job_manager.clone();
                             let tx = job_tx.clone();
                             let names2 = names.clone();
                             let plan2 = plan.clone();
                             let job_id = id.clone();
                             tokio::spawn(async move {
-                                if tx
-                                    .send(arx::jobs::JobEvent::Running { id: job_id.clone() })
-                                    .is_err()
-                                {
+                                if !jobs.publish_event(
+                                    &tx,
+                                    arx::jobs::JobEvent::Running { id: job_id.clone() },
+                                ) {
                                     return;
                                 }
                                 let tx2 = tx.clone();
@@ -1278,43 +1289,59 @@ async fn event_loop(
                                     cancel,
                                     |p| {
                                         let pct = p.completed.saturating_mul(100) / p.total.max(1);
-                                        tx2.send(arx::jobs::JobEvent::Progress {
-                                            id: jid.clone(),
-                                            progress: arx::jobs::Progress::Percent(pct as u8),
-                                        })
-                                        .ok();
+                                        let _ = jobs.publish_event(
+                                            &tx2,
+                                            arx::jobs::JobEvent::Progress {
+                                                id: jid.clone(),
+                                                progress: arx::jobs::Progress::Percent(pct as u8)
+                                                    .into(),
+                                            },
+                                        );
                                     },
                                 )
                                 .await;
                                 match result {
                                     Ok(outcome) => {
-                                        tx.send(arx::jobs::JobEvent::Done {
-                                            id: job_id,
-                                            message: format!("Moved {} item(s)", outcome.completed),
-                                        })
-                                        .ok();
+                                        let _ = jobs.publish_event(
+        &tx,
+        arx::jobs::JobEvent::Completed {
+            id: job_id,
+            result: arx::jobs::JobResult::generic(
+                format!("Moved {} item(s)", outcome.completed),
+                outcome.completed,
+            ),
+        },
+    );
                                     }
                                     Err(
                                         arx::transfer::executor::TransferExecutionError::Cancelled {
                                             completed,
                                         },
                                     ) => {
-                                        tx.send(arx::jobs::JobEvent::Cancelled {
-                                            id: job_id,
-                                            completed,
-                                        })
-                                        .ok();
+                                        let _ = jobs.publish_event(
+        &tx,
+        arx::jobs::JobEvent::Cancelled {
+            id: job_id,
+            result: arx::jobs::JobResult::generic(
+                format!("Cancelled after {completed} item(s)"),
+                completed,
+            ),
+        },
+    );
                                     }
                                     Err(e) => {
-                                        tx.send(arx::jobs::JobEvent::Failed {
-                                            id: job_id,
-                                            error: e.to_string(),
-                                        })
-                                        .ok();
+                                        let _ = jobs.publish_event(
+        &tx,
+        arx::jobs::JobEvent::Failed {
+            id: job_id,
+            error: e.to_string(),
+            result: None,
+        },
+    );
                                     }
                                 }
                             });
-                            state.message = Some(format!("Move queued (job {})", state.jobs.len()));
+                            state.message = Some(format!("Move queued ({id})"));
                             state.selected.clear();
                         }
                         // F8: delete selected (or cursor) from active pane
@@ -1330,32 +1357,30 @@ async fn event_loop(
                                 );
                                 continue;
                             };
-
-                            let id = format!("trash-{}", state.jobs.len());
-                            let cancel = arx::jobs::job_token();
-                            state.jobs.push(arx::jobs::Job {
-                                id: id.clone(),
-                                description: format!("Trash {}", names.join(", ")),
-                                kind: arx::jobs::JobKind::Delete,
-                                status: arx::jobs::JobStatus::Pending,
-                                progress: arx::jobs::Progress::default(),
-                                source: Some(Location::Local(dir.clone())),
-                                destination: None,
-                                cancel: cancel.clone(),
-                            });
-
+                            let job = job_manager.create_job(
+                                "trash",
+                                arx::jobs::JobKind::Delete,
+                                format!("Trash {}", names.join(", ")),
+                                Some(Location::Local(dir.clone())),
+                                None,
+                            );
+                            let id = job.id.clone();
+                            let cancel = job.cancel.clone();
+                            state.jobs = job_manager.snapshot();
+                            let jobs = job_manager.clone();
                             let tx = job_tx.clone();
                             let job_id = id.clone();
                             tokio::spawn(async move {
-                                if tx
-                                    .send(arx::jobs::JobEvent::Running { id: job_id.clone() })
-                                    .is_err()
-                                {
+                                if !jobs.publish_event(
+                                    &tx,
+                                    arx::jobs::JobEvent::Running { id: job_id.clone() },
+                                ) {
                                     return;
                                 }
 
                                 let tx_progress = tx.clone();
                                 let progress_id = job_id.clone();
+                                let progress_jobs = jobs.clone();
                                 let result = MutationService::trash_local(
                                     dir,
                                     names,
@@ -1363,35 +1388,57 @@ async fn event_loop(
                                     move |progress| {
                                         let percent = progress.completed.saturating_mul(100)
                                             / progress.total.max(1);
-                                        let _ = tx_progress.send(arx::jobs::JobEvent::Progress {
-                                            id: progress_id.clone(),
-                                            progress: arx::jobs::Progress::Percent(percent as u8),
-                                        });
+                                        let _ = progress_jobs.publish_event(
+                                            &tx_progress,
+                                            arx::jobs::JobEvent::Progress {
+                                                id: progress_id.clone(),
+                                                progress: arx::jobs::Progress::Percent(
+                                                    percent as u8,
+                                                )
+                                                .into(),
+                                            },
+                                        );
                                     },
                                 )
                                 .await;
 
                                 match result {
                                     Ok(outcome) => {
-                                        let _ = tx.send(arx::jobs::JobEvent::Done {
-                                            id: job_id,
-                                            message: format!(
-                                                "Trashed {} item(s)",
-                                                outcome.completed
-                                            ),
-                                        });
+                                        let _ = jobs.publish_event(
+                                            &tx,
+                                            arx::jobs::JobEvent::Completed {
+                                                id: job_id,
+                                                result: arx::jobs::JobResult::generic(
+                                                    format!(
+                                                        "Trashed {} item(s)",
+                                                        outcome.completed
+                                                    ),
+                                                    outcome.completed,
+                                                ),
+                                            },
+                                        );
                                     }
                                     Err(MutationError::Cancelled { completed }) => {
-                                        let _ = tx.send(arx::jobs::JobEvent::Cancelled {
-                                            id: job_id,
-                                            completed,
-                                        });
+                                        let _ = jobs.publish_event(
+                                            &tx,
+                                            arx::jobs::JobEvent::Cancelled {
+                                                id: job_id,
+                                                result: arx::jobs::JobResult::generic(
+                                                    format!("Cancelled after {completed} item(s)"),
+                                                    completed,
+                                                ),
+                                            },
+                                        );
                                     }
                                     Err(error) => {
-                                        let _ = tx.send(arx::jobs::JobEvent::Failed {
-                                            id: job_id,
-                                            error: error.to_string(),
-                                        });
+                                        let _ = jobs.publish_event(
+                                            &tx,
+                                            arx::jobs::JobEvent::Failed {
+                                                id: job_id,
+                                                error: error.to_string(),
+                                                result: None,
+                                            },
+                                        );
                                     }
                                 }
                             });
@@ -1507,14 +1554,10 @@ async fn event_loop(
                         }
                         // Ctrl+J: jobs panel
                         KeyCode::Delete if state.show_jobs => {
-                            if state.job_cursor < state.jobs.len() {
-                                let job = &mut state.jobs[state.job_cursor];
-                                job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                                if matches!(
-                                    job.status,
-                                    arx::jobs::JobStatus::Pending | arx::jobs::JobStatus::Running
-                                ) {
-                                    job.status = arx::jobs::JobStatus::Cancelling;
+                            if let Some(job) = state.jobs.get(state.job_cursor) {
+                                let id = job.id.clone();
+                                if job_manager.cancel(&id) {
+                                    state.jobs = job_manager.snapshot();
                                 }
                             }
                         }
@@ -3017,51 +3060,42 @@ fn parse_size(s: &str) -> Result<u64, ()> {
     num_str.parse::<u64>().map(|n| n * mult).map_err(|_| ())
 }
 
-/// Process a job event — updates state and refreshes file lists after copy/move/delete.
-fn handle_job_event(ev: arx::jobs::JobEvent, state: &mut AppState) -> bool {
-    let mut refresh = false;
+/// Present an already-accepted JobManager event. Lifecycle state lives in JobManager.
+fn handle_job_event(ev: &arx::jobs::JobEvent, state: &mut AppState) -> bool {
     match ev {
-        arx::jobs::JobEvent::Paused { id } => {
-            if let Some(job) = state.jobs.iter_mut().find(|j| j.id == id) {
-                job.status = arx::jobs::JobStatus::Paused;
-            }
+        arx::jobs::JobEvent::Completed { id, result } => {
+            state.message = Some(match result {
+                arx::jobs::JobResult::Generic { message, .. } => message
+                    .clone()
+                    .unwrap_or_else(|| format!("Job {id} completed")),
+                arx::jobs::JobResult::WorkspaceSync(outcome) => format!(
+                    "Sync completed: {} physical step(s), {} bytes",
+                    outcome.completed.len(),
+                    outcome.transferred_bytes
+                ),
+            });
+            true
         }
-        arx::jobs::JobEvent::Running { id } => {
-            if let Some(job) = state.jobs.iter_mut().find(|j| j.id == id) {
-                job.status = arx::jobs::JobStatus::Running;
-            }
+        arx::jobs::JobEvent::Failed { error, .. } => {
+            state.message = Some(error.clone());
+            true
         }
-        arx::jobs::JobEvent::Progress { id, progress } => {
-            if let Some(job) = state.jobs.iter_mut().find(|j| j.id == id) {
-                job.progress = progress;
-            }
+        arx::jobs::JobEvent::Cancelled { id, result } => {
+            state.message = Some(match result {
+                arx::jobs::JobResult::Generic { message, .. } => message
+                    .clone()
+                    .unwrap_or_else(|| format!("Job {id} cancelled")),
+                arx::jobs::JobResult::WorkspaceSync(outcome) => format!(
+                    "Sync cancelled after {} completed physical step(s)",
+                    outcome.completed.len()
+                ),
+            });
+            true
         }
-        arx::jobs::JobEvent::Done { id, message } => {
-            if let Some(job) = state.jobs.iter_mut().find(|j| j.id == id) {
-                job.status = arx::jobs::JobStatus::Done;
-                job.progress = arx::jobs::Progress::Percent(100);
-            }
-            state.message = Some(message);
-            refresh = true;
-        }
-        arx::jobs::JobEvent::Failed { id, error } => {
-            if let Some(job) = state.jobs.iter_mut().find(|job| job.id == id) {
-                job.status = arx::jobs::JobStatus::Failed;
-            }
-            state.message = Some(error);
-            refresh = true;
-        }
-        arx::jobs::JobEvent::Cancelled { id, completed } => {
-            if let Some(job) = state.jobs.iter_mut().find(|job| job.id == id) {
-                job.status = arx::jobs::JobStatus::Cancelled;
-            }
-            state.message = Some(format!(
-                "Job {id} cancelled after {completed} completed item(s)"
-            ));
-            refresh = true;
-        }
+        arx::jobs::JobEvent::Running { .. }
+        | arx::jobs::JobEvent::Progress { .. }
+        | arx::jobs::JobEvent::Paused { .. } => false,
     }
-    refresh
 }
 
 fn dispatch_ui_action(

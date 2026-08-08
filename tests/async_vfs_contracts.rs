@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use arx::app::{AppState, Pane};
-use arx::jobs::{Job, JobKind, JobQueue, JobStatus, Progress, job_token};
+use arx::jobs::{JobEvent, JobKind, JobManager, JobStatus};
 use arx::services::{
     PaneLoadId, PaneLoadPurpose, PaneLoader, WorkspaceScanOptions, scan_workspace,
 };
@@ -219,44 +219,27 @@ async fn recursive_workspace_scan_obeys_depth_bound() {
     );
 }
 
-fn pending_job(id: &str) -> Job {
-    Job {
-        id: id.into(),
-        description: id.into(),
-        kind: JobKind::Transfer,
-        status: JobStatus::Pending,
-        progress: Progress::Indeterminate,
-        source: None,
-        destination: None,
-        cancel: job_token(),
-    }
+#[test]
+fn cancelled_pending_job_never_regresses_to_running() {
+    let manager = JobManager::new();
+    let job = manager.create_job("contract", JobKind::Transfer, "cancel-me", None, None);
+    let token = job.cancel.clone();
+
+    assert_eq!(job.status, JobStatus::Pending);
+    assert!(manager.cancel(&job.id));
+    assert!(token.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(manager.get(&job.id).unwrap().status, JobStatus::Cancelling);
+
+    assert!(manager.apply_event(&JobEvent::Running { id: job.id.clone() }));
+    assert_eq!(manager.get(&job.id).unwrap().status, JobStatus::Cancelling);
 }
 
 #[test]
-fn cancelled_pending_job_never_reaches_worker() {
-    let queue = JobQueue::new(1);
-    queue.enqueue(pending_job("cancel-me"));
-    assert!(queue.cancel("cancel-me"));
-    assert!(queue.promote().is_empty());
-
-    let snapshot = queue.snapshot();
-    assert_eq!(snapshot.len(), 1);
-    assert_eq!(snapshot[0].status, JobStatus::Cancelled);
-}
-
-#[test]
-fn transfer_worker_uses_same_cancel_token_exposed_to_ui() {
+fn transfer_worker_uses_same_cancel_token_owned_by_job_manager() {
     let tui = include_str!("../src/tui.rs");
-    assert!(
-        tui.contains("cancel: cancel.clone()"),
-        "job UI and transfer worker no longer share the same cancellation token"
-    );
-    assert!(
-        !tui.contains(
-            "let cancel =\n                                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))"
-        ),
-        "transfer worker recreated a private cancellation token"
-    );
+    assert!(tui.contains("let cancel = job.cancel.clone();"));
+    assert!(tui.contains("job_manager.cancel(&id)"));
+    assert!(!tui.contains("state.jobs.push("));
 }
 
 #[test]
