@@ -29,6 +29,7 @@ jobs:
           fi
           if ! grep -q 'ConfirmWorkspaceSync' src/app/actions.rs; then
             python3 .github/fix_ux_state_bootstrap.py
+            python3 .github/fix_ux_state_clippy.py
             python3 .github/ux_state_migrate.py
           fi
           cargo fmt
