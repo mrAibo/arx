@@ -21,17 +21,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if grep -q 'pub struct WorkspaceSyncJobContext' src/jobs/mod.rs; then
-            echo 'job context migration already applied'
-            exit 0
+          if ! grep -q 'pub struct WorkspaceSyncJobContext' src/jobs/mod.rs; then
+            python3 .github/ux_jobs_migrate.py
           fi
-          python3 .github/ux_jobs_migrate.py
+          if grep -q 'cancel_during_first_step_starts_verification_with_zero_completed_steps' tests/workspace_sync_verification.rs; then
+            python3 .github/ux_test_hardening.py
+          fi
           cargo fmt
           cargo clippy --all-targets --all-features -- -D warnings
           cargo test --all-targets --all-features
           git diff --check
+          if git diff --quiet -- src tests; then
+            echo 'no migration changes to commit'
+            exit 0
+          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src
+          git add src tests
           git commit -m 'feat: add direction-aware workspace sync job context'
           git push origin HEAD:feature/remote-workspace-ux
