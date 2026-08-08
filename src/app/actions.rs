@@ -28,6 +28,11 @@ pub enum ActionId {
     ReverseWorkspaceDirection,
     ToggleWorkspaceSyncMode,
     CloseWorkspaceSyncPreview,
+    ExecuteWorkspaceSync,
+    ConfirmWorkspaceSync,
+    CancelWorkspaceSync,
+    ShowWorkspaceSyncDetails,
+    ReturnToWorkspaceSyncPreview,
 }
 
 /// A concrete action invocation.
@@ -58,6 +63,11 @@ pub enum Action {
     ReverseWorkspaceDirection,
     ToggleWorkspaceSyncMode,
     CloseWorkspaceSyncPreview,
+    ExecuteWorkspaceSync,
+    ConfirmWorkspaceSync,
+    CancelWorkspaceSync,
+    ShowWorkspaceSyncDetails,
+    ReturnToWorkspaceSyncPreview,
 }
 
 impl Action {
@@ -85,6 +95,11 @@ impl Action {
             Self::ReverseWorkspaceDirection => ActionId::ReverseWorkspaceDirection,
             Self::ToggleWorkspaceSyncMode => ActionId::ToggleWorkspaceSyncMode,
             Self::CloseWorkspaceSyncPreview => ActionId::CloseWorkspaceSyncPreview,
+            Self::ExecuteWorkspaceSync => ActionId::ExecuteWorkspaceSync,
+            Self::ConfirmWorkspaceSync => ActionId::ConfirmWorkspaceSync,
+            Self::CancelWorkspaceSync => ActionId::CancelWorkspaceSync,
+            Self::ShowWorkspaceSyncDetails => ActionId::ShowWorkspaceSyncDetails,
+            Self::ReturnToWorkspaceSyncPreview => ActionId::ReturnToWorkspaceSyncPreview,
         }
     }
 }
@@ -112,6 +127,11 @@ pub const ALL_ACTIONS: &[Action] = &[
     Action::ReverseWorkspaceDirection,
     Action::ToggleWorkspaceSyncMode,
     Action::CloseWorkspaceSyncPreview,
+    Action::ExecuteWorkspaceSync,
+    Action::ConfirmWorkspaceSync,
+    Action::CancelWorkspaceSync,
+    Action::ShowWorkspaceSyncDetails,
+    Action::ReturnToWorkspaceSyncPreview,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -285,8 +305,43 @@ pub const ACTION_CATALOG: &[ActionMeta] = &[
     },
     ActionMeta {
         id: ActionId::CloseWorkspaceSyncPreview,
-        label: "Close sync preview",
-        description: "Return to the two-pane workspace",
+        label: "Hide workspace sync",
+        description: "Hide the sync overlay without cancelling the job",
+        category: ActionCategory::Workspace,
+        destructive: false,
+    },
+    ActionMeta {
+        id: ActionId::ExecuteWorkspaceSync,
+        label: "Execute workspace sync",
+        description: "Freeze the current preview and execute it when safe",
+        category: ActionCategory::Workspace,
+        destructive: false,
+    },
+    ActionMeta {
+        id: ActionId::ConfirmWorkspaceSync,
+        label: "Confirm workspace sync",
+        description: "Explicitly confirm this exact destructive frozen plan",
+        category: ActionCategory::Workspace,
+        destructive: true,
+    },
+    ActionMeta {
+        id: ActionId::CancelWorkspaceSync,
+        label: "Cancel workspace sync",
+        description: "Request cancellation of the active sync job",
+        category: ActionCategory::Workspace,
+        destructive: false,
+    },
+    ActionMeta {
+        id: ActionId::ShowWorkspaceSyncDetails,
+        label: "Show workspace sync details",
+        description: "Reopen the current sync progress or verification overlay",
+        category: ActionCategory::Workspace,
+        destructive: false,
+    },
+    ActionMeta {
+        id: ActionId::ReturnToWorkspaceSyncPreview,
+        label: "Return to sync preview",
+        description: "Return from confirmation or result details to the current diff preview",
         category: ActionCategory::Workspace,
         destructive: false,
     },
@@ -309,6 +364,8 @@ pub enum InputContext {
     Viewer,
     Help,
     SyncPreview,
+    SyncConfirmation,
+    SyncJob,
     Bookmarks,
     Hosts,
     Jobs,
@@ -337,7 +394,17 @@ impl AppState {
                 Some(super::OverlayKind::Hosts) => InputContext::Hosts,
                 Some(super::OverlayKind::Jobs) => InputContext::Jobs,
                 Some(super::OverlayKind::UserMenu) => InputContext::UserMenu,
-                Some(super::OverlayKind::SyncPreview) => InputContext::SyncPreview,
+                Some(super::OverlayKind::SyncPreview) => match self.remote_workspace.ux {
+                    super::WorkspaceSyncUxState::ConfirmationRequired { .. } => {
+                        InputContext::SyncConfirmation
+                    }
+                    super::WorkspaceSyncUxState::Queued { .. }
+                    | super::WorkspaceSyncUxState::Running { .. }
+                    | super::WorkspaceSyncUxState::Cancelling { .. }
+                    | super::WorkspaceSyncUxState::Verifying { .. }
+                    | super::WorkspaceSyncUxState::Finished { .. } => InputContext::SyncJob,
+                    _ => InputContext::SyncPreview,
+                },
                 _ => InputContext::Browser,
             }
         }

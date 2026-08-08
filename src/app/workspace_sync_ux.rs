@@ -54,7 +54,10 @@ impl WorkspaceSyncUxState {
     }
 
     pub fn is_preview_editable(&self) -> bool {
-        matches!(self, Self::Scanning | Self::Preview { .. } | Self::Blocked { .. })
+        matches!(
+            self,
+            Self::Scanning | Self::Preview { .. } | Self::Blocked { .. }
+        )
     }
 
     pub fn is_job_flow(&self) -> bool {
@@ -75,8 +78,10 @@ mod tests {
             .job_id(),
             Some("sync-1")
         );
-        assert!(WorkspaceSyncUxState::Preview { plan_id: None }
-            .job_id()
-            .is_none());
+        assert!(
+            WorkspaceSyncUxState::Preview { plan_id: None }
+                .job_id()
+                .is_none()
+        );
     }
 }

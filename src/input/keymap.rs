@@ -126,7 +126,7 @@ impl Keymap {
 
 impl Default for Keymap {
     fn default() -> Self {
-        use InputContext::{Browser, Help, SyncPreview};
+        use InputContext::{Browser, Help, SyncConfirmation, SyncJob, SyncPreview};
         use KeyCode::{Char, F};
         const CONTROL: KeyModifiers = KeyModifiers::CONTROL;
         const NONE: KeyModifiers = KeyModifiers::NONE;
@@ -178,6 +178,32 @@ impl Default for Keymap {
                 SyncPreview,
                 vec![KeyStroke::new(KeyCode::Esc, NONE)],
                 Action::CloseWorkspaceSyncPreview,
+            ),
+            KeyBinding::new(
+                SyncPreview,
+                vec![KeyStroke::new(KeyCode::Enter, NONE)],
+                Action::ExecuteWorkspaceSync,
+            ),
+            KeyBinding::new(
+                SyncConfirmation,
+                vec![KeyStroke::new(KeyCode::Enter, NONE)],
+                Action::ConfirmWorkspaceSync,
+            ),
+            KeyBinding::new(
+                SyncConfirmation,
+                vec![KeyStroke::new(KeyCode::Esc, NONE)],
+                Action::ReturnToWorkspaceSyncPreview,
+            ),
+            KeyBinding::new(SyncJob, vec![plain('c')], Action::CancelWorkspaceSync),
+            KeyBinding::new(
+                SyncJob,
+                vec![KeyStroke::new(KeyCode::Esc, NONE)],
+                Action::CloseWorkspaceSyncPreview,
+            ),
+            KeyBinding::new(
+                SyncJob,
+                vec![plain('b')],
+                Action::ReturnToWorkspaceSyncPreview,
             ),
         ];
 

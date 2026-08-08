@@ -23,6 +23,8 @@ mod overlay;
 pub use overlay::OverlayKind;
 mod remote_workspace;
 pub use remote_workspace::RemoteWorkspaceState;
+mod workspace_sync_ux;
+pub use workspace_sync_ux::WorkspaceSyncUxState;
 
 /// Command Center channel tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

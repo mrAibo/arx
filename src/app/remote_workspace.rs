@@ -1,9 +1,12 @@
+use super::WorkspaceSyncUxState;
+use crate::jobs::{Job, JobResult, JobStatus};
 use crate::services::{WorkspaceScanId, WorkspaceScanResponse};
 use crate::vfs::{Entry, Location};
 use crate::workspace_sync::{
     DiffState, SyncDirection, SyncMode, SyncPolicy, WorkspaceDiff, WorkspaceEntry,
     WorkspaceFingerprint, WorkspaceSide, WorkspaceSyncPlan,
 };
+use crate::workspace_sync_execution::FrozenWorkspaceSyncPlan;
 use crate::workspace_sync_verification::{SyncVerificationSnapshot, SyncVerificationStatus};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -14,6 +17,12 @@ pub struct RemoteWorkspaceState {
     pub preview_open: bool,
     pub diff: Option<WorkspaceDiff>,
     pub plan: Option<WorkspaceSyncPlan>,
+    /// Frozen preview selected for explicit execution/confirmation. It is
+    /// invalidated whenever the diff or policy changes.
+    pub frozen_plan: Option<FrozenWorkspaceSyncPlan>,
+    /// Presentation-only stage. Runtime truth remains in JobManager and the
+    /// verification coordinator.
+    pub ux: WorkspaceSyncUxState,
     pub policy: SyncPolicy,
     pub left_scan: Option<WorkspaceScanId>,
     pub right_scan: Option<WorkspaceScanId>,
@@ -31,6 +40,8 @@ impl Default for RemoteWorkspaceState {
             preview_open: false,
             diff: None,
             plan: None,
+            frozen_plan: None,
+            ux: WorkspaceSyncUxState::Idle,
             policy: SyncPolicy::default(),
             left_scan: None,
             right_scan: None,
@@ -50,6 +61,8 @@ impl RemoteWorkspaceState {
         self.preview_open = false;
         self.diff = None;
         self.plan = None;
+        self.frozen_plan = None;
+        self.ux = WorkspaceSyncUxState::Idle;
         self.left_scan = None;
         self.right_scan = None;
         self.left_entries = None;
@@ -66,6 +79,10 @@ impl RemoteWorkspaceState {
         self.right_entries = None;
         self.diff = None;
         self.plan = None;
+        self.frozen_plan = None;
+        if self.preview_open {
+            self.ux = WorkspaceSyncUxState::Scanning;
+        }
         Arc::clone(&self.scan_cancel)
     }
 
@@ -194,10 +211,116 @@ impl RemoteWorkspaceState {
     }
 
     pub fn rebuild_plan(&mut self) {
+        self.frozen_plan = None;
         self.plan = self
             .diff
             .as_ref()
             .map(|diff| WorkspaceSyncPlan::build(diff, self.policy));
+        if self.preview_open && !self.ux.is_job_flow() {
+            self.ux = WorkspaceSyncUxState::Preview { plan_id: None };
+        }
+    }
+
+    pub fn set_frozen_plan(&mut self, frozen: FrozenWorkspaceSyncPlan) {
+        let plan_id = frozen.id();
+        if frozen.requires_confirmation() {
+            self.ux = WorkspaceSyncUxState::ConfirmationRequired {
+                plan_id,
+                digest: frozen.digest(),
+                destructive_operations: frozen.destructive_operations(),
+            };
+        } else {
+            self.ux = WorkspaceSyncUxState::Launching { plan_id };
+        }
+        self.frozen_plan = Some(frozen);
+    }
+
+    pub fn mark_launching(&mut self) {
+        if let Some(frozen) = &self.frozen_plan {
+            self.ux = WorkspaceSyncUxState::Launching {
+                plan_id: frozen.id(),
+            };
+        }
+    }
+
+    pub fn mark_blocked(&mut self, message: impl Into<String>) {
+        self.ux = WorkspaceSyncUxState::Blocked {
+            message: message.into(),
+        };
+    }
+
+    pub fn mark_preview(&mut self) {
+        self.frozen_plan = None;
+        self.ux = WorkspaceSyncUxState::Preview { plan_id: None };
+    }
+
+    pub fn sync_from_job(&mut self, job: &Job) {
+        let Some(context) = &job.sync_context else {
+            return;
+        };
+        let same_workspace = self.diff.as_ref().is_some_and(|diff| {
+            diff.left_root == context.left_root && diff.right_root == context.right_root
+        });
+        let current_job = self.ux.job_id().is_some_and(|id| id == job.id);
+        if !same_workspace && !current_job {
+            return;
+        }
+
+        self.ux = match job.status {
+            JobStatus::Pending => WorkspaceSyncUxState::Queued {
+                job_id: job.id.clone(),
+            },
+            JobStatus::Running => WorkspaceSyncUxState::Running {
+                job_id: job.id.clone(),
+            },
+            JobStatus::Cancelling => WorkspaceSyncUxState::Cancelling {
+                job_id: job.id.clone(),
+            },
+            JobStatus::Paused => WorkspaceSyncUxState::Running {
+                job_id: job.id.clone(),
+            },
+            JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled => {
+                let needs_verification = match &job.result {
+                    Some(JobResult::WorkspaceSync(outcome)) => match outcome.terminal {
+                        crate::workspace_sync_executor::SyncTerminalState::Completed => true,
+                        crate::workspace_sync_executor::SyncTerminalState::Cancelled { .. }
+                        | crate::workspace_sync_executor::SyncTerminalState::Failed { .. } => {
+                            outcome.workspace_may_have_changed
+                        }
+                    },
+                    _ => false,
+                };
+                if needs_verification
+                    && job
+                        .verification
+                        .as_ref()
+                        .is_none_or(|item| !item.status.is_terminal())
+                {
+                    WorkspaceSyncUxState::Verifying {
+                        job_id: job.id.clone(),
+                    }
+                } else {
+                    WorkspaceSyncUxState::Finished {
+                        job_id: job.id.clone(),
+                    }
+                }
+            }
+        };
+    }
+
+    pub fn sync_verification_stage(&mut self, job_id: &str) {
+        let Some(verification) = &self.verification else {
+            return;
+        };
+        self.ux = if verification.status.is_terminal() {
+            WorkspaceSyncUxState::Finished {
+                job_id: job_id.to_string(),
+            }
+        } else {
+            WorkspaceSyncUxState::Verifying {
+                job_id: job_id.to_string(),
+            }
+        };
     }
 
     pub fn reverse_direction(&mut self) {
@@ -302,6 +425,24 @@ mod tests {
             state.policy.conflicts,
             crate::workspace_sync::ConflictPolicy::RequireResolution
         );
+    }
+
+    #[test]
+    fn policy_change_invalidates_frozen_execution_context() {
+        let mut state = RemoteWorkspaceState {
+            preview_open: true,
+            ..RemoteWorkspaceState::default()
+        };
+        state.refresh_visible(
+            Location::Local(PathBuf::from("/left")),
+            Location::Local(PathBuf::from("/right")),
+            &[file("local.txt", 10)],
+            &[],
+        );
+        assert!(matches!(state.ux, WorkspaceSyncUxState::Preview { .. }));
+        state.toggle_mode();
+        assert!(state.frozen_plan.is_none());
+        assert!(matches!(state.ux, WorkspaceSyncUxState::Preview { .. }));
     }
 
     #[test]

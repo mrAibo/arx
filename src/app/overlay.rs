@@ -120,14 +120,19 @@ impl AppState {
     }
 
     pub fn close_overlay(&mut self, overlay: OverlayKind) {
-        if self.active_overlay() == Some(overlay) {
+        if self.active_overlay() != Some(overlay) {
+            return;
+        }
+        if overlay == OverlayKind::SyncPreview {
+            self.remote_workspace.preview_open = false;
+        } else {
             self.close_all_overlays();
         }
     }
 
     pub fn toggle_overlay(&mut self, overlay: OverlayKind) {
         if self.active_overlay() == Some(overlay) {
-            self.close_all_overlays();
+            self.close_overlay(overlay);
         } else {
             self.open_overlay(overlay);
         }
@@ -157,6 +162,21 @@ mod tests {
         assert_eq!(state.active_overlay(), Some(OverlayKind::Hosts));
         state.toggle_overlay(OverlayKind::Hosts);
         assert_eq!(state.active_overlay(), None);
+    }
+
+    #[test]
+    fn hiding_sync_overlay_preserves_sync_workflow_state() {
+        let mut state = AppState::default();
+        state.remote_workspace.ux = super::super::WorkspaceSyncUxState::Running {
+            job_id: "sync-1".into(),
+        };
+        state.open_overlay(OverlayKind::SyncPreview);
+        state.close_overlay(OverlayKind::SyncPreview);
+        assert!(!state.remote_workspace.preview_open);
+        assert!(matches!(
+            state.remote_workspace.ux,
+            super::super::WorkspaceSyncUxState::Running { .. }
+        ));
     }
 
     #[test]
