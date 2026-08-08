@@ -8,6 +8,7 @@ mod pane_loader;
 mod preview;
 mod tree;
 mod workspace_scanner;
+mod workspace_sync_controller;
 
 pub use desktop::DesktopService;
 pub use diff::DiffService;
@@ -23,3 +24,4 @@ pub use workspace_scanner::{
     WorkspaceScanError, WorkspaceScanId, WorkspaceScanOptions, WorkspaceScanResponse,
     WorkspaceScanner,
 };
+pub use workspace_sync_controller::{WorkspaceSyncController, WorkspaceSyncLaunchError};
