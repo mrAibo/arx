@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
 use tokio::sync::mpsc;
 
@@ -17,6 +17,8 @@ use crate::workspace_sync_executor::{
     SyncCompileError, SyncExecutionCompiler, SyncExecutorMatrix, WorkspaceSyncExecutor,
 };
 use crate::workspace_sync_verification::{SyncVerificationCoordinator, SyncVerificationEvent};
+
+use super::{WorkspaceScanError, WorkspaceScanOptions, scan_workspace};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SyncLaunchId(u64);
@@ -169,8 +171,16 @@ impl WorkspaceSyncController {
             )
             .await?;
         self.ensure_launch_current(launch_id)?;
+        let fresh = self
+            .rescan_current(
+                launch_id,
+                executable.plan().left_root(),
+                executable.plan().right_root(),
+            )
+            .await?;
+        SyncPlanValidator::validate_frozen(executable.plan(), &fresh)?;
         let compiled =
-            SyncExecutionCompiler::compile(executable, &current, &self.registry, &executors)?;
+            SyncExecutionCompiler::compile(executable, &fresh, &self.registry, &executors)?;
         self.ensure_launch_current(launch_id)?;
         let journal = match &self.journal {
             Some(journal) => journal.clone(),
@@ -210,6 +220,37 @@ impl WorkspaceSyncController {
         } else {
             Err(WorkspaceSyncLaunchError::Superseded)
         }
+    }
+
+    async fn rescan_current(
+        &self,
+        launch_id: SyncLaunchId,
+        left: &Location,
+        right: &Location,
+    ) -> Result<WorkspaceDiff, WorkspaceSyncLaunchError> {
+        let cancel = AtomicBool::new(false);
+        let left_entries = scan_workspace(
+            &self.registry,
+            left,
+            WorkspaceScanOptions::default(),
+            &cancel,
+        )
+        .await?;
+        self.ensure_launch_current(launch_id)?;
+        let right_entries = scan_workspace(
+            &self.registry,
+            right,
+            WorkspaceScanOptions::default(),
+            &cancel,
+        )
+        .await?;
+        self.ensure_launch_current(launch_id)?;
+        Ok(WorkspaceDiff::compare(
+            left.clone(),
+            right.clone(),
+            left_entries,
+            right_entries,
+        ))
     }
 
     async fn executor_matrix(
@@ -252,6 +293,8 @@ pub enum WorkspaceSyncLaunchError {
     Gate(#[from] SyncExecutionGateError),
     #[error(transparent)]
     Compile(#[from] SyncCompileError),
+    #[error("workspace revalidation failed: {0}")]
+    Revalidation(#[from] WorkspaceScanError),
     #[error("transfer capability probe failed: {0}")]
     Probe(String),
     #[error("transfer capability worker failed: {0}")]
@@ -357,6 +400,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn out_of_band_change_is_rescanned_before_job_creation() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        tokio::fs::write(right.path().join("old.txt"), b"x")
+            .await
+            .unwrap();
+
+        let registry = default_registry();
+        let left_root = Location::Local(left.path().to_path_buf());
+        let right_root = Location::Local(right.path().to_path_buf());
+        let cancel = AtomicBool::new(false);
+        let original = WorkspaceDiff::compare(
+            left_root.clone(),
+            right_root.clone(),
+            scan_workspace(
+                &registry,
+                &left_root,
+                WorkspaceScanOptions::default(),
+                &cancel,
+            )
+            .await
+            .unwrap(),
+            scan_workspace(
+                &registry,
+                &right_root,
+                WorkspaceScanOptions::default(),
+                &cancel,
+            )
+            .await
+            .unwrap(),
+        );
+        let plan = WorkspaceSyncPlan::build(
+            &original,
+            SyncPolicy {
+                mode: SyncMode::Mirror,
+                ..SyncPolicy::default()
+            },
+        );
+        let controller = WorkspaceSyncController::new(registry);
+        let frozen = controller.freeze(&plan, &original).unwrap();
+
+        tokio::fs::write(
+            right.path().join("old.txt"),
+            b"changed-after-preview-with-different-size\n",
+        )
+        .await
+        .unwrap();
+
+        let jobs = JobManager::new();
+        let (job_tx, _job_rx) = mpsc::unbounded_channel();
+        let (verification_tx, _verification_rx) = mpsc::unbounded_channel();
+        let error = controller
+            .launch(
+                frozen,
+                original,
+                true,
+                jobs.clone(),
+                job_tx,
+                verification_tx,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WorkspaceSyncLaunchError::Validation(SyncValidationError::DestinationChanged { ref path })
+                if path == "old.txt"
+        ));
+        assert!(jobs.snapshot().is_empty());
+        assert_eq!(
+            tokio::fs::read(right.path().join("old.txt")).await.unwrap(),
+            b"changed-after-preview-with-different-size\n"
+        );
+    }
+
+    #[tokio::test]
     async fn stale_confirmed_frozen_plan_cannot_queue_after_workspace_change() {
         let left = tempfile::tempdir().unwrap();
         let right = tempfile::tempdir().unwrap();
@@ -394,10 +513,12 @@ mod tests {
         assert!(jobs.snapshot().is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn compiler_rejection_creates_no_job_and_no_mutation() {
         let left = tempfile::tempdir().unwrap();
         let right = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("missing-target", left.path().join("link")).unwrap();
         let source = WorkspaceEntry {
             relative_path: "link".into(),
             fingerprint: WorkspaceFingerprint {
