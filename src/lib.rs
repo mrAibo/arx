@@ -18,3 +18,4 @@ pub mod workspace_sync;
 pub mod workspace_sync_execution;
 pub mod workspace_sync_executor;
 pub mod workspace_sync_journal;
+pub mod workspace_sync_verification;

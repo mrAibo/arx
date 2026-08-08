@@ -11,6 +11,10 @@ use crate::workspace_sync_executor::{
     CompiledSyncPlan, PhysicalStepId, SyncExecutionEvent, SyncExecutionOutcome, SyncTerminalState,
     WorkspaceSyncExecutor,
 };
+use crate::workspace_sync_verification::{
+    SyncVerificationCoordinator, SyncVerificationEvent, SyncVerificationSnapshot,
+    SyncVerificationStatus,
+};
 
 // ── Generic progress model ──
 
@@ -215,6 +219,8 @@ pub struct Job {
     pub cancel: Arc<AtomicBool>,
     pub result: Option<JobResult>,
     pub error: Option<String>,
+    /// Post-execution verification is a separate fact from terminal job status.
+    pub verification: Option<SyncVerificationSnapshot>,
 }
 
 impl Job {
@@ -236,6 +242,7 @@ impl Job {
             cancel: job_token(),
             result: None,
             error: None,
+            verification: None,
         }
     }
 
@@ -511,6 +518,60 @@ impl JobManager {
         }
     }
 
+    /// Attach verification to a terminal sync job without mutating the
+    /// executor-owned terminal status/result/error.
+    pub fn apply_sync_verification(
+        &self,
+        id: &str,
+        verification: &SyncVerificationSnapshot,
+    ) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(job) = state.jobs.get_mut(id) else {
+            return false;
+        };
+        if job.kind != JobKind::Synchronize || !job.status.is_terminal() {
+            return false;
+        }
+        let Some(JobResult::WorkspaceSync(outcome)) = &job.result else {
+            return false;
+        };
+        if outcome.plan_id != verification.plan_id
+            || job.source.as_ref() != Some(&verification.left_root)
+            || job.destination.as_ref() != Some(&verification.right_root)
+        {
+            return false;
+        }
+
+        match &job.verification {
+            None => {
+                if !matches!(verification.status, SyncVerificationStatus::Pending) {
+                    return false;
+                }
+            }
+            Some(current) if verification.id < current.id => return false,
+            Some(current) if verification.id > current.id => {
+                if !matches!(verification.status, SyncVerificationStatus::Pending) {
+                    return false;
+                }
+            }
+            Some(current) => {
+                if current.plan_id != verification.plan_id
+                    || current.left_root != verification.left_root
+                    || current.right_root != verification.right_root
+                    || !current.status.can_transition_to(&verification.status)
+                {
+                    return false;
+                }
+            }
+        }
+
+        job.verification = Some(verification.clone());
+        true
+    }
+
     pub fn snapshot(&self) -> Vec<Job> {
         let state = self
             .state
@@ -542,15 +603,47 @@ impl JobManager {
         true
     }
 
-    /// Spawn one workspace-sync job. The manager creates the only cancellation
-    /// token and passes that exact `Arc` through the sync executor into the
-    /// transfer executor. Compilation/planning never happens here.
+    /// Spawn one workspace-sync job without a post-run verification pass.
+    /// Remote Workspace uses the verified adapter below; compilation/planning
+    /// remains outside the Job layer in both paths.
     pub fn spawn_workspace_sync(
         &self,
         compiled_plan: CompiledSyncPlan,
         executor: WorkspaceSyncExecutor,
         events: mpsc::UnboundedSender<JobEvent>,
     ) -> String {
+        self.spawn_workspace_sync_inner(compiled_plan, executor, events, None)
+    }
+
+    pub fn spawn_workspace_sync_with_verification(
+        &self,
+        compiled_plan: CompiledSyncPlan,
+        executor: WorkspaceSyncExecutor,
+        events: mpsc::UnboundedSender<JobEvent>,
+        verification: SyncVerificationCoordinator,
+        verification_events: mpsc::UnboundedSender<SyncVerificationEvent>,
+    ) -> String {
+        self.spawn_workspace_sync_inner(
+            compiled_plan,
+            executor,
+            events,
+            Some((verification, verification_events)),
+        )
+    }
+
+    fn spawn_workspace_sync_inner(
+        &self,
+        compiled_plan: CompiledSyncPlan,
+        executor: WorkspaceSyncExecutor,
+        events: mpsc::UnboundedSender<JobEvent>,
+        verification: Option<(
+            SyncVerificationCoordinator,
+            mpsc::UnboundedSender<SyncVerificationEvent>,
+        )>,
+    ) -> String {
+        let verification_plan_id = compiled_plan.plan_id();
+        let verification_left_root = compiled_plan.left_root().clone();
+        let verification_right_root = compiled_plan.right_root().clone();
         let description = format!(
             "Sync {} → {}",
             compiled_plan.left_root(),
@@ -616,23 +709,82 @@ impl JobManager {
                 }
             }
 
-            let terminal_event = match terminal {
-                Ok(outcome) => job_event_from_sync_outcome(worker_id, outcome),
-                Err(error) => JobEvent::Failed {
-                    id: worker_id,
-                    error: error.to_string(),
-                    result: None,
-                },
-            };
-            publish(&manager, &events, terminal_event);
+            match terminal {
+                Ok(outcome) => {
+                    let should_verify = sync_outcome_needs_verification(&outcome);
+                    let terminal_event = job_event_from_sync_outcome(worker_id.clone(), outcome);
+                    let accepted = publish(&manager, &events, terminal_event);
+                    if accepted
+                        && should_verify
+                        && let Some((coordinator, verification_events)) = verification
+                    {
+                        spawn_sync_verification_bridge(
+                            manager.clone(),
+                            worker_id,
+                            verification_plan_id,
+                            verification_left_root,
+                            verification_right_root,
+                            coordinator,
+                            verification_events,
+                        );
+                    }
+                }
+                Err(error) => {
+                    publish(
+                        &manager,
+                        &events,
+                        JobEvent::Failed {
+                            id: worker_id,
+                            error: error.to_string(),
+                            result: None,
+                        },
+                    );
+                }
+            }
         });
 
         id
     }
 }
 
-fn publish(manager: &JobManager, events: &mpsc::UnboundedSender<JobEvent>, event: JobEvent) {
-    let _ = manager.publish_event(events, event);
+fn publish(
+    manager: &JobManager,
+    events: &mpsc::UnboundedSender<JobEvent>,
+    event: JobEvent,
+) -> bool {
+    manager.publish_event(events, event)
+}
+
+fn sync_outcome_needs_verification(outcome: &SyncExecutionOutcome) -> bool {
+    match &outcome.terminal {
+        SyncTerminalState::Completed => true,
+        SyncTerminalState::Cancelled { .. } | SyncTerminalState::Failed { .. } => {
+            !outcome.completed.is_empty()
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_sync_verification_bridge(
+    manager: JobManager,
+    job_id: String,
+    plan_id: crate::workspace_sync_execution::SyncPlanId,
+    left_root: Location,
+    right_root: Location,
+    coordinator: SyncVerificationCoordinator,
+    verification_events: mpsc::UnboundedSender<SyncVerificationEvent>,
+) {
+    let mut run = coordinator.start(job_id.clone(), plan_id, left_root, right_root);
+    tokio::spawn(async move {
+        while let Some(verification) = run.recv().await {
+            if manager.apply_sync_verification(&job_id, &verification) {
+                let _ = verification_events.send(SyncVerificationEvent {
+                    job_id: job_id.clone(),
+                    verification,
+                });
+            }
+        }
+    });
 }
 
 fn sync_progress_event(
