@@ -351,8 +351,8 @@ pub const ACTION_CATALOG: &[ActionMeta] = &[
     },
     ActionMeta {
         id: ActionId::ReturnToWorkspaceSyncPreview,
-        label: "Return to sync preview",
-        description: "Return from confirmation or result details to the current diff preview",
+        label: "Back in workspace sync",
+        description: "Return from verification details or to the current preview when it still exists",
         category: ActionCategory::Workspace,
         destructive: false,
     },
@@ -414,7 +414,8 @@ impl AppState {
                     | super::WorkspaceSyncUxState::Running { .. }
                     | super::WorkspaceSyncUxState::Cancelling { .. }
                     | super::WorkspaceSyncUxState::Verifying { .. }
-                    | super::WorkspaceSyncUxState::Finished { .. } => InputContext::SyncJob,
+                    | super::WorkspaceSyncUxState::Finished { .. }
+                    | super::WorkspaceSyncUxState::VerificationDiff { .. } => InputContext::SyncJob,
                     _ => InputContext::SyncPreview,
                 },
                 _ => InputContext::Browser,

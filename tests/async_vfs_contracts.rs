@@ -270,7 +270,7 @@ fn workspace_sync_execution_stays_gated_behind_application_controller() {
 
     assert!(tui.contains("WorkspaceSyncController"));
     assert!(sync_ui.contains("sync.controller.freeze("));
-    assert!(sync_ui.contains(".launch("));
+    assert!(sync_ui.contains(".launch_guarded("));
     assert!(!tui.contains("execution intentionally disabled"));
     for forbidden in [
         "SyncExecutionCompiler",

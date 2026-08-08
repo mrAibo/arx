@@ -24,4 +24,6 @@ pub use workspace_scanner::{
     WorkspaceScanError, WorkspaceScanId, WorkspaceScanOptions, WorkspaceScanResponse,
     WorkspaceScanner,
 };
-pub use workspace_sync_controller::{WorkspaceSyncController, WorkspaceSyncLaunchError};
+pub use workspace_sync_controller::{
+    SyncLaunchId, WorkspaceSyncController, WorkspaceSyncLaunchError,
+};

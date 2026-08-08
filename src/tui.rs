@@ -8,11 +8,13 @@ use arx::effects::{Effect, EffectEvent};
 use arx::input::{KeyResolution, KeyRouter};
 use arx::services::{
     DesktopService, FileInfoService, GitService, MutationError, MutationService, PaneLoadPurpose,
-    PaneLoadResponse, PaneLoader, PreviewService, WorkspaceScanError, WorkspaceScanOptions,
-    WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
+    PaneLoadResponse, PaneLoader, PreviewService, SyncLaunchId, WorkspaceScanError,
+    WorkspaceScanOptions, WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
 };
 use arx::vfs::{Entry, EntryKind, Location};
-use arx::workspace_sync::{SyncDirection, SyncMode, WorkspaceSide, WorkspaceSyncOperation};
+use arx::workspace_sync::{
+    DiffState, SyncDirection, SyncMode, WorkspaceSide, WorkspaceSyncOperation,
+};
 use arx::workspace_sync_execution::SyncPlanId;
 use arx::workspace_sync_verification::{
     SyncVerificationEvent, SyncVerificationStatus, SyncVerificationVerdict,
@@ -43,6 +45,7 @@ struct SyncUiRuntime {
 }
 
 struct SyncLaunchResponse {
+    launch_id: SyncLaunchId,
     plan_id: SyncPlanId,
     result: Result<String, String>,
 }
@@ -178,11 +181,14 @@ async fn event_loop(
                 continue;
             }
             Some(response) = sync_launch_rx.recv() => {
-                let still_current = state
-                    .remote_workspace
-                    .frozen_plan
-                    .as_ref()
-                    .is_some_and(|frozen| frozen.id() == response.plan_id);
+                let still_current = sync_runtime
+                    .controller
+                    .is_launch_current(response.launch_id)
+                    && state
+                        .remote_workspace
+                        .frozen_plan
+                        .as_ref()
+                        .is_some_and(|frozen| frozen.id() == response.plan_id);
                 if still_current {
                     match response.result {
                         Ok(job_id) => {
@@ -2581,6 +2587,11 @@ fn render_sync_preview(frame: &mut ratatui::Frame, area: Rect, state: &AppState)
             title = " Workspace Sync — PREPARING ".into();
             lines.push(Line::from("Freezing transport choice and execution steps…"));
             lines.push(Line::from("No Job has been created yet."));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Esc hides this view. A newer compare/direction/mode action supersedes preparation.",
+                Style::default().fg(Color::DarkGray),
+            )));
         }
         WorkspaceSyncUxState::Blocked { message } => {
             title = " Workspace Sync — CANNOT EXECUTE ".into();
@@ -2592,6 +2603,14 @@ fn render_sync_preview(frame: &mut ratatui::Frame, area: Rect, state: &AppState)
                 Style::default().fg(Color::DarkGray),
             )));
         }
+        WorkspaceSyncUxState::VerificationDiff { job_id } => {
+            title = " Post-sync Verification Diff ".into();
+            if let Some(job) = state.jobs.iter().find(|job| job.id == *job_id) {
+                render_sync_verification_diff_lines(job, &mut lines);
+            } else {
+                lines.push(Line::from("The verification Job is no longer available."));
+            }
+        }
         WorkspaceSyncUxState::Queued { job_id }
         | WorkspaceSyncUxState::Running { job_id }
         | WorkspaceSyncUxState::Cancelling { job_id }
@@ -2599,7 +2618,14 @@ fn render_sync_preview(frame: &mut ratatui::Frame, area: Rect, state: &AppState)
         | WorkspaceSyncUxState::Finished { job_id } => {
             if let Some(job) = state.jobs.iter().find(|job| job.id == *job_id) {
                 title = sync_job_title(job, &state.remote_workspace.ux);
-                render_sync_job_lines(job, &state.remote_workspace.ux, &mut lines);
+                let can_return_to_preview =
+                    ActionContext::from_state(state).sync_return_preview_ready;
+                render_sync_job_lines(
+                    job,
+                    &state.remote_workspace.ux,
+                    can_return_to_preview,
+                    &mut lines,
+                );
             } else {
                 lines.push(Line::from("Waiting for JobManager snapshot…"));
             }
@@ -2728,6 +2754,7 @@ fn sync_job_title(job: &arx::jobs::Job, ux: &WorkspaceSyncUxState) -> String {
 fn render_sync_job_lines(
     job: &arx::jobs::Job,
     ux: &WorkspaceSyncUxState,
+    can_return_to_preview: bool,
     lines: &mut Vec<Line<'static>>,
 ) {
     if let (Some(source), Some(destination)) = (job.display_source(), job.display_destination()) {
@@ -2843,14 +2870,86 @@ fn render_sync_job_lines(
         WorkspaceSyncUxState::Cancelling { .. } | WorkspaceSyncUxState::Verifying { .. } => {
             "Esc hide"
         }
-        WorkspaceSyncUxState::Finished { .. } if verification_has_differences(job) => {
-            "V view diff   B back to current preview   Esc hide"
+        WorkspaceSyncUxState::Finished { .. }
+            if verification_has_differences(job) && can_return_to_preview =>
+        {
+            "V verification diff   B current preview   Esc hide"
         }
-        WorkspaceSyncUxState::Finished { .. } => "B back to current preview   Esc hide",
+        WorkspaceSyncUxState::Finished { .. } if verification_has_differences(job) => {
+            "V verification diff   Esc hide · current panes moved"
+        }
+        WorkspaceSyncUxState::Finished { .. } if can_return_to_preview => {
+            "B current preview   Esc hide"
+        }
+        WorkspaceSyncUxState::Finished { .. } => {
+            "Esc hide · compare current panes for a new preview"
+        }
         _ => "Esc hide",
     };
     lines.push(Line::from(Span::styled(
         footer,
+        Style::default().fg(Color::DarkGray),
+    )));
+}
+
+fn render_sync_verification_diff_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>>) {
+    let Some(verification) = &job.verification else {
+        lines.push(Line::from("No post-sync verification result is available."));
+        return;
+    };
+    let SyncVerificationStatus::Finished(result) = &verification.status else {
+        lines.push(Line::from("Verification has not finished yet."));
+        return;
+    };
+    if !matches!(
+        result.verdict,
+        SyncVerificationVerdict::DifferencesRemain { .. }
+    ) {
+        lines.push(Line::from(
+            "Verification did not report remaining differences.",
+        ));
+        return;
+    }
+
+    lines.push(Line::from(format!("LEFT   {}", result.left_root)));
+    lines.push(Line::from(format!("RIGHT  {}", result.right_root)));
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "{} proven difference(s) · {} conflict(s) · {} unverified",
+        result.changed_entries, result.conflicts, result.unverified_entries
+    )));
+    lines.push(Line::from(Span::styled(
+        "This is the recursive post-sync verification snapshot for this Job.",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+
+    let visible = result
+        .diff
+        .entries
+        .iter()
+        .filter(|entry| entry.state != DiffState::SameFingerprint)
+        .collect::<Vec<_>>();
+    for entry in visible.iter().take(40) {
+        let label = match entry.state {
+            DiffState::OnlyLeft => "LEFT ONLY",
+            DiffState::OnlyRight => "RIGHT ONLY",
+            DiffState::LeftNewer => "LEFT NEWER",
+            DiffState::RightNewer => "RIGHT NEWER",
+            DiffState::Different => "COMPARE",
+            DiffState::SameFingerprint => continue,
+        };
+        lines.push(Line::from(format!("{label:>11}  {}", entry.relative_path)));
+    }
+    if visible.len() > 40 {
+        lines.push(Line::from(format!(
+            "… {} more verification entry/entries",
+            visible.len() - 40
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "B back to Job result   Esc hide",
         Style::default().fg(Color::DarkGray),
     )));
 }
@@ -3488,6 +3587,17 @@ fn dispatch_ui_action(
     workspace_scanner: &WorkspaceScanner,
     sync: &SyncUiRuntime,
 ) {
+    if matches!(
+        action,
+        Action::ToggleWorkspaceComparison
+            | Action::PreviewWorkspaceSync
+            | Action::ReverseWorkspaceDirection
+            | Action::ToggleWorkspaceSyncMode
+    ) && !supersede_workspace_launch_for_new_action(state, sync)
+    {
+        return;
+    }
+
     match action {
         Action::Quit => state.apply(action),
         Action::OpenCommandCenter => {
@@ -3564,12 +3674,18 @@ fn dispatch_ui_action(
             }
         }
         Action::ShowWorkspaceVerificationDiff => {
-            state.remote_workspace.preview_open = false;
-            state.show_diff = true;
-            state.message = Some("Showing the current post-sync verification diff".into());
+            if let Some(job_id) = state.remote_workspace.ux.job_id().map(str::to_string) {
+                state.remote_workspace.show_verification_diff(job_id);
+                state.open_overlay(OverlayKind::SyncPreview);
+                // The overlay renders the recursive Job-bound verification
+                // snapshot. Do not reuse shallow pane-level diff highlighting.
+                state.show_diff = false;
+            }
         }
         Action::ReturnToWorkspaceSyncPreview => {
-            if matches!(
+            if state.remote_workspace.return_from_verification_diff() {
+                state.open_overlay(OverlayKind::SyncPreview);
+            } else if matches!(
                 state.remote_workspace.ux,
                 WorkspaceSyncUxState::ConfirmationRequired { .. }
                     | WorkspaceSyncUxState::Blocked { .. }
@@ -3583,6 +3699,27 @@ fn dispatch_ui_action(
         }
         Action::CloseWorkspaceSyncOverlay => state.close_overlay(OverlayKind::SyncPreview),
         _ => state.apply(action),
+    }
+}
+
+fn supersede_workspace_launch_for_new_action(state: &mut AppState, sync: &SyncUiRuntime) -> bool {
+    if !matches!(
+        state.remote_workspace.ux,
+        WorkspaceSyncUxState::Launching { .. }
+    ) {
+        return true;
+    }
+
+    if sync.controller.supersede_launch() {
+        state.remote_workspace.supersede_launch_presentation();
+        true
+    } else {
+        state.open_overlay(OverlayKind::SyncPreview);
+        state.message = Some(
+            "Workspace sync has already crossed the Job queue boundary; waiting for its Job view."
+                .into(),
+        );
+        false
     }
 }
 
@@ -3621,6 +3758,7 @@ fn launch_workspace_sync(state: &mut AppState, sync: &SyncUiRuntime, confirmed: 
         return;
     };
     let plan_id = frozen.id();
+    let launch_id = sync.controller.begin_launch();
     state.remote_workspace.mark_launching();
     let controller = sync.controller.clone();
     let jobs = sync.jobs.clone();
@@ -3629,17 +3767,21 @@ fn launch_workspace_sync(state: &mut AppState, sync: &SyncUiRuntime, confirmed: 
     let launch_events = sync.launch_events.clone();
     tokio::spawn(async move {
         let result = controller
-            .launch(
+            .launch_guarded(
+                launch_id,
                 frozen,
                 diff,
                 confirmed,
                 jobs,
-                job_events,
-                verification_events,
+                (job_events, verification_events),
             )
             .await
             .map_err(|error| error.user_message());
-        let _ = launch_events.send(SyncLaunchResponse { plan_id, result });
+        let _ = launch_events.send(SyncLaunchResponse {
+            launch_id,
+            plan_id,
+            result,
+        });
     });
 }
 

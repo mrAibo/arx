@@ -36,6 +36,9 @@ pub enum WorkspaceSyncUxState {
     Finished {
         job_id: String,
     },
+    VerificationDiff {
+        job_id: String,
+    },
     Blocked {
         message: String,
     },
@@ -48,7 +51,8 @@ impl WorkspaceSyncUxState {
             | Self::Running { job_id }
             | Self::Cancelling { job_id }
             | Self::Verifying { job_id }
-            | Self::Finished { job_id } => Some(job_id),
+            | Self::Finished { job_id }
+            | Self::VerificationDiff { job_id } => Some(job_id),
             _ => None,
         }
     }
@@ -64,15 +68,14 @@ impl WorkspaceSyncUxState {
         self.job_id().is_some()
     }
 
-    /// While an immutable plan is launching or a Job is still active, actions
-    /// that rebuild/disable the workspace comparison are presentation-unsafe.
-    /// Normal pane navigation remains available; late verification correlation
-    /// protects those independent workspace changes.
+    /// Once a Job exists, actions that rebuild/disable the workspace
+    /// comparison are presentation-unsafe. `Launching` is intentionally
+    /// supersedable: a newer workspace action invalidates the old launch before
+    /// it can queue a Job.
     pub fn is_locked_flow(&self) -> bool {
         matches!(
             self,
-            Self::Launching { .. }
-                | Self::Queued { .. }
+            Self::Queued { .. }
                 | Self::Running { .. }
                 | Self::Cancelling { .. }
                 | Self::Verifying { .. }
@@ -85,7 +88,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn launching_and_active_job_states_lock_preview_mutation() {
+    fn active_jobs_lock_preview_mutation_but_launching_can_be_superseded() {
         let launching = WorkspaceSyncUxState::Launching {
             plan_id: crate::workspace_sync_execution::SyncPlanValidator::freeze(
                 &crate::workspace_sync::WorkspaceSyncPlan::build(
@@ -124,7 +127,7 @@ mod tests {
             .unwrap()
             .id(),
         };
-        assert!(launching.is_locked_flow());
+        assert!(!launching.is_locked_flow());
         assert!(
             WorkspaceSyncUxState::Running {
                 job_id: "sync-1".into()
@@ -154,5 +157,15 @@ mod tests {
                 .job_id()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn verification_diff_keeps_the_job_identity() {
+        let state = WorkspaceSyncUxState::VerificationDiff {
+            job_id: "sync-old".into(),
+        };
+        assert_eq!(state.job_id(), Some("sync-old"));
+        assert!(state.is_job_flow());
+        assert!(!state.is_locked_flow());
     }
 }

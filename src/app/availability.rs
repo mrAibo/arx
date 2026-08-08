@@ -82,12 +82,16 @@ impl ActionContext {
                         )
                 )
             });
-        let sync_return_preview_ready = matches!(
-            state.remote_workspace.ux,
+        let current_preview_ready = state
+            .remote_workspace
+            .has_current_preview(&state.left.location, &state.right.location);
+        let sync_return_preview_ready = match state.remote_workspace.ux {
+            WorkspaceSyncUxState::VerificationDiff { .. } => true,
             WorkspaceSyncUxState::ConfirmationRequired { .. }
-                | WorkspaceSyncUxState::Blocked { .. }
-                | WorkspaceSyncUxState::Finished { .. }
-        );
+            | WorkspaceSyncUxState::Blocked { .. }
+            | WorkspaceSyncUxState::Finished { .. } => current_preview_ready,
+            _ => false,
+        };
 
         Self {
             active_provider,
@@ -165,7 +169,7 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
         }
         ActionId::ReturnToWorkspaceSyncPreview if !ctx.sync_return_preview_ready => {
             ActionAvailability::Disabled {
-                reason: "There is no confirmation, result, or blocked sync view to leave".into(),
+                reason: "No current workspace preview is available to return to".into(),
             }
         }
         _ => ActionAvailability::Available,

@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::io;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
@@ -17,6 +18,21 @@ use crate::workspace_sync_executor::{
 };
 use crate::workspace_sync_verification::{SyncVerificationCoordinator, SyncVerificationEvent};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SyncLaunchId(u64);
+
+impl SyncLaunchId {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Default)]
+struct SyncLaunchGeneration {
+    current: u64,
+    committed: bool,
+}
+
 /// Application-level wiring for the existing workspace-sync pipeline.
 ///
 /// Presentation code may ask this controller to freeze or launch a plan, but it
@@ -27,6 +43,7 @@ pub struct WorkspaceSyncController {
     registry: ProviderRegistry,
     journal: Option<OperationJournal>,
     verification: SyncVerificationCoordinator,
+    launch_generation: Arc<Mutex<SyncLaunchGeneration>>,
 }
 
 impl WorkspaceSyncController {
@@ -35,6 +52,7 @@ impl WorkspaceSyncController {
             verification: SyncVerificationCoordinator::new(registry.clone()),
             registry,
             journal: None,
+            launch_generation: Arc::new(Mutex::new(SyncLaunchGeneration::default())),
         }
     }
 
@@ -43,6 +61,7 @@ impl WorkspaceSyncController {
             verification: SyncVerificationCoordinator::new(registry.clone()),
             registry,
             journal: Some(journal),
+            launch_generation: Arc::new(Mutex::new(SyncLaunchGeneration::default())),
         }
     }
 
@@ -54,6 +73,44 @@ impl WorkspaceSyncController {
         SyncPlanValidator::freeze(plan, current, &self.registry)
     }
 
+    pub fn begin_launch(&self) -> SyncLaunchId {
+        let mut generation = self
+            .launch_generation
+            .lock()
+            .expect("workspace sync launch generation poisoned");
+        generation.current = generation
+            .current
+            .checked_add(1)
+            .expect("workspace sync launch generation exhausted");
+        generation.committed = false;
+        SyncLaunchId(generation.current)
+    }
+
+    /// Supersede an in-flight preparation. Returns false once that preparation
+    /// has atomically crossed the Job-creation boundary.
+    pub fn supersede_launch(&self) -> bool {
+        let mut generation = self
+            .launch_generation
+            .lock()
+            .expect("workspace sync launch generation poisoned");
+        if generation.committed {
+            return false;
+        }
+        generation.current = generation
+            .current
+            .checked_add(1)
+            .expect("workspace sync launch generation exhausted");
+        true
+    }
+
+    pub fn is_launch_current(&self, launch_id: SyncLaunchId) -> bool {
+        self.launch_generation
+            .lock()
+            .expect("workspace sync launch generation poisoned")
+            .current
+            == launch_id.get()
+    }
+
     pub async fn launch(
         &self,
         frozen: FrozenWorkspaceSyncPlan,
@@ -63,6 +120,33 @@ impl WorkspaceSyncController {
         job_events: mpsc::UnboundedSender<JobEvent>,
         verification_events: mpsc::UnboundedSender<SyncVerificationEvent>,
     ) -> Result<String, WorkspaceSyncLaunchError> {
+        let launch_id = self.begin_launch();
+        self.launch_guarded(
+            launch_id,
+            frozen,
+            current,
+            explicitly_confirmed,
+            jobs,
+            (job_events, verification_events),
+        )
+        .await
+    }
+
+    pub async fn launch_guarded(
+        &self,
+        launch_id: SyncLaunchId,
+        frozen: FrozenWorkspaceSyncPlan,
+        current: WorkspaceDiff,
+        explicitly_confirmed: bool,
+        jobs: JobManager,
+        events: (
+            mpsc::UnboundedSender<JobEvent>,
+            mpsc::UnboundedSender<SyncVerificationEvent>,
+        ),
+    ) -> Result<String, WorkspaceSyncLaunchError> {
+        let (job_events, verification_events) = events;
+        self.ensure_launch_current(launch_id)?;
+
         // A confirmation is permission for this exact frozen plan, not a waiver
         // of stale-preview checks.
         SyncPlanValidator::validate_frozen(&frozen, &current)?;
@@ -84,21 +168,48 @@ impl WorkspaceSyncController {
                 executable.plan().right_root(),
             )
             .await?;
+        self.ensure_launch_current(launch_id)?;
         let compiled =
             SyncExecutionCompiler::compile(executable, &current, &self.registry, &executors)?;
+        self.ensure_launch_current(launch_id)?;
         let journal = match &self.journal {
             Some(journal) => journal.clone(),
             None => OperationJournal::open_default()?,
         };
         let executor = WorkspaceSyncExecutor::new(self.registry.clone(), journal);
 
-        Ok(jobs.spawn_workspace_sync_with_verification(
+        // Hold the generation lock across the synchronous Job creation call.
+        // If a newer workspace action superseded this launch first, no Job can
+        // appear. If we commit first, a concurrent supersede attempt returns
+        // false and the UI keeps the immutable launch locked until its Job id
+        // arrives.
+        let mut generation = self
+            .launch_generation
+            .lock()
+            .expect("workspace sync launch generation poisoned");
+        if generation.current != launch_id.get() {
+            return Err(WorkspaceSyncLaunchError::Superseded);
+        }
+        generation.committed = true;
+        let job_id = jobs.spawn_workspace_sync_with_verification(
             compiled,
             executor,
             job_events,
             self.verification.clone(),
             verification_events,
-        ))
+        );
+        Ok(job_id)
+    }
+
+    fn ensure_launch_current(
+        &self,
+        launch_id: SyncLaunchId,
+    ) -> Result<(), WorkspaceSyncLaunchError> {
+        if self.is_launch_current(launch_id) {
+            Ok(())
+        } else {
+            Err(WorkspaceSyncLaunchError::Superseded)
+        }
     }
 
     async fn executor_matrix(
@@ -147,6 +258,8 @@ pub enum WorkspaceSyncLaunchError {
     ProbeWorker(String),
     #[error("operation journal is unavailable: {0}")]
     Journal(#[from] io::Error),
+    #[error("workspace sync preparation was superseded by a newer action")]
+    Superseded,
 }
 
 impl WorkspaceSyncLaunchError {
@@ -170,6 +283,9 @@ impl WorkspaceSyncLaunchError {
             }
             Self::Probe(error) | Self::ProbeWorker(error) => {
                 format!("ARX could not verify the remote transfer capability: {error}")
+            }
+            Self::Superseded => {
+                "A newer workspace action replaced this preparation.".to_string()
             }
             other => other.to_string(),
         };
@@ -393,5 +509,44 @@ mod tests {
             Vec::<WorkspaceEntry>::new(),
         );
         assert!(controller.freeze(&plan, &diff).is_err());
+    }
+
+    #[tokio::test]
+    async fn superseded_launch_generation_cannot_create_a_job() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        tokio::fs::write(left.path().join("a.txt"), b"a")
+            .await
+            .unwrap();
+        let diff = WorkspaceDiff::compare(
+            Location::Local(left.path().to_path_buf()),
+            Location::Local(right.path().to_path_buf()),
+            vec![file("a.txt", 1)],
+            Vec::<WorkspaceEntry>::new(),
+        );
+        let plan = WorkspaceSyncPlan::build(&diff, SyncPolicy::default());
+        let controller = WorkspaceSyncController::new(default_registry());
+        let frozen = controller.freeze(&plan, &diff).unwrap();
+        let stale_launch = controller.begin_launch();
+        assert!(controller.supersede_launch());
+
+        let jobs = JobManager::new();
+        let (job_tx, _job_rx) = mpsc::unbounded_channel();
+        let (verification_tx, _verification_rx) = mpsc::unbounded_channel();
+        let error = controller
+            .launch_guarded(
+                stale_launch,
+                frozen,
+                diff,
+                false,
+                jobs.clone(),
+                (job_tx, verification_tx),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, WorkspaceSyncLaunchError::Superseded));
+        assert!(jobs.snapshot().is_empty());
+        assert!(!right.path().join("a.txt").exists());
     }
 }

@@ -261,6 +261,48 @@ impl RemoteWorkspaceState {
         self.ux = WorkspaceSyncUxState::Preview { plan_id: None };
     }
 
+    pub fn supersede_launch_presentation(&mut self) {
+        if !matches!(self.ux, WorkspaceSyncUxState::Launching { .. }) {
+            return;
+        }
+        self.frozen_plan = None;
+        self.ux = if self.preview_open && self.plan.is_some() {
+            WorkspaceSyncUxState::Preview { plan_id: None }
+        } else {
+            WorkspaceSyncUxState::Idle
+        };
+    }
+
+    pub fn show_verification_diff(&mut self, job_id: impl Into<String>) {
+        self.ux = WorkspaceSyncUxState::VerificationDiff {
+            job_id: job_id.into(),
+        };
+    }
+
+    pub fn return_from_verification_diff(&mut self) -> bool {
+        let WorkspaceSyncUxState::VerificationDiff { job_id } = &self.ux else {
+            return false;
+        };
+        self.ux = WorkspaceSyncUxState::Finished {
+            job_id: job_id.clone(),
+        };
+        true
+    }
+
+    pub fn has_current_preview(
+        &self,
+        current_left_root: &Location,
+        current_right_root: &Location,
+    ) -> bool {
+        self.enabled
+            && self.diff.as_ref().is_some_and(|diff| {
+                diff.left_root == *current_left_root && diff.right_root == *current_right_root
+            })
+            && self.plan.as_ref().is_some_and(|plan| {
+                plan.left_root == *current_left_root && plan.right_root == *current_right_root
+            })
+    }
+
     pub fn sync_from_job(&mut self, job: &Job) {
         let Some(context) = &job.sync_context else {
             return;
@@ -571,5 +613,51 @@ mod tests {
             RemoteWorkspaceState::default().policy.mode,
             SyncMode::Update
         );
+    }
+
+    #[test]
+    fn finished_job_after_navigation_has_no_current_preview_to_return_to() {
+        let left = Location::Local(PathBuf::from("/left"));
+        let right = Location::Local(PathBuf::from("/right"));
+        let mut state = RemoteWorkspaceState {
+            preview_open: true,
+            ..RemoteWorkspaceState::default()
+        };
+        state.refresh_visible(left.clone(), right.clone(), &[file("a.txt", 1)], &[]);
+        state.ux = WorkspaceSyncUxState::Finished {
+            job_id: "sync-old".into(),
+        };
+
+        assert!(state.has_current_preview(&left, &right));
+        state.disable();
+
+        assert!(matches!(
+            state.ux,
+            WorkspaceSyncUxState::Finished { ref job_id } if job_id == "sync-old"
+        ));
+        assert!(!state.has_current_preview(&left, &right));
+        assert!(state.diff.is_none());
+        assert!(state.plan.is_none());
+    }
+
+    #[test]
+    fn verification_diff_returns_to_the_same_job_result() {
+        let mut state = RemoteWorkspaceState {
+            ux: WorkspaceSyncUxState::Finished {
+                job_id: "sync-old".into(),
+            },
+            ..RemoteWorkspaceState::default()
+        };
+
+        state.show_verification_diff("sync-old");
+        assert!(matches!(
+            state.ux,
+            WorkspaceSyncUxState::VerificationDiff { ref job_id } if job_id == "sync-old"
+        ));
+        assert!(state.return_from_verification_diff());
+        assert!(matches!(
+            state.ux,
+            WorkspaceSyncUxState::Finished { ref job_id } if job_id == "sync-old"
+        ));
     }
 }

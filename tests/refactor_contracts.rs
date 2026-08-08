@@ -156,20 +156,15 @@ fn unresolved_conflict_is_not_executable() {
 }
 
 #[test]
-fn launching_workspace_sync_locks_preview_rebuild_actions() {
-    let actions = include_str!("../src/app/actions.rs");
+fn launching_workspace_sync_is_supersedable_before_job_creation() {
     let tui = include_str!("../src/tui.rs");
-    assert!(actions.contains("WorkspaceSyncUxState::Launching { .. }"));
-    assert!(actions.contains("InputContext::SyncJob"));
-    assert!(tui.contains("state.remote_workspace.ux.is_locked_flow()"));
-    for action in [
-        "Action::ToggleWorkspaceComparison",
-        "Action::PreviewWorkspaceSync",
-        "Action::ReverseWorkspaceDirection",
-        "Action::ToggleWorkspaceSyncMode",
-    ] {
-        assert!(tui.contains(action));
-    }
+    let controller = include_str!("../src/services/workspace_sync_controller.rs");
+
+    assert!(tui.contains("supersede_workspace_launch_for_new_action"));
+    assert!(tui.contains("sync.controller.supersede_launch()"));
+    assert!(controller.contains("pub async fn launch_guarded("));
+    assert!(controller.contains("generation.committed = true"));
+    assert!(controller.contains("WorkspaceSyncLaunchError::Superseded"));
 }
 
 #[test]
@@ -183,7 +178,7 @@ fn sync_preview_ui_routes_execution_through_workspace_sync_controller() {
     let sync_ui = &tui[start..end];
 
     assert!(sync_ui.contains("sync.controller.freeze("));
-    assert!(sync_ui.contains(".launch("));
+    assert!(sync_ui.contains(".launch_guarded("));
     assert!(!tui.contains("execution intentionally disabled"));
     assert!(tui.contains("Audit record finalization failed"));
     assert!(tui.contains("No mismatch was proven"));
@@ -218,4 +213,36 @@ fn direct_key_actions_share_action_availability_and_sync_ui_stays_orchestrated()
     assert!(actions.contains("CloseWorkspaceSyncOverlay"));
     assert!(!tui.contains("SyncConfirmationToken::from_explicit_confirmation"));
     assert!(!tui.contains("SyncExecutionCompiler::compile"));
+}
+
+#[test]
+fn verification_diff_is_bound_to_the_finished_job_not_generic_pane_diff() {
+    let tui = include_str!("../src/tui.rs");
+    let start = tui
+        .find("Action::ShowWorkspaceVerificationDiff =>")
+        .unwrap();
+    let end = tui[start..]
+        .find("Action::ReturnToWorkspaceSyncPreview =>")
+        .map(|offset| start + offset)
+        .unwrap();
+    let action_arm = &tui[start..end];
+
+    assert!(action_arm.contains("show_verification_diff"));
+    assert!(!action_arm.contains("state.show_diff = true"));
+    assert!(tui.contains("render_sync_verification_diff_lines"));
+    assert!(tui.contains("let visible = result"));
+    assert!(tui.contains(".diff"));
+    assert!(tui.contains(".entries"));
+    assert!(tui.contains("recursive post-sync verification snapshot"));
+}
+
+#[test]
+fn return_to_preview_is_gated_by_a_current_diff_and_plan() {
+    let availability = include_str!("../src/app/availability.rs");
+    let remote_workspace = include_str!("../src/app/remote_workspace.rs");
+
+    assert!(availability.contains("has_current_preview"));
+    assert!(availability.contains("WorkspaceSyncUxState::VerificationDiff"));
+    assert!(remote_workspace.contains("self.diff.as_ref().is_some_and"));
+    assert!(remote_workspace.contains("self.plan.as_ref().is_some_and"));
 }

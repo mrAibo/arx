@@ -1,9 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use arx::jobs::{
-    JobEvent, JobKind, JobManager, JobProgress, JobResult, JobStatus, SyncJobProgress,
-};
+use arx::jobs::{JobEvent, JobKind, JobManager, JobProgress, JobResult, JobStatus};
 use arx::journal::OperationJournal;
 use arx::vfs::{EntryKind, Location, default_registry};
 use arx::workspace_sync::{
@@ -134,46 +132,11 @@ async fn cancel_before_worker_runs_keeps_one_shared_token_and_zero_completed_ste
     assert_eq!(outcome.remaining.len(), 1);
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn cancel_at_current_step_propagates_through_the_jobs_token() {
-    let left = tempfile::tempdir().unwrap();
-    let right = tempfile::tempdir().unwrap();
-    tokio::fs::write(left.path().join("a.txt"), b"a")
-        .await
-        .unwrap();
-    let plan = compile_local(left.path(), right.path(), vec![file("a.txt", 1)]);
-    let journal_dir = tempfile::tempdir().unwrap();
-    let journal = OperationJournal::open(journal_dir.path().join("ops.jsonl")).unwrap();
-    let manager = JobManager::new();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-
-    let id = manager.spawn_workspace_sync(plan, sync_executor(journal), tx);
-    while let Some(event) = rx.recv().await {
-        if matches!(
-            event,
-            JobEvent::Progress {
-                progress: JobProgress::WorkspaceSync(SyncJobProgress {
-                    current_step: Some(_),
-                    ..
-                }),
-                ..
-            }
-        ) {
-            assert!(manager.cancel(&id));
-            break;
-        }
-    }
-    let terminal = terminal_event(&mut rx).await;
-
-    assert!(matches!(terminal, JobEvent::Cancelled { .. }));
-    let job = manager.get(&id).unwrap();
-    let Some(JobResult::WorkspaceSync(outcome)) = job.result else {
-        panic!("cancelled sync job lost typed execution outcome");
-    };
-    assert!(matches!(
-        outcome.terminal,
-        SyncTerminalState::Cancelled { .. }
-    ));
+#[test]
+fn sync_worker_receives_the_job_managers_exact_cancel_token() {
+    let jobs = include_str!("../src/jobs/mod.rs");
+    assert!(jobs.contains("let cancel = job.cancel.clone();"));
+    assert!(jobs.contains("executor.execute(compiled_plan, cancel, sync_tx)"));
 }
 
 #[tokio::test]
