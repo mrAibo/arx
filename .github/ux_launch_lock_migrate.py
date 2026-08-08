@@ -140,7 +140,7 @@ insert = '''    #[test]
         .id();
         let mut state = AppState::default();
         state.remote_workspace.preview_open = true;
-        state.remote_workspace.ux = super::WorkspaceSyncUxState::Launching { plan_id };
+        state.remote_workspace.ux = crate::app::WorkspaceSyncUxState::Launching { plan_id };
         assert_eq!(state.input_context(), InputContext::SyncJob);
     }
 
@@ -152,9 +152,6 @@ path.write_text(text)
 
 path = Path('src/tui.rs')
 text = path.read_text()
-# Guard the workspace-control actions before their existing branches. Keeping
-# the guard local to the dispatcher makes keyboard, Command Center and future
-# context-menu invocation obey the same lock.
 old = '''        Action::ToggleWorkspaceComparison => {
             if state.remote_workspace.enabled {
                 state.remote_workspace.disable();
