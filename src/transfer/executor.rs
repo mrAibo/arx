@@ -358,6 +358,16 @@ mod tests {
         assert!(rendered.iter().any(|arg| arg.as_ref() == "prod:/dst"));
     }
 
+    #[test]
+    fn byte_progress_saturates_instead_of_overflowing() {
+        let progress = crate::jobs::Progress::Bytes {
+            done: u64::MAX,
+            total: u64::MAX,
+            rate: 1,
+        };
+        assert_eq!(progress.percent(), Some(100));
+    }
+
     #[tokio::test]
     async fn remote_to_remote_rsync_is_rejected() {
         let plan = TransferPlan {

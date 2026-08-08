@@ -1,0 +1,240 @@
+use crate::services::{WorkspaceScanId, WorkspaceScanResponse};
+use crate::vfs::{Entry, Location};
+use crate::workspace_sync::{
+    DiffState, SyncDirection, SyncMode, SyncPolicy, WorkspaceDiff, WorkspaceEntry,
+    WorkspaceFingerprint, WorkspaceSide, WorkspaceSyncPlan,
+};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+#[derive(Debug, Clone)]
+pub struct RemoteWorkspaceState {
+    pub enabled: bool,
+    pub preview_open: bool,
+    pub diff: Option<WorkspaceDiff>,
+    pub plan: Option<WorkspaceSyncPlan>,
+    pub policy: SyncPolicy,
+    pub left_scan: Option<WorkspaceScanId>,
+    pub right_scan: Option<WorkspaceScanId>,
+    pub left_entries: Option<Vec<WorkspaceEntry>>,
+    pub right_entries: Option<Vec<WorkspaceEntry>>,
+    pub scan_cancel: Arc<AtomicBool>,
+}
+
+impl Default for RemoteWorkspaceState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            preview_open: false,
+            diff: None,
+            plan: None,
+            policy: SyncPolicy::default(),
+            left_scan: None,
+            right_scan: None,
+            left_entries: None,
+            right_entries: None,
+            scan_cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl RemoteWorkspaceState {
+    pub fn disable(&mut self) {
+        self.scan_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.enabled = false;
+        self.preview_open = false;
+        self.diff = None;
+        self.plan = None;
+        self.left_scan = None;
+        self.right_scan = None;
+        self.left_entries = None;
+        self.right_entries = None;
+    }
+
+    pub fn begin_recursive_scan(&mut self) -> Arc<AtomicBool> {
+        self.scan_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.scan_cancel = Arc::new(AtomicBool::new(false));
+        self.left_entries = None;
+        self.right_entries = None;
+        self.diff = None;
+        self.plan = None;
+        Arc::clone(&self.scan_cancel)
+    }
+
+    pub fn register_scan(&mut self, side: WorkspaceSide, id: WorkspaceScanId) {
+        match side {
+            WorkspaceSide::Left => self.left_scan = Some(id),
+            WorkspaceSide::Right => self.right_scan = Some(id),
+        }
+    }
+
+    pub fn accepts_scan(&self, response: &WorkspaceScanResponse) -> bool {
+        match response.side {
+            WorkspaceSide::Left => self.left_scan == Some(response.id),
+            WorkspaceSide::Right => self.right_scan == Some(response.id),
+        }
+    }
+
+    pub fn finish_scan(&mut self, side: WorkspaceSide, id: WorkspaceScanId) {
+        match side {
+            WorkspaceSide::Left if self.left_scan == Some(id) => self.left_scan = None,
+            WorkspaceSide::Right if self.right_scan == Some(id) => self.right_scan = None,
+            _ => {}
+        }
+    }
+
+    pub fn try_build_recursive_diff(&mut self, left_root: Location, right_root: Location) -> bool {
+        let (Some(left), Some(right)) = (&self.left_entries, &self.right_entries) else {
+            return false;
+        };
+        self.diff = Some(WorkspaceDiff::compare(
+            left_root,
+            right_root,
+            left.clone(),
+            right.clone(),
+        ));
+        self.rebuild_plan();
+        true
+    }
+
+    /// Build an immediate shallow comparison from the entries already visible
+    /// in both panes. Rich metadata/hashes may replace this snapshot
+    /// asynchronously without changing the UI model.
+    pub fn refresh_visible(
+        &mut self,
+        left_root: Location,
+        right_root: Location,
+        left_entries: &[Entry],
+        right_entries: &[Entry],
+    ) {
+        self.enabled = true;
+        self.diff = Some(WorkspaceDiff::compare(
+            left_root,
+            right_root,
+            left_entries.iter().map(workspace_entry),
+            right_entries.iter().map(workspace_entry),
+        ));
+        self.rebuild_plan();
+    }
+
+    pub fn rebuild_plan(&mut self) {
+        self.plan = self
+            .diff
+            .as_ref()
+            .map(|diff| WorkspaceSyncPlan::build(diff, self.policy));
+    }
+
+    pub fn reverse_direction(&mut self) {
+        self.policy.direction = match self.policy.direction {
+            SyncDirection::LeftToRight => SyncDirection::RightToLeft,
+            SyncDirection::RightToLeft => SyncDirection::LeftToRight,
+        };
+        self.rebuild_plan();
+    }
+
+    pub fn toggle_mode(&mut self) {
+        self.policy.mode = match self.policy.mode {
+            SyncMode::Update => SyncMode::Mirror,
+            SyncMode::Mirror => SyncMode::Update,
+        };
+        self.rebuild_plan();
+    }
+
+    pub fn direction_label(&self) -> &'static str {
+        match self.policy.direction {
+            SyncDirection::LeftToRight => "LEFT → RIGHT",
+            SyncDirection::RightToLeft => "RIGHT → LEFT",
+        }
+    }
+
+    pub fn mode_label(&self) -> &'static str {
+        match self.policy.mode {
+            SyncMode::Update => "UPDATE",
+            SyncMode::Mirror => "MIRROR",
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        let Some(diff) = &self.diff else {
+            return "workspace: waiting for comparison".into();
+        };
+        let mut left = 0usize;
+        let mut right = 0usize;
+        let mut different = 0usize;
+        for entry in &diff.entries {
+            match entry.state {
+                DiffState::OnlyLeft | DiffState::LeftNewer => left += 1,
+                DiffState::OnlyRight | DiffState::RightNewer => right += 1,
+                DiffState::Different => different += 1,
+                DiffState::SameFingerprint => {}
+            }
+        }
+
+        format!(
+            "workspace: {} | {} | ←{} →{} ≠{}",
+            self.direction_label(),
+            self.mode_label(),
+            right,
+            left,
+            different
+        )
+    }
+}
+
+fn workspace_entry(entry: &Entry) -> WorkspaceEntry {
+    WorkspaceEntry {
+        relative_path: entry.name.clone(),
+        fingerprint: WorkspaceFingerprint {
+            kind: entry.kind,
+            size: entry.size,
+            // Entry currently does not expose these fields. The async metadata
+            // enrichment effect introduced next upgrades this fingerprint.
+            modified_unix_ms: None,
+            content_hash: None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vfs::EntryKind;
+    use std::path::PathBuf;
+
+    fn file(name: &str, size: u64) -> Entry {
+        Entry {
+            name: name.into(),
+            kind: EntryKind::File,
+            size: Some(size),
+        }
+    }
+
+    #[test]
+    fn visible_refresh_produces_plan_without_executing_anything() {
+        let mut state = RemoteWorkspaceState::default();
+        state.refresh_visible(
+            Location::Local(PathBuf::from("/left")),
+            Location::Local(PathBuf::from("/right")),
+            &[file("local.txt", 10)],
+            &[file("remote.txt", 20)],
+        );
+
+        assert!(state.enabled);
+        assert!(state.diff.is_some());
+        assert!(state.plan.is_some());
+        assert_eq!(
+            state.policy.conflicts,
+            crate::workspace_sync::ConflictPolicy::RequireResolution
+        );
+    }
+
+    #[test]
+    fn mirror_is_never_the_default() {
+        assert_eq!(
+            RemoteWorkspaceState::default().policy.mode,
+            SyncMode::Update
+        );
+    }
+}
