@@ -1,5 +1,24 @@
-use arx::app::{Action, AppState, Pane, PaneState, PanelMode, SortMode};
-use arx::vfs::{Entry, EntryKind, Location, ProviderRegistry, VfsOps};
+use arx::app::{
+    Action, ActionAvailability, ActionContext, AppState, CommandItem, CommandKind, CommandTarget,
+    OverlayKind, Pane, PaneState, PanelMode, SortMode, WorkspaceSyncUxState, action_availability,
+    action_meta, build_command_items,
+};
+use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectResponse, EffectScope};
+use arx::effects::{Effect, EffectEvent};
+use arx::input::{KeyResolution, KeyRouter};
+use arx::services::{
+    DesktopService, FileInfoService, GitService, MutationError, MutationService, PaneLoadPurpose,
+    PaneLoadResponse, PaneLoader, PreviewService, SyncLaunchId, WorkspaceScanError,
+    WorkspaceScanOptions, WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
+};
+use arx::vfs::{Entry, EntryKind, Location};
+use arx::workspace_sync::{
+    DiffState, SyncDirection, SyncMode, WorkspaceSide, WorkspaceSyncOperation,
+};
+use arx::workspace_sync_execution::SyncPlanId;
+use arx::workspace_sync_verification::{
+    SyncVerificationEvent, SyncVerificationStatus, SyncVerificationVerdict,
+};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
     execute,
@@ -13,8 +32,23 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::sync::mpsc;
+
+#[derive(Clone)]
+struct SyncUiRuntime {
+    controller: WorkspaceSyncController,
+    jobs: arx::jobs::JobManager,
+    job_events: mpsc::UnboundedSender<arx::jobs::JobEvent>,
+    verification_events: mpsc::UnboundedSender<SyncVerificationEvent>,
+    launch_events: mpsc::UnboundedSender<SyncLaunchResponse>,
+}
+
+struct SyncLaunchResponse {
+    launch_id: SyncLaunchId,
+    plan_id: SyncPlanId,
+    result: Result<String, String>,
+}
 
 pub async fn run(config: arx::config::ArxConfig) -> io::Result<()> {
     enable_raw_mode()?;
@@ -46,72 +80,44 @@ async fn event_loop(
         menu: AppState::load_menu(),
         ..AppState::default()
     };
-    // ponytail: bridge — sync thread-local registry for old Location::list() dispatch
-    let reg = std::mem::replace(&mut state.registry, ProviderRegistry::new());
-    arx::vfs::set_global_registry(reg);
-    state.registry = arx::vfs::default_registry();
-    let mut left_entries = load_entries(&state.left.location, state.show_hidden, state.sort_mode);
-    let mut right_entries = load_entries(&state.right.location, state.show_hidden, state.sort_mode);
+    let (pane_loader, mut pane_load_rx) = PaneLoader::channel(state.registry.clone());
+    let (workspace_scanner, mut workspace_scan_rx) =
+        WorkspaceScanner::channel(state.registry.clone());
+    let mut left_entries = Vec::new();
+    let mut right_entries = Vec::new();
+    schedule_pane_load(&pane_loader, &mut state, Pane::Left);
+    schedule_pane_load(&pane_loader, &mut state, Pane::Right);
     let mut left_list = ListState::default();
     let mut right_list = ListState::default();
     let mut split_left_list = ListState::default();
     let mut split_right_list = ListState::default();
-
-    // Background job notification channel
+    let mut key_router = KeyRouter::default();
+    let (effect_dispatcher, mut effect_rx) = EffectDispatcher::channel();
+    // JobManager is the runtime source of truth. AppState.jobs is only a render snapshot.
+    let job_manager = arx::jobs::JobManager::new();
     let (job_tx, mut job_rx) = mpsc::unbounded_channel::<arx::jobs::JobEvent>();
+    let (verification_tx, mut verification_rx) = mpsc::unbounded_channel::<SyncVerificationEvent>();
+    let (sync_launch_tx, mut sync_launch_rx) = mpsc::unbounded_channel::<SyncLaunchResponse>();
+    let sync_runtime = SyncUiRuntime {
+        controller: WorkspaceSyncController::new(state.registry.clone()),
+        jobs: job_manager.clone(),
+        job_events: job_tx.clone(),
+        verification_events: verification_tx,
+        launch_events: sync_launch_tx,
+    };
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
 
     loop {
         if state.should_quit {
             break;
         }
-        let mut refresh_entries = false;
-        // Drain completed/failed job events
-        while let Ok(event) = job_rx.try_recv() {
-            match event {
-                arx::jobs::JobEvent::Paused { ref id } => {
-                    if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
-                        job.status = arx::jobs::JobStatus::Paused;
-                    }
-                }
-                arx::jobs::JobEvent::Running { ref id } => {
-                    if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
-                        job.status = arx::jobs::JobStatus::Running;
-                    }
-                }
-                arx::jobs::JobEvent::Progress { ref id, progress } => {
-                    if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
-                        job.progress = progress.clone();
-                    }
-                }
-                arx::jobs::JobEvent::Done {
-                    ref id,
-                    ref message,
-                } => {
-                    if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
-                        job.status = arx::jobs::JobStatus::Done;
-                        job.progress = arx::jobs::Progress::Percent(100);
-                    }
-                    state.message = Some(message.clone());
-                    refresh_entries = true;
-                }
-                arx::jobs::JobEvent::Failed { ref id, ref error } => {
-                    let _ = std::process::Command::new("notify-send")
-                        .args(["ARX", &format!("Job {} failed: {}", id, error)])
-                        .spawn();
-                    if let Some(job) = state.jobs.iter_mut().find(|j| j.id == *id) {
-                        job.status = arx::jobs::JobStatus::Failed;
-                    }
-                    state.message = Some(error.clone());
-                    refresh_entries = true;
-                }
-            }
+        // Cache Git status by location instead of spawning two git processes
+        // from render() on every 50ms frame.
+        let active_location = state.active_pane().location.clone();
+        if state.git_status_location.as_ref() != Some(&active_location) {
+            state.git_status = GitService::status_suffix(&active_location).await;
+            state.git_status_location = Some(active_location);
         }
-
-        if refresh_entries {
-            left_entries = load_entries(&state.left.location, state.show_hidden, state.sort_mode);
-            right_entries = load_entries(&state.right.location, state.show_hidden, state.sort_mode);
-        }
-
         let left_filtered = apply_filter(&left_entries, &state.filter);
         let right_filtered = apply_filter(&right_entries, &state.filter);
         // clamp cursors
@@ -137,6 +143,7 @@ async fn event_loop(
                 &mut right_list,
                 &mut split_left_list,
                 &mut split_right_list,
+                &key_router,
                 msg.as_deref(),
             )
         })?;
@@ -149,11 +156,91 @@ async fn event_loop(
 
         // ── tokio::select! async event loop ──
         // Unified dispatch: crossterm key/mouse + background jobs + PTY
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
         let next_input = tokio::select! {
+            Some(response) = workspace_scan_rx.recv() => {
+                handle_workspace_scan_response(response, &mut state);
+                continue;
+            }
+            Some(response) = pane_load_rx.recv() => {
+                apply_pane_load_response(
+                    response,
+                    &mut state,
+                    &mut left_entries,
+                    &mut right_entries,
+                );
+                continue;
+            }
+            Some(response) = effect_rx.recv() => {
+                handle_effect_response(
+                    response,
+                    &mut state,
+                    &mut left_entries,
+                    &mut right_entries,
+                    &pane_loader,
+                );
+                continue;
+            }
+            Some(response) = sync_launch_rx.recv() => {
+                let still_current = sync_runtime
+                    .controller
+                    .is_launch_current(response.launch_id)
+                    && state
+                        .remote_workspace
+                        .frozen_plan
+                        .as_ref()
+                        .is_some_and(|frozen| frozen.id() == response.plan_id);
+                if still_current {
+                    match response.result {
+                        Ok(job_id) => {
+                            state.jobs = job_manager.snapshot();
+                            if let Some(job) = job_manager.get(&job_id) {
+                                state.remote_workspace.sync_from_job(&job);
+                            }
+                        }
+                        Err(message) => state.remote_workspace.mark_blocked(message),
+                    }
+                }
+                continue;
+            }
+            Some(event) = verification_rx.recv() => {
+                let left_root = state.left.location.clone();
+                let right_root = state.right.location.clone();
+                let accepted = state.remote_workspace.apply_verification(
+                    &event.verification,
+                    &left_root,
+                    &right_root,
+                );
+                // JobManager accepted the verification before publishing this
+                // event, so its render snapshot is useful even when pane roots
+                // have moved and RemoteWorkspaceState rejects the old diff.
+                state.jobs = job_manager.snapshot();
+                if accepted {
+                    state.remote_workspace.sync_verification_stage(&event.job_id);
+                } else {
+                    state
+                        .remote_workspace
+                        .settle_rejected_verification(&event.job_id, &event.verification);
+                }
+                continue;
+            }
             Some(ev) = job_rx.recv() => {
-                // Background job completed — update state and refresh
-                handle_job_event(ev, &mut state, &mut left_entries, &mut right_entries);
+        // The manager already accepted this transition before publishing it.
+        state.jobs = job_manager.snapshot();
+        let sync_job_id = job_event_id(&ev);
+        if let Some(job) = job_manager.get(sync_job_id) {
+            state.remote_workspace.sync_from_job(&job);
+        }
+        if let arx::jobs::JobEvent::Failed { id, error, .. } = &ev {
+                    let body = format!("Job {id} failed: {error}");
+                    tokio::spawn(async move {
+                        DesktopService::notify("ARX", &body).await;
+                    });
+                }
+                let refresh_panes = handle_job_event(&ev, &mut state);
+                if refresh_panes {
+                    schedule_pane_load(&pane_loader, &mut state, Pane::Left);
+                    schedule_pane_load(&pane_loader, &mut state, Pane::Right);
+                }
                 if let Some(ref mut term) = state.term { term.drain(); }
                 continue;
             }
@@ -264,6 +351,92 @@ async fn event_loop(
                     }
                 }
                 Event::Key(key) => {
+                    // Command Center owns keyboard input while open. Keep this
+                    // before generic text-input routing so Ctrl+P has a real,
+                    // usable interaction model.
+                    if state.show_command_center {
+                        match key.code {
+                            KeyCode::Esc => {
+                                state.show_command_center = false;
+                                state.filter.clear();
+                                state.command_matches.clear();
+                                state.overlay_list_state = ratatui::widgets::ListState::default();
+                            }
+                            KeyCode::Enter => {
+                                let idx = state.overlay_list_state.selected().unwrap_or(0);
+                                let idx = idx.min(state.command_matches.len().saturating_sub(1));
+                                if let Some(item) = state.command_matches.get(idx).cloned() {
+                                    if let ActionAvailability::Disabled { reason } =
+                                        &item.availability
+                                    {
+                                        state.message = Some(reason.clone());
+                                        continue;
+                                    }
+                                    state.show_command_center = false;
+                                    state.filter.clear();
+                                    state.command_matches.clear();
+                                    let focused_entry = if state.active == Pane::Left {
+                                        left_filtered.get(state.left.cursor)
+                                    } else {
+                                        right_filtered.get(state.right.cursor)
+                                    };
+                                    if let Some(effect) = execute_command_target(
+                                        &mut state,
+                                        item.target,
+                                        focused_entry.copied(),
+                                        &workspace_scanner,
+                                        &pane_loader,
+                                        &sync_runtime,
+                                    ) {
+                                        let id = effect_dispatcher.dispatch(
+                                            EffectLane::GlobalProcess,
+                                            EffectScope::Global,
+                                            effect,
+                                        );
+                                        state.register_effect(EffectLane::GlobalProcess, id);
+                                    }
+                                    schedule_both_pane_loads(&pane_loader, &mut state);
+                                }
+                            }
+                            KeyCode::Up | KeyCode::Char('k')
+                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                let current = state.overlay_list_state.selected().unwrap_or(0);
+                                state
+                                    .overlay_list_state
+                                    .select(Some(current.saturating_sub(1)));
+                            }
+                            KeyCode::Down | KeyCode::Char('j')
+                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                let current = state.overlay_list_state.selected().unwrap_or(0);
+                                let max = state.command_matches.len().saturating_sub(1);
+                                state
+                                    .overlay_list_state
+                                    .select(Some((current + 1).min(max)));
+                            }
+                            KeyCode::Backspace => {
+                                state.filter.pop();
+                                state.command_matches = build_command_items(&state.filter, &state);
+                                state
+                                    .overlay_list_state
+                                    .select((!state.command_matches.is_empty()).then_some(0));
+                            }
+                            KeyCode::Char(c)
+                                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                            {
+                                state.filter.push(c);
+                                state.command_matches = build_command_items(&state.filter, &state);
+                                state
+                                    .overlay_list_state
+                                    .select((!state.command_matches.is_empty()).then_some(0));
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // If composing filter/glob/go-to, keys go to buffer
                     if state.filtering || state.glob_input || state.go_input || state.cmd_input {
                         match key.code {
@@ -298,41 +471,17 @@ async fn event_loop(
                                             _ => target,
                                         }
                                     };
-                                    if resolved.is_dir() {
-                                        // F7: tmux session attach (before pane borrow)
-                                        if key.code == KeyCode::F(7) && !state.show_terminal {
-                                            let sessions = list_tmux_sessions();
-                                            if sessions.is_empty() {
-                                                state.message =
-                                                    Some("No tmux sessions found".into());
-                                            } else {
-                                                state.command_matches = sessions;
-                                                state.show_command_center = true;
-                                                state.overlay_list_state =
-                                                    ratatui::widgets::ListState::default();
-                                                state.overlay_list_state.select(Some(0));
-                                                continue;
-                                            }
-                                        }
-
-                                        let pane = state.active_pane_mut();
-                                        pane.location = Location::Local(resolved);
-                                        pane.cursor = 0;
-                                        state.selected.clear();
-                                        left_entries = load_entries(
-                                            &state.left.location,
-                                            state.show_hidden,
-                                            state.sort_mode,
-                                        );
-                                        right_entries = load_entries(
-                                            &state.right.location,
-                                            state.show_hidden,
-                                            state.sort_mode,
-                                        );
-                                    } else {
-                                        state.message =
-                                            Some(format!("Not a directory: {}", state.filter));
-                                    }
+                                    let active = state.active;
+                                    schedule_pane_navigation(
+                                        &pane_loader,
+                                        &mut state,
+                                        active,
+                                        Location::Local(resolved),
+                                        PaneLoadPurpose::Navigate {
+                                            remember_current: true,
+                                        },
+                                    );
+                                    state.message = Some("Opening path…".into());
                                     state.filter.clear();
                                 }
                                 if state.cmd_input {
@@ -341,31 +490,13 @@ async fn event_loop(
                                     if command.is_empty() {
                                         state.message = Some(": command cancelled".into());
                                     } else {
-                                        // Run shell command, capture output
-                                        let output = std::process::Command::new("sh")
-                                            .arg("-c")
-                                            .arg(&command)
-                                            .output();
-                                        state.message = match output {
-                                            Ok(o) => {
-                                                let stdout = String::from_utf8_lossy(&o.stdout)
-                                                    .trim()
-                                                    .to_string();
-                                                let limit = 80;
-                                                if stdout.is_empty() && o.status.success() {
-                                                    Some(format!(": {command} — ok"))
-                                                } else if stdout.len() > limit {
-                                                    Some(format!(
-                                                        ": {} — {}...",
-                                                        command,
-                                                        &stdout[..limit]
-                                                    ))
-                                                } else {
-                                                    Some(format!(": {} — {}", command, stdout))
-                                                }
-                                            }
-                                            Err(e) => Some(format!(": {command} failed: {e}")),
-                                        };
+                                        let id = effect_dispatcher.dispatch(
+                                            EffectLane::GlobalProcess,
+                                            EffectScope::Global,
+                                            Effect::RunShellCapture { command },
+                                        );
+                                        state.register_effect(EffectLane::GlobalProcess, id);
+                                        state.message = Some("Command started…".into());
                                     }
                                 }
                                 state.filtering = false;
@@ -386,11 +517,11 @@ async fn event_loop(
                                     state.filter.push(c);
                                     if state.show_command_center {
                                         state.command_matches =
-                                            build_cc_matches(&state.filter, &state);
+                                            build_command_items(&state.filter, &state);
                                     }
                                     if state.show_command_center {
                                         state.command_matches =
-                                            build_cc_matches(&state.filter, &state);
+                                            build_command_items(&state.filter, &state);
                                     }
                                 }
                             }
@@ -450,36 +581,18 @@ async fn event_loop(
                             KeyCode::Enter => {
                                 let loc = state.bookmarks.get(state.bookmark_cursor).cloned();
                                 if let Some(loc) = loc {
-                                    // F7: tmux session attach (before pane borrow)
-                                    if key.code == KeyCode::F(7) && !state.show_terminal {
-                                        let sessions = list_tmux_sessions();
-                                        if sessions.is_empty() {
-                                            state.message = Some("No tmux sessions found".into());
-                                        } else {
-                                            state.command_matches = sessions;
-                                            state.show_command_center = true;
-                                            state.overlay_list_state =
-                                                ratatui::widgets::ListState::default();
-                                            state.overlay_list_state.select(Some(0));
-                                            continue;
-                                        }
-                                    }
-
-                                    let pane = state.active_pane_mut();
-                                    pane.location = loc;
-                                    pane.cursor = 0;
-                                    state.selected.clear();
-                                    state.show_bookmarks = false;
-                                    left_entries = load_entries(
-                                        &state.left.location,
-                                        state.show_hidden,
-                                        state.sort_mode,
+                                    let active = state.active;
+                                    state.close_all_overlays();
+                                    schedule_pane_navigation(
+                                        &pane_loader,
+                                        &mut state,
+                                        active,
+                                        loc,
+                                        PaneLoadPurpose::Navigate {
+                                            remember_current: true,
+                                        },
                                     );
-                                    right_entries = load_entries(
-                                        &state.right.location,
-                                        state.show_hidden,
-                                        state.sort_mode,
-                                    );
+                                    state.message = Some("Opening bookmark…".into());
                                 }
                             }
                             _ => {}
@@ -507,40 +620,23 @@ async fn event_loop(
                             KeyCode::Enter => {
                                 let host = state.hosts.get(state.host_cursor).cloned();
                                 if let Some(host) = host {
-                                    // F7: tmux session attach (before pane borrow)
-                                    if key.code == KeyCode::F(7) && !state.show_terminal {
-                                        let sessions = list_tmux_sessions();
-                                        if sessions.is_empty() {
-                                            state.message = Some("No tmux sessions found".into());
-                                        } else {
-                                            state.command_matches = sessions;
-                                            state.show_command_center = true;
-                                            state.overlay_list_state =
-                                                ratatui::widgets::ListState::default();
-                                            state.overlay_list_state.select(Some(0));
-                                            continue;
-                                        }
-                                    }
-
-                                    let pane = state.active_pane_mut();
                                     let default_path = host.default_path.as_deref().unwrap_or("/");
-                                    pane.location = Location::Sftp {
+                                    let target = Location::Sftp {
                                         host: host.id.clone(),
                                         path: default_path.into(),
                                     };
-                                    pane.cursor = 0;
-                                    state.selected.clear();
-                                    state.show_hosts = false;
-                                    left_entries = load_entries(
-                                        &state.left.location,
-                                        state.show_hidden,
-                                        state.sort_mode,
+                                    let active = state.active;
+                                    state.close_all_overlays();
+                                    schedule_pane_navigation(
+                                        &pane_loader,
+                                        &mut state,
+                                        active,
+                                        target,
+                                        PaneLoadPurpose::Navigate {
+                                            remember_current: true,
+                                        },
                                     );
-                                    right_entries = load_entries(
-                                        &state.right.location,
-                                        state.show_hidden,
-                                        state.sort_mode,
-                                    );
+                                    state.message = Some(format!("Connecting to {}…", host.name));
                                 }
                             }
                             _ => {}
@@ -592,33 +688,13 @@ async fn event_loop(
                             KeyCode::Enter => {
                                 if let Some(entry) = state.menu.get(state.menu_cursor) {
                                     let cmd = entry.command.clone();
-                                    state.show_menu = false;
-                                    // Run menu command, show output
-                                    let output = std::process::Command::new("sh")
-                                        .arg("-c")
-                                        .arg(&cmd)
-                                        .output();
-                                    state.message = match output {
-                                        Ok(o) => {
-                                            let out = String::from_utf8_lossy(&o.stdout)
-                                                .trim()
-                                                .to_string();
-                                            if out.is_empty() && o.status.success() {
-                                                Some(format!("menu: {} — ok", entry.label))
-                                            } else if out.len() > 80 {
-                                                Some(format!(
-                                                    "menu: {} — {}...",
-                                                    entry.label,
-                                                    &out[..80]
-                                                ))
-                                            } else {
-                                                Some(format!("menu: {} — {out}", entry.label))
-                                            }
-                                        }
-                                        Err(e) => {
-                                            Some(format!("menu: {} failed: {e}", entry.label))
-                                        }
-                                    };
+                                    state.close_all_overlays();
+                                    let id = effect_dispatcher.dispatch(
+                                        EffectLane::GlobalProcess,
+                                        EffectScope::Global,
+                                        Effect::RunShellCapture { command: cmd },
+                                    );
+                                    state.register_effect(EffectLane::GlobalProcess, id);
                                 }
                             }
                             _ => {}
@@ -639,43 +715,45 @@ async fn event_loop(
                             pane.cursor
                         }
                     };
-                    let cmd_prefix = state.cmd_prefix;
 
-                    if state.show_command_center && key.code == KeyCode::Enter {
-                        let idx = state.overlay_list_state.selected().unwrap_or(0);
-                        let idx = idx.min(state.command_matches.len().saturating_sub(1));
-                        if let Some((_, target)) = state.command_matches.get(idx) {
-                            let target = target.clone();
-                            navigate_to(&mut state, &target);
-                            state.show_command_center = false;
-                            state.filtering = false;
-                            state.filter.clear();
-                            left_entries = load_entries(
-                                &state.left.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
-                            right_entries = load_entries(
-                                &state.right.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
+                    // First migration slice: resolve stable app actions before
+                    // falling back to the legacy key matcher below.
+                    match key_router.resolve(state.input_context(), key) {
+                        KeyResolution::Pending => {
+                            // PR #4 will render key_router.continuations()
+                            // here as the Which-Key overlay.
                             continue;
                         }
+                        KeyResolution::Action(action) => {
+                            let context = ActionContext::from_state(&state);
+                            match action_availability(action.id(), &context) {
+                                ActionAvailability::Available => dispatch_ui_action(
+                                    &mut state,
+                                    action,
+                                    entries.get(cursor).copied(),
+                                    &workspace_scanner,
+                                    &sync_runtime,
+                                ),
+                                ActionAvailability::Disabled { reason } => {
+                                    state.message = Some(reason);
+                                }
+                                ActionAvailability::Hidden => {}
+                            }
+                            continue;
+                        }
+                        KeyResolution::Unhandled => {}
                     }
 
                     // F7: tmux session attach (before pane borrow)
                     if key.code == KeyCode::F(7) && !state.show_terminal {
-                        let sessions = list_tmux_sessions();
-                        if sessions.is_empty() {
-                            state.message = Some("No tmux sessions found".into());
-                        } else {
-                            state.command_matches = sessions;
-                            state.show_command_center = true;
-                            state.overlay_list_state = ratatui::widgets::ListState::default();
-                            state.overlay_list_state.select(Some(0));
-                            continue;
-                        }
+                        let id = effect_dispatcher.dispatch(
+                            EffectLane::TmuxDiscovery,
+                            EffectScope::Global,
+                            Effect::ListTmuxSessions,
+                        );
+                        state.register_effect(EffectLane::TmuxDiscovery, id);
+                        state.message = Some("Discovering tmux sessions…".into());
+                        continue;
                     }
 
                     // Handle tree-filter Backspace before borrowing the active pane.
@@ -723,53 +801,18 @@ async fn event_loop(
                                     EntryKind::Directory => {
                                         if let Location::Local(dir) = &pane.location {
                                             let p = dir.join(&entry.name);
-                                            let du = std::process::Command::new("du")
-                                                .args(["-sh", &p.to_string_lossy()])
-                                                .output()
-                                                .map(|o| {
-                                                    String::from_utf8_lossy(&o.stdout)
-                                                        .trim()
-                                                        .to_string()
-                                                })
-                                                .unwrap_or_default();
-                                            let df = std::process::Command::new("df")
-                                                .args(["-h", &p.to_string_lossy()])
-                                                .output()
-                                                .map(|o| {
-                                                    let s = String::from_utf8_lossy(&o.stdout);
-                                                    s.lines().last().unwrap_or_default().to_string()
-                                                })
-                                                .unwrap_or_default();
-                                            state.viewer_content = vec![
-                                                format!("Directory: {}", p.display()),
-                                                format!("Size:     {du}"),
-                                                format!("Free:     {df}"),
-                                            ];
+                                            state.viewer_content =
+                                                FileInfoService::directory_summary(&p).await;
                                             state.viewer_scroll = 0;
                                         }
                                     }
                                     _ => {
-                                        // File: show sha256 hash
                                         if let Location::Local(dir) = &pane.location {
                                             let p = dir.join(&entry.name);
-                                            let hash = std::process::Command::new("sha256sum")
-                                                .arg(&p)
-                                                .output()
-                                                .map(|o| {
-                                                    let s = String::from_utf8_lossy(&o.stdout);
-                                                    s.split_whitespace()
-                                                        .next()
-                                                        .unwrap_or("?")
-                                                        .to_string()
-                                                })
-                                                .unwrap_or_else(|_| "?".into());
                                             let size =
                                                 entry.size.map(format_size).unwrap_or_default();
-                                            state.viewer_content = vec![
-                                                format!("File: {}", p.display()),
-                                                format!("Size: {size}"),
-                                                format!("SHA256: {hash}"),
-                                            ];
+                                            state.viewer_content =
+                                                FileInfoService::file_hash_summary(&p, &size).await;
                                             state.viewer_scroll = 0;
                                         }
                                     }
@@ -804,103 +847,50 @@ async fn event_loop(
                                 && key.modifiers.contains(KeyModifiers::SHIFT) =>
                         {
                             if let Location::Local(dir) = &pane.location {
-                                let dir_c = dir.clone();
-                                let _dir_loc = Location::Local(dir_c.clone());
-                                let entries = _dir_loc.list().unwrap_or_default();
-                                let mut lines = vec!["Directory sizes:".into()];
-                                for e in &entries {
-                                    if e.kind == EntryKind::Directory {
-                                        let p = dir_c.join(&e.name);
-                                        let size = std::process::Command::new("du")
-                                            .args(["-sh", &p.to_string_lossy()])
-                                            .output()
-                                            .map(|o| {
-                                                String::from_utf8_lossy(&o.stdout)
-                                                    .trim()
-                                                    .to_string()
-                                            })
-                                            .unwrap_or_else(|_| "?".into());
-                                        lines.push(format!("  {}  {}", size, e.name));
-                                    }
-                                }
-                                state.viewer_content = lines;
-                                state.viewer_scroll = 0;
+                                let location = Location::Local(dir.clone());
+                                let id = effect_dispatcher.dispatch(
+                                    EffectLane::Preview,
+                                    EffectScope::Location(location),
+                                    Effect::DirectoryChildrenSizes { path: dir.clone() },
+                                );
+                                state.register_effect(EffectLane::Preview, id);
+                                state.message = Some("Calculating directory sizes…".into());
                             }
                         }
                         KeyCode::Enter => {
                             if let Some(entry) = entries.get(cursor) {
                                 if entry.kind == EntryKind::Directory {
-                                    let old_location = pane.location.clone();
-                                    let new_location = match &pane.location {
-                                        Location::Local(p) => Location::Local(p.join(&entry.name)),
-                                        Location::Sftp { host, path } => {
-                                            let new_path = if path.ends_with('/') {
-                                                format!("{path}{}", entry.name)
-                                            } else {
-                                                format!("{path}/{}", entry.name)
-                                            };
-                                            Location::Sftp {
-                                                host: host.clone(),
-                                                path: new_path,
-                                            }
-                                        }
-                                        Location::Archive {
-                                            archive,
-                                            inner_path,
-                                        } => {
-                                            let new_path = if inner_path.is_empty() {
-                                                entry.name.clone()
-                                            } else if inner_path.ends_with('/') {
-                                                format!("{inner_path}{}", entry.name)
-                                            } else {
-                                                format!("{inner_path}/{}", entry.name)
-                                            };
-                                            Location::Archive {
-                                                archive: archive.clone(),
-                                                inner_path: new_path,
-                                            }
-                                        }
-                                    };
-                                    pane.dir_history.push(old_location);
-                                    pane.location = new_location;
-                                    pane.cursor = 0;
-                                    state.selected.clear();
-                                    if state.active == Pane::Left {
-                                        left_entries = load_entries(
-                                            &state.left.location,
-                                            state.show_hidden,
-                                            state.sort_mode,
-                                        );
-                                    } else {
-                                        right_entries = load_entries(
-                                            &state.right.location,
-                                            state.show_hidden,
-                                            state.sort_mode,
-                                        );
-                                    }
+                                    let new_location = pane.location.child(&entry.name);
+                                    let active = state.active;
+                                    schedule_pane_navigation(
+                                        &pane_loader,
+                                        &mut state,
+                                        active,
+                                        new_location,
+                                        PaneLoadPurpose::Navigate {
+                                            remember_current: true,
+                                        },
+                                    );
+                                    state.message = Some("Opening directory…".into());
                                 } else if is_archive(&entry.name) {
                                     // Open archive file
                                     if let Location::Local(dir) = &pane.location {
                                         let archive_path = dir.join(&entry.name);
-                                        pane.location = Location::Archive {
+                                        let target = Location::Archive {
                                             archive: archive_path,
                                             inner_path: String::new(),
                                         };
-                                        pane.cursor = 0;
-                                        state.selected.clear();
-                                        if state.active == Pane::Left {
-                                            left_entries = load_entries(
-                                                &state.left.location,
-                                                state.show_hidden,
-                                                state.sort_mode,
-                                            );
-                                        } else {
-                                            right_entries = load_entries(
-                                                &state.right.location,
-                                                state.show_hidden,
-                                                state.sort_mode,
-                                            );
-                                        }
+                                        let active = state.active;
+                                        schedule_pane_navigation(
+                                            &pane_loader,
+                                            &mut state,
+                                            active,
+                                            target,
+                                            PaneLoadPurpose::Navigate {
+                                                remember_current: true,
+                                            },
+                                        );
+                                        state.message = Some("Opening archive…".into());
                                     }
                                 } else if state.show_diff {
                                     // Content diff: diff this file against other pane's same-named file
@@ -909,26 +899,20 @@ async fn event_loop(
                                     {
                                         let left_path = left_dir.join(&entry.name);
                                         let right_path = right_dir.join(&entry.name);
-                                        if left_path.exists() && right_path.exists() {
-                                            let output = std::process::Command::new("diff")
-                                                .args(["--color=never", "-u"])
-                                                .arg(&left_path)
-                                                .arg(&right_path)
-                                                .output()
-                                                .map(|o| {
-                                                    let s = String::from_utf8_lossy(&o.stdout)
-                                                        .into_owned();
-                                                    if s.is_empty() {
-                                                        "Files are identical".into()
-                                                    } else {
-                                                        s
-                                                    }
-                                                })
-                                                .unwrap_or_else(|e| format!("diff error: {e}"));
-                                            state.viewer_content =
-                                                output.lines().map(|l| l.to_string()).collect();
-                                            state.viewer_scroll = 0;
-                                        }
+                                        let scope = EffectScope::Workspace {
+                                            left: state.left.location.clone(),
+                                            right: state.right.location.clone(),
+                                        };
+                                        let id = effect_dispatcher.dispatch(
+                                            EffectLane::Preview,
+                                            scope,
+                                            Effect::UnifiedDiff {
+                                                left: left_path,
+                                                right: right_path,
+                                            },
+                                        );
+                                        state.register_effect(EffectLane::Preview, id);
+                                        state.message = Some("Building diff…".into());
                                     }
                                 }
                             }
@@ -981,50 +965,32 @@ async fn event_loop(
                                 }
                             };
                             if let Some(new_loc) = go_back {
-                                pane.location = new_loc;
-                                pane.cursor = 0;
-                                state.selected.clear();
-                                if state.active == Pane::Left {
-                                    left_entries = load_entries(
-                                        &state.left.location,
-                                        state.show_hidden,
-                                        state.sort_mode,
-                                    );
-                                } else {
-                                    right_entries = load_entries(
-                                        &state.right.location,
-                                        state.show_hidden,
-                                        state.sort_mode,
-                                    );
-                                }
+                                let active = state.active;
+                                schedule_pane_navigation(
+                                    &pane_loader,
+                                    &mut state,
+                                    active,
+                                    new_loc,
+                                    PaneLoadPurpose::Navigate {
+                                        remember_current: false,
+                                    },
+                                );
+                                state.message = Some("Opening parent…".into());
                             }
                         }
                         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            left_entries = load_entries(
-                                &state.left.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
-                            right_entries = load_entries(
-                                &state.right.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
+                            schedule_both_pane_loads(&pane_loader, &mut state);
+                            state.message = Some("Refreshing panes…".into());
                         }
                         // Ctrl+U: swap panes
                         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             std::mem::swap(&mut state.left, &mut state.right);
+                            std::mem::swap(&mut left_entries, &mut right_entries);
+                            state.selected.clear();
+                            state.remote_workspace.disable();
+                            state.show_diff = false;
                             state.message = Some("Swapped".into());
-                            left_entries = load_entries(
-                                &state.left.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
-                            right_entries = load_entries(
-                                &state.right.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
+                            schedule_both_pane_loads(&pane_loader, &mut state);
                         }
                         // F7: create directory
                         KeyCode::F(7) => {
@@ -1043,25 +1009,17 @@ async fn event_loop(
                             if let Some(entry) = entries.get(cursor) {
                                 if let Location::Local(dir) = &pane.location {
                                     let p = dir.join(&entry.name);
-                                    let stat_out = std::process::Command::new("stat")
-                                        .args(["-c", "%a %A %U:%G %s", &p.to_string_lossy()])
-                                        .output()
-                                        .map(|o| {
-                                            String::from_utf8_lossy(&o.stdout).trim().to_string()
-                                        })
-                                        .unwrap_or_default();
-                                    let parts: Vec<&str> = stat_out.splitn(4, ' ').collect();
-                                    let (octal, symbolic, owner, size_str) = if parts.len() >= 4 {
-                                        (parts[0], parts[1], parts[2], parts[3])
-                                    } else {
-                                        ("?", "?", "?", "?")
-                                    };
-                                    state.viewer_content = vec![
-                                        format!("File: {}", p.display()),
-                                        format!("Permissions: {symbolic} ({octal})"),
-                                        format!("Owner:Group: {owner}"),
-                                        format!("Size:     {size_str} bytes"),
-                                    ];
+                                    let size = entry.size.map(format_size).unwrap_or_default();
+                                    state.viewer_content = FileInfoService::metadata_summary(
+                                        &p,
+                                        &entry.name,
+                                        entry.kind,
+                                        &size,
+                                    )
+                                    .await
+                                    .unwrap_or_else(|error| {
+                                        vec![format!("File info failed: {error}")]
+                                    });
                                     state.viewer_scroll = 0;
                                 }
                             }
@@ -1071,95 +1029,63 @@ async fn event_loop(
                             if let Some(entry) = entries.get(cursor) {
                                 if let Location::Local(dir) = &pane.location {
                                     let path = dir.join(&entry.name);
-                                    if let Ok(meta) = std::fs::symlink_metadata(&path) {
-                                        let k = match entry.kind {
-                                            EntryKind::Directory => "d",
-                                            EntryKind::Symlink => "l",
-                                            _ => "-",
-                                        };
-                                        let mode = format!(
-                                            "{k}r--r--r-- {}",
-                                            if meta.permissions().readonly() {
-                                                "ro"
-                                            } else {
-                                                "rw"
-                                            }
-                                        );
-                                        let size = entry.size.map(format_size).unwrap_or_default();
-                                        let info = vec![
-                                            format!("Name:      {}", entry.name),
-                                            format!("Path:      {}", path.display()),
-                                            format!("Type:      {:?}", entry.kind),
-                                            format!("Size:      {size}"),
-                                            format!("Mode:      {mode}"),
-                                        ];
-                                        state.viewer_content = info;
-                                        state.viewer_scroll = 0;
-                                    }
+                                    let size = entry.size.map(format_size).unwrap_or_default();
+                                    state.viewer_content = FileInfoService::metadata_summary(
+                                        &path,
+                                        &entry.name,
+                                        entry.kind,
+                                        &size,
+                                    )
+                                    .await
+                                    .unwrap_or_else(|error| {
+                                        vec![format!("File info failed: {error}")]
+                                    });
+                                    state.viewer_scroll = 0;
                                 }
                             }
                         }
                         // Alt+O: sync other pane to active pane
                         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::ALT) => {
                             let src = state.active_pane().location.clone();
+                            let destination_pane = match state.active {
+                                Pane::Left => Pane::Right,
+                                Pane::Right => Pane::Left,
+                            };
                             let dst = state.other_pane_mut();
                             dst.location = src;
                             dst.cursor = 0;
+                            state.remote_workspace.disable();
+                            state.show_diff = false;
                             state.message = Some("Directory synced".into());
-                            left_entries = load_entries(
-                                &state.left.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
-                            right_entries = load_entries(
-                                &state.right.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
+                            schedule_pane_load(&pane_loader, &mut state, destination_pane);
                         }
                         // Alt+Down: go back in directory history
                         KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-                            // F7: tmux session attach (before pane borrow)
-                            if key.code == KeyCode::F(7) && !state.show_terminal {
-                                let sessions = list_tmux_sessions();
-                                if sessions.is_empty() {
-                                    state.message = Some("No tmux sessions found".into());
-                                } else {
-                                    state.command_matches = sessions;
-                                    state.show_command_center = true;
-                                    state.overlay_list_state =
-                                        ratatui::widgets::ListState::default();
-                                    state.overlay_list_state.select(Some(0));
-                                    continue;
-                                }
-                            }
-
                             let pane = state.active_pane_mut();
-                            if let Some(prev) = pane.dir_history.pop() {
-                                pane.location = prev;
-                                pane.cursor = 0;
-                                state.message = Some("History back".into());
-                                if state.active == Pane::Left {
-                                    left_entries = load_entries(
-                                        &state.left.location,
-                                        state.show_hidden,
-                                        state.sort_mode,
-                                    );
-                                } else {
-                                    right_entries = load_entries(
-                                        &state.right.location,
-                                        state.show_hidden,
-                                        state.sort_mode,
-                                    );
-                                }
+                            if let Some(prev) = pane.dir_history.last().cloned() {
+                                let active = state.active;
+                                schedule_pane_navigation(
+                                    &pane_loader,
+                                    &mut state,
+                                    active,
+                                    prev,
+                                    PaneLoadPurpose::HistoryBack,
+                                );
+                                state.message = Some("History back…".into());
                             }
                         }
                         // Ctrl+\\: open active directory in file explorer
                         KeyCode::Char('\\') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             if let Location::Local(dir) = &state.active_pane().location {
-                                let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
                                 let dir_c = dir.clone();
-                                let _dir_loc = Location::Local(dir_c.clone());
+                                let id = effect_dispatcher.dispatch(
+                                    EffectLane::GlobalProcess,
+                                    EffectScope::Location(Location::Local(dir_c.clone())),
+                                    Effect::OpenPath {
+                                        path: dir_c.clone(),
+                                    },
+                                );
+                                state.register_effect(EffectLane::GlobalProcess, id);
                                 state.message = Some(format!("Opening {}", dir_c.display()));
                                 state.dir_history.push(dir_c);
                                 if state.dir_history.len() > 20 {
@@ -1235,10 +1161,8 @@ async fn event_loop(
                         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             disable_raw_mode()?;
                             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                            let _ = std::process::Command::new(
-                                std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
-                            )
-                            .status();
+                            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+                            let _ = DesktopService::run_interactive_shell(&shell).await;
                             execute!(terminal.backend_mut(), EnterAlternateScreen)?;
                             enable_raw_mode()?;
                         }
@@ -1253,16 +1177,7 @@ async fn event_loop(
                             } else {
                                 "Hidden files hidden".into()
                             });
-                            left_entries = load_entries(
-                                &state.left.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
-                            right_entries = load_entries(
-                                &state.right.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
+                            schedule_both_pane_loads(&pane_loader, &mut state);
                         }
                         // F5: copy — Detection → Planner → Executor
                         KeyCode::F(5) => {
@@ -1303,31 +1218,28 @@ async fn event_loop(
                                     continue;
                                 }
                             };
-                            let id = format!("copy-{}", state.jobs.len());
-                            let desc = format!("Copy {} → {}", names.join(", "), dst_loc.label());
-                            state.jobs.push(arx::jobs::Job {
-                                id: id.clone(),
-                                description: desc,
-                                kind: arx::jobs::JobKind::Copy,
-                                status: arx::jobs::JobStatus::Pending,
-                                progress: arx::jobs::Progress::default(),
-                                cancel: arx::jobs::job_token(),
-                                source: Some(src_loc.clone()),
-                                destination: Some(dst_loc.clone()),
-                            });
+                            let job = job_manager.create_job(
+                                "copy",
+                                arx::jobs::JobKind::Copy,
+                                format!("Copy {} → {}", names.join(", "), dst_loc.label()),
+                                Some(src_loc.clone()),
+                                Some(dst_loc.clone()),
+                            );
+                            let id = job.id.clone();
+                            let cancel = job.cancel.clone();
+                            state.jobs = job_manager.snapshot();
+                            let jobs = job_manager.clone();
                             let tx = job_tx.clone();
                             let names2 = names.clone();
                             let plan2 = plan.clone();
                             let job_id = id.clone();
                             tokio::spawn(async move {
-                                if tx
-                                    .send(arx::jobs::JobEvent::Running { id: job_id.clone() })
-                                    .is_err()
-                                {
+                                if !jobs.publish_event(
+                                    &tx,
+                                    arx::jobs::JobEvent::Running { id: job_id.clone() },
+                                ) {
                                     return;
                                 }
-                                let cancel =
-                                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                                 let tx2 = tx.clone();
                                 let jid = job_id.clone();
                                 let result = arx::transfer::executor::execute_transfer(
@@ -1336,46 +1248,60 @@ async fn event_loop(
                                     cancel,
                                     |p| {
                                         let pct = p.completed.saturating_mul(100) / p.total.max(1);
-                                        tx2.send(arx::jobs::JobEvent::Progress {
-                                            id: jid.clone(),
-                                            progress: arx::jobs::Progress::Percent(pct as u8),
-                                        })
-                                        .ok();
+                                        let _ = jobs.publish_event(
+                                            &tx2,
+                                            arx::jobs::JobEvent::Progress {
+                                                id: jid.clone(),
+                                                progress: arx::jobs::Progress::Percent(pct as u8)
+                                                    .into(),
+                                            },
+                                        );
                                     },
                                 )
                                 .await;
                                 match result {
                                     Ok(outcome) => {
-                                        tx.send(arx::jobs::JobEvent::Done {
-                                            id: job_id,
-                                            message: format!(
-                                                "Copied {} item(s)",
-                                                outcome.completed
-                                            ),
-                                        })
-                                        .ok();
+                                        let _ = jobs.publish_event(
+        &tx,
+        arx::jobs::JobEvent::Completed {
+            id: job_id,
+            result: arx::jobs::JobResult::generic(
+                format!("Copied {} item(s)", outcome.completed),
+                outcome.completed,
+            ),
+        },
+    );
+                                    }
+                                    Err(
+                                        arx::transfer::executor::TransferExecutionError::Cancelled {
+                                            completed,
+                                        },
+                                    ) => {
+                                        let _ = jobs.publish_event(
+        &tx,
+        arx::jobs::JobEvent::Cancelled {
+            id: job_id,
+            result: arx::jobs::JobResult::generic(
+                format!("Cancelled after {completed} item(s)"),
+                completed,
+            ),
+        },
+    );
                                     }
                                     Err(e) => {
-                                        tx.send(arx::jobs::JobEvent::Failed {
-                                            id: job_id,
-                                            error: e.to_string(),
-                                        })
-                                        .ok();
+                                        let _ = jobs.publish_event(
+        &tx,
+        arx::jobs::JobEvent::Failed {
+            id: job_id,
+            error: e.to_string(),
+            result: None,
+        },
+    );
                                     }
                                 }
                             });
-                            state.message = Some(format!("Copy queued (job {})", state.jobs.len()));
+                            state.message = Some(format!("Copy queued ({id})"));
                             state.selected.clear();
-                            left_entries = load_entries(
-                                &state.left.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
-                            right_entries = load_entries(
-                                &state.right.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
                         }
                         // F6: move — Detection → Planner → Executor
                         KeyCode::F(6) => {
@@ -1416,31 +1342,28 @@ async fn event_loop(
                                     continue;
                                 }
                             };
-                            let id = format!("move-{}", state.jobs.len());
-                            let desc = format!("Move {} → {}", names.join(", "), dst_loc.label());
-                            state.jobs.push(arx::jobs::Job {
-                                id: id.clone(),
-                                description: desc,
-                                kind: arx::jobs::JobKind::Copy, // ponytail: reused Copy kind for UI
-                                status: arx::jobs::JobStatus::Pending,
-                                progress: arx::jobs::Progress::default(),
-                                cancel: arx::jobs::job_token(),
-                                source: Some(src_loc.clone()),
-                                destination: Some(dst_loc.clone()),
-                            });
+                            let job = job_manager.create_job(
+                                "move",
+                                arx::jobs::JobKind::Move,
+                                format!("Move {} → {}", names.join(", "), dst_loc.label()),
+                                Some(src_loc.clone()),
+                                Some(dst_loc.clone()),
+                            );
+                            let id = job.id.clone();
+                            let cancel = job.cancel.clone();
+                            state.jobs = job_manager.snapshot();
+                            let jobs = job_manager.clone();
                             let tx = job_tx.clone();
                             let names2 = names.clone();
                             let plan2 = plan.clone();
                             let job_id = id.clone();
                             tokio::spawn(async move {
-                                if tx
-                                    .send(arx::jobs::JobEvent::Running { id: job_id.clone() })
-                                    .is_err()
-                                {
+                                if !jobs.publish_event(
+                                    &tx,
+                                    arx::jobs::JobEvent::Running { id: job_id.clone() },
+                                ) {
                                     return;
                                 }
-                                let cancel =
-                                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                                 let tx2 = tx.clone();
                                 let jid = job_id.clone();
                                 let result = arx::transfer::executor::execute_transfer(
@@ -1449,71 +1372,164 @@ async fn event_loop(
                                     cancel,
                                     |p| {
                                         let pct = p.completed.saturating_mul(100) / p.total.max(1);
-                                        tx2.send(arx::jobs::JobEvent::Progress {
-                                            id: jid.clone(),
-                                            progress: arx::jobs::Progress::Percent(pct as u8),
-                                        })
-                                        .ok();
+                                        let _ = jobs.publish_event(
+                                            &tx2,
+                                            arx::jobs::JobEvent::Progress {
+                                                id: jid.clone(),
+                                                progress: arx::jobs::Progress::Percent(pct as u8)
+                                                    .into(),
+                                            },
+                                        );
                                     },
                                 )
                                 .await;
                                 match result {
                                     Ok(outcome) => {
-                                        tx.send(arx::jobs::JobEvent::Done {
-                                            id: job_id,
-                                            message: format!("Moved {} item(s)", outcome.completed),
-                                        })
-                                        .ok();
+                                        let _ = jobs.publish_event(
+        &tx,
+        arx::jobs::JobEvent::Completed {
+            id: job_id,
+            result: arx::jobs::JobResult::generic(
+                format!("Moved {} item(s)", outcome.completed),
+                outcome.completed,
+            ),
+        },
+    );
+                                    }
+                                    Err(
+                                        arx::transfer::executor::TransferExecutionError::Cancelled {
+                                            completed,
+                                        },
+                                    ) => {
+                                        let _ = jobs.publish_event(
+        &tx,
+        arx::jobs::JobEvent::Cancelled {
+            id: job_id,
+            result: arx::jobs::JobResult::generic(
+                format!("Cancelled after {completed} item(s)"),
+                completed,
+            ),
+        },
+    );
                                     }
                                     Err(e) => {
-                                        tx.send(arx::jobs::JobEvent::Failed {
-                                            id: job_id,
-                                            error: e.to_string(),
-                                        })
-                                        .ok();
+                                        let _ = jobs.publish_event(
+        &tx,
+        arx::jobs::JobEvent::Failed {
+            id: job_id,
+            error: e.to_string(),
+            result: None,
+        },
+    );
                                     }
                                 }
                             });
-                            state.message = Some(format!("Move queued (job {})", state.jobs.len()));
+                            state.message = Some(format!("Move queued ({id})"));
                             state.selected.clear();
-                            left_entries = load_entries(
-                                &state.left.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
-                            right_entries = load_entries(
-                                &state.right.location,
-                                state.show_hidden,
-                                state.sort_mode,
-                            );
                         }
+                        // F8: delete selected (or cursor) from active pane
                         // F8: delete selected (or cursor) from active pane
                         KeyCode::F(8) => {
                             let names = selection_or_cursor(&state, entries, cursor);
-                            let active_path = pane_location_path(&state);
-                            if let Some(dir) = active_path {
-                                let loc = Location::Local(dir.to_path_buf());
-                                match loc.delete_files(&dir.to_string_lossy(), &names) {
-                                    Ok(n) => {
-                                        state.message = Some(format!("Trashed {n} item(s)"));
+                            if names.is_empty() {
+                                continue;
+                            }
+                            let Location::Local(dir) = state.active_pane().location.clone() else {
+                                state.message = Some(
+                                    "Trash is currently available for local files only".into(),
+                                );
+                                continue;
+                            };
+                            let job = job_manager.create_job(
+                                "trash",
+                                arx::jobs::JobKind::Delete,
+                                format!("Trash {}", names.join(", ")),
+                                Some(Location::Local(dir.clone())),
+                                None,
+                            );
+                            let id = job.id.clone();
+                            let cancel = job.cancel.clone();
+                            state.jobs = job_manager.snapshot();
+                            let jobs = job_manager.clone();
+                            let tx = job_tx.clone();
+                            let job_id = id.clone();
+                            tokio::spawn(async move {
+                                if !jobs.publish_event(
+                                    &tx,
+                                    arx::jobs::JobEvent::Running { id: job_id.clone() },
+                                ) {
+                                    return;
+                                }
+
+                                let tx_progress = tx.clone();
+                                let progress_id = job_id.clone();
+                                let progress_jobs = jobs.clone();
+                                let result = MutationService::trash_local(
+                                    dir,
+                                    names,
+                                    cancel,
+                                    move |progress| {
+                                        let percent = progress.completed.saturating_mul(100)
+                                            / progress.total.max(1);
+                                        let _ = progress_jobs.publish_event(
+                                            &tx_progress,
+                                            arx::jobs::JobEvent::Progress {
+                                                id: progress_id.clone(),
+                                                progress: arx::jobs::Progress::Percent(
+                                                    percent as u8,
+                                                )
+                                                .into(),
+                                            },
+                                        );
+                                    },
+                                )
+                                .await;
+
+                                match result {
+                                    Ok(outcome) => {
+                                        let _ = jobs.publish_event(
+                                            &tx,
+                                            arx::jobs::JobEvent::Completed {
+                                                id: job_id,
+                                                result: arx::jobs::JobResult::generic(
+                                                    format!(
+                                                        "Trashed {} item(s)",
+                                                        outcome.completed
+                                                    ),
+                                                    outcome.completed,
+                                                ),
+                                            },
+                                        );
                                     }
-                                    Err(e) => {
-                                        state.message = Some(format!("Delete error: {e}"));
+                                    Err(MutationError::Cancelled { completed }) => {
+                                        let _ = jobs.publish_event(
+                                            &tx,
+                                            arx::jobs::JobEvent::Cancelled {
+                                                id: job_id,
+                                                result: arx::jobs::JobResult::generic(
+                                                    format!("Cancelled after {completed} item(s)"),
+                                                    completed,
+                                                ),
+                                            },
+                                        );
+                                    }
+                                    Err(error) => {
+                                        let _ = jobs.publish_event(
+                                            &tx,
+                                            arx::jobs::JobEvent::Failed {
+                                                id: job_id,
+                                                error: error.to_string(),
+                                                result: None,
+                                            },
+                                        );
                                     }
                                 }
-                                state.selected.clear();
-                                left_entries = load_entries(
-                                    &state.left.location,
-                                    state.show_hidden,
-                                    state.sort_mode,
-                                );
-                                right_entries = load_entries(
-                                    &state.right.location,
-                                    state.show_hidden,
-                                    state.sort_mode,
-                                );
-                            }
+                            });
+
+                            state.selected.clear();
+                            state.message = Some(format!("Trash queued ({id})"));
                         }
+
                         // *: invert selection on visible entries
                         KeyCode::Char('*') => {
                             let filt = if state.active == Pane::Left {
@@ -1543,16 +1559,8 @@ async fn event_loop(
                             } else {
                                 state.sort_mode = state.sort_mode.next();
                                 state.message = Some(format!("Sort: {}", state.sort_mode.label()));
-                                left_entries = load_entries(
-                                    &state.left.location,
-                                    state.show_hidden,
-                                    state.sort_mode,
-                                );
-                                right_entries = load_entries(
-                                    &state.right.location,
-                                    state.show_hidden,
-                                    state.sort_mode,
-                                );
+                                sort_entries(&mut left_entries, state.sort_mode);
+                                sort_entries(&mut right_entries, state.sort_mode);
                             }
                         }
                         // F3: view file
@@ -1564,13 +1572,9 @@ async fn event_loop(
                                         _ => continue,
                                     };
                                     if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                        // ponytail: use bat for syntax-highlighted paging
-                                        let _ = std::process::Command::new("bat")
-                                            .arg("--paging=always")
-                                            .arg(&path)
-                                            .status();
+                                        let _ = DesktopService::page_with_bat(&path).await;
                                     } else {
-                                        state.viewer_content = preview_file(&path);
+                                        state.viewer_content = PreviewService::preview(&path).await;
                                         state.viewer_scroll = 0;
                                     }
                                 }
@@ -1591,20 +1595,11 @@ async fn event_loop(
                                 // Leave raw mode, spawn editor, restore
                                 disable_raw_mode()?;
                                 execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                                let _ = std::process::Command::new(&editor_cmd).arg(&path).status();
+                                let _ = DesktopService::open_editor(&editor_cmd, &path).await;
                                 execute!(terminal.backend_mut(), EnterAlternateScreen)?;
                                 enable_raw_mode()?;
                                 // Refresh after edit
-                                left_entries = load_entries(
-                                    &state.left.location,
-                                    state.show_hidden,
-                                    state.sort_mode,
-                                );
-                                right_entries = load_entries(
-                                    &state.right.location,
-                                    state.show_hidden,
-                                    state.sort_mode,
-                                );
+                                schedule_active_pane_load(&pane_loader, &mut state);
                             }
                         }
                         // Ctrl+C: copy filename to clipboard
@@ -1613,14 +1608,13 @@ async fn event_loop(
                                 let name = &entry.name;
                                 if let Location::Local(dir) = &pane.location {
                                     let full = dir.join(name);
-                                    let path = full.to_string_lossy();
-                                    let _ = std::process::Command::new("sh")
-                                    .arg("-c")
-                                    .arg(format!(
-                                        "echo -n '{}' | xclip -selection clipboard 2>/dev/null || echo -n '{}' | wl-copy 2>/dev/null || printf '%s' '{}'",
-                                        path, path, path
-                                    ))
-                                    .output();
+                                    let path = full.to_string_lossy().into_owned();
+                                    if let Err(error) =
+                                        DesktopService::copy_to_clipboard(&path).await
+                                    {
+                                        state.message = Some(format!("Clipboard failed: {error}"));
+                                        continue;
+                                    }
                                 }
                                 state.message = Some(format!("Copied: {name}"));
                             }
@@ -1643,10 +1637,11 @@ async fn event_loop(
                         }
                         // Ctrl+J: jobs panel
                         KeyCode::Delete if state.show_jobs => {
-                            if state.job_cursor < state.jobs.len() {
-                                let job = &mut state.jobs[state.job_cursor];
-                                job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                                job.status = arx::jobs::JobStatus::Cancelled;
+                            if let Some(job) = state.jobs.get(state.job_cursor) {
+                                let id = job.id.clone();
+                                if job_manager.cancel(&id) {
+                                    state.jobs = job_manager.snapshot();
+                                }
                             }
                         }
                         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1662,12 +1657,37 @@ async fn event_loop(
                             }
                         }
                         KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            state.show_infra = !state.show_infra;
+                            let opening =
+                                state.active_overlay() != Some(OverlayKind::Infrastructure);
+                            state.toggle_overlay(OverlayKind::Infrastructure);
+                            if opening {
+                                state.infrastructure_lines = vec!["Checking SSH hosts…".into()];
+                                let id = effect_dispatcher.dispatch(
+                                    EffectLane::Infrastructure,
+                                    EffectScope::Global,
+                                    Effect::InfrastructureSnapshot,
+                                );
+                                state.register_effect(EffectLane::Infrastructure, id);
+                            }
                         }
                         // Ctrl+T: toggle Smart Tree
                         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            state.show_tree = !state.show_tree;
+                            let opening = state.active_overlay() != Some(OverlayKind::Tree);
+                            state.toggle_overlay(OverlayKind::Tree);
                             state.tree_filter.clear();
+                            if opening {
+                                let location = state.active_pane().location.clone();
+                                state.tree_lines = vec!["Loading tree…".into()];
+                                let id = effect_dispatcher.dispatch(
+                                    EffectLane::Tree,
+                                    EffectScope::Location(location.clone()),
+                                    Effect::TreeSnapshot {
+                                        location,
+                                        filter: String::new(),
+                                    },
+                                );
+                                state.register_effect(EffectLane::Tree, id);
+                            }
                         }
                         // Type in tree filter (when tree is shown) — Esc to close
                         KeyCode::Esc if state.show_tree => {
@@ -1679,6 +1699,16 @@ async fn event_loop(
                                 && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
                             state.tree_filter.push(c);
+                            let location = state.active_pane().location.clone();
+                            let id = effect_dispatcher.dispatch(
+                                EffectLane::Tree,
+                                EffectScope::Location(location.clone()),
+                                Effect::TreeSnapshot {
+                                    location,
+                                    filter: state.tree_filter.clone(),
+                                },
+                            );
+                            state.register_effect(EffectLane::Tree, id);
                         }
                         // Ctrl+X D: toggle directory compare
                         // Alt+T: toggle panel mode (Full ↔ Brief) KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => { state.panel_mode = match state.panel_mode { PanelMode::Full => PanelMode::Brief, PanelMode::Brief => PanelMode::Full, }; }
@@ -1695,7 +1725,6 @@ async fn event_loop(
                             state.cmd.clear();
                             state.cmd_input = true;
                         }
-                        // Ctrl+X S: symlink (MC-style prefix)
                         KeyCode::Char('\\') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             let pane = state.active_pane_mut();
                             pane.split = !pane.split;
@@ -1711,64 +1740,12 @@ async fn event_loop(
                                 }
                             ));
                         }
-                        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            state.cmd_prefix = true;
-                        }
-                        KeyCode::Char('s')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) && cmd_prefix =>
-                        {
-                            if let Some(entry) = entries.get(cursor) {
-                                state.cmd = format!("ln -s '{}' ", entry.name);
-                                state.cmd_input = true;
-                            }
-                            state.cmd_prefix = false;
-                        }
-                        KeyCode::Char('c')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) && cmd_prefix =>
-                        {
-                            state.cmd = "chmod ".into();
-                            state.cmd_input = true;
-                            state.cmd_prefix = false;
-                        }
-                        KeyCode::Char('l')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) && cmd_prefix =>
-                        {
-                            // Ctrl+X L: hard link
-                            if let Some(entry) = entries.get(cursor) {
-                                state.cmd = format!("ln '{}' ", entry.name);
-                                state.cmd_input = true;
-                            }
-                            state.cmd_prefix = false;
-                        }
-                        KeyCode::Char('o')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) && cmd_prefix =>
-                        {
-                            // Ctrl+X O: chown
-                            state.cmd = "chown ".into();
-                            state.cmd_input = true;
-                            state.cmd_prefix = false;
-                        }
                         // Alt+1-9: switch to tab N
                         KeyCode::Char(c)
                             if key.modifiers.contains(KeyModifiers::ALT)
                                 && ('1'..='9').contains(&c) =>
                         {
                             let idx = (c as u8 - b'1') as usize;
-                            // F7: tmux session attach (before pane borrow)
-                            if key.code == KeyCode::F(7) && !state.show_terminal {
-                                let sessions = list_tmux_sessions();
-                                if sessions.is_empty() {
-                                    state.message = Some("No tmux sessions found".into());
-                                } else {
-                                    state.command_matches = sessions;
-                                    state.show_command_center = true;
-                                    state.overlay_list_state =
-                                        ratatui::widgets::ListState::default();
-                                    state.overlay_list_state.select(Some(0));
-                                    continue;
-                                }
-                            }
-
                             let pane = state.active_pane_mut();
                             if idx < pane.tabs.len() + 1 {
                                 if idx != 0 {
@@ -1779,62 +1756,55 @@ async fn event_loop(
                                 }
                                 let n = pane.tabs.len() + 1;
                                 state.message = Some(format!("Tab {}/{n}", idx + 1));
-                                let show = state.show_hidden;
-                                let sort = state.sort_mode;
-                                left_entries = load_entries(&state.left.location, show, sort);
-                                right_entries = load_entries(&state.right.location, show, sort);
+                                state.selected.clear();
+                                state.remote_workspace.disable();
+                                state.show_diff = false;
+                                schedule_active_pane_load(&pane_loader, &mut state);
                             }
                         }
                         // Ctrl+T: new tab in active pane
                         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let show_hidden = state.show_hidden;
-                            let sort_mode = state.sort_mode;
                             state.active_pane_mut().new_tab();
                             let tabs = state.active_pane().tabs.len() + 1;
-                            left_entries =
-                                load_entries(&state.left.location, show_hidden, sort_mode);
-                            right_entries =
-                                load_entries(&state.right.location, show_hidden, sort_mode);
+                            state.selected.clear();
+                            state.remote_workspace.disable();
+                            state.show_diff = false;
+                            schedule_active_pane_load(&pane_loader, &mut state);
                             state.message = Some(format!("Tab {tabs}/{tabs}"));
                         }
                         // Ctrl+W: close tab in active pane
                         KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let show_hidden = state.show_hidden;
-                            let sort_mode = state.sort_mode;
                             state.active_pane_mut().close_tab();
                             let tabs = state.active_pane().tabs.len() + 1;
-                            left_entries =
-                                load_entries(&state.left.location, show_hidden, sort_mode);
-                            right_entries =
-                                load_entries(&state.right.location, show_hidden, sort_mode);
+                            state.selected.clear();
+                            state.remote_workspace.disable();
+                            state.show_diff = false;
+                            schedule_active_pane_load(&pane_loader, &mut state);
                             state.message = Some(format!("Tab {}/{}", tabs.min(1), tabs));
                         }
                         // Ctrl+Left: previous tab
                         KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let show_hidden = state.show_hidden;
-                            let sort_mode = state.sort_mode;
                             let tabs_len = state.active_pane().tabs.len();
                             if tabs_len > 0 {
                                 state.active_pane_mut().switch_tab(tabs_len - 1);
-                                left_entries =
-                                    load_entries(&state.left.location, show_hidden, sort_mode);
-                                right_entries =
-                                    load_entries(&state.right.location, show_hidden, sort_mode);
+                                state.selected.clear();
+                                state.remote_workspace.disable();
+                                state.show_diff = false;
+                                schedule_active_pane_load(&pane_loader, &mut state);
                                 state.message = Some("Tab ←".into());
                             }
                         }
                         // Ctrl+Right: next tab
-                        KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let show_hidden = state.show_hidden;
-                            let sort_mode = state.sort_mode;
-                            if state.active_pane().tabs.len() >= 2 {
-                                state.active_pane_mut().switch_tab(0);
-                                left_entries =
-                                    load_entries(&state.left.location, show_hidden, sort_mode);
-                                right_entries =
-                                    load_entries(&state.right.location, show_hidden, sort_mode);
-                                state.message = Some("Tab →".into());
-                            }
+                        KeyCode::Right
+                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                && state.active_pane().tabs.len() >= 2 =>
+                        {
+                            state.active_pane_mut().switch_tab(0);
+                            state.selected.clear();
+                            state.remote_workspace.disable();
+                            state.show_diff = false;
+                            schedule_active_pane_load(&pane_loader, &mut state);
+                            state.message = Some("Tab →".into());
                         }
                         _ => {}
                     }
@@ -1846,14 +1816,115 @@ async fn event_loop(
     Ok(())
 }
 
-fn load_entries(location: &Location, show_hidden: bool, sort_mode: SortMode) -> Vec<Entry> {
-    // ponytail: VfsOps trait dispatch handles all backends
-    let mut entries = location.list().unwrap_or_default();
+fn normalize_entries(
+    mut entries: Vec<Entry>,
+    show_hidden: bool,
+    sort_mode: SortMode,
+) -> Vec<Entry> {
     if !show_hidden {
         entries.retain(|e| !e.name.starts_with('.'));
     }
     sort_entries(&mut entries, sort_mode);
     entries
+}
+
+fn schedule_pane_load(loader: &PaneLoader, state: &mut AppState, pane: Pane) {
+    let location = match pane {
+        Pane::Left => state.left.location.clone(),
+        Pane::Right => state.right.location.clone(),
+    };
+    let id = loader.load(pane, location.clone(), PaneLoadPurpose::Refresh);
+    state.register_pane_load(pane, id, location, PaneLoadPurpose::Refresh);
+}
+
+fn schedule_pane_navigation(
+    loader: &PaneLoader,
+    state: &mut AppState,
+    pane: Pane,
+    location: Location,
+    purpose: PaneLoadPurpose,
+) {
+    let id = loader.load(pane, location.clone(), purpose);
+    state.register_pane_load(pane, id, location, purpose);
+}
+
+fn schedule_active_pane_load(loader: &PaneLoader, state: &mut AppState) {
+    schedule_pane_load(loader, state, state.active);
+}
+
+fn schedule_both_pane_loads(loader: &PaneLoader, state: &mut AppState) {
+    schedule_pane_load(loader, state, Pane::Left);
+    schedule_pane_load(loader, state, Pane::Right);
+}
+
+fn apply_pane_load_response(
+    response: PaneLoadResponse,
+    state: &mut AppState,
+    left_entries: &mut Vec<Entry>,
+    right_entries: &mut Vec<Entry>,
+) {
+    if !state.accepts_pane_load(response.pane, response.id, &response.location) {
+        return;
+    }
+    state.finish_pane_load(response.pane, response.id);
+
+    match response.result {
+        Ok(entries) => {
+            let entries = normalize_entries(entries, state.show_hidden, state.sort_mode);
+            let active = state.active == response.pane;
+            match response.pane {
+                Pane::Left => {
+                    if response.purpose != PaneLoadPurpose::Refresh {
+                        let old = state.left.location.clone();
+                        match response.purpose {
+                            PaneLoadPurpose::Navigate {
+                                remember_current: true,
+                            } => state.left.dir_history.push(old),
+                            PaneLoadPurpose::HistoryBack => {
+                                let _ = state.left.dir_history.pop();
+                            }
+                            _ => {}
+                        }
+                        state.left.location = response.location.clone();
+                        state.left.cursor = 0;
+                    }
+                    *left_entries = entries;
+                    state.left.cursor = state.left.cursor.min(left_entries.len().saturating_sub(1));
+                }
+                Pane::Right => {
+                    if response.purpose != PaneLoadPurpose::Refresh {
+                        let old = state.right.location.clone();
+                        match response.purpose {
+                            PaneLoadPurpose::Navigate {
+                                remember_current: true,
+                            } => state.right.dir_history.push(old),
+                            PaneLoadPurpose::HistoryBack => {
+                                let _ = state.right.dir_history.pop();
+                            }
+                            _ => {}
+                        }
+                        state.right.location = response.location.clone();
+                        state.right.cursor = 0;
+                    }
+                    *right_entries = entries;
+                    state.right.cursor = state
+                        .right
+                        .cursor
+                        .min(right_entries.len().saturating_sub(1));
+                }
+            }
+            if active && response.purpose != PaneLoadPurpose::Refresh {
+                state.selected.clear();
+                state.remote_workspace.disable();
+                state.show_diff = false;
+            }
+        }
+        Err(error) => {
+            // Transactional navigation: current pane location is intentionally
+            // untouched on error.
+            state.message = Some(format!("{}: {error}", response.location));
+        }
+    }
 }
 
 fn sort_entries(entries: &mut [Entry], mode: SortMode) {
@@ -1897,13 +1968,6 @@ fn apply_filter<'a>(entries: &'a [Entry], filter: &str) -> Vec<&'a Entry> {
     }
 }
 
-fn pane_location_path(state: &AppState) -> Option<&Path> {
-    match &state.active_pane().location {
-        Location::Local(p) => Some(p),
-        _ => None,
-    }
-}
-
 fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> Vec<String> {
     if !state.selected.is_empty() {
         state.selected.iter().cloned().collect()
@@ -1934,6 +1998,7 @@ fn render(
     right_list: &mut ListState,
     split_left_list: &mut ListState,
     split_right_list: &mut ListState,
+    key_router: &KeyRouter,
     message: Option<&str>,
 ) {
     let area = frame.area();
@@ -2110,40 +2175,57 @@ fn render(
         render_viewer(frame, area, state);
     }
 
+    // Which-Key is derived from the active KeyRouter prefix and the shared
+    // Action Catalog. There is intentionally no second shortcut table here.
+    let input_context = state.input_context();
+    let continuations = key_router.continuations(input_context);
+    if !continuations.is_empty() {
+        let prefix = key_router
+            .pending()
+            .iter()
+            .map(|stroke| stroke.label())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let items: Vec<ListItem> = continuations
+            .iter()
+            .filter_map(|continuation| {
+                action_meta(continuation.action).map(|meta| {
+                    ListItem::new(format!(
+                        "{:<10} {}",
+                        continuation.stroke.label(),
+                        meta.label
+                    ))
+                })
+            })
+            .collect();
+
+        if !items.is_empty() {
+            let height = (items.len() as u16 + 2).min(area.height.max(1));
+            let width = area.width.saturating_mul(70).saturating_div(100).max(30);
+            let width = width.min(area.width);
+            let x = area.x + area.width.saturating_sub(width) / 2;
+            let y = area
+                .y
+                .saturating_add(area.height.saturating_sub(height).saturating_sub(1));
+            let popup = Rect::new(x, y, width, height);
+
+            frame.render_widget(Clear, popup);
+            frame.render_widget(
+                List::new(items).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" {prefix} … "))
+                        .border_style(Style::default().fg(Color::Cyan)),
+                ),
+                popup,
+            );
+        }
+    }
+
     // Infrastructure Center overlay (Ctrl+I)
     if state.show_infra {
-        // ponytail: parse ssh config for host list + quick reachability check
-        let hosts = arx::remote::ssh_config::parse_ssh_config();
-        let mut lines: Vec<String> = Vec::new();
-        for (alias, entry) in hosts.iter().take(30) {
-            let status = if std::process::Command::new("ssh")
-                .args([
-                    "-o",
-                    "ConnectTimeout=2",
-                    "-o",
-                    "BatchMode=yes",
-                    &format!(
-                        "{}@{}",
-                        entry.user.as_deref().unwrap_or("root"),
-                        entry.hostname.as_deref().unwrap_or(alias)
-                    ),
-                ])
-                .arg("echo ok 2>/dev/null")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-            {
-                "✓"
-            } else {
-                "✗"
-            };
-            lines.push(format!(
-                "{} {} ({})",
-                status,
-                alias,
-                entry.hostname.as_deref().unwrap_or("?")
-            ));
-        }
+        let lines = &state.infrastructure_lines;
         let h = (lines.len().max(1) + 3).min(30) as u16;
         let popup = centered_rect(80, h, area);
         frame.render_widget(Clear, popup);
@@ -2159,31 +2241,11 @@ fn render(
     }
     // Smart Tree overlay (Ctrl+T)
     if state.show_tree {
-        let pane = state.active_pane();
-        let cur_dir = match &pane.location {
-            Location::Local(p) => p.display().to_string(),
-            Location::Sftp { host: _, path, .. } => path.clone(),
-            Location::Archive {
-                archive: _,
-                inner_path: _,
-            } => ".".into(),
-        };
-        let tree_out = std::process::Command::new("tree")
-            .args(["-L", "2", "-C", "--noreport", &cur_dir])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_else(|_| "tree not found".into());
-        let tl: Vec<&str> = tree_out
-            .lines()
-            .filter(|l| {
-                state.tree_filter.is_empty()
-                    || l.to_lowercase().contains(&state.tree_filter.to_lowercase())
-            })
-            .collect();
+        let tl = &state.tree_lines;
         let h = (tl.len().max(1) + 3).min(30) as u16;
         let popup = centered_rect(80, h, area);
         frame.render_widget(Clear, popup);
-        let items: Vec<ListItem> = tl.iter().map(|l| ListItem::new(*l)).collect();
+        let items: Vec<ListItem> = tl.iter().map(|l| ListItem::new(l.as_str())).collect();
         let title = format!(
             " ARX Smart Tree — :{}_ | Ctrl+T toggle, Esc close ",
             state.tree_filter
@@ -2201,8 +2263,27 @@ fn render(
         let items: Vec<ListItem> = state
             .command_matches
             .iter()
-            .map(|(l, _)| ListItem::new(l.as_str()))
+            .map(|item| {
+                let style = if !item.availability.is_available() {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    match item.kind {
+                        CommandKind::Action => Style::default().fg(Color::Cyan),
+                        CommandKind::Host => Style::default().fg(Color::Green),
+                        CommandKind::Bookmark => Style::default().fg(Color::Magenta),
+                        CommandKind::History => Style::default(),
+                        CommandKind::Session => Style::default().fg(Color::Yellow),
+                        CommandKind::UserCommand => Style::default().fg(Color::Blue),
+                    }
+                };
+                let line = match item.availability.reason() {
+                    Some(reason) => format!("{}  —  unavailable: {reason}", item.display_line()),
+                    None => item.display_line(),
+                };
+                ListItem::new(line).style(style)
+            })
             .collect();
+
         let list = ratatui::widgets::List::new(items)
             .block(Block::default().borders(Borders::ALL).title(format!(
                 " ARX Command Center — :{}_ | bat chafa pdftotext ffprobe 7z ",
@@ -2213,24 +2294,6 @@ fn render(
     }
 
     // Command Center overlay (Ctrl+P)
-    if state.show_command_center {
-        let h = (state.command_matches.len().max(1) + 3).min(20) as u16;
-        let popup = centered_rect(70, h, area);
-        frame.render_widget(Clear, popup);
-        let items: Vec<ListItem> = state
-            .command_matches
-            .iter()
-            .map(|(l, _)| ListItem::new(l.as_str()))
-            .collect();
-        let list = ratatui::widgets::List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(format!(
-                " ARX Command Center — :{}_ | bat chafa pdftotext ffprobe 7z ",
-                state.filter
-            )))
-            .highlight_style(Style::default().fg(Color::Yellow));
-        frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
-    }
-
     // Context menu (right-click)
     if state.show_context_menu {
         let popup = centered_rect(18, 7, area);
@@ -2433,12 +2496,15 @@ fn render(
         state.left.tabs.len() + 1,
         state.right.tabs.len() + 1
     );
-    // Git info — ponytail: cached branch/dirty check per navigation, stat(2) on Cargo.toml/.git
-    let git_info = git_branch_for(&pane.location);
+    let git_info = state.git_status.as_str();
     let msg_hint = message.map(|m| format!(" | {m}")).unwrap_or_default();
-
+    let workspace_hint = if state.remote_workspace.enabled {
+        format!(" | {}", state.remote_workspace.summary())
+    } else {
+        String::new()
+    };
     let status = Paragraph::new(Line::from(format!(
-        "ARX v0.1.0 | {}{hidden}{tab_info} | sel: {} |{hint}{msg_hint}{git_info} | ?: help",
+        "ARX v0.1.0 | {}{hidden}{tab_info} | sel: {} |{hint}{msg_hint}{git_info}{workspace_hint} | ?: help",
         loc_str,
         state.selected.len(),
     )))
@@ -2451,6 +2517,512 @@ fn render(
         Style::default().fg(Color::Black).bg(Color::DarkGray),
     );
     frame.render_widget(Paragraph::new(shortcuts), chunks[2]);
+
+    if state.active_overlay() == Some(OverlayKind::SyncPreview) {
+        render_sync_preview(frame, area, state);
+    }
+}
+
+fn render_sync_preview(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    let popup = centered_rect(86, 82, area);
+    frame.render_widget(Clear, popup);
+
+    let mut lines = Vec::new();
+    let mut title = " Workspace Sync ".to_string();
+    let mut border = Style::default().fg(Color::Cyan);
+
+    match &state.remote_workspace.ux {
+        WorkspaceSyncUxState::Idle | WorkspaceSyncUxState::Scanning => {
+            title = " Workspace Sync — SCANNING ".into();
+            lines.push(Line::from("Scanning both workspace roots…"));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "No files will be changed. Esc hides this view.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        WorkspaceSyncUxState::Preview { .. } => {
+            render_sync_plan_lines(state, &mut lines);
+            if let Some(plan) = state.remote_workspace.plan.as_ref() {
+                title = if plan.can_execute() {
+                    " Sync Preview — READY ".into()
+                } else {
+                    border = Style::default().fg(Color::Yellow);
+                    " Sync Preview — RESOLVE CONFLICTS ".into()
+                };
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "D reverse   M update/mirror   Enter execute   Esc hide",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        WorkspaceSyncUxState::ConfirmationRequired {
+            digest,
+            destructive_operations,
+            ..
+        } => {
+            title = " Confirm Mirror Sync ".into();
+            border = Style::default().fg(Color::Yellow);
+            render_sync_plan_lines(state, &mut lines);
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("DELETE {destructive_operations} destructive operation(s)"),
+                Style::default().fg(Color::Red),
+            )));
+            lines.push(Line::from(
+                "Destination-only entries in this frozen plan may be removed.",
+            ));
+            lines.push(Line::from(format!(
+                "Preview digest: {}…",
+                &digest.as_hex()[..8]
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Esc back to preview                 Enter confirm exact plan",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        WorkspaceSyncUxState::Launching { .. } => {
+            title = " Workspace Sync — PREPARING ".into();
+            lines.push(Line::from("Freezing transport choice and execution steps…"));
+            lines.push(Line::from("No Job has been created yet."));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Esc hides this view. A newer compare/direction/mode action supersedes preparation.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        WorkspaceSyncUxState::Blocked { message } => {
+            title = " Workspace Sync — CANNOT EXECUTE ".into();
+            border = Style::default().fg(Color::Yellow);
+            lines.extend(message.lines().map(|line| Line::from(line.to_string())));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Esc hide   D/M adjust preview and try again",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        WorkspaceSyncUxState::VerificationDiff { job_id } => {
+            title = " Post-sync Verification Diff ".into();
+            if let Some(job) = state.jobs.iter().find(|job| job.id == *job_id) {
+                render_sync_verification_diff_lines(job, &mut lines);
+            } else {
+                lines.push(Line::from("The verification Job is no longer available."));
+            }
+        }
+        WorkspaceSyncUxState::Queued { job_id }
+        | WorkspaceSyncUxState::Running { job_id }
+        | WorkspaceSyncUxState::Cancelling { job_id }
+        | WorkspaceSyncUxState::Verifying { job_id }
+        | WorkspaceSyncUxState::Finished { job_id } => {
+            if let Some(job) = state.jobs.iter().find(|job| job.id == *job_id) {
+                title = sync_job_title(job, &state.remote_workspace.ux);
+                let can_return_to_preview =
+                    ActionContext::from_state(state).sync_return_preview_ready;
+                render_sync_job_lines(
+                    job,
+                    &state.remote_workspace.ux,
+                    can_return_to_preview,
+                    &mut lines,
+                );
+            } else {
+                lines.push(Line::from("Waiting for JobManager snapshot…"));
+            }
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(border),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn render_sync_plan_lines(state: &AppState, lines: &mut Vec<Line<'static>>) {
+    let Some(plan) = state.remote_workspace.plan.as_ref() else {
+        lines.push(Line::from("Preview is not ready yet."));
+        return;
+    };
+    let (source, destination) =
+        sync_display_roots(&plan.left_root, &plan.right_root, plan.policy.direction);
+    let copies = plan
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation, WorkspaceSyncOperation::Copy { .. }))
+        .count();
+    let deletes = plan
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation, WorkspaceSyncOperation::Delete { .. }))
+        .count();
+    let create_dirs = state
+        .remote_workspace
+        .diff
+        .as_ref()
+        .map(|diff| {
+            plan.operations
+                .iter()
+                .filter(|operation| match operation {
+                    WorkspaceSyncOperation::Copy {
+                        relative_path,
+                        from,
+                        ..
+                    } => diff
+                        .entries
+                        .iter()
+                        .find(|entry| entry.relative_path == *relative_path)
+                        .and_then(|entry| match from {
+                            WorkspaceSide::Left => entry.left.as_ref(),
+                            WorkspaceSide::Right => entry.right.as_ref(),
+                        })
+                        .is_some_and(|fingerprint| fingerprint.kind == EntryKind::Directory),
+                    _ => false,
+                })
+                .count()
+        })
+        .unwrap_or(0);
+
+    lines.push(Line::from(Span::styled(
+        format!("{source}  →  {destination}"),
+        Style::default().fg(Color::Cyan),
+    )));
+    lines.push(Line::from(format!(
+        "{} · {}",
+        state.remote_workspace.direction_label(),
+        state.remote_workspace.mode_label()
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("Copy / update     {copies}")));
+    lines.push(Line::from(format!("Create dirs       {create_dirs}")));
+    lines.push(Line::from(format!("Delete            {deletes}")));
+    lines.push(Line::from(format!("Conflicts         {}", plan.conflicts)));
+    lines.push(Line::from(format!(
+        "Transfer          {}",
+        format_size(plan.bytes_to_transfer)
+    )));
+    lines.push(Line::from(""));
+    if plan.destructive_operations == 0 && plan.policy.mode == SyncMode::Update {
+        lines.push(Line::from(
+            "Safe update — destination-only entries are preserved.",
+        ));
+    } else if plan.destructive_operations == 0 {
+        lines.push(Line::from("This plan is non-destructive."));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "This plan contains {} destructive operation(s).",
+                plan.destructive_operations
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+}
+
+fn sync_display_roots<'a>(
+    left: &'a Location,
+    right: &'a Location,
+    direction: SyncDirection,
+) -> (&'a Location, &'a Location) {
+    match direction {
+        SyncDirection::LeftToRight => (left, right),
+        SyncDirection::RightToLeft => (right, left),
+    }
+}
+
+fn sync_job_title(job: &arx::jobs::Job, ux: &WorkspaceSyncUxState) -> String {
+    let destination = job
+        .display_destination()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "destination".into());
+    match ux {
+        WorkspaceSyncUxState::Queued { .. } => format!(" Sync queued → {destination} "),
+        WorkspaceSyncUxState::Running { .. } => format!(" Syncing → {destination} "),
+        WorkspaceSyncUxState::Cancelling { .. } => " Cancelling… ".into(),
+        WorkspaceSyncUxState::Verifying { .. } => " Execution finished — VERIFYING ".into(),
+        WorkspaceSyncUxState::Finished { .. } => " Workspace Sync — RESULT ".into(),
+        _ => " Workspace Sync ".into(),
+    }
+}
+
+fn render_sync_job_lines(
+    job: &arx::jobs::Job,
+    ux: &WorkspaceSyncUxState,
+    can_return_to_preview: bool,
+    lines: &mut Vec<Line<'static>>,
+) {
+    if let (Some(source), Some(destination)) = (job.display_source(), job.display_destination()) {
+        lines.push(Line::from(Span::styled(
+            format!("{source}  →  {destination}"),
+            Style::default().fg(Color::Cyan),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    if let arx::jobs::JobProgress::WorkspaceSync(progress) = &job.progress {
+        let percent = progress.percent().unwrap_or(0);
+        let filled = usize::from(percent) / 5;
+        lines.push(Line::from(format!(
+            "[{}{}] {percent}%",
+            "█".repeat(filled),
+            "░".repeat(20usize.saturating_sub(filled))
+        )));
+        lines.push(Line::from(format!(
+            "{} / {} physical steps",
+            progress.completed_steps, progress.total_steps
+        )));
+        lines.push(Line::from(format!(
+            "{} / {} transferred",
+            format_size(progress.transferred_bytes),
+            format_size(progress.total_bytes)
+        )));
+        if let Some(path) = &progress.current_path {
+            lines.push(Line::from(format!("Current  → {path}")));
+        }
+        lines.push(Line::from(""));
+    }
+
+    match &job.result {
+        Some(arx::jobs::JobResult::WorkspaceSync(outcome)) => {
+            match &outcome.terminal {
+                arx::workspace_sync_executor::SyncTerminalState::Completed => {
+                    lines.push(Line::from("✓ Execution completed"));
+                }
+                arx::workspace_sync_executor::SyncTerminalState::Cancelled { .. } => {
+                    lines.push(Line::from("Sync cancelled"));
+                    lines.push(Line::from(format!(
+                        "✓ {} physical step(s) completed",
+                        outcome.completed.len()
+                    )));
+                    lines.push(Line::from(format!(
+                        "○ {} physical step(s) not completed",
+                        outcome.remaining.len()
+                    )));
+                    if outcome.workspace_may_have_changed {
+                        lines.push(Line::from("Workspace may have changed."));
+                    }
+                }
+                arx::workspace_sync_executor::SyncTerminalState::Failed { step, error } => {
+                    lines.push(Line::from(Span::styled(
+                        "✗ Sync partially completed",
+                        Style::default().fg(Color::Red),
+                    )));
+                    lines.push(Line::from(format!(
+                        "✓ {} physical step(s) completed",
+                        outcome.completed.len()
+                    )));
+                    lines.push(Line::from(format!("✗ Step {} failed: {error}", step.0)));
+                    lines.push(Line::from(format!(
+                        "○ {} physical step(s) not started",
+                        outcome.remaining.len()
+                    )));
+                    lines.push(Line::from("No global rollback was attempted."));
+                }
+            }
+            lines.push(Line::from(format!(
+                "{} transferred",
+                format_size(outcome.transferred_bytes)
+            )));
+            if let arx::workspace_sync_executor::SyncJournalFinalization::Failed { error } =
+                &outcome.journal
+            {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "⚠ Audit record finalization failed",
+                    Style::default().fg(Color::Yellow),
+                )));
+                lines.push(Line::from(error.to_string()));
+                lines.push(Line::from("The physical result was preserved."));
+            }
+        }
+        Some(arx::jobs::JobResult::Generic { .. }) | None => {}
+    }
+
+    if matches!(ux, WorkspaceSyncUxState::Cancelling { .. }) {
+        lines.push(Line::from(Span::styled(
+            "Cancelling… waiting for the executor's terminal outcome.",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    if matches!(ux, WorkspaceSyncUxState::Verifying { .. }) {
+        lines.push(Line::from(""));
+        lines.push(Line::from("Verifying current workspace…"));
+        lines.push(Line::from("Scanning both workspace roots again."));
+    }
+
+    if matches!(ux, WorkspaceSyncUxState::Finished { .. }) {
+        lines.push(Line::from(""));
+        render_verification_lines(job, lines);
+    }
+
+    lines.push(Line::from(""));
+    let footer = match ux {
+        WorkspaceSyncUxState::Queued { .. } | WorkspaceSyncUxState::Running { .. } => {
+            "C cancel   Esc hide"
+        }
+        WorkspaceSyncUxState::Cancelling { .. } | WorkspaceSyncUxState::Verifying { .. } => {
+            "Esc hide"
+        }
+        WorkspaceSyncUxState::Finished { .. }
+            if verification_has_differences(job) && can_return_to_preview =>
+        {
+            "V verification diff   B current preview   Esc hide"
+        }
+        WorkspaceSyncUxState::Finished { .. } if verification_has_differences(job) => {
+            "V verification diff   Esc hide · current panes moved"
+        }
+        WorkspaceSyncUxState::Finished { .. } if can_return_to_preview => {
+            "B current preview   Esc hide"
+        }
+        WorkspaceSyncUxState::Finished { .. } => {
+            "Esc hide · compare current panes for a new preview"
+        }
+        _ => "Esc hide",
+    };
+    lines.push(Line::from(Span::styled(
+        footer,
+        Style::default().fg(Color::DarkGray),
+    )));
+}
+
+fn render_sync_verification_diff_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>>) {
+    let Some(verification) = &job.verification else {
+        lines.push(Line::from("No post-sync verification result is available."));
+        return;
+    };
+    let SyncVerificationStatus::Finished(result) = &verification.status else {
+        lines.push(Line::from("Verification has not finished yet."));
+        return;
+    };
+    if !matches!(
+        result.verdict,
+        SyncVerificationVerdict::DifferencesRemain { .. }
+    ) {
+        lines.push(Line::from(
+            "Verification did not report remaining differences.",
+        ));
+        return;
+    }
+
+    lines.push(Line::from(format!("LEFT   {}", result.left_root)));
+    lines.push(Line::from(format!("RIGHT  {}", result.right_root)));
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "{} proven difference(s) · {} conflict(s) · {} unverified",
+        result.changed_entries, result.conflicts, result.unverified_entries
+    )));
+    lines.push(Line::from(Span::styled(
+        "This is the recursive post-sync verification snapshot for this Job.",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+
+    let visible = result
+        .diff
+        .entries
+        .iter()
+        .filter(|entry| entry.state != DiffState::SameFingerprint)
+        .collect::<Vec<_>>();
+    for entry in visible.iter().take(40) {
+        let label = match entry.state {
+            DiffState::OnlyLeft => "LEFT ONLY",
+            DiffState::OnlyRight => "RIGHT ONLY",
+            DiffState::LeftNewer => "LEFT NEWER",
+            DiffState::RightNewer => "RIGHT NEWER",
+            DiffState::Different => "COMPARE",
+            DiffState::SameFingerprint => continue,
+        };
+        lines.push(Line::from(format!("{label:>11}  {}", entry.relative_path)));
+    }
+    if visible.len() > 40 {
+        lines.push(Line::from(format!(
+            "… {} more verification entry/entries",
+            visible.len() - 40
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "B back to Job result   Esc hide",
+        Style::default().fg(Color::DarkGray),
+    )));
+}
+
+fn verification_has_differences(job: &arx::jobs::Job) -> bool {
+    job.verification.as_ref().is_some_and(|verification| {
+        matches!(
+            &verification.status,
+            SyncVerificationStatus::Finished(result)
+                if matches!(
+                    &result.verdict,
+                    SyncVerificationVerdict::DifferencesRemain { .. }
+                )
+        )
+    })
+}
+
+fn render_verification_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>>) {
+    let Some(verification) = &job.verification else {
+        return;
+    };
+    match &verification.status {
+        SyncVerificationStatus::Finished(result) => match &result.verdict {
+            SyncVerificationVerdict::Synchronized => {
+                lines.push(Line::from("✓ Workspace verified"));
+                lines.push(Line::from("Both workspace roots are synchronized."));
+            }
+            SyncVerificationVerdict::DifferencesRemain {
+                changed,
+                conflicts,
+                unverified,
+            } => {
+                lines.push(Line::from(Span::styled(
+                    "⚠ Verification found differences",
+                    Style::default().fg(Color::Yellow),
+                )));
+                lines.push(Line::from(format!("{changed} entries still differ")));
+                lines.push(Line::from(format!("{conflicts} conflict(s)")));
+                if *unverified > 0 {
+                    lines.push(Line::from(format!("{unverified} entry/entries unverified")));
+                }
+                lines.push(Line::from(
+                    "Preview the next sync to resolve current differences.",
+                ));
+            }
+            SyncVerificationVerdict::Inconclusive { unverified } => {
+                lines.push(Line::from("? Verification inconclusive"));
+                lines.push(Line::from(format!(
+                    "ARX cannot prove {unverified} entry/entries are identical."
+                )));
+                lines.push(Line::from("No mismatch was proven."));
+            }
+        },
+        SyncVerificationStatus::Failed { error, .. } => {
+            lines.push(Line::from(Span::styled(
+                "⚠ Workspace verification could not finish",
+                Style::default().fg(Color::Yellow),
+            )));
+            lines.push(Line::from(error.clone()));
+            lines.push(Line::from("Execution truth above is unchanged."));
+        }
+        SyncVerificationStatus::Cancelled => {
+            lines.push(Line::from("Verification cancelled."));
+        }
+        SyncVerificationStatus::Superseded => {
+            lines.push(Line::from(
+                "Verification superseded by a newer workspace state.",
+            ));
+        }
+        SyncVerificationStatus::Pending | SyncVerificationStatus::Running { .. } => {
+            lines.push(Line::from("Verifying current workspace…"));
+        }
+    }
 }
 
 fn render_help(frame: &mut ratatui::Frame, area: Rect) {
@@ -2916,41 +3488,6 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Get git branch + dirty count for a local directory.
-fn git_branch_for(loc: &arx::vfs::Location) -> String {
-    let dir = match loc {
-        arx::vfs::Location::Local(p) => p.clone(),
-        _ => return String::new(),
-    };
-    // ponytail: check .git directly, no heavy status call
-    if !dir.join(".git").exists() && !dir.join("HEAD").exists() {
-        return String::new();
-    }
-    let branch = std::process::Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(&dir)
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    if branch.is_empty() {
-        return String::new();
-    }
-    let dirty = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(&dir)
-        .output()
-        .ok()
-        .map(|o| o.stdout.iter().filter(|&&b| b == b'\n').count())
-        .unwrap_or(0);
-    if dirty > 0 {
-        format!(" | git:{}+{}", branch, dirty)
-    } else {
-        format!(" | git:{}", branch)
-    }
-}
-
 /// Parse filter string for size:>1G, size:<100M modifiers.
 fn parse_filter(raw: &str) -> (String, Option<u64>, Option<u64>) {
     let mut name_part = String::new();
@@ -2994,358 +3531,504 @@ fn parse_size(s: &str) -> Result<u64, ()> {
     num_str.parse::<u64>().map(|n| n * mult).map_err(|_| ())
 }
 
-/// Process a job event — updates state and refreshes file lists after copy/move/delete.
-fn handle_job_event(
-    ev: arx::jobs::JobEvent,
-    state: &mut AppState,
-    left: &mut Vec<Entry>,
-    right: &mut Vec<Entry>,
-) {
+fn job_event_id(event: &arx::jobs::JobEvent) -> &str {
+    match event {
+        arx::jobs::JobEvent::Running { id }
+        | arx::jobs::JobEvent::Paused { id }
+        | arx::jobs::JobEvent::Progress { id, .. }
+        | arx::jobs::JobEvent::Completed { id, .. }
+        | arx::jobs::JobEvent::Failed { id, .. }
+        | arx::jobs::JobEvent::Cancelled { id, .. } => id,
+    }
+}
+
+/// Present an already-accepted JobManager event. Lifecycle state lives in JobManager.
+fn handle_job_event(ev: &arx::jobs::JobEvent, state: &mut AppState) -> bool {
     match ev {
-        arx::jobs::JobEvent::Paused { id } => {
-            if let Some(job) = state.jobs.iter_mut().find(|j| j.id == id) {
-                job.status = arx::jobs::JobStatus::Paused;
-            }
+        arx::jobs::JobEvent::Completed { id, result } => {
+            state.message = Some(match result {
+                arx::jobs::JobResult::Generic { message, .. } => message
+                    .clone()
+                    .unwrap_or_else(|| format!("Job {id} completed")),
+                arx::jobs::JobResult::WorkspaceSync(outcome) => format!(
+                    "Sync completed: {} physical step(s), {} bytes",
+                    outcome.completed.len(),
+                    outcome.transferred_bytes
+                ),
+            });
+            true
         }
-        arx::jobs::JobEvent::Running { id } => {
-            if let Some(job) = state.jobs.iter_mut().find(|j| j.id == id) {
-                job.status = arx::jobs::JobStatus::Running;
-            }
+        arx::jobs::JobEvent::Failed { error, .. } => {
+            state.message = Some(error.clone());
+            true
         }
-        arx::jobs::JobEvent::Progress { id, progress } => {
-            if let Some(job) = state.jobs.iter_mut().find(|j| j.id == id) {
-                job.progress = progress;
-            }
+        arx::jobs::JobEvent::Cancelled { id, result } => {
+            state.message = Some(match result {
+                arx::jobs::JobResult::Generic { message, .. } => message
+                    .clone()
+                    .unwrap_or_else(|| format!("Job {id} cancelled")),
+                arx::jobs::JobResult::WorkspaceSync(outcome) => format!(
+                    "Sync cancelled after {} completed physical step(s)",
+                    outcome.completed.len()
+                ),
+            });
+            true
         }
-        arx::jobs::JobEvent::Done { id, message } => {
-            if let Some(job) = state.jobs.iter_mut().find(|j| j.id == id) {
-                job.status = arx::jobs::JobStatus::Done;
-                job.progress = arx::jobs::Progress::Percent(100);
-            }
-            state.message = Some(message);
-            *left = load_entries(&state.left.location, state.show_hidden, state.sort_mode);
-            *right = load_entries(&state.right.location, state.show_hidden, state.sort_mode);
-        }
-        arx::jobs::JobEvent::Failed { id, error } => {
-            if let Some(job) = state.jobs.iter_mut().find(|j| j.id == id) {
-                job.status = arx::jobs::JobStatus::Failed;
-            }
-            state.message = Some(error);
-            *left = load_entries(&state.left.location, state.show_hidden, state.sort_mode);
-            *right = load_entries(&state.right.location, state.show_hidden, state.sort_mode);
-        }
+        arx::jobs::JobEvent::Running { .. }
+        | arx::jobs::JobEvent::Progress { .. }
+        | arx::jobs::JobEvent::Paused { .. } => false,
     }
 }
 
-/// Preview a file using system tools: bat, chafa, pdftotext, ffprobe, 7z.
-/// Falls back to plain head(1) read.
-/// Terminal image backend capability.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ImageBackend {
-    Kitty,  // kitty icat protocol
-    Sixel,  // sixel (mlterm, xterm -ti 340)
-    Iterm2, // iTerm2 imgcat
-    Chafa,  // fallback: chafa ASCII blocks
-    None,   // no image support
-}
-
-/// Detect what image backend the terminal supports.
-fn detect_image_backend() -> ImageBackend {
-    // Kitty protocol check
-    if std::env::var("KITTY_WINDOW_ID").is_ok() {
-        return ImageBackend::Kitty;
-    }
-    if std::env::var("ITERM_SESSION_ID").is_ok() {
-        return ImageBackend::Iterm2;
-    }
-    if std::env::var("TERM").is_ok_and(|t| t.contains("sixel")) {
-        return ImageBackend::Sixel;
-    }
-    // Chafa fallback
-    if std::process::Command::new("chafa")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+fn dispatch_ui_action(
+    state: &mut AppState,
+    action: Action,
+    focused: Option<&Entry>,
+    workspace_scanner: &WorkspaceScanner,
+    sync: &SyncUiRuntime,
+) {
+    if matches!(
+        action,
+        Action::ToggleWorkspaceComparison
+            | Action::PreviewWorkspaceSync
+            | Action::ReverseWorkspaceDirection
+            | Action::ToggleWorkspaceSyncMode
+    ) && !supersede_workspace_launch_for_new_action(state, sync)
     {
-        return ImageBackend::Chafa;
-    }
-    ImageBackend::None
-}
-
-/// Render an image to terminal escape sequences (returns lines to display).
-fn render_image(path_str: &str, backend: ImageBackend) -> Vec<String> {
-    match backend {
-        ImageBackend::Kitty => {
-            // kitty icat — print directly to terminal
-            // ponytail: icat writes to tty, we just note it
-            let _ = std::process::Command::new("kitten")
-                .args(["icat", "--place", "80x20@0x0", path_str])
-                .status();
-            vec![format!("[Image/Kitty] {}", path_str)]
-        }
-        ImageBackend::Sixel => {
-            // img2sixel / convert to sixel
-            // convert to sixel
-            #[allow(clippy::collapsible_if)]
-            if let Ok(out) = std::process::Command::new("convert")
-                .args([path_str, "-geometry", "640x480", "sixel:-"])
-                .output()
-            {
-                if out.status.success() {
-                    return vec![
-                        format!("[Image/Sixel] {}", path_str),
-                        String::from_utf8_lossy(&out.stdout).to_string(),
-                    ];
-                }
-            }
-            vec![format!("[Image/Sixel] {} — convert failed", path_str)]
-        }
-        ImageBackend::Iterm2 => {
-            let _ = std::process::Command::new("imgcat")
-                .args(["--width", "80%", path_str])
-                .status();
-            vec![format!("[Image/iTerm2] {}", path_str)]
-        }
-        ImageBackend::Chafa | ImageBackend::None => {
-            // Fallback: chafa block characters
-            #[allow(clippy::collapsible_if)]
-            if backend == ImageBackend::Chafa {
-                if let Ok(out) = std::process::Command::new("chafa")
-                    .args(["--symbols", "block", "--size", "80x20", path_str])
-                    .output()
-                {
-                    if out.status.success() {
-                        let mut lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
-                            .lines()
-                            .map(|l| l.to_string())
-                            .collect();
-                        lines.insert(0, format!("[Image/Chafa] {}", path_str));
-                        return lines;
-                    }
-                }
-            }
-            vec![format!("[Image] {} (no renderer available)", path_str)]
-        }
-    }
-}
-
-fn preview_file(path: &std::path::Path) -> Vec<String> {
-    static IMAGE_BACKEND: std::sync::OnceLock<ImageBackend> = std::sync::OnceLock::new();
-    let backend = IMAGE_BACKEND.get_or_init(detect_image_backend);
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    let path_str = path.to_str().unwrap_or("");
-
-    // Images → native terminal renderer (kitty/sixel/iterm2/chafa)
-    if matches!(
-        ext.as_str(),
-        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp"
-    ) {
-        return render_image(path_str, *backend);
-    }
-
-    // PDF → pdftotext
-    if ext == "pdf" && run_cmd("pdftotext", &["-l", "1", path_str, "-"]) {
-        let mut lines = run_cmd_output("pdftotext", &["-l", "1", path_str, "-"]);
-        lines.insert(
-            0,
-            format!("[PDF] {} — {} lines", path.display(), lines.len() - 1),
-        );
-        return lines;
-    }
-
-    // Media → ffprobe
-    if matches!(
-        ext.as_str(),
-        "mp4" | "mkv" | "avi" | "mov" | "webm" | "mp3" | "flac"
-    ) && run_cmd(
-        "ffprobe",
-        &[
-            "-hide_banner",
-            "-show_entries",
-            "format=duration,size,bit_rate:stream=codec_type,codec_name,width,height",
-            "-of",
-            "default=noprint_wrappers=1",
-            path_str,
-        ],
-    ) {
-        let mut lines = run_cmd_output(
-            "ffprobe",
-            &[
-                "-hide_banner",
-                "-show_entries",
-                "format=duration,size,bit_rate:stream=codec_type,codec_name,width,height",
-                "-of",
-                "default=noprint_wrappers=1",
-                path_str,
-            ],
-        );
-        lines.insert(0, format!("[Media] {}", path.display()));
-        return lines;
-    }
-
-    // Archives
-    if matches!(ext.as_str(), "zip" | "tar" | "gz" | "xz" | "7z" | "rar") {
-        let (cmd, args) = if matches!(ext.as_str(), "7z" | "rar" | "zip") {
-            ("7z", vec!["l", path_str])
-        } else {
-            ("tar", vec!["tvf", path_str])
-        };
-        if run_cmd(cmd, &args) {
-            let mut lines = run_cmd_output(cmd, &args);
-            lines.insert(0, format!("[Archive] {}", path.display()));
-            return lines;
-        }
-    }
-
-    // Code → bat
-    if run_cmd(
-        "bat",
-        &[
-            "--style=plain",
-            "--color=never",
-            "--paging=never",
-            "--line-range=:200",
-            path_str,
-        ],
-    ) {
-        let mut lines = run_cmd_output(
-            "bat",
-            &[
-                "--style=plain",
-                "--color=never",
-                "--paging=never",
-                "--line-range=:200",
-                path_str,
-            ],
-        );
-        let total = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        lines.insert(0, format!("[Code] {} — {} bytes", path.display(), total));
-        return lines;
-    }
-
-    // Fallback
-    let loc = arx::vfs::Location::Local(
-        path.parent()
-            .unwrap_or(std::path::Path::new("/"))
-            .to_path_buf(),
-    );
-    loc.read_head(&path.to_string_lossy(), 500)
-        .unwrap_or_else(|e| vec![format!("Error: {e}")])
-}
-
-/// Check if a command runs successfully (exit 0).
-fn run_cmd(cmd: &str, args: &[&str]) -> bool {
-    std::process::Command::new(cmd)
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Run a command and return stdout lines.
-fn run_cmd_output(cmd: &str, args: &[&str]) -> Vec<String> {
-    std::process::Command::new(cmd)
-        .args(args)
-        .output()
-        .map(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn build_cc_matches(filter: &str, state: &AppState) -> Vec<(String, String)> {
-    let q = filter.to_lowercase();
-    let mut m = Vec::new();
-    for h in arx::remote::hosts_config::load_hosts() {
-        let l = format!("Host: {}", h.name);
-        if l.to_lowercase().contains(&q) || h.hostname.to_lowercase().contains(&q) {
-            m.push((l, format!("sftp://{}", h.hostname)));
-        }
-    }
-    for loc in &state.bookmarks {
-        let l = loc.to_string();
-        if l.to_lowercase().contains(&q) {
-            m.push((format!("Bookmark: {}", l), l));
-        }
-    }
-    for d in &state.dir_history {
-        let l = d.to_string_lossy().to_string();
-        if l.to_lowercase().contains(&q) {
-            m.push((format!("History: {}", l), l));
-        }
-    }
-    for e in &state.menu {
-        if e.label.to_lowercase().contains(&q) {
-            m.push((format!("Cmd: {}", e.label), e.command.clone()));
-        }
-    }
-    m.sort_by_key(|(l, _)| l.to_lowercase());
-    m.truncate(50);
-    m
-}
-
-fn navigate_to(state: &mut AppState, target: &str) {
-    if target.starts_with("tmux:") {
-        let session = target.trim_start_matches("tmux:");
-        state.message = Some(format!("Attaching tmux: {session} (Ctrl+B D to detach)"));
-        let _ = std::process::Command::new("tmux")
-            .args(["attach-session", "-t", session])
-            .status();
-        return;
-    }
-    if target.starts_with("screen:") {
-        let session = target.trim_start_matches("screen:");
-        state.message = Some(format!("Attaching screen: {session}"));
-        let _ = std::process::Command::new("screen")
-            .args(["-r", session])
-            .status();
         return;
     }
 
-    if target.starts_with("sftp://") {
-        let h = target.trim_start_matches("sftp://");
-        state.active_pane_mut().location = arx::vfs::Location::Sftp {
-            host: h.into(),
-            path: "/".into(),
-        };
-    } else if target.starts_with('/') || target.starts_with('~') {
-        let p = std::path::PathBuf::from(
-            target.replace('~', &std::env::var("HOME").unwrap_or_default()),
-        );
-        if p.is_dir() {
-            state.active_pane_mut().location = arx::vfs::Location::Local(p);
+    match action {
+        Action::Quit => state.apply(action),
+        Action::OpenCommandCenter => {
+            state.open_overlay(OverlayKind::CommandCenter);
+            state.filter.clear();
+            state.command_matches = build_command_items("", state);
+            state
+                .overlay_list_state
+                .select((!state.command_matches.is_empty()).then_some(0));
         }
+        Action::OpenBookmarks => state.toggle_overlay(OverlayKind::Bookmarks),
+        Action::OpenJobs => state.toggle_overlay(OverlayKind::Jobs),
+        Action::OpenHosts => {
+            if state.hosts.is_empty() {
+                state.message = Some("No hosts configured — add ~/.config/arx/hosts.toml".into());
+            } else {
+                state.toggle_overlay(OverlayKind::Hosts);
+            }
+        }
+        Action::OpenHelp => state.toggle_overlay(OverlayKind::Help),
+        Action::BeginSymlink => {
+            if let Some(entry) = focused {
+                state.cmd = format!("ln -s '{}' ", entry.name);
+                state.cmd_input = true;
+            }
+        }
+        Action::BeginChmod => {
+            state.cmd = "chmod ".into();
+            state.cmd_input = true;
+        }
+        Action::BeginHardLink => {
+            if let Some(entry) = focused {
+                state.cmd = format!("ln '{}' ", entry.name);
+                state.cmd_input = true;
+            }
+        }
+        Action::BeginChown => {
+            state.cmd = "chown ".into();
+            state.cmd_input = true;
+        }
+        Action::ToggleWorkspaceComparison
+        | Action::PreviewWorkspaceSync
+        | Action::ReverseWorkspaceDirection
+        | Action::ToggleWorkspaceSyncMode
+            if state.remote_workspace.ux.is_locked_flow() =>
+        {
+            state.open_overlay(OverlayKind::SyncPreview);
+            state.message = Some(
+                "Workspace sync is already preparing or active; the current immutable plan is locked."
+                    .into(),
+            );
+        }
+        Action::ToggleWorkspaceComparison => {
+            if state.remote_workspace.enabled {
+                state.remote_workspace.disable();
+                state.show_diff = false;
+                state.message = Some("Remote Workspace comparison off".into());
+            } else {
+                start_workspace_scan(workspace_scanner, state, false);
+            }
+        }
+        Action::PreviewWorkspaceSync => {
+            start_workspace_scan(workspace_scanner, state, true);
+            state.open_overlay(OverlayKind::SyncPreview);
+        }
+        Action::ReverseWorkspaceDirection => state.remote_workspace.reverse_direction(),
+        Action::ToggleWorkspaceSyncMode => state.remote_workspace.toggle_mode(),
+        Action::ExecuteWorkspaceSync => prepare_workspace_sync(state, sync),
+        Action::ConfirmWorkspaceSync => launch_workspace_sync(state, sync, true),
+        Action::CancelWorkspaceSync => cancel_workspace_sync(state, sync),
+        Action::ShowWorkspaceSyncDetails => {
+            if state.remote_workspace.ux.is_job_flow() {
+                state.open_overlay(OverlayKind::SyncPreview);
+            }
+        }
+        Action::ShowWorkspaceVerificationDiff => {
+            if let Some(job_id) = state.remote_workspace.ux.job_id().map(str::to_string) {
+                state.remote_workspace.show_verification_diff(job_id);
+                state.open_overlay(OverlayKind::SyncPreview);
+                // The overlay renders the recursive Job-bound verification
+                // snapshot. Do not reuse shallow pane-level diff highlighting.
+                state.show_diff = false;
+            }
+        }
+        Action::ReturnToWorkspaceSyncPreview => {
+            if state.remote_workspace.return_from_verification_diff() {
+                state.open_overlay(OverlayKind::SyncPreview);
+            } else if matches!(
+                state.remote_workspace.ux,
+                WorkspaceSyncUxState::ConfirmationRequired { .. }
+                    | WorkspaceSyncUxState::Blocked { .. }
+                    | WorkspaceSyncUxState::Finished { .. }
+            ) {
+                state.remote_workspace.mark_preview();
+            } else if state.remote_workspace.ux.is_job_flow() {
+                state.message =
+                    Some("The active sync remains in its Job view until it is finished.".into());
+            }
+        }
+        Action::CloseWorkspaceSyncOverlay => state.close_overlay(OverlayKind::SyncPreview),
+        _ => state.apply(action),
+    }
+}
+
+fn supersede_workspace_launch_for_new_action(state: &mut AppState, sync: &SyncUiRuntime) -> bool {
+    if !matches!(
+        state.remote_workspace.ux,
+        WorkspaceSyncUxState::Launching { .. }
+    ) {
+        return true;
+    }
+
+    if sync.controller.supersede_launch() {
+        state.remote_workspace.supersede_launch_presentation();
+        true
     } else {
-        let _ = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(target)
-            .spawn();
+        state.open_overlay(OverlayKind::SyncPreview);
+        state.message = Some(
+            "Workspace sync has already crossed the Job queue boundary; waiting for its Job view."
+                .into(),
+        );
+        false
     }
 }
 
-fn list_tmux_sessions() -> Vec<(String, String)> {
-    let mut sessions = Vec::new();
-    // tmux ls
-    if let Ok(out) = std::process::Command::new("tmux")
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-        && out.status.success()
-    {
-        for name in String::from_utf8_lossy(&out.stdout).lines() {
-            if !name.is_empty() {
-                sessions.push((format!("tmux: {name}"), format!("tmux:{name}")));
+fn prepare_workspace_sync(state: &mut AppState, sync: &SyncUiRuntime) {
+    let (Some(plan), Some(diff)) = (
+        state.remote_workspace.plan.as_ref(),
+        state.remote_workspace.diff.as_ref(),
+    ) else {
+        state.remote_workspace.mark_blocked(
+            "Plan cannot be executed\nThe workspace preview is not ready.\nNo files were changed.",
+        );
+        return;
+    };
+    match sync.controller.freeze(plan, diff) {
+        Ok(frozen) => {
+            let requires_confirmation = frozen.requires_confirmation();
+            state.remote_workspace.set_frozen_plan(frozen);
+            if !requires_confirmation {
+                launch_workspace_sync(state, sync, false);
             }
         }
+        Err(error) => state.remote_workspace.mark_blocked(format!(
+            "Plan cannot be executed\n{error}\nNo files were changed."
+        )),
     }
-    sessions
+}
+
+fn launch_workspace_sync(state: &mut AppState, sync: &SyncUiRuntime, confirmed: bool) {
+    let (Some(frozen), Some(diff)) = (
+        state.remote_workspace.frozen_plan.clone(),
+        state.remote_workspace.diff.clone(),
+    ) else {
+        state.remote_workspace.mark_blocked(
+            "Plan cannot be executed\nThe frozen preview is no longer current.\nNo files were changed.",
+        );
+        return;
+    };
+    let plan_id = frozen.id();
+    let launch_id = sync.controller.begin_launch();
+    state.remote_workspace.mark_launching();
+    let controller = sync.controller.clone();
+    let jobs = sync.jobs.clone();
+    let job_events = sync.job_events.clone();
+    let verification_events = sync.verification_events.clone();
+    let launch_events = sync.launch_events.clone();
+    tokio::spawn(async move {
+        let result = controller
+            .launch_guarded(
+                launch_id,
+                frozen,
+                diff,
+                confirmed,
+                jobs,
+                (job_events, verification_events),
+            )
+            .await
+            .map_err(|error| error.user_message());
+        let _ = launch_events.send(SyncLaunchResponse {
+            launch_id,
+            plan_id,
+            result,
+        });
+    });
+}
+
+fn cancel_workspace_sync(state: &mut AppState, sync: &SyncUiRuntime) {
+    let Some(job_id) = state.remote_workspace.ux.job_id().map(str::to_string) else {
+        return;
+    };
+    if sync.jobs.cancel(&job_id) {
+        state.jobs = sync.jobs.snapshot();
+        if let Some(job) = sync.jobs.get(&job_id) {
+            state.remote_workspace.sync_from_job(&job);
+        }
+    }
+}
+
+fn execute_command_target(
+    state: &mut AppState,
+    target: CommandTarget,
+    focused: Option<&Entry>,
+    workspace_scanner: &WorkspaceScanner,
+    pane_loader: &PaneLoader,
+    sync: &SyncUiRuntime,
+) -> Option<Effect> {
+    match target {
+        CommandTarget::Action(action) => {
+            dispatch_ui_action(state, action, focused, workspace_scanner, sync);
+            None
+        }
+        CommandTarget::Location(location) => {
+            let active = state.active;
+            schedule_pane_navigation(
+                pane_loader,
+                state,
+                active,
+                location,
+                PaneLoadPurpose::Navigate {
+                    remember_current: true,
+                },
+            );
+            None
+        }
+        CommandTarget::Host { ssh_alias, path } => {
+            let active = state.active;
+            schedule_pane_navigation(
+                pane_loader,
+                state,
+                active,
+                Location::Sftp {
+                    host: ssh_alias,
+                    path,
+                },
+                PaneLoadPurpose::Navigate {
+                    remember_current: true,
+                },
+            );
+            None
+        }
+        CommandTarget::TmuxSession(session) => {
+            state.message = Some(format!("Attaching tmux: {session} (Ctrl+B D to detach)"));
+            Some(Effect::AttachTmux { session })
+        }
+        CommandTarget::ScreenSession(session) => {
+            state.message = Some(format!("Attaching screen: {session}"));
+            Some(Effect::AttachScreen { session })
+        }
+        CommandTarget::ShellCommand(command) => Some(Effect::SpawnShell { command }),
+    }
+}
+
+fn start_workspace_scan(scanner: &WorkspaceScanner, state: &mut AppState, keep_preview_open: bool) {
+    let left_root = state.left.location.clone();
+    let right_root = state.right.location.clone();
+    let cancel = state.remote_workspace.begin_recursive_scan();
+    state.remote_workspace.enabled = true;
+    state.remote_workspace.preview_open = keep_preview_open;
+    state.show_diff = true;
+
+    let options = WorkspaceScanOptions::default();
+    let left_id = scanner.scan(WorkspaceSide::Left, left_root, options, cancel.clone());
+    let right_id = scanner.scan(WorkspaceSide::Right, right_root, options, cancel);
+    state
+        .remote_workspace
+        .register_scan(WorkspaceSide::Left, left_id);
+    state
+        .remote_workspace
+        .register_scan(WorkspaceSide::Right, right_id);
+    state.message = Some("Remote Workspace: scanning both panes…".into());
+}
+
+fn handle_workspace_scan_response(response: WorkspaceScanResponse, state: &mut AppState) {
+    if !state.remote_workspace.accepts_scan(&response) {
+        return;
+    }
+
+    let current_root = match response.side {
+        WorkspaceSide::Left => &state.left.location,
+        WorkspaceSide::Right => &state.right.location,
+    };
+    if current_root != &response.root {
+        state
+            .remote_workspace
+            .finish_scan(response.side, response.id);
+        return;
+    }
+
+    let side = response.side;
+    let id = response.id;
+    match response.result {
+        Ok(entries) => match side {
+            WorkspaceSide::Left => state.remote_workspace.left_entries = Some(entries),
+            WorkspaceSide::Right => state.remote_workspace.right_entries = Some(entries),
+        },
+        Err(WorkspaceScanError::Cancelled) => {
+            state.remote_workspace.finish_scan(side, id);
+            return;
+        }
+        Err(error) => {
+            state.remote_workspace.finish_scan(side, id);
+            state.message = Some(format!("Workspace scan failed: {error}"));
+            return;
+        }
+    }
+    state.remote_workspace.finish_scan(side, id);
+
+    if state
+        .remote_workspace
+        .try_build_recursive_diff(state.left.location.clone(), state.right.location.clone())
+    {
+        state.message = Some(state.remote_workspace.summary());
+    } else {
+        let waiting = match side {
+            WorkspaceSide::Left => "right",
+            WorkspaceSide::Right => "left",
+        };
+        state.message = Some(format!("Remote Workspace: waiting for {waiting} pane…"));
+    }
+}
+
+fn apply_effect_event(state: &mut AppState, event: EffectEvent) {
+    match event {
+        EffectEvent::ShellCaptured {
+            command,
+            success,
+            stdout,
+            stderr,
+        } => {
+            let stdout = stdout.trim();
+            let stderr = stderr.trim();
+            let text = if !stdout.is_empty() {
+                stdout
+            } else if !stderr.is_empty() {
+                stderr
+            } else if success {
+                "ok"
+            } else {
+                "failed"
+            };
+            state.message = Some(format!(": {command} — {}", truncate_message(text, 80)));
+        }
+        EffectEvent::ProcessExited { label, success } => {
+            state.message = Some(format!(
+                "{label} — {}",
+                if success { "done" } else { "failed" }
+            ));
+        }
+        EffectEvent::Spawned { label } => {
+            state.message = Some(format!("{label} — started"));
+        }
+        EffectEvent::TmuxSessions { sessions } => {
+            if sessions.is_empty() {
+                state.message = Some("No tmux sessions found".into());
+                return;
+            }
+            state.command_matches = sessions
+                .into_iter()
+                .map(|name| CommandItem {
+                    title: name.clone(),
+                    subtitle: Some("Attach tmux session".into()),
+                    kind: CommandKind::Session,
+                    target: CommandTarget::TmuxSession(name),
+                    score: 0,
+                    availability: ActionAvailability::Available,
+                })
+                .collect();
+            state.open_overlay(OverlayKind::CommandCenter);
+            state.overlay_list_state.select(Some(0));
+        }
+        EffectEvent::ViewerLines { title, lines } => {
+            state.viewer_content = lines;
+            state.viewer_scroll = 0;
+            state.message = Some(title);
+        }
+        EffectEvent::InfrastructureLines { lines } => {
+            state.infrastructure_lines = if lines.is_empty() {
+                vec!["No SSH hosts discovered".into()]
+            } else {
+                lines
+            };
+        }
+        EffectEvent::TreeLines { lines } => {
+            state.tree_lines = if lines.is_empty() {
+                vec!["(empty)".into()]
+            } else {
+                lines
+            };
+        }
+        EffectEvent::PathOpened { path } => {
+            state.message = Some(format!("Opened {}", path.display()));
+        }
+        EffectEvent::Failed { label, error } => {
+            state.message = Some(format!("{label} failed: {error}"));
+        }
+    }
+}
+
+fn handle_effect_response(
+    response: EffectResponse,
+    state: &mut AppState,
+    _left_entries: &mut Vec<Entry>,
+    _right_entries: &mut Vec<Entry>,
+    pane_loader: &PaneLoader,
+) {
+    if !state.accepts_effect(response.id, response.lane, &response.scope) {
+        return;
+    }
+    state.finish_effect(response.lane, response.id);
+    apply_effect_event(state, response.event);
+
+    // Pure process responses normally do not require directory refresh. Pane
+    // and workspace effect lanes added later can opt into targeted refresh.
+    match response.lane {
+        EffectLane::LeftPane => {
+            schedule_pane_load(pane_loader, state, Pane::Left);
+        }
+        EffectLane::RightPane => {
+            schedule_pane_load(pane_loader, state, Pane::Right);
+        }
+        _ => {}
+    }
+}
+
+fn truncate_message(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
+    }
 }

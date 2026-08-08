@@ -1,3 +1,5 @@
+use super::ProviderId;
+
 /// Filesystem-like operations that a registered VFS provider can perform.
 ///
 /// A capability is a promise about the provider's current implementation, not
@@ -55,6 +57,10 @@ pub const LOCAL_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
 /// Transfers and mutation are intentionally delegated to the transfer layer.
 pub const SFTP_CAPABILITIES: CapabilitySet = CapabilitySet::NONE.with(Capability::List);
 
+/// Archive browsing currently supports listing only. Extraction/mutation stay
+/// outside the provider contract until they have transactional semantics.
+pub const ARCHIVE_CAPABILITIES: CapabilitySet = CapabilitySet::NONE.with(Capability::List);
+
 /// The current WebDAV provider implements PROPFIND and GET only.
 pub const WEBDAV_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::List)
@@ -62,6 +68,22 @@ pub const WEBDAV_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
 
 /// S3 is still a stub and must not advertise operations it cannot execute.
 pub const S3_CAPABILITIES: CapabilitySet = CapabilitySet::NONE;
+
+/// Built-in capability declaration for a provider kind.
+///
+/// The registry remains authoritative when a concrete provider instance is
+/// registered. This fallback is useful during the ongoing registry migration,
+/// where `AppState.registry` and the legacy thread-local registry can differ.
+pub const fn builtin_capabilities(provider: ProviderId) -> CapabilitySet {
+    match provider {
+        ProviderId::Local => LOCAL_CAPABILITIES,
+        ProviderId::Sftp => SFTP_CAPABILITIES,
+        ProviderId::S3 => S3_CAPABILITIES,
+        ProviderId::WebDAV => WEBDAV_CAPABILITIES,
+        // Archive capabilities are not yet declared as a stable contract.
+        ProviderId::Archive => CapabilitySet::NONE,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -83,6 +105,7 @@ mod tests {
     fn builtins_do_not_overpromise() {
         assert!(LOCAL_CAPABILITIES.supports(Capability::Move));
         assert!(!SFTP_CAPABILITIES.supports(Capability::Move));
+        assert!(ARCHIVE_CAPABILITIES.supports(Capability::List));
         assert!(WEBDAV_CAPABILITIES.supports(Capability::Read));
         assert!(!WEBDAV_CAPABILITIES.supports(Capability::Delete));
         assert_eq!(S3_CAPABILITIES, CapabilitySet::NONE);

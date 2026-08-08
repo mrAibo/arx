@@ -1,12 +1,30 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use ratatui::layout::Rect;
 
+use crate::effect_dispatcher::{EffectId, EffectLane, EffectScope};
 use crate::jobs::Job;
 use crate::remote::Host;
+use crate::services::{PaneLoadId, PaneLoadPurpose};
 use crate::terminal::TermPane;
 use crate::vfs::Location;
+
+mod actions;
+pub use actions::{
+    ACTION_CATALOG, ALL_ACTIONS, Action, ActionCategory, ActionId, ActionMeta, InputContext,
+    action_meta,
+};
+mod availability;
+pub use availability::{ActionAvailability, ActionContext, action_availability};
+mod command_center;
+pub use command_center::{CommandItem, CommandKind, CommandTarget, build_command_items};
+mod overlay;
+pub use overlay::OverlayKind;
+mod remote_workspace;
+pub use remote_workspace::RemoteWorkspaceState;
+mod workspace_sync_ux;
+pub use workspace_sync_ux::WorkspaceSyncUxState;
 
 /// Command Center channel tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -26,26 +44,11 @@ pub struct MenuEntry {
     pub command: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Pane {
     Left,
     Right,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    Quit,
-    Up,
-    Down,
-    Enter,
-    Back,
-    SwitchPane,
-    ToggleSelect,
-    Refresh,
-    OpenJobs,
-    OpenHosts,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortMode {
     NameAsc,
@@ -138,6 +141,18 @@ pub struct AppState {
     pub filter: String,
     pub filtering: bool,
     pub message: Option<String>,
+    /// Cached status-bar Git suffix. Never compute Git state from render().
+    pub git_status: String,
+    pub git_status_location: Option<Location>,
+    /// Local ↔ remote (or any provider ↔ provider) comparison/sync workspace.
+    pub remote_workspace: RemoteWorkspaceState,
+    /// Latest effect per lane. Older responses are discarded deterministically.
+    pub pending_effects: BTreeMap<EffectLane, EffectId>,
+    /// Latest async VFS load generation for each pane.
+    pub pending_pane_loads: BTreeMap<Pane, PaneLoadId>,
+    pub pending_pane_targets: BTreeMap<Pane, (Location, PaneLoadPurpose)>,
+    pub infrastructure_lines: Vec<String>,
+    pub tree_lines: Vec<String>,
     pub glob_input: bool,
     pub go_input: bool,
     pub show_help: bool,
@@ -158,7 +173,7 @@ pub struct AppState {
     pub hosts: Vec<Host>,
     pub show_hosts: bool,
     pub host_cursor: usize,
-    // B4: job queue
+    // B4: render-only snapshot; JobManager owns runtime lifecycle.
     pub jobs: Vec<Job>,
     pub show_jobs: bool,
     pub job_cursor: usize,
@@ -200,7 +215,7 @@ pub struct AppState {
     pub tree_filter: String,
     pub show_context_menu: bool,
     pub context_menu_pos: (u16, u16),
-    pub command_matches: Vec<(String, String)>,
+    pub command_matches: Vec<CommandItem>,
     pub overlay_list_state: ratatui::widgets::ListState,
     /// Provider registry — phased replacement of match-Location dispatch
     pub registry: crate::vfs::ProviderRegistry,
@@ -237,6 +252,14 @@ impl Default for AppState {
             filter: String::new(),
             filtering: false,
             message: None,
+            git_status: String::new(),
+            git_status_location: None,
+            remote_workspace: RemoteWorkspaceState::default(),
+            pending_effects: BTreeMap::new(),
+            pending_pane_loads: BTreeMap::new(),
+            pending_pane_targets: BTreeMap::new(),
+            infrastructure_lines: Vec::new(),
+            tree_lines: Vec::new(),
             glob_input: false,
             go_input: false,
             show_help: false,
@@ -294,6 +317,70 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn register_pane_load(
+        &mut self,
+        pane: Pane,
+        id: PaneLoadId,
+        location: Location,
+        purpose: PaneLoadPurpose,
+    ) {
+        self.pending_pane_loads.insert(pane, id);
+        self.pending_pane_targets.insert(pane, (location, purpose));
+    }
+
+    pub fn accepts_pane_load(&self, pane: Pane, id: PaneLoadId, location: &Location) -> bool {
+        if self.pending_pane_loads.get(&pane) != Some(&id) {
+            return false;
+        }
+        let Some((target, purpose)) = self.pending_pane_targets.get(&pane) else {
+            return false;
+        };
+        if target != location {
+            return false;
+        }
+        if matches!(purpose, PaneLoadPurpose::Refresh) {
+            let committed_location = match pane {
+                Pane::Left => &self.left.location,
+                Pane::Right => &self.right.location,
+            };
+            return committed_location == location;
+        }
+        true
+    }
+
+    pub fn finish_pane_load(&mut self, pane: Pane, id: PaneLoadId) {
+        if self.pending_pane_loads.get(&pane) == Some(&id) {
+            self.pending_pane_loads.remove(&pane);
+            self.pending_pane_targets.remove(&pane);
+        }
+    }
+
+    pub fn register_effect(&mut self, lane: EffectLane, id: EffectId) {
+        self.pending_effects.insert(lane, id);
+    }
+
+    pub fn accepts_effect(&self, id: EffectId, lane: EffectLane, scope: &EffectScope) -> bool {
+        if self.pending_effects.get(&lane) != Some(&id) {
+            return false;
+        }
+
+        match scope {
+            EffectScope::Global => true,
+            EffectScope::Location(location) => {
+                &self.left.location == location || &self.right.location == location
+            }
+            EffectScope::Workspace { left, right } => {
+                &self.left.location == left && &self.right.location == right
+            }
+        }
+    }
+
+    pub fn finish_effect(&mut self, lane: EffectLane, id: EffectId) {
+        if self.pending_effects.get(&lane) == Some(&id) {
+            self.pending_effects.remove(&lane);
+        }
+    }
+
     pub fn apply(&mut self, action: Action) {
         match action {
             Action::Quit => self.should_quit = true,
