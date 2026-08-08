@@ -4,6 +4,7 @@ use crate::workspace_sync::{
     DiffState, SyncDirection, SyncMode, SyncPolicy, WorkspaceDiff, WorkspaceEntry,
     WorkspaceFingerprint, WorkspaceSide, WorkspaceSyncPlan,
 };
+use crate::workspace_sync_verification::{SyncVerificationSnapshot, SyncVerificationStatus};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -19,6 +20,8 @@ pub struct RemoteWorkspaceState {
     pub left_entries: Option<Vec<WorkspaceEntry>>,
     pub right_entries: Option<Vec<WorkspaceEntry>>,
     pub scan_cancel: Arc<AtomicBool>,
+    /// Latest post-sync verification for the currently displayed roots.
+    pub verification: Option<SyncVerificationSnapshot>,
 }
 
 impl Default for RemoteWorkspaceState {
@@ -34,6 +37,7 @@ impl Default for RemoteWorkspaceState {
             left_entries: None,
             right_entries: None,
             scan_cancel: Arc::new(AtomicBool::new(false)),
+            verification: None,
         }
     }
 }
@@ -50,12 +54,14 @@ impl RemoteWorkspaceState {
         self.right_scan = None;
         self.left_entries = None;
         self.right_entries = None;
+        self.verification = None;
     }
 
     pub fn begin_recursive_scan(&mut self) -> Arc<AtomicBool> {
         self.scan_cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.scan_cancel = Arc::new(AtomicBool::new(false));
+        self.supersede_active_verification();
         self.left_entries = None;
         self.right_entries = None;
         self.diff = None;
@@ -109,6 +115,7 @@ impl RemoteWorkspaceState {
         left_entries: &[Entry],
         right_entries: &[Entry],
     ) {
+        self.supersede_active_verification();
         self.enabled = true;
         self.diff = Some(WorkspaceDiff::compare(
             left_root,
@@ -117,6 +124,73 @@ impl RemoteWorkspaceState {
             right_entries.iter().map(workspace_entry),
         ));
         self.rebuild_plan();
+    }
+
+    pub fn apply_verification(
+        &mut self,
+        verification: &SyncVerificationSnapshot,
+        current_left_root: &Location,
+        current_right_root: &Location,
+    ) -> bool {
+        if !self.enabled
+            || verification.left_root != *current_left_root
+            || verification.right_root != *current_right_root
+        {
+            if let Some(current) = &mut self.verification
+                && current.id == verification.id
+                && !current.status.is_terminal()
+            {
+                current.status = SyncVerificationStatus::Superseded;
+            }
+            return false;
+        }
+
+        match &self.verification {
+            None => {
+                if !matches!(verification.status, SyncVerificationStatus::Pending) {
+                    return false;
+                }
+            }
+            Some(current) if verification.id < current.id => return false,
+            Some(current) if verification.id > current.id => {
+                if !matches!(verification.status, SyncVerificationStatus::Pending) {
+                    return false;
+                }
+            }
+            Some(current) => {
+                if current.plan_id != verification.plan_id
+                    || current.left_root != verification.left_root
+                    || current.right_root != verification.right_root
+                    || !current.status.can_transition_to(&verification.status)
+                {
+                    return false;
+                }
+            }
+        }
+
+        if let SyncVerificationStatus::Finished(result) = &verification.status {
+            if result.plan_id != verification.plan_id
+                || result.left_root != verification.left_root
+                || result.right_root != verification.right_root
+            {
+                return false;
+            }
+            self.diff = Some(result.diff.clone());
+            self.rebuild_plan();
+        }
+        self.verification = Some(verification.clone());
+        true
+    }
+
+    fn supersede_active_verification(&mut self) {
+        let Some(mut verification) = self.verification.take() else {
+            return;
+        };
+        if verification.status.is_terminal() {
+            return;
+        }
+        verification.status = SyncVerificationStatus::Superseded;
+        self.verification = Some(verification);
     }
 
     pub fn rebuild_plan(&mut self) {
