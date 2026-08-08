@@ -44,6 +44,9 @@ jobs:
             python3 .github/fix_ux_late_verification_test.py
             python3 .github/ux_late_verification_migrate.py
           fi
+          if ! grep -q 'is_locked_flow' src/app/workspace_sync_ux.rs; then
+            python3 .github/ux_launch_lock_migrate.py
+          fi
           cargo fmt
           cargo clippy --all-targets --all-features -- -D warnings
           cargo test --all-targets --all-features
@@ -55,5 +58,5 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add src tests
-          git commit -m 'fix: settle superseded workspace verification UX'
+          git commit -m 'fix: lock workspace sync launch presentation'
           git push origin HEAD:feature/remote-workspace-ux
