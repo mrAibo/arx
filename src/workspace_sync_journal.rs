@@ -8,6 +8,15 @@ use crate::journal::{
 use crate::workspace_sync::{SyncDirection, SyncMode};
 use crate::workspace_sync_execution::{ExecutableSyncPlan, FrozenWorkspaceSyncPlan};
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SyncJournalExecutionMetadata {
+    pub completed_steps: usize,
+    pub failed_step: Option<usize>,
+    pub remaining_steps: usize,
+    pub transferred_bytes: u64,
+    pub rollback_attempted: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncJournalMetadata {
     pub plan_id: u64,
@@ -19,6 +28,10 @@ pub struct SyncJournalMetadata {
     pub operations: usize,
     pub bytes: u64,
     pub destructive_operations: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_steps: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<SyncJournalExecutionMetadata>,
 }
 
 impl SyncJournalMetadata {
@@ -33,6 +46,8 @@ impl SyncJournalMetadata {
             operations: plan.operations().len(),
             bytes: plan.total_bytes(),
             destructive_operations: plan.destructive_operations(),
+            physical_steps: None,
+            execution: None,
         }
     }
 }
@@ -52,10 +67,10 @@ pub enum SyncJournalError {
 
 /// Append-only lifecycle writer for one executable sync plan.
 ///
-/// Creating a session records `Started`. The executor must call
-/// `mark_running` immediately before its first mutation, then exactly one
-/// terminal transition. All rows keep the same `OperationId` and frozen plan
-/// metadata so a crash never rewrites or erases earlier facts.
+/// Creating a session records `Started`. The executor records `Running` when
+/// execution enters the physical-step loop, then exactly one terminal state.
+/// All rows keep the same `OperationId` and frozen plan facts. Terminal rows
+/// may additionally attach structured physical execution facts.
 #[derive(Debug)]
 pub struct SyncJournalSession {
     journal: OperationJournal,
@@ -67,13 +82,22 @@ impl SyncJournalSession {
         journal: OperationJournal,
         executable: &ExecutableSyncPlan,
     ) -> Result<Self, SyncJournalError> {
+        Self::begin_with_step_count(journal, executable, executable.plan().operations().len())
+    }
+
+    pub fn begin_with_step_count(
+        journal: OperationJournal,
+        executable: &ExecutableSyncPlan,
+        physical_steps: usize,
+    ) -> Result<Self, SyncJournalError> {
         let plan = executable.plan();
-        let metadata = SyncJournalMetadata::from_plan(plan);
+        let mut metadata = SyncJournalMetadata::from_plan(plan);
+        metadata.physical_steps = Some(physical_steps);
         let (source, destination) = source_destination(plan);
         let mut record = OperationRecord::new(OperationKind::Synchronize);
         record.source = Some(source);
         record.destination = Some(destination);
-        record.item_count = Some(plan.operations().len());
+        record.item_count = Some(physical_steps);
         record.metadata = Some(serde_json::to_value(metadata)?);
         journal.append(&record)?;
 
@@ -96,7 +120,7 @@ impl SyncJournalSession {
     }
 
     pub fn mark_running(&mut self) -> Result<(), SyncJournalError> {
-        self.append_transition(OperationState::Running, None)
+        self.append_transition(OperationState::Running, None, None)
     }
 
     pub fn complete(&mut self, completed_operations: usize) -> Result<(), SyncJournalError> {
@@ -106,6 +130,22 @@ impl SyncJournalSession {
             Some(format!(
                 "completed {completed_operations} of {total} sync operation(s)"
             )),
+            None,
+        )
+    }
+
+    pub fn complete_with_execution(
+        &mut self,
+        completed_steps: usize,
+        execution: SyncJournalExecutionMetadata,
+    ) -> Result<(), SyncJournalError> {
+        let total = self.current.item_count.unwrap_or(0);
+        self.append_transition(
+            OperationState::Completed,
+            Some(format!(
+                "completed {completed_steps} of {total} sync step(s)"
+            )),
+            Some(execution),
         )
     }
 
@@ -116,6 +156,22 @@ impl SyncJournalSession {
             Some(format!(
                 "cancelled after {completed_operations} of {total} sync operation(s)"
             )),
+            None,
+        )
+    }
+
+    pub fn cancel_with_execution(
+        &mut self,
+        completed_steps: usize,
+        execution: SyncJournalExecutionMetadata,
+    ) -> Result<(), SyncJournalError> {
+        let total = self.current.item_count.unwrap_or(0);
+        self.append_transition(
+            OperationState::Cancelled,
+            Some(format!(
+                "cancelled after {completed_steps} of {total} sync step(s)"
+            )),
+            Some(execution),
         )
     }
 
@@ -131,6 +187,24 @@ impl SyncJournalSession {
                 "failed after {completed_operations} of {total} sync operation(s): {}",
                 error.into()
             )),
+            None,
+        )
+    }
+
+    pub fn fail_with_execution(
+        &mut self,
+        completed_steps: usize,
+        error: impl Into<String>,
+        execution: SyncJournalExecutionMetadata,
+    ) -> Result<(), SyncJournalError> {
+        let total = self.current.item_count.unwrap_or(0);
+        self.append_transition(
+            OperationState::Failed,
+            Some(format!(
+                "failed after {completed_steps} of {total} sync step(s): {}",
+                error.into()
+            )),
+            Some(execution),
         )
     }
 
@@ -138,6 +212,7 @@ impl SyncJournalSession {
         &mut self,
         state: OperationState,
         message: Option<String>,
+        execution: Option<SyncJournalExecutionMetadata>,
     ) -> Result<(), SyncJournalError> {
         if !valid_transition(self.current.state, state) {
             return Err(SyncJournalError::InvalidTransition {
@@ -146,11 +221,29 @@ impl SyncJournalSession {
             });
         }
 
-        let next = self.current.transition(state, message);
+        let mut next = self.current.transition(state, message);
+        if let Some(execution) = execution {
+            attach_execution_metadata(&mut next, execution)?;
+        }
         self.journal.append(&next)?;
         self.current = next;
         Ok(())
     }
+}
+
+fn attach_execution_metadata(
+    record: &mut OperationRecord,
+    execution: SyncJournalExecutionMetadata,
+) -> Result<(), SyncJournalError> {
+    let mut metadata: SyncJournalMetadata = serde_json::from_value(
+        record
+            .metadata
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({})),
+    )?;
+    metadata.execution = Some(execution);
+    record.metadata = Some(serde_json::to_value(metadata)?);
+    Ok(())
 }
 
 fn valid_transition(from: OperationState, to: OperationState) -> bool {
@@ -253,6 +346,7 @@ mod tests {
         assert_eq!(metadata.direction, "left_to_right");
         assert_eq!(metadata.mode, "update");
         assert_eq!(metadata.operations, 1);
+        assert_eq!(metadata.physical_steps, Some(1));
         assert_eq!(metadata.bytes, 7);
         assert_eq!(session.state(), OperationState::Started);
     }
@@ -283,6 +377,39 @@ mod tests {
             ]
         );
         assert_eq!(journal.latest_for(&id).unwrap(), records.last().cloned());
+    }
+
+    #[test]
+    fn terminal_execution_metadata_is_structured() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = OperationJournal::open(dir.path().join("ops.jsonl")).unwrap();
+        let executable = executable(SyncDirection::LeftToRight);
+        let mut session =
+            SyncJournalSession::begin_with_step_count(journal.clone(), &executable, 3).unwrap();
+        session.mark_running().unwrap();
+        session
+            .fail_with_execution(
+                1,
+                "boom",
+                SyncJournalExecutionMetadata {
+                    completed_steps: 1,
+                    failed_step: Some(2),
+                    remaining_steps: 1,
+                    transferred_bytes: 7,
+                    rollback_attempted: false,
+                },
+            )
+            .unwrap();
+
+        let record = journal.read_all().unwrap().pop().unwrap();
+        let metadata: SyncJournalMetadata =
+            serde_json::from_value(record.metadata.unwrap()).unwrap();
+        let execution = metadata.execution.unwrap();
+        assert_eq!(metadata.physical_steps, Some(3));
+        assert_eq!(execution.completed_steps, 1);
+        assert_eq!(execution.failed_step, Some(2));
+        assert_eq!(execution.remaining_steps, 1);
+        assert!(!execution.rollback_attempted);
     }
 
     #[test]
