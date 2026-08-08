@@ -1,4 +1,4 @@
-name: Temporary Remote Workspace UX Jobs Migration
+name: Temporary Remote Workspace UX Migration
 
 on:
   push:
@@ -27,6 +27,11 @@ jobs:
           if grep -q 'cancel_during_first_step_starts_verification_with_zero_completed_steps' tests/workspace_sync_verification.rs; then
             python3 .github/ux_test_hardening.py
           fi
+          if ! grep -q 'SyncConfirmationRequired' src/app/actions.rs && ! grep -q 'ConfirmWorkspaceSync' src/app/actions.rs; then
+            python3 .github/ux_state_migrate.py
+          elif ! grep -q 'ConfirmWorkspaceSync' src/app/actions.rs; then
+            python3 .github/ux_state_migrate.py
+          fi
           cargo fmt
           cargo clippy --all-targets --all-features -- -D warnings
           cargo test --all-targets --all-features
@@ -38,5 +43,5 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add src tests
-          git commit -m 'feat: add direction-aware workspace sync job context'
+          git commit -m 'feat: model workspace sync UX state and actions'
           git push origin HEAD:feature/remote-workspace-ux
