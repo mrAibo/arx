@@ -398,7 +398,8 @@ impl AppState {
                     super::WorkspaceSyncUxState::ConfirmationRequired { .. } => {
                         InputContext::SyncConfirmation
                     }
-                    super::WorkspaceSyncUxState::Queued { .. }
+                    super::WorkspaceSyncUxState::Launching { .. }
+                    | super::WorkspaceSyncUxState::Queued { .. }
                     | super::WorkspaceSyncUxState::Running { .. }
                     | super::WorkspaceSyncUxState::Cancelling { .. }
                     | super::WorkspaceSyncUxState::Verifying { .. }
@@ -459,6 +460,39 @@ mod tests {
             ..AppState::default()
         };
         assert_eq!(state.input_context(), InputContext::Terminal);
+    }
+
+    #[test]
+    fn launching_sync_owns_input_without_preview_execute_binding() {
+        let diff = crate::workspace_sync::WorkspaceDiff::compare(
+            crate::vfs::Location::Local("/left".into()),
+            crate::vfs::Location::Local("/right".into()),
+            vec![crate::workspace_sync::WorkspaceEntry {
+                relative_path: "a.txt".into(),
+                fingerprint: crate::workspace_sync::WorkspaceFingerprint {
+                    kind: crate::vfs::EntryKind::File,
+                    size: Some(1),
+                    modified_unix_ms: None,
+                    content_hash: None,
+                },
+            }],
+            Vec::new(),
+        );
+        let plan = crate::workspace_sync::WorkspaceSyncPlan::build(
+            &diff,
+            crate::workspace_sync::SyncPolicy::default(),
+        );
+        let plan_id = crate::workspace_sync_execution::SyncPlanValidator::freeze(
+            &plan,
+            &diff,
+            &crate::vfs::default_registry(),
+        )
+        .unwrap()
+        .id();
+        let mut state = AppState::default();
+        state.remote_workspace.preview_open = true;
+        state.remote_workspace.ux = crate::app::WorkspaceSyncUxState::Launching { plan_id };
+        assert_eq!(state.input_context(), InputContext::SyncJob);
     }
 
     #[test]

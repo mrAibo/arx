@@ -323,6 +323,24 @@ impl RemoteWorkspaceState {
         };
     }
 
+    /// A verification result can belong to a Job that is still shown while the
+    /// panes already point at a newer workspace. In that case the old result
+    /// must not replace the new diff, but a terminal result must still settle
+    /// the old Job presentation instead of leaving it stuck in Verifying.
+    pub fn settle_rejected_verification(
+        &mut self,
+        job_id: &str,
+        verification: &SyncVerificationSnapshot,
+    ) {
+        if verification.status.is_terminal()
+            && self.ux.job_id().is_some_and(|current| current == job_id)
+        {
+            self.ux = WorkspaceSyncUxState::Finished {
+                job_id: job_id.to_string(),
+            };
+        }
+    }
+
     pub fn reverse_direction(&mut self) {
         self.policy.direction = match self.policy.direction {
             SyncDirection::LeftToRight => SyncDirection::RightToLeft,
@@ -425,6 +443,59 @@ mod tests {
             state.policy.conflicts,
             crate::workspace_sync::ConflictPolicy::RequireResolution
         );
+    }
+
+    #[test]
+    fn rejected_terminal_verification_settles_old_job_without_replacing_new_workspace() {
+        let mut state = RemoteWorkspaceState {
+            enabled: true,
+            ux: WorkspaceSyncUxState::Verifying {
+                job_id: "sync-old".into(),
+            },
+            ..RemoteWorkspaceState::default()
+        };
+        state.refresh_visible(
+            Location::Local(PathBuf::from("/new-left")),
+            Location::Local(PathBuf::from("/new-right")),
+            &[file("new.txt", 1)],
+            &[],
+        );
+        state.ux = WorkspaceSyncUxState::Verifying {
+            job_id: "sync-old".into(),
+        };
+        let new_diff = state.diff.clone().unwrap();
+        let current_plan = state.plan.clone().unwrap();
+        let plan_id = crate::workspace_sync_execution::SyncPlanValidator::freeze(
+            &current_plan,
+            &new_diff,
+            &crate::vfs::default_registry(),
+        )
+        .unwrap()
+        .id();
+        let old_roots = (
+            Location::Local(PathBuf::from("/old-left")),
+            Location::Local(PathBuf::from("/old-right")),
+        );
+        let verification = SyncVerificationSnapshot {
+            id: crate::workspace_sync_verification::SyncVerificationId(99),
+            plan_id,
+            left_root: old_roots.0,
+            right_root: old_roots.1,
+            status: SyncVerificationStatus::Superseded,
+        };
+
+        assert!(!state.apply_verification(
+            &verification,
+            &Location::Local(PathBuf::from("/new-left")),
+            &Location::Local(PathBuf::from("/new-right")),
+        ));
+        state.settle_rejected_verification("sync-old", &verification);
+
+        assert_eq!(state.diff.as_ref(), Some(&new_diff));
+        assert!(matches!(
+            state.ux,
+            WorkspaceSyncUxState::Finished { ref job_id } if job_id == "sync-old"
+        ));
     }
 
     #[test]

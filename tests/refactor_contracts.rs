@@ -156,6 +156,23 @@ fn unresolved_conflict_is_not_executable() {
 }
 
 #[test]
+fn launching_workspace_sync_locks_preview_rebuild_actions() {
+    let actions = include_str!("../src/app/actions.rs");
+    let tui = include_str!("../src/tui.rs");
+    assert!(actions.contains("WorkspaceSyncUxState::Launching { .. }"));
+    assert!(actions.contains("InputContext::SyncJob"));
+    assert!(tui.contains("state.remote_workspace.ux.is_locked_flow()"));
+    for action in [
+        "Action::ToggleWorkspaceComparison",
+        "Action::PreviewWorkspaceSync",
+        "Action::ReverseWorkspaceDirection",
+        "Action::ToggleWorkspaceSyncMode",
+    ] {
+        assert!(tui.contains(action));
+    }
+}
+
+#[test]
 fn sync_preview_ui_routes_execution_through_workspace_sync_controller() {
     let tui = include_str!("../src/tui.rs");
     let start = tui.find("fn prepare_workspace_sync(").unwrap();

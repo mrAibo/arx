@@ -198,13 +198,21 @@ async fn event_loop(
             Some(event) = verification_rx.recv() => {
                 let left_root = state.left.location.clone();
                 let right_root = state.right.location.clone();
-                if state.remote_workspace.apply_verification(
+                let accepted = state.remote_workspace.apply_verification(
                     &event.verification,
                     &left_root,
                     &right_root,
-                ) {
+                );
+                // JobManager accepted the verification before publishing this
+                // event, so its render snapshot is useful even when pane roots
+                // have moved and RemoteWorkspaceState rejects the old diff.
+                state.jobs = job_manager.snapshot();
+                if accepted {
                     state.remote_workspace.sync_verification_stage(&event.job_id);
-                    state.jobs = job_manager.snapshot();
+                } else {
+                    state
+                        .remote_workspace
+                        .settle_rejected_verification(&event.job_id, &event.verification);
                 }
                 continue;
             }
@@ -3464,6 +3472,18 @@ fn dispatch_ui_action(
         Action::BeginChown => {
             state.cmd = "chown ".into();
             state.cmd_input = true;
+        }
+        Action::ToggleWorkspaceComparison
+        | Action::PreviewWorkspaceSync
+        | Action::ReverseWorkspaceDirection
+        | Action::ToggleWorkspaceSyncMode
+            if state.remote_workspace.ux.is_locked_flow() =>
+        {
+            state.open_overlay(OverlayKind::SyncPreview);
+            state.message = Some(
+                "Workspace sync is already preparing or active; the current immutable plan is locked."
+                    .into(),
+            );
         }
         Action::ToggleWorkspaceComparison => {
             if state.remote_workspace.enabled {
