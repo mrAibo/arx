@@ -156,12 +156,48 @@ fn unresolved_conflict_is_not_executable() {
 }
 
 #[test]
-fn sync_preview_ui_does_not_contain_an_execution_shortcut_yet() {
+fn launching_workspace_sync_locks_preview_rebuild_actions() {
+    let actions = include_str!("../src/app/actions.rs");
     let tui = include_str!("../src/tui.rs");
-    assert!(
-        tui.contains("execution intentionally disabled"),
-        "execution was enabled before the sync executor safety gate was introduced"
-    );
+    assert!(actions.contains("WorkspaceSyncUxState::Launching { .. }"));
+    assert!(actions.contains("InputContext::SyncJob"));
+    assert!(tui.contains("state.remote_workspace.ux.is_locked_flow()"));
+    for action in [
+        "Action::ToggleWorkspaceComparison",
+        "Action::PreviewWorkspaceSync",
+        "Action::ReverseWorkspaceDirection",
+        "Action::ToggleWorkspaceSyncMode",
+    ] {
+        assert!(tui.contains(action));
+    }
+}
+
+#[test]
+fn sync_preview_ui_routes_execution_through_workspace_sync_controller() {
+    let tui = include_str!("../src/tui.rs");
+    let start = tui.find("fn prepare_workspace_sync(").unwrap();
+    let end = tui[start..]
+        .find("fn start_workspace_scan(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let sync_ui = &tui[start..end];
+
+    assert!(sync_ui.contains("sync.controller.freeze("));
+    assert!(sync_ui.contains(".launch("));
+    assert!(!tui.contains("execution intentionally disabled"));
+    assert!(tui.contains("Audit record finalization failed"));
+    assert!(tui.contains("No mismatch was proven"));
+    assert!(tui.contains("Cancelling…"));
+    for forbidden in [
+        "SyncExecutionCompiler",
+        "SyncPlanValidator",
+        "TransferPlanner",
+        "MutationService",
+        "SyncConfirmationToken",
+        "execute_transfer",
+    ] {
+        assert!(!sync_ui.contains(forbidden));
+    }
 }
 
 #[test]
@@ -171,4 +207,15 @@ fn tui_jobs_are_render_snapshots_not_a_second_lifecycle_store() {
     assert!(!tui.contains("state.jobs.push("));
     assert!(!tui.contains("job.status = arx::jobs::JobStatus"));
     assert!(!tui.contains("job.cancel.store("));
+}
+
+#[test]
+fn direct_key_actions_share_action_availability_and_sync_ui_stays_orchestrated() {
+    let tui = include_str!("../src/tui.rs");
+    let actions = include_str!("../src/app/actions.rs");
+    assert!(tui.contains("action_availability(action.id(), &context)"));
+    assert!(actions.contains("ShowWorkspaceVerificationDiff"));
+    assert!(actions.contains("CloseWorkspaceSyncOverlay"));
+    assert!(!tui.contains("SyncConfirmationToken::from_explicit_confirmation"));
+    assert!(!tui.contains("SyncExecutionCompiler::compile"));
 }

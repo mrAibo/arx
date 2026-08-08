@@ -1,4 +1,4 @@
-use super::{ActionId, AppState};
+use super::{ActionId, AppState, WorkspaceSyncUxState};
 use crate::vfs::{Capability, CapabilitySet, ProviderId, capabilities::builtin_capabilities};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +28,12 @@ pub struct ActionContext {
     pub active_capabilities: CapabilitySet,
     pub passive_capabilities: CapabilitySet,
     pub selection_count: usize,
+    pub sync_execute_ready: bool,
+    pub sync_confirmation_ready: bool,
+    pub sync_cancel_ready: bool,
+    pub sync_details_ready: bool,
+    pub sync_verification_diff_ready: bool,
+    pub sync_return_preview_ready: bool,
 }
 
 impl ActionContext {
@@ -43,12 +49,58 @@ impl ActionContext {
             .capabilities(&passive_provider)
             .unwrap_or_else(|| builtin_capabilities(passive_provider));
 
+        let sync_execute_ready = matches!(
+            state.remote_workspace.ux,
+            WorkspaceSyncUxState::Preview { .. }
+        ) && state
+            .remote_workspace
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.can_execute());
+        let sync_confirmation_ready = matches!(
+            state.remote_workspace.ux,
+            WorkspaceSyncUxState::ConfirmationRequired { .. }
+        ) && state.remote_workspace.frozen_plan.is_some();
+        let sync_cancel_ready = matches!(
+            state.remote_workspace.ux,
+            WorkspaceSyncUxState::Queued { .. } | WorkspaceSyncUxState::Running { .. }
+        );
+        let sync_details_ready = state.remote_workspace.ux.is_job_flow();
+        let sync_verification_diff_ready = state
+            .remote_workspace
+            .ux
+            .job_id()
+            .and_then(|id| state.jobs.iter().find(|job| job.id == id))
+            .and_then(|job| job.verification.as_ref())
+            .is_some_and(|verification| {
+                matches!(
+                    &verification.status,
+                    crate::workspace_sync_verification::SyncVerificationStatus::Finished(result)
+                        if matches!(
+                            &result.verdict,
+                            crate::workspace_sync_verification::SyncVerificationVerdict::DifferencesRemain { .. }
+                        )
+                )
+            });
+        let sync_return_preview_ready = matches!(
+            state.remote_workspace.ux,
+            WorkspaceSyncUxState::ConfirmationRequired { .. }
+                | WorkspaceSyncUxState::Blocked { .. }
+                | WorkspaceSyncUxState::Finished { .. }
+        );
+
         Self {
             active_provider,
             passive_provider,
             active_capabilities,
             passive_capabilities,
             selection_count: state.selected.len(),
+            sync_execute_ready,
+            sync_confirmation_ready,
+            sync_cancel_ready,
+            sync_details_ready,
+            sync_verification_diff_ready,
+            sync_return_preview_ready,
         }
     }
 }
@@ -90,6 +142,32 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
                 reason: "Owner changes are currently local-only".into(),
             }
         }
+        ActionId::ExecuteWorkspaceSync if !ctx.sync_execute_ready => ActionAvailability::Disabled {
+            reason: "Workspace sync needs a current conflict-free preview".into(),
+        },
+        ActionId::ConfirmWorkspaceSync if !ctx.sync_confirmation_ready => {
+            ActionAvailability::Disabled {
+                reason: "No destructive frozen sync plan is awaiting confirmation".into(),
+            }
+        }
+        ActionId::CancelWorkspaceSync if !ctx.sync_cancel_ready => ActionAvailability::Disabled {
+            reason: "No queued or running workspace sync can be cancelled".into(),
+        },
+        ActionId::ShowWorkspaceSyncDetails if !ctx.sync_details_ready => {
+            ActionAvailability::Disabled {
+                reason: "No workspace sync Job is active or available".into(),
+            }
+        }
+        ActionId::ShowWorkspaceVerificationDiff if !ctx.sync_verification_diff_ready => {
+            ActionAvailability::Disabled {
+                reason: "Verification has not produced remaining differences to show".into(),
+            }
+        }
+        ActionId::ReturnToWorkspaceSyncPreview if !ctx.sync_return_preview_ready => {
+            ActionAvailability::Disabled {
+                reason: "There is no confirmation, result, or blocked sync view to leave".into(),
+            }
+        }
         _ => ActionAvailability::Available,
     }
 }
@@ -106,6 +184,12 @@ mod tests {
             active_capabilities,
             passive_capabilities: LOCAL_CAPABILITIES,
             selection_count: 0,
+            sync_execute_ready: false,
+            sync_confirmation_ready: false,
+            sync_cancel_ready: false,
+            sync_details_ready: false,
+            sync_verification_diff_ready: false,
+            sync_return_preview_ready: false,
         }
     }
 
@@ -123,6 +207,49 @@ mod tests {
         let ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
         let availability = action_availability(ActionId::BeginChmod, &ctx);
         assert!(availability.reason().is_some());
+    }
+
+    #[test]
+    fn workspace_sync_actions_follow_presentation_state() {
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        assert!(matches!(
+            action_availability(ActionId::ExecuteWorkspaceSync, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+
+        ctx.sync_execute_ready = true;
+        assert_eq!(
+            action_availability(ActionId::ExecuteWorkspaceSync, &ctx),
+            ActionAvailability::Available
+        );
+
+        ctx.sync_confirmation_ready = true;
+        assert_eq!(
+            action_availability(ActionId::ConfirmWorkspaceSync, &ctx),
+            ActionAvailability::Available
+        );
+
+        ctx.sync_cancel_ready = true;
+        assert_eq!(
+            action_availability(ActionId::CancelWorkspaceSync, &ctx),
+            ActionAvailability::Available
+        );
+        ctx.sync_cancel_ready = false;
+        assert!(matches!(
+            action_availability(ActionId::CancelWorkspaceSync, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+
+        ctx.sync_details_ready = true;
+        assert_eq!(
+            action_availability(ActionId::ShowWorkspaceSyncDetails, &ctx),
+            ActionAvailability::Available
+        );
+        ctx.sync_return_preview_ready = true;
+        assert_eq!(
+            action_availability(ActionId::ReturnToWorkspaceSyncPreview, &ctx),
+            ActionAvailability::Available
+        );
     }
 
     #[test]

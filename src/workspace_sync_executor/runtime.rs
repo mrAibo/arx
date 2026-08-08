@@ -85,6 +85,20 @@ pub struct SyncExecutionOutcome {
     pub journal: SyncJournalFinalization,
 }
 
+impl SyncExecutionOutcome {
+    /// Whether a terminal physical outcome requires a fresh workspace rescan.
+    /// Completed always verifies; failed/cancelled runs verify only after a
+    /// mutation adapter may have touched the workspace.
+    pub fn needs_verification(&self) -> bool {
+        match self.terminal {
+            SyncTerminalState::Completed => true,
+            SyncTerminalState::Cancelled { .. } | SyncTerminalState::Failed { .. } => {
+                self.workspace_may_have_changed
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncExecutionEvent {
     Started {
