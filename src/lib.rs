@@ -16,3 +16,4 @@ pub mod transfer;
 pub mod vfs;
 pub mod workspace_sync;
 pub mod workspace_sync_execution;
+pub mod workspace_sync_journal;

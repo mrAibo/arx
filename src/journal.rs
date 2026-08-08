@@ -10,7 +10,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const JOURNAL_FILE: &str = "operations.jsonl";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,10 +29,11 @@ pub enum OperationKind {
     Custom(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationState {
     Started,
+    Running,
     Completed,
     Failed,
     Cancelled,
@@ -59,6 +60,10 @@ pub struct OperationRecord {
     pub item_count: Option<usize>,
     pub message: Option<String>,
     pub undo: Option<UndoRecord>,
+    /// Operation-specific structured facts. Older schema-v1 records omit this
+    /// field and continue to deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 impl OperationRecord {
@@ -75,7 +80,20 @@ impl OperationRecord {
             item_count: None,
             message: None,
             undo: None,
+            metadata: None,
         }
+    }
+
+    /// Create the next append-only lifecycle record for the same logical
+    /// operation. The operation identity and structured facts stay frozen;
+    /// only state, timestamp, and the transition message change.
+    pub fn transition(&self, state: OperationState, message: Option<String>) -> Self {
+        let mut next = self.clone();
+        next.schema_version = SCHEMA_VERSION;
+        next.timestamp_unix_ms = now_ms();
+        next.state = state;
+        next.message = message;
+        next
     }
 }
 
@@ -145,6 +163,15 @@ impl OperationJournal {
         Ok(records[start..].to_vec())
     }
 
+    /// Return the newest lifecycle snapshot for one logical operation.
+    pub fn latest_for(&self, id: &OperationId) -> io::Result<Option<OperationRecord>> {
+        Ok(self
+            .read_all()?
+            .into_iter()
+            .rev()
+            .find(|record| record.id == *id))
+    }
+
     pub fn latest_undoable(&self) -> io::Result<Option<OperationRecord>> {
         Ok(self
             .read_all()?
@@ -181,6 +208,59 @@ mod tests {
     }
 
     #[test]
+    fn transition_preserves_operation_identity_and_metadata() {
+        let mut started = OperationRecord::new(OperationKind::Synchronize);
+        started.metadata = Some(serde_json::json!({"plan_id": 7}));
+        started.source = Some("file:///left".into());
+        started.destination = Some("file:///right".into());
+
+        let running = started.transition(OperationState::Running, Some("running".into()));
+
+        assert_eq!(running.id, started.id);
+        assert_eq!(running.kind, started.kind);
+        assert_eq!(running.metadata, started.metadata);
+        assert_eq!(running.source, started.source);
+        assert_eq!(running.destination, started.destination);
+        assert_eq!(running.state, OperationState::Running);
+        assert_eq!(running.message.as_deref(), Some("running"));
+        assert_eq!(running.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn reads_schema_v1_records_without_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ops.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"schema_version\":1,\"id\":\"op-old\",\"timestamp_unix_ms\":1,",
+                "\"kind\":\"copy\",\"state\":\"completed\",\"source\":null,",
+                "\"destination\":null,\"item_count\":null,\"message\":null,\"undo\":null}\n"
+            ),
+        )
+        .unwrap();
+        let journal = OperationJournal::open(path).unwrap();
+
+        let records = journal.read_all().unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].schema_version, 1);
+        assert_eq!(records[0].metadata, None);
+    }
+
+    #[test]
+    fn latest_for_returns_latest_lifecycle_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = OperationJournal::open(dir.path().join("ops.jsonl")).unwrap();
+        let started = OperationRecord::new(OperationKind::Synchronize);
+        let running = started.transition(OperationState::Running, None);
+        journal.append(&started).unwrap();
+        journal.append(&running).unwrap();
+
+        assert_eq!(journal.latest_for(&started.id).unwrap(), Some(running));
+    }
+
+    #[test]
     fn finds_latest_undoable_operation() {
         let dir = tempfile::tempdir().unwrap();
         let journal = OperationJournal::open(dir.path().join("ops.jsonl")).unwrap();
@@ -209,7 +289,7 @@ mod tests {
         journal.append(&record).unwrap();
 
         let mut file = OpenOptions::new().append(true).open(path).unwrap();
-        file.write_all(b"{\"schema_version\":1").unwrap();
+        file.write_all(b"{\"schema_version\":2").unwrap();
 
         assert_eq!(journal.read_all().unwrap(), vec![record]);
     }
