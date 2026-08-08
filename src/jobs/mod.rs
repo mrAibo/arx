@@ -759,7 +759,7 @@ fn sync_outcome_needs_verification(outcome: &SyncExecutionOutcome) -> bool {
     match &outcome.terminal {
         SyncTerminalState::Completed => true,
         SyncTerminalState::Cancelled { .. } | SyncTerminalState::Failed { .. } => {
-            !outcome.completed.is_empty()
+            outcome.workspace_may_have_changed
         }
     }
 }

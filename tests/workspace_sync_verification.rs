@@ -414,8 +414,8 @@ async fn pre_cancel_with_zero_completed_steps_does_not_start_verification() {
     assert!(manager.get(&id).unwrap().verification.is_none());
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn partial_cancel_starts_verification_without_changing_cancelled_status() {
+#[tokio::test]
+async fn partial_failure_starts_verification_without_changing_failed_status() {
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
     for name in ["a.txt", "b.txt"] {
@@ -424,6 +424,47 @@ async fn partial_cancel_starts_verification_without_changing_cancelled_status() 
             .unwrap();
     }
     let plan = compile_local(left.path(), right.path(), &["a.txt", "b.txt"]);
+    tokio::fs::write(left.path().join("b.txt"), b"changed")
+        .await
+        .unwrap();
+    let journal_dir = tempfile::tempdir().unwrap();
+    let journal = OperationJournal::open(journal_dir.path().join("ops.jsonl")).unwrap();
+    let manager = JobManager::new();
+    let (job_tx, mut job_rx) = mpsc::unbounded_channel();
+    let (verification_tx, mut verification_rx) = mpsc::unbounded_channel();
+
+    let id = manager.spawn_workspace_sync_with_verification(
+        plan,
+        sync_executor(journal),
+        job_tx,
+        SyncVerificationCoordinator::new(default_registry()),
+        verification_tx,
+    );
+    assert!(matches!(
+        terminal_job_event(&mut job_rx).await,
+        JobEvent::Failed { .. }
+    ));
+    let _ = terminal_verification_event(&mut verification_rx).await;
+
+    let job = manager.get(&id).unwrap();
+    assert_eq!(job.status, JobStatus::Failed);
+    let Some(JobResult::WorkspaceSync(outcome)) = job.result else {
+        panic!("failed partial execution outcome was lost");
+    };
+    assert_eq!(outcome.completed.len(), 1);
+    assert!(outcome.workspace_may_have_changed);
+    assert!(matches!(outcome.terminal, SyncTerminalState::Failed { .. }));
+    assert!(job.verification.is_some());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancel_during_first_step_starts_verification_with_zero_completed_steps() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    tokio::fs::write(left.path().join("a.txt"), b"a")
+        .await
+        .unwrap();
+    let plan = compile_local(left.path(), right.path(), &["a.txt"]);
     let journal_dir = tempfile::tempdir().unwrap();
     let journal = OperationJournal::open(journal_dir.path().join("ops.jsonl")).unwrap();
     let manager = JobManager::new();
@@ -442,7 +483,8 @@ async fn partial_cancel_starts_verification_without_changing_cancelled_status() 
             progress: arx::jobs::JobProgress::WorkspaceSync(progress),
             ..
         } = event
-            && progress.completed_steps == 1
+            && progress.current_step.is_some()
+            && progress.completed_steps == 0
         {
             assert!(manager.cancel(&id));
             break;
@@ -457,9 +499,10 @@ async fn partial_cancel_starts_verification_without_changing_cancelled_status() 
     let job = manager.get(&id).unwrap();
     assert_eq!(job.status, JobStatus::Cancelled);
     let Some(JobResult::WorkspaceSync(outcome)) = job.result else {
-        panic!("cancelled execution outcome was lost");
+        panic!("cancelled first-step outcome was lost");
     };
-    assert_eq!(outcome.completed.len(), 1);
+    assert!(outcome.completed.is_empty());
+    assert!(outcome.workspace_may_have_changed);
     assert!(job.verification.is_some());
 }
 
