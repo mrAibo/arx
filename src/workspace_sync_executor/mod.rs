@@ -9,7 +9,7 @@ pub use runtime::{
 
 use crate::transfer::TransferPlan;
 use crate::vfs::Location;
-use crate::workspace_sync::WorkspaceFingerprint;
+use crate::workspace_sync::{SyncDirection, SyncMode, WorkspaceFingerprint};
 use crate::workspace_sync_execution::{ExecutableSyncPlan, PlanDigest, SyncPlanId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -109,6 +109,14 @@ impl CompiledSyncPlan {
 
     pub fn right_root(&self) -> &Location {
         self.executable.plan().right_root()
+    }
+
+    pub fn direction(&self) -> SyncDirection {
+        self.executable.plan().direction()
+    }
+
+    pub fn mode(&self) -> SyncMode {
+        self.executable.plan().mode()
     }
 
     pub fn steps(&self) -> &[CompiledSyncStep] {
