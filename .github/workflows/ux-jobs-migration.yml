@@ -37,6 +37,7 @@ jobs:
             python3 .github/ux_tui_postfix.py
           fi
           if ! grep -q 'sync_execute_ready' src/app/availability.rs; then
+            python3 .github/fix_ux_contracts_semantics.py
             python3 .github/ux_contracts_migrate.py
           fi
           cargo fmt
