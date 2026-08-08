@@ -3,8 +3,8 @@ mod runtime;
 
 pub use compiler::{SyncCompileError, SyncExecutionCompiler, SyncExecutorMatrix};
 pub use runtime::{
-    CompletedSyncStep, SyncExecutionError, SyncExecutionEvent, SyncExecutionOutcome, SyncRunError,
-    SyncTerminalState, WorkspaceSyncExecutor,
+    CompletedSyncStep, SyncExecutionError, SyncExecutionEvent, SyncExecutionOutcome,
+    SyncJournalFinalization, SyncRunError, SyncTerminalState, WorkspaceSyncExecutor,
 };
 
 use crate::transfer::TransferPlan;

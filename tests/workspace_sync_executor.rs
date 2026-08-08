@@ -10,7 +10,7 @@ use arx::workspace_sync::{
 use arx::workspace_sync_execution::{ExecutableSyncPlan, SyncConfirmationToken, SyncPlanValidator};
 use arx::workspace_sync_executor::{
     SyncExecutionCompiler, SyncExecutionError, SyncExecutionEvent, SyncExecutorMatrix,
-    SyncTerminalState, WorkspaceSyncExecutor,
+    SyncJournalFinalization, SyncRunError, SyncTerminalState, WorkspaceSyncExecutor,
 };
 use arx::workspace_sync_journal::SyncJournalMetadata;
 use tokio::sync::mpsc;
@@ -110,6 +110,8 @@ async fn successful_plan_journals_started_running_completed() {
 
     assert!(matches!(outcome.terminal, SyncTerminalState::Completed));
     assert_eq!(outcome.completed.len(), 1);
+    assert!(outcome.workspace_may_have_changed);
+    assert_eq!(outcome.journal, SyncJournalFinalization::Recorded);
     assert!(outcome.remaining.is_empty());
     assert_eq!(
         tokio::fs::read(right.path().join("a.txt")).await.unwrap(),
@@ -154,6 +156,7 @@ async fn already_cancelled_plan_completes_zero_steps() {
         SyncTerminalState::Cancelled { completed_steps: 0 }
     ));
     assert_eq!(outcome.completed.len(), 0);
+    assert!(!outcome.workspace_may_have_changed);
     assert_eq!(outcome.remaining.len(), 1);
     assert!(!right.path().join("a.txt").exists());
     assert_eq!(
@@ -200,6 +203,7 @@ async fn source_change_after_compile_stops_before_mutation() {
         }
     ));
     assert!(outcome.completed.is_empty());
+    assert!(!outcome.workspace_may_have_changed);
     assert!(!right.path().join("a.txt").exists());
     assert_eq!(states(&journal).last(), Some(&OperationState::Failed));
 }
@@ -279,6 +283,7 @@ async fn new_child_prevents_non_recursive_directory_delete() {
             ..
         }
     ));
+    assert!(outcome.workspace_may_have_changed);
     assert!(right.path().join("old/IMPORTANT").exists());
 }
 
@@ -406,5 +411,82 @@ async fn cancellation_at_transfer_start_uses_the_same_shared_token() {
         outcome.terminal,
         SyncTerminalState::Cancelled { completed_steps: 0 }
     ));
+    assert!(outcome.workspace_may_have_changed);
+    assert!(!right.path().join("a.txt").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_journal_failure_preserves_completed_physical_outcome() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    tokio::fs::write(left.path().join("a.txt"), b"a")
+        .await
+        .unwrap();
+    let plan = compile_local(
+        left.path(),
+        right.path(),
+        vec![file("a.txt", 1)],
+        Vec::new(),
+        SyncPolicy::default(),
+    );
+    let journal_dir = tempfile::tempdir().unwrap();
+    let journal_path = journal_dir.path().join("ops.jsonl");
+    let journal = OperationJournal::open(journal_path.clone()).unwrap();
+    let sync_executor = executor(journal);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        sync_executor
+            .execute(plan, Arc::new(AtomicBool::new(false)), tx)
+            .await
+    });
+
+    while let Some(event) = rx.recv().await {
+        if matches!(event, SyncExecutionEvent::StepCompleted { id, .. } if id.0 == 1) {
+            std::fs::remove_file(&journal_path).unwrap();
+            std::fs::create_dir(&journal_path).unwrap();
+            break;
+        }
+    }
+
+    let outcome = handle.await.unwrap().unwrap();
+    assert!(matches!(outcome.terminal, SyncTerminalState::Completed));
+    assert_eq!(outcome.completed.len(), 1);
+    assert!(outcome.workspace_may_have_changed);
+    assert!(matches!(
+        outcome.journal,
+        SyncJournalFinalization::Failed { .. }
+    ));
+    assert_eq!(
+        tokio::fs::read(right.path().join("a.txt")).await.unwrap(),
+        b"a"
+    );
+}
+
+#[tokio::test]
+async fn journal_failure_before_mutation_remains_fatal() {
+    let left = tempfile::tempdir().unwrap();
+    let right = tempfile::tempdir().unwrap();
+    tokio::fs::write(left.path().join("a.txt"), b"a")
+        .await
+        .unwrap();
+    let plan = compile_local(
+        left.path(),
+        right.path(),
+        vec![file("a.txt", 1)],
+        Vec::new(),
+        SyncPolicy::default(),
+    );
+    let journal_dir = tempfile::tempdir().unwrap();
+    let journal_path = journal_dir.path().join("ops.jsonl");
+    std::fs::create_dir(&journal_path).unwrap();
+    let journal = OperationJournal::open(journal_path).unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let error = executor(journal)
+        .execute(plan, Arc::new(AtomicBool::new(false)), tx)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, SyncRunError::Journal(_)));
     assert!(!right.path().join("a.txt").exists());
 }

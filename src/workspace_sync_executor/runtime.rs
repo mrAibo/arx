@@ -10,7 +10,9 @@ use crate::transfer::executor::{TransferExecutionError, execute_transfer};
 use crate::vfs::{Location, ProviderRegistry};
 use crate::workspace_sync::WorkspaceFingerprint;
 use crate::workspace_sync_execution::SyncPlanId;
-use crate::workspace_sync_journal::{SyncJournalExecutionMetadata, SyncJournalSession};
+use crate::workspace_sync_journal::{
+    SyncJournalError, SyncJournalExecutionMetadata, SyncJournalSession,
+};
 
 use super::{CompiledSyncPlan, CompiledSyncStep, PhysicalStepId, PhysicalSyncStep};
 
@@ -19,6 +21,12 @@ pub struct CompletedSyncStep {
     pub id: PhysicalStepId,
     pub relative_path: String,
     pub transferred_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncJournalFinalization {
+    Recorded,
+    Failed { error: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +77,12 @@ pub struct SyncExecutionOutcome {
     pub terminal: SyncTerminalState,
     pub remaining: Vec<CompiledSyncStep>,
     pub transferred_bytes: u64,
+    /// Conservative physical truth: once a validated step enters its mutation
+    /// adapter, the workspace may have changed even if that step does not
+    /// reach `CompletedSyncStep`.
+    pub workspace_may_have_changed: bool,
+    /// Durable audit finalization is separate from physical execution truth.
+    pub journal: SyncJournalFinalization,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,14 +155,16 @@ impl WorkspaceSyncExecutor {
 
         let mut completed = Vec::new();
         let mut transferred_bytes = 0u64;
+        let mut workspace_may_have_changed = false;
 
         for (index, compiled) in plan.steps().iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
-                return self.finish_cancelled(
+                return Self::finish_cancelled(
                     &plan,
                     index,
                     completed,
                     transferred_bytes,
+                    workspace_may_have_changed,
                     &events,
                     &mut journal,
                 );
@@ -167,20 +183,23 @@ impl WorkspaceSyncExecutor {
                     index,
                     completed,
                     transferred_bytes,
+                    workspace_may_have_changed,
                     error,
                     &events,
                     &mut journal,
                 );
             }
 
+            workspace_may_have_changed = true;
             match self.execute_step(&compiled.step, cancel.clone()).await {
                 Ok(()) => {}
                 Err(StepExecutionResult::Cancelled) => {
-                    return self.finish_cancelled(
+                    return Self::finish_cancelled(
                         &plan,
                         index,
                         completed,
                         transferred_bytes,
+                        workspace_may_have_changed,
                         &events,
                         &mut journal,
                     );
@@ -192,6 +211,7 @@ impl WorkspaceSyncExecutor {
                         index,
                         completed,
                         transferred_bytes,
+                        workspace_may_have_changed,
                         error,
                         &events,
                         &mut journal,
@@ -218,9 +238,12 @@ impl WorkspaceSyncExecutor {
             tokio::task::yield_now().await;
         }
 
-        journal.complete_with_execution(
-            completed.len(),
-            execution_metadata(completed.len(), None, 0, transferred_bytes),
+        let journal = finalize_journal(
+            journal.complete_with_execution(
+                completed.len(),
+                execution_metadata(completed.len(), None, 0, transferred_bytes),
+            ),
+            workspace_may_have_changed,
         )?;
         let _ = events.send(SyncExecutionEvent::Completed {
             steps: completed.len(),
@@ -232,22 +255,27 @@ impl WorkspaceSyncExecutor {
             terminal: SyncTerminalState::Completed,
             remaining: Vec::new(),
             transferred_bytes,
+            workspace_may_have_changed,
+            journal,
         })
     }
 
     fn finish_cancelled(
-        &self,
         plan: &CompiledSyncPlan,
         index: usize,
         completed: Vec<CompletedSyncStep>,
         transferred_bytes: u64,
+        workspace_may_have_changed: bool,
         events: &mpsc::UnboundedSender<SyncExecutionEvent>,
         journal: &mut SyncJournalSession,
     ) -> Result<SyncExecutionOutcome, SyncRunError> {
         let remaining = plan.steps()[index..].to_vec();
-        journal.cancel_with_execution(
-            completed.len(),
-            execution_metadata(completed.len(), None, remaining.len(), transferred_bytes),
+        let journal = finalize_journal(
+            journal.cancel_with_execution(
+                completed.len(),
+                execution_metadata(completed.len(), None, remaining.len(), transferred_bytes),
+            ),
+            workspace_may_have_changed,
         )?;
         let _ = events.send(SyncExecutionEvent::Cancelled {
             completed_steps: completed.len(),
@@ -260,6 +288,8 @@ impl WorkspaceSyncExecutor {
             completed,
             remaining,
             transferred_bytes,
+            workspace_may_have_changed,
+            journal,
         })
     }
 
@@ -271,20 +301,24 @@ impl WorkspaceSyncExecutor {
         index: usize,
         completed: Vec<CompletedSyncStep>,
         transferred_bytes: u64,
+        workspace_may_have_changed: bool,
         error: SyncExecutionError,
         events: &mpsc::UnboundedSender<SyncExecutionEvent>,
         journal: &mut SyncJournalSession,
     ) -> Result<SyncExecutionOutcome, SyncRunError> {
         let remaining = plan.steps()[index + 1..].to_vec();
-        journal.fail_with_execution(
-            completed.len(),
-            error.to_string(),
-            execution_metadata(
+        let journal = finalize_journal(
+            journal.fail_with_execution(
                 completed.len(),
-                Some(compiled.id.0),
-                remaining.len(),
-                transferred_bytes,
+                error.to_string(),
+                execution_metadata(
+                    completed.len(),
+                    Some(compiled.id.0),
+                    remaining.len(),
+                    transferred_bytes,
+                ),
             ),
+            workspace_may_have_changed,
         )?;
         let _ = events.send(SyncExecutionEvent::Failed {
             step: compiled.id,
@@ -300,6 +334,8 @@ impl WorkspaceSyncExecutor {
             },
             remaining,
             transferred_bytes,
+            workspace_may_have_changed,
+            journal,
         })
     }
 
@@ -455,6 +491,19 @@ fn failed_mutation(path: &str, error: impl std::fmt::Display) -> StepExecutionRe
         path: path.to_string(),
         error: error.to_string(),
     })
+}
+
+fn finalize_journal(
+    result: Result<(), SyncJournalError>,
+    workspace_may_have_changed: bool,
+) -> Result<SyncJournalFinalization, SyncRunError> {
+    match result {
+        Ok(()) => Ok(SyncJournalFinalization::Recorded),
+        Err(error) if workspace_may_have_changed => Ok(SyncJournalFinalization::Failed {
+            error: error.to_string(),
+        }),
+        Err(error) => Err(SyncRunError::Journal(error)),
+    }
 }
 
 fn execution_metadata(
