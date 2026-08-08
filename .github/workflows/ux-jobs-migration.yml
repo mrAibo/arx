@@ -1,0 +1,37 @@
+name: Temporary Remote Workspace UX Jobs Migration
+
+on:
+  push:
+    branches: [feature/remote-workspace-ux]
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+      - name: Migrate and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -q 'pub struct WorkspaceSyncJobContext' src/jobs/mod.rs; then
+            echo 'job context migration already applied'
+            exit 0
+          fi
+          python3 .github/ux_jobs_migrate.py
+          cargo fmt
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --all-features
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src
+          git commit -m 'feat: add direction-aware workspace sync job context'
+          git push origin HEAD:feature/remote-workspace-ux
