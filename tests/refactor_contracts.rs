@@ -156,12 +156,31 @@ fn unresolved_conflict_is_not_executable() {
 }
 
 #[test]
-fn sync_preview_ui_does_not_contain_an_execution_shortcut_yet() {
+fn sync_preview_ui_routes_execution_through_workspace_sync_controller() {
     let tui = include_str!("../src/tui.rs");
-    assert!(
-        tui.contains("execution intentionally disabled"),
-        "execution was enabled before the sync executor safety gate was introduced"
-    );
+    let start = tui.find("fn prepare_workspace_sync(").unwrap();
+    let end = tui[start..]
+        .find("fn start_workspace_scan(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let sync_ui = &tui[start..end];
+
+    assert!(sync_ui.contains("sync.controller.freeze("));
+    assert!(sync_ui.contains(".launch("));
+    assert!(!tui.contains("execution intentionally disabled"));
+    assert!(tui.contains("Audit record finalization failed"));
+    assert!(tui.contains("No mismatch was proven"));
+    assert!(tui.contains("Cancelling…"));
+    for forbidden in [
+        "SyncExecutionCompiler",
+        "SyncPlanValidator",
+        "TransferPlanner",
+        "MutationService",
+        "SyncConfirmationToken",
+        "execute_transfer",
+    ] {
+        assert!(!sync_ui.contains(forbidden));
+    }
 }
 
 #[test]

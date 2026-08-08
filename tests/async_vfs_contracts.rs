@@ -259,10 +259,30 @@ fn legacy_thread_local_registry_bridge_is_not_used_by_runtime() {
 }
 
 #[test]
-fn workspace_sync_execution_remains_gated_after_recursive_scanner_wiring() {
+fn workspace_sync_execution_stays_gated_behind_application_controller() {
     let tui = include_str!("../src/tui.rs");
-    assert!(
-        tui.contains("execution intentionally disabled"),
-        "recursive scan work accidentally enabled destructive sync execution"
-    );
+    let start = tui.find("fn prepare_workspace_sync(").unwrap();
+    let end = tui[start..]
+        .find("fn start_workspace_scan(")
+        .map(|offset| start + offset)
+        .unwrap();
+    let sync_ui = &tui[start..end];
+
+    assert!(tui.contains("WorkspaceSyncController"));
+    assert!(sync_ui.contains("sync.controller.freeze("));
+    assert!(sync_ui.contains(".launch("));
+    assert!(!tui.contains("execution intentionally disabled"));
+    for forbidden in [
+        "SyncExecutionCompiler",
+        "SyncPlanValidator",
+        "TransferPlanner",
+        "MutationService",
+        "SyncConfirmationToken",
+        "execute_transfer",
+    ] {
+        assert!(
+            !sync_ui.contains(forbidden),
+            "workspace sync presentation re-entered backend planning through {forbidden}"
+        );
+    }
 }
