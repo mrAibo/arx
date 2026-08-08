@@ -15,3 +15,4 @@ pub mod terminal;
 pub mod transfer;
 pub mod vfs;
 pub mod workspace_sync;
+pub mod workspace_sync_execution;
