@@ -171,7 +171,7 @@ pub struct AppState {
     pub hosts: Vec<Host>,
     pub show_hosts: bool,
     pub host_cursor: usize,
-    // B4: job queue
+    // B4: render-only snapshot; JobManager owns runtime lifecycle.
     pub jobs: Vec<Job>,
     pub show_jobs: bool,
     pub job_cursor: usize,
