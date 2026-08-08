@@ -27,9 +27,8 @@ jobs:
           if grep -q 'cancel_during_first_step_starts_verification_with_zero_completed_steps' tests/workspace_sync_verification.rs; then
             python3 .github/ux_test_hardening.py
           fi
-          if ! grep -q 'SyncConfirmationRequired' src/app/actions.rs && ! grep -q 'ConfirmWorkspaceSync' src/app/actions.rs; then
-            python3 .github/ux_state_migrate.py
-          elif ! grep -q 'ConfirmWorkspaceSync' src/app/actions.rs; then
+          if ! grep -q 'ConfirmWorkspaceSync' src/app/actions.rs; then
+            python3 .github/fix_ux_state_bootstrap.py
             python3 .github/ux_state_migrate.py
           fi
           cargo fmt
