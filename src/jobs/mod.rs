@@ -32,7 +32,7 @@ impl Progress {
         match self {
             Self::Percent(p) => Some(*p),
             Self::Bytes { done, total, .. } if *total > 0 => {
-                Some(((done * 100) / total).min(100) as u8)
+                Some(((((*done as u128) * 100) / (*total as u128)).min(100)) as u8)
             }
             Self::Items { done, total } if *total > 0 => {
                 Some(((done * 100) / total).min(100) as u8)
@@ -126,6 +126,7 @@ pub enum JobKind {
 pub enum JobStatus {
     Pending,
     Running,
+    Cancelling,
     Paused,
     Done,
     Failed,
@@ -139,6 +140,7 @@ pub enum JobEvent {
     Done { id: String, message: String },
     Failed { id: String, error: String },
     Paused { id: String },
+    Cancelled { id: String, completed: usize },
 }
 
 impl Job {
@@ -146,6 +148,7 @@ impl Job {
         match self.status {
             JobStatus::Pending => "⏳",
             JobStatus::Running => "⚡",
+            JobStatus::Cancelling => "⏹",
             JobStatus::Paused => "⏸",
             JobStatus::Done => "✅",
             JobStatus::Failed => "❌",
@@ -157,7 +160,7 @@ impl Job {
     pub fn eta(&self) -> Option<String> {
         match &self.progress {
             Progress::Bytes { done, total, rate } if *rate > 0 && *total > 0 => {
-                let remaining = total - done;
+                let remaining = total.saturating_sub(*done);
                 let secs = remaining / rate;
                 if secs < 60 {
                     Some(format!("{}s", secs))
@@ -175,7 +178,10 @@ impl Job {
 impl std::fmt::Display for Job {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.status_icon(), self.description)?;
-        if self.status == JobStatus::Running || self.status == JobStatus::Paused {
+        if matches!(
+            self.status,
+            JobStatus::Running | JobStatus::Cancelling | JobStatus::Paused
+        ) {
             write!(f, " {}", self.progress)?;
         }
         if let Some(eta) = self.eta() {
@@ -220,14 +226,43 @@ impl JobQueue {
 
     /// Cancel a pending or active job by id. Returns true if found.
     pub fn cancel(&self, id: &str) -> bool {
-        // Cancel in pending
-        if let Some(job) = self.pending.lock().unwrap().iter().find(|j| j.id == id) {
+        // Pending work has not started, so cancellation is immediately
+        // terminal and the job must never be promoted to a worker.
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(pos) = pending.iter().position(|job| job.id == id) {
+            let mut job = pending.remove(pos).expect("pending position disappeared");
             job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            job.status = JobStatus::Cancelled;
+            drop(pending);
+            self.done.lock().unwrap().push(job);
             return true;
         }
+        drop(pending);
+
         // Cancel in active
-        if let Some(job) = self.active.lock().unwrap().iter().find(|j| j.id == id) {
+        if let Some(job) = self
+            .active
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|job| job.id == id)
+        {
             job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            if job.status == JobStatus::Running {
+                job.status = JobStatus::Cancelling;
+            }
+            return true;
+        }
+
+        // Idempotent cancellation: cancelling an already-cancelled job is a
+        // successful no-op.
+        if self
+            .done
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|job| job.id == id && job.status == JobStatus::Cancelled)
+        {
             return true;
         }
         false
@@ -244,9 +279,16 @@ impl JobQueue {
         let mut pending = self.pending.lock().unwrap();
         let mut promoted = Vec::new();
         for _ in 0..available {
-            if let Some(job) = pending.pop_front() {
+            while let Some(mut job) = pending.pop_front() {
+                if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    job.status = JobStatus::Cancelled;
+                    self.done.lock().unwrap().push(job);
+                    continue;
+                }
+                job.status = JobStatus::Running;
                 promoted.push(job.clone());
                 active.push(job);
+                break;
             }
         }
         promoted
@@ -256,7 +298,12 @@ impl JobQueue {
     pub fn complete(&self, id: &str) {
         let mut active = self.active.lock().unwrap();
         if let Some(pos) = active.iter().position(|j| j.id == id) {
-            let job = active.remove(pos);
+            let mut job = active.remove(pos);
+            if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                job.status = JobStatus::Cancelled;
+            } else {
+                job.status = JobStatus::Done;
+            }
             self.done.lock().unwrap().push(job);
         }
     }
@@ -264,6 +311,7 @@ impl JobQueue {
     pub fn active_count(&self) -> usize {
         self.active.lock().unwrap().len()
     }
+
     pub fn pending_count(&self) -> usize {
         self.pending.lock().unwrap().len()
     }
@@ -280,6 +328,56 @@ impl JobQueue {
         all.extend(self.active.lock().unwrap().iter().cloned());
         all.extend(self.done.lock().unwrap().iter().cloned());
         all
+    }
+}
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    fn job(id: &str) -> Job {
+        Job {
+            id: id.into(),
+            description: id.into(),
+            kind: JobKind::Transfer,
+            status: JobStatus::Pending,
+            progress: Progress::Indeterminate,
+            source: None,
+            destination: None,
+            cancel: job_token(),
+        }
+    }
+
+    #[test]
+    fn pending_cancel_never_promotes_job() {
+        let queue = JobQueue::new(1);
+        queue.enqueue(job("a"));
+        assert!(queue.cancel("a"));
+        assert!(queue.promote().is_empty());
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].status, JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn active_cancel_sets_shared_token_and_cancelling_state() {
+        let queue = JobQueue::new(1);
+        let original = job("a");
+        let token = original.cancel.clone();
+        queue.enqueue(original);
+        let promoted = queue.promote();
+        assert_eq!(promoted.len(), 1);
+
+        assert!(queue.cancel("a"));
+        assert!(token.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(queue.snapshot()[0].status, JobStatus::Cancelling);
+    }
+
+    #[test]
+    fn cancel_is_idempotent_after_terminal_cancel() {
+        let queue = JobQueue::new(1);
+        queue.enqueue(job("a"));
+        assert!(queue.cancel("a"));
+        assert!(queue.cancel("a"));
     }
 }
 

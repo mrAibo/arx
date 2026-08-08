@@ -1,6 +1,6 @@
 use super::{Entry, EntryKind};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Archive filesystem backend. Uses system `tar` / `unzip` for listing.
 pub struct ArchiveFs;
@@ -117,5 +117,44 @@ impl ArchiveFs {
         });
 
         Ok(result)
+    }
+}
+/// Registry-backed archive provider. Each archive file is a distinct provider
+/// instance; the path argument is the inner archive path only.
+#[derive(Debug)]
+pub struct ArchiveProvider {
+    pub archive: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl super::VfsProvider for ArchiveProvider {
+    fn list(&self, path: &str) -> io::Result<Vec<Entry>> {
+        ArchiveFs::list(&self.archive, path)
+    }
+
+    async fn list_async(&self, path: &str) -> io::Result<Vec<Entry>> {
+        let archive = self.archive.clone();
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || ArchiveFs::list(&archive, &path))
+            .await
+            .map_err(|error| io::Error::other(format!("archive worker failed: {error}")))?
+    }
+
+    fn read_head(&self, _path: &str, _lines: usize) -> io::Result<Vec<String>> {
+        Err(io::Error::other("archive read_head not implemented"))
+    }
+
+    fn copy_files(&self, _src: &str, _dst: &str, _names: &[String]) -> io::Result<usize> {
+        Err(io::Error::other(
+            "archive copy is handled by transfer/extract services",
+        ))
+    }
+
+    fn move_files(&self, _src: &str, _dst: &str, _names: &[String]) -> io::Result<usize> {
+        Err(io::Error::other("archive move is unsupported"))
+    }
+
+    fn delete_files(&self, _dir: &str, _names: &[String]) -> io::Result<usize> {
+        Err(io::Error::other("archive delete is unsupported"))
     }
 }

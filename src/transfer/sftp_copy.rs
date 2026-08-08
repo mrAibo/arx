@@ -53,25 +53,29 @@ pub(crate) async fn execute_sftp_copy(
     let total = names.len();
     let mut completed = 0;
 
-    for name in names {
-        validate_name(name)?;
-        check_cancelled(&cancel, completed)?;
+    let result = async {
+        for name in names {
+            validate_name(name)?;
+            check_cancelled(&cancel, completed)?;
+            match direction {
+                Direction::Upload { src, remote_dir } => {
+                    upload_file(&connection, src, remote_dir, name, &cancel, completed).await?;
+                }
+                Direction::Download { remote_dir, dst } => {
+                    download_file(&connection, remote_dir, dst, name, &cancel, completed).await?;
+                }
+            }
 
-        match direction {
-            Direction::Upload { src, remote_dir } => {
-                upload_file(&connection, src, remote_dir, name, &cancel, completed).await?;
-            }
-            Direction::Download { remote_dir, dst } => {
-                download_file(&connection, remote_dir, dst, name, &cancel, completed).await?;
-            }
+            completed += 1;
+            on_progress(TransferProgress { completed, total });
         }
-
-        completed += 1;
-        on_progress(TransferProgress { completed, total });
+        Ok(TransferOutcome { completed, total })
     }
+    .await;
 
+    // Always attempt protocol shutdown, including error/cancel paths.
     let _ = connection.close().await;
-    Ok(TransferOutcome { completed, total })
+    result
 }
 
 #[derive(Clone, Copy)]
@@ -134,7 +138,10 @@ async fn upload_file(
             "SFTP upload verification failed: staged size differs",
         ));
     }
-
+    if let Err(cancelled) = check_cancelled(cancel, completed) {
+        let _ = connection.session.remove_file(temp.clone()).await;
+        return Err(cancelled);
+    }
     let had_target = match remote_exists(&connection.session, &target).await {
         Ok(exists) => exists,
         Err(error) => {
@@ -151,7 +158,18 @@ async fn upload_file(
         let _ = connection.session.remove_file(temp.clone()).await;
         return Err(sftp_failure(name, error));
     }
-
+    // Cancellation after target→backup must roll the original target back
+    // instead of committing the staged replacement.
+    if let Err(cancelled) = check_cancelled(cancel, completed) {
+        let _ = connection.session.remove_file(temp.clone()).await;
+        if had_target {
+            let _ = connection
+                .session
+                .rename(backup.clone(), target.clone())
+                .await;
+        }
+        return Err(cancelled);
+    }
     if let Err(error) = connection
         .session
         .rename(temp.clone(), target.clone())
@@ -225,7 +243,10 @@ async fn download_file(
             "SFTP download verification failed: staged size differs",
         ));
     }
-
+    if let Err(cancelled) = check_cancelled(cancel, completed) {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(cancelled);
+    }
     let had_target = match local_exists(&target).await {
         Ok(exists) => exists,
         Err(error) => {
@@ -237,7 +258,13 @@ async fn download_file(
         let _ = tokio::fs::remove_file(&temp).await;
         return Err(error.into());
     }
-
+    if let Err(cancelled) = check_cancelled(cancel, completed) {
+        let _ = tokio::fs::remove_file(&temp).await;
+        if had_target {
+            let _ = tokio::fs::rename(&backup, &target).await;
+        }
+        return Err(cancelled);
+    }
     if let Err(error) = tokio::fs::rename(&temp, &target).await {
         let _ = tokio::fs::remove_file(&temp).await;
         if had_target {
@@ -267,6 +294,7 @@ where
             return Ok(());
         }
         writer.write_all(&buffer[..read]).await?;
+        check_cancelled(cancel, completed)?;
     }
 }
 

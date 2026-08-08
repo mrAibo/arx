@@ -321,13 +321,18 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
 // ── VfsProvider impl (Provider Registry) ──
 
 use crate::vfs::VfsProvider;
-
 #[derive(Debug)]
 pub struct LocalProvider;
-
+#[async_trait::async_trait]
 impl VfsProvider for LocalProvider {
     fn list(&self, path: &str) -> std::io::Result<Vec<Entry>> {
         LocalFs::list(std::path::Path::new(path))
+    }
+    async fn list_async(&self, path: &str) -> std::io::Result<Vec<Entry>> {
+        let path = std::path::PathBuf::from(path);
+        tokio::task::spawn_blocking(move || LocalFs::list(&path))
+            .await
+            .map_err(|error| std::io::Error::other(format!("local list worker failed: {error}")))?
     }
     fn read_head(&self, path: &str, lines: usize) -> std::io::Result<Vec<String>> {
         LocalFs::read_head(std::path::Path::new(path), lines)

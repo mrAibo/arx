@@ -16,6 +16,7 @@ pub use capabilities::{Capability, CapabilitySet};
 // Once all call sites use registry, delete old Location enum.
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 // ── Error taxonomy ──
 // ponytail: typed error replaces anyhow in VFS layer. anyhow stays in TUI via From impl.
@@ -50,6 +51,41 @@ impl fmt::Display for VfsError {
             Self::ProtocolError(msg) => write!(f, "protocol error: {msg}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_registry_tests {
+    use super::*;
+
+    #[test]
+    fn different_sftp_hosts_have_different_provider_instance_keys() {
+        let a = Location::Sftp {
+            host: "prod-a".into(),
+            path: "/srv".into(),
+        };
+        let b = Location::Sftp {
+            host: "prod-b".into(),
+            path: "/srv".into(),
+        };
+        assert_ne!(
+            ProviderRegistry::instance_key_for_location(&a),
+            ProviderRegistry::instance_key_for_location(&b)
+        );
+    }
+
+    #[test]
+    fn cloned_registries_share_provider_instances() {
+        let registry = default_registry();
+        let clone = registry.clone();
+        assert_eq!(registry.instance_count(), 1);
+        assert_eq!(clone.instance_count(), 1);
+        clone.insert(
+            ProviderId::S3,
+            Box::new(s3::S3Provider),
+            capabilities::S3_CAPABILITIES,
+        );
+        assert_eq!(registry.instance_count(), 2);
     }
 }
 
@@ -153,43 +189,93 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
     fn delete_files(&self, dir: &str, names: &[String]) -> std::io::Result<usize>;
 }
 
-#[derive(Debug)]
-struct RegisteredProvider {
-    provider: Box<dyn VfsProvider>,
-    capabilities: CapabilitySet,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ProviderInstanceKey {
+    Singleton(ProviderId),
+    SftpHost(String),
+    ArchiveFile(PathBuf),
 }
 
-#[derive(Debug)]
-pub struct ProviderRegistry(HashMap<ProviderId, RegisteredProvider>);
+#[derive(Debug, Clone)]
+struct RegisteredProvider {
+    provider: Arc<dyn VfsProvider>,
+}
+
+/// Cloneable, async-safe provider registry.
+///
+/// Provider *capabilities* are keyed by provider class (`ProviderId`), while
+/// provider *instances* are keyed by the concrete resource. This distinction
+/// is essential for multiple SFTP hosts and multiple archive files.
+#[derive(Debug, Clone)]
+pub struct ProviderRegistry {
+    providers: Arc<RwLock<HashMap<ProviderInstanceKey, RegisteredProvider>>>,
+    capabilities: Arc<RwLock<HashMap<ProviderId, CapabilitySet>>>,
+}
 
 impl ProviderRegistry {
     pub fn new() -> Self {
-        Self(HashMap::new())
+        Self {
+            providers: Arc::new(RwLock::new(HashMap::new())),
+            capabilities: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
     pub fn insert(
-        &mut self,
+        &self,
         id: ProviderId,
         provider: Box<dyn VfsProvider>,
         capabilities: CapabilitySet,
     ) {
-        self.0.insert(
+        self.insert_instance(
+            ProviderInstanceKey::Singleton(id),
             id,
-            RegisteredProvider {
-                provider,
-                capabilities,
-            },
+            Arc::from(provider),
+            capabilities,
         );
     }
 
-    pub fn get(&self, id: &ProviderId) -> Option<&dyn VfsProvider> {
-        self.0
-            .get(id)
-            .map(|registered| registered.provider.as_ref())
+    fn insert_instance(
+        &self,
+        key: ProviderInstanceKey,
+        id: ProviderId,
+        provider: Arc<dyn VfsProvider>,
+        capabilities: CapabilitySet,
+    ) {
+        self.providers
+            .write()
+            .expect("provider registry poisoned")
+            .insert(key, RegisteredProvider { provider });
+        self.capabilities
+            .write()
+            .expect("provider capabilities poisoned")
+            .insert(id, capabilities);
+    }
+
+    pub fn get(&self, id: &ProviderId) -> Option<Arc<dyn VfsProvider>> {
+        self.providers
+            .read()
+            .expect("provider registry poisoned")
+            .get(&ProviderInstanceKey::Singleton(*id))
+            .map(|registered| Arc::clone(&registered.provider))
     }
 
     pub fn capabilities(&self, id: &ProviderId) -> Option<CapabilitySet> {
-        self.0.get(id).map(|registered| registered.capabilities)
+        if let Some(capabilities) = self
+            .capabilities
+            .read()
+            .expect("provider capabilities poisoned")
+            .get(id)
+            .copied()
+        {
+            return Some(capabilities);
+        }
+        Some(match id {
+            ProviderId::Local => capabilities::LOCAL_CAPABILITIES,
+            ProviderId::Sftp => capabilities::SFTP_CAPABILITIES,
+            ProviderId::Archive => capabilities::ARCHIVE_CAPABILITIES,
+            ProviderId::S3 => capabilities::S3_CAPABILITIES,
+            ProviderId::WebDAV => capabilities::WEBDAV_CAPABILITIES,
+        })
     }
 
     pub fn supports(&self, id: &ProviderId, capability: Capability) -> bool {
@@ -209,13 +295,29 @@ impl ProviderRegistry {
     }
 
     pub fn contains_key(&self, id: &ProviderId) -> bool {
-        self.0.contains_key(id)
+        self.providers
+            .read()
+            .expect("provider registry poisoned")
+            .contains_key(&ProviderInstanceKey::Singleton(*id))
+    }
+
+    pub fn contains_instance(&self, key: &ProviderInstanceKey) -> bool {
+        self.providers
+            .read()
+            .expect("provider registry poisoned")
+            .contains_key(key)
+    }
+
+    pub fn instance_count(&self) -> usize {
+        self.providers
+            .read()
+            .expect("provider registry poisoned")
+            .len()
     }
 }
-
 /// Build default registry with local backend. SFTP/Archive registered per-connection.
 pub fn default_registry() -> ProviderRegistry {
-    let mut r = ProviderRegistry::new();
+    let r = ProviderRegistry::new();
     r.insert(
         ProviderId::Local,
         Box::new(local::LocalProvider),
@@ -246,51 +348,85 @@ where
 #[allow(clippy::derivable_impls)]
 impl Default for ProviderRegistry {
     fn default() -> Self {
-        Self(HashMap::new())
+        Self::new()
     }
 }
-
 impl ProviderRegistry {
-    /// Map old Location enum → (ProviderId, path) and dispatch through registry.
-    /// ponytail: bridge; delete when Location enum is replaced by Target.
-    fn map_location(&mut self, loc: &Location) -> (ProviderId, String) {
-        let (pid, path) = match loc {
-            Location::Local(p) => (ProviderId::Local, p.to_string_lossy().into_owned()),
-            Location::Sftp { host, path } => {
-                // ponytail: lazy-register SFTP provider per-host
-                if !self.contains_key(&ProviderId::Sftp) {
-                    let h = crate::remote::Host::from_alias(host);
-                    self.insert(
-                        ProviderId::Sftp,
-                        Box::new(sftp::SftpProvider { host: h }),
-                        capabilities::SFTP_CAPABILITIES,
-                    );
-                }
-                (ProviderId::Sftp, path.clone())
-            }
-            Location::Archive {
-                archive: _,
-                inner_path,
-            } => (ProviderId::Archive, inner_path.clone()),
+    pub fn instance_key_for_location(loc: &Location) -> ProviderInstanceKey {
+        match loc {
+            Location::Local(_) => ProviderInstanceKey::Singleton(ProviderId::Local),
+            Location::Sftp { host, .. } => ProviderInstanceKey::SftpHost(host.clone()),
+            Location::Archive { archive, .. } => ProviderInstanceKey::ArchiveFile(archive.clone()),
+        }
+    }
+
+    fn provider_for_location(
+        &self,
+        loc: &Location,
+    ) -> std::io::Result<(Arc<dyn VfsProvider>, String)> {
+        let key = Self::instance_key_for_location(loc);
+        let path = match loc {
+            Location::Local(path) => path.to_string_lossy().into_owned(),
+            Location::Sftp { path, .. } => path.clone(),
+            Location::Archive { inner_path, .. } => inner_path.clone(),
         };
-        (pid, path)
+
+        if let Some(provider) = self
+            .providers
+            .read()
+            .expect("provider registry poisoned")
+            .get(&key)
+            .map(|registered| Arc::clone(&registered.provider))
+        {
+            return Ok((provider, path));
+        }
+
+        let (id, provider, capabilities): (ProviderId, Arc<dyn VfsProvider>, CapabilitySet) =
+            match loc {
+                Location::Local(_) => (
+                    ProviderId::Local,
+                    Arc::new(local::LocalProvider),
+                    capabilities::LOCAL_CAPABILITIES,
+                ),
+                Location::Sftp { host, .. } => (
+                    ProviderId::Sftp,
+                    Arc::new(sftp::SftpProvider::new(crate::remote::Host::from_alias(
+                        host,
+                    ))),
+                    capabilities::SFTP_CAPABILITIES,
+                ),
+                Location::Archive { archive, .. } => (
+                    ProviderId::Archive,
+                    Arc::new(archive::ArchiveProvider {
+                        archive: archive.clone(),
+                    }),
+                    capabilities::ARCHIVE_CAPABILITIES,
+                ),
+            };
+
+        let mut providers = self.providers.write().expect("provider registry poisoned");
+        let registered = providers.entry(key).or_insert_with(|| RegisteredProvider {
+            provider: Arc::clone(&provider),
+        });
+        let provider = Arc::clone(&registered.provider);
+        drop(providers);
+
+        self.capabilities
+            .write()
+            .expect("provider capabilities poisoned")
+            .insert(id, capabilities);
+
+        Ok((provider, path))
     }
 
-    pub fn list_location(&mut self, loc: &Location) -> std::io::Result<Vec<Entry>> {
-        let (pid, path) = self.map_location(loc);
-        self.get(&pid)
-            .ok_or_else(|| std::io::Error::other("provider not registered"))?
-            .list(&path)
+    pub fn list_location(&self, loc: &Location) -> std::io::Result<Vec<Entry>> {
+        let (provider, path) = self.provider_for_location(loc)?;
+        provider.list(&path)
     }
-
     /// Async entry point — delegates to list_async() on the provider.
-    /// ponytail: use this in async contexts; sync list_location() kept for backward compat.
-    pub async fn list_location_async(&mut self, loc: &Location) -> std::io::Result<Vec<Entry>> {
-        let (pid, path) = self.map_location(loc);
-        self.get(&pid)
-            .ok_or_else(|| std::io::Error::other("provider not registered"))?
-            .list_async(&path)
-            .await
+    pub async fn list_location_async(&self, loc: &Location) -> std::io::Result<Vec<Entry>> {
+        let (provider, path) = self.provider_for_location(loc)?;
+        provider.list_async(&path).await
     }
 }
 
@@ -344,6 +480,40 @@ impl Location {
             Self::Archive { inner_path, .. } => {
                 let last = inner_path.rsplit('/').next().unwrap_or(inner_path);
                 last.to_string()
+            }
+        }
+    }
+
+    /// Resolve one immediate child without changing provider identity.
+    pub fn child(&self, name: &str) -> Self {
+        match self {
+            Self::Local(path) => Self::Local(path.join(name)),
+            Self::Sftp { host, path } => {
+                let base = path.trim_end_matches('/');
+                let child = if base.is_empty() || base == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{base}/{name}")
+                };
+                Self::Sftp {
+                    host: host.clone(),
+                    path: child,
+                }
+            }
+            Self::Archive {
+                archive,
+                inner_path,
+            } => {
+                let base = inner_path.trim_end_matches('/');
+                let child = if base.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{base}/{name}")
+                };
+                Self::Archive {
+                    archive: archive.clone(),
+                    inner_path: child,
+                }
             }
         }
     }
@@ -437,6 +607,21 @@ mod tests {
             path: "/var/log".into(),
         };
         assert_eq!(location.to_string(), "sftp://db-prod/var/log");
+    }
+
+    #[test]
+    fn child_preserves_sftp_host_identity() {
+        let root = Location::Sftp {
+            host: "prod".into(),
+            path: "/srv".into(),
+        };
+        assert_eq!(
+            root.child("app"),
+            Location::Sftp {
+                host: "prod".into(),
+                path: "/srv/app".into(),
+            }
+        );
     }
 
     #[test]

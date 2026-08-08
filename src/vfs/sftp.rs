@@ -3,6 +3,7 @@ use crate::remote::Host;
 use anyhow::Context;
 use std::collections::BTreeSet;
 use std::io;
+use tokio::sync::Mutex;
 
 /// SFTP filesystem backend.
 pub struct SftpFs;
@@ -40,7 +41,12 @@ async fn list_sftp(host: &Host, remote_path: &str) -> anyhow::Result<Vec<Entry>>
         .read_dir(remote_path.to_string())
         .await
         .with_context(|| format!("SFTP read_dir {remote_path}"))?;
+    let result = entries_from_read_dir(read_dir.collect());
+    let _ = connection.close().await;
+    Ok(result)
+}
 
+fn entries_from_read_dir(read_dir: Vec<russh_sftp::client::fs::DirEntry>) -> Vec<Entry> {
     let mut result: Vec<Entry> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for entry in read_dir {
@@ -63,8 +69,6 @@ async fn list_sftp(host: &Host, remote_path: &str) -> anyhow::Result<Vec<Entry>>
         });
     }
 
-    let _ = connection.close().await;
-
     result.sort_by(|a, b| {
         match (
             a.kind == super::EntryKind::Directory,
@@ -75,17 +79,72 @@ async fn list_sftp(host: &Host, remote_path: &str) -> anyhow::Result<Vec<Entry>>
             _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
         }
     });
-
-    Ok(result)
+    result
 }
 
 use crate::vfs::VfsProvider;
-
-#[derive(Debug)]
 pub struct SftpProvider {
     pub host: crate::remote::Host,
+    connection: Mutex<Option<crate::remote::openssh_sftp::OpenSshSftpConnection>>,
 }
 
+impl std::fmt::Debug for SftpProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SftpProvider")
+            .field("host", &self.host)
+            .field("connection", &"<pooled>")
+            .finish()
+    }
+}
+
+impl SftpProvider {
+    pub fn new(host: crate::remote::Host) -> Self {
+        Self {
+            host,
+            connection: Mutex::new(None),
+        }
+    }
+
+    async fn list_pooled(&self, path: &str) -> std::io::Result<Vec<Entry>> {
+        let mut guard = self.connection.lock().await;
+
+        // One reconnect attempt handles servers closing an idle subsystem
+        // between directory reads while avoiding a reconnect per directory.
+        for attempt in 0..2 {
+            if guard.is_none() {
+                *guard = Some(
+                    crate::remote::openssh_sftp::OpenSshSftpConnection::connect(
+                        &self.host.ssh_alias,
+                    )
+                    .await?,
+                );
+            }
+
+            let result = guard
+                .as_ref()
+                .expect("connection initialized")
+                .session
+                .read_dir(path.to_string())
+                .await;
+
+            match result {
+                Ok(entries) => return Ok(entries_from_read_dir(entries.collect())),
+                Err(error) => {
+                    if let Some(mut broken) = guard.take() {
+                        broken.abort().await;
+                    }
+                    if attempt == 1 {
+                        return Err(std::io::Error::other(format!(
+                            "SFTP read_dir {path}: {error}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        unreachable!("SFTP retry loop always returns")
+    }
+}
 #[async_trait::async_trait]
 impl VfsProvider for SftpProvider {
     fn list(&self, path: &str) -> std::io::Result<Vec<Entry>> {
@@ -93,9 +152,7 @@ impl VfsProvider for SftpProvider {
     }
 
     async fn list_async(&self, path: &str) -> std::io::Result<Vec<Entry>> {
-        list_sftp(&self.host, path)
-            .await
-            .map_err(|error| std::io::Error::other(format!("SFTP: {error:#}")))
+        self.list_pooled(path).await
     }
 
     fn read_head(&self, _path: &str, _lines: usize) -> std::io::Result<Vec<String>> {
