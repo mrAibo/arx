@@ -33,6 +33,7 @@ jobs:
             python3 .github/ux_state_migrate.py
           fi
           if ! grep -q 'struct SyncUiRuntime' src/tui.rs; then
+            python3 .github/fix_ux_tui_clippy.py
             python3 .github/ux_tui_migrate.py
           fi
           cargo fmt
