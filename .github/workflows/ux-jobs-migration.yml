@@ -41,6 +41,7 @@ jobs:
             python3 .github/ux_contracts_migrate.py
           fi
           if ! grep -q 'settle_rejected_verification' src/app/remote_workspace.rs; then
+            python3 .github/fix_ux_late_verification_test.py
             python3 .github/ux_late_verification_migrate.py
           fi
           cargo fmt
