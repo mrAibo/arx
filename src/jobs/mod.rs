@@ -7,6 +7,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 use crate::vfs::Location;
+use crate::workspace_sync::{SyncDirection, SyncMode};
 use crate::workspace_sync_executor::{
     CompiledSyncPlan, PhysicalStepId, SyncExecutionEvent, SyncExecutionOutcome, SyncTerminalState,
     WorkspaceSyncExecutor,
@@ -206,6 +207,30 @@ impl JobResult {
 
 // ── Job model ──
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSyncJobContext {
+    pub left_root: Location,
+    pub right_root: Location,
+    pub direction: SyncDirection,
+    pub mode: SyncMode,
+}
+
+impl WorkspaceSyncJobContext {
+    pub fn source(&self) -> &Location {
+        match self.direction {
+            SyncDirection::LeftToRight => &self.left_root,
+            SyncDirection::RightToLeft => &self.right_root,
+        }
+    }
+
+    pub fn destination(&self) -> &Location {
+        match self.direction {
+            SyncDirection::LeftToRight => &self.right_root,
+            SyncDirection::RightToLeft => &self.left_root,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Job {
     pub id: String,
@@ -215,6 +240,9 @@ pub struct Job {
     pub progress: JobProgress,
     pub source: Option<Location>,
     pub destination: Option<Location>,
+    /// Workspace roots stay canonical left/right for verification. Presentation
+    /// direction lives here instead of overloading generic source/destination.
+    pub sync_context: Option<WorkspaceSyncJobContext>,
     /// The one cancellation flag owned by this job and shared with executors.
     pub cancel: Arc<AtomicBool>,
     pub result: Option<JobResult>,
@@ -239,11 +267,26 @@ impl Job {
             progress: JobProgress::default(),
             source,
             destination,
+            sync_context: None,
             cancel: job_token(),
             result: None,
             error: None,
             verification: None,
         }
+    }
+
+    pub fn display_source(&self) -> Option<&Location> {
+        self.sync_context
+            .as_ref()
+            .map(WorkspaceSyncJobContext::source)
+            .or(self.source.as_ref())
+    }
+
+    pub fn display_destination(&self) -> Option<&Location> {
+        self.sync_context
+            .as_ref()
+            .map(WorkspaceSyncJobContext::destination)
+            .or(self.destination.as_ref())
     }
 
     pub fn status_icon(&self) -> &str {
@@ -644,18 +687,34 @@ impl JobManager {
         let verification_plan_id = compiled_plan.plan_id();
         let verification_left_root = compiled_plan.left_root().clone();
         let verification_right_root = compiled_plan.right_root().clone();
+        let sync_context = WorkspaceSyncJobContext {
+            left_root: compiled_plan.left_root().clone(),
+            right_root: compiled_plan.right_root().clone(),
+            direction: compiled_plan.direction(),
+            mode: compiled_plan.mode(),
+        };
         let description = format!(
             "Sync {} → {}",
-            compiled_plan.left_root(),
-            compiled_plan.right_root()
+            sync_context.source(),
+            sync_context.destination()
         );
-        let job = self.create_job(
+        let mut job = self.create_job(
             "sync",
             JobKind::Synchronize,
             description,
             Some(compiled_plan.left_root().clone()),
             Some(compiled_plan.right_root().clone()),
         );
+        job.sync_context = Some(sync_context.clone());
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(stored) = state.jobs.get_mut(&job.id) {
+                stored.sync_context = Some(sync_context);
+            }
+        }
         let id = job.id.clone();
         let worker_id = id.clone();
         let manager = self.clone();
@@ -989,6 +1048,20 @@ mod tests {
             usize::from(completed.join().unwrap()) + usize::from(cancelled.join().unwrap());
         assert_eq!(accepted, 1);
         assert!(manager.get(&job.id).unwrap().status.is_terminal());
+    }
+
+    #[test]
+    fn right_to_left_sync_context_reverses_display_without_reversing_workspace_roots() {
+        let context = WorkspaceSyncJobContext {
+            left_root: Location::Local("/left".into()),
+            right_root: Location::Local("/right".into()),
+            direction: SyncDirection::RightToLeft,
+            mode: SyncMode::Update,
+        };
+        assert_eq!(context.source(), &Location::Local("/right".into()));
+        assert_eq!(context.destination(), &Location::Local("/left".into()));
+        assert_eq!(context.left_root, Location::Local("/left".into()));
+        assert_eq!(context.right_root, Location::Local("/right".into()));
     }
 
     #[test]

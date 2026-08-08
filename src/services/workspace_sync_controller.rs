@@ -5,9 +5,7 @@ use tokio::sync::mpsc;
 
 use crate::jobs::{JobEvent, JobManager};
 use crate::journal::OperationJournal;
-use crate::transfer::probe::{
-    detect_local_tools, detect_remote_tools, local_remote_executors,
-};
+use crate::transfer::probe::{detect_local_tools, detect_remote_tools, local_remote_executors};
 use crate::vfs::{Location, ProviderRegistry};
 use crate::workspace_sync::{WorkspaceDiff, WorkspaceSyncPlan};
 use crate::workspace_sync_execution::{
@@ -17,9 +15,7 @@ use crate::workspace_sync_execution::{
 use crate::workspace_sync_executor::{
     SyncCompileError, SyncExecutionCompiler, SyncExecutorMatrix, WorkspaceSyncExecutor,
 };
-use crate::workspace_sync_verification::{
-    SyncVerificationCoordinator, SyncVerificationEvent,
-};
+use crate::workspace_sync_verification::{SyncVerificationCoordinator, SyncVerificationEvent};
 
 /// Application-level wiring for the existing workspace-sync pipeline.
 ///
@@ -83,14 +79,13 @@ impl WorkspaceSyncController {
         };
         let executable = ExecutableSyncPlan::new(frozen, confirmation)?;
         let executors = self
-            .executor_matrix(executable.plan().left_root(), executable.plan().right_root())
+            .executor_matrix(
+                executable.plan().left_root(),
+                executable.plan().right_root(),
+            )
             .await?;
-        let compiled = SyncExecutionCompiler::compile(
-            executable,
-            &current,
-            &self.registry,
-            &executors,
-        )?;
+        let compiled =
+            SyncExecutionCompiler::compile(executable, &current, &self.registry, &executors)?;
         let journal = match &self.journal {
             Some(journal) => journal.clone(),
             None => OperationJournal::open_default()?,
@@ -188,9 +183,7 @@ mod tests {
 
     use super::*;
     use crate::vfs::{EntryKind, default_registry};
-    use crate::workspace_sync::{
-        SyncMode, SyncPolicy, WorkspaceEntry, WorkspaceFingerprint,
-    };
+    use crate::workspace_sync::{SyncMode, SyncPolicy, WorkspaceEntry, WorkspaceFingerprint};
 
     fn file(path: &str, size: u64) -> WorkspaceEntry {
         WorkspaceEntry {
@@ -235,14 +228,7 @@ mod tests {
         let (verification_tx, _verification_rx) = mpsc::unbounded_channel();
 
         let error = controller
-            .launch(
-                frozen,
-                diff,
-                false,
-                jobs.clone(),
-                job_tx,
-                verification_tx,
-            )
+            .launch(frozen, diff, false, jobs.clone(), job_tx, verification_tx)
             .await
             .unwrap_err();
 
@@ -279,14 +265,7 @@ mod tests {
         let (verification_tx, _verification_rx) = mpsc::unbounded_channel();
 
         let id = controller
-            .launch(
-                frozen,
-                diff,
-                false,
-                jobs.clone(),
-                job_tx,
-                verification_tx,
-            )
+            .launch(frozen, diff, false, jobs.clone(), job_tx, verification_tx)
             .await
             .unwrap();
 
@@ -302,8 +281,8 @@ mod tests {
 
     #[test]
     fn launch_error_message_never_claims_a_mutation() {
-        let error = WorkspaceSyncLaunchError::Compile(
-            SyncCompileError::RemoteToRemoteUnsupported {
+        let error =
+            WorkspaceSyncLaunchError::Compile(SyncCompileError::RemoteToRemoteUnsupported {
                 source_location: Location::Sftp {
                     host: "a".into(),
                     path: "/src".into(),
@@ -312,8 +291,7 @@ mod tests {
                     host: "b".into(),
                     path: "/dst".into(),
                 },
-            },
-        );
+            });
         let message = error.user_message();
         assert!(message.contains("Remote → Remote sync is not supported yet"));
         assert!(message.contains("No files were changed"));
