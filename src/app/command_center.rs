@@ -99,6 +99,33 @@ fn kind_bias(kind: CommandKind) -> i64 {
     }
 }
 
+/// Empty Command Center is a discovery surface, not an alphabetic dump.
+///
+/// This is ranking only: labels and execution still come from the shared
+/// Action Catalog and typed `Action` targets. Once the user types a query,
+/// normal text relevance owns ranking again.
+fn empty_query_action_bias(id: ActionId, state: &AppState) -> i64 {
+    if state.remote_workspace.plan.is_some() {
+        match id {
+            ActionId::PreviewWorkspaceSync => 500,
+            ActionId::ToggleWorkspaceComparison => 400,
+            ActionId::OpenHosts => 300,
+            ActionId::OpenHelp => 200,
+            ActionId::OpenJobs => 100,
+            _ => 0,
+        }
+    } else {
+        match id {
+            ActionId::ToggleWorkspaceComparison => 500,
+            ActionId::OpenHosts => 400,
+            ActionId::OpenHelp => 300,
+            ActionId::OpenJobs => 200,
+            ActionId::OpenBookmarks => 100,
+            _ => 0,
+        }
+    }
+}
+
 /// Build a deterministic, typed Command Center result list.
 ///
 /// The state is the single source for already-loaded hosts/bookmarks/history;
@@ -119,12 +146,22 @@ pub fn build_command_items(filter: &str, state: &AppState) -> Vec<CommandItem> {
             continue;
         };
         if let Some(score) = text_score(&query, meta.label, Some(meta.description)) {
+            let discovery_bias = if query.is_empty() {
+                empty_query_action_bias(action.id(), state)
+            } else {
+                0
+            };
+            let subtitle = if discovery_bias > 0 {
+                format!("Recommended · {}", meta.description)
+            } else {
+                meta.description.to_string()
+            };
             items.push(CommandItem {
                 title: meta.label.to_string(),
-                subtitle: Some(meta.description.to_string()),
+                subtitle: Some(subtitle),
                 kind: CommandKind::Action,
                 target: CommandTarget::Action(action),
-                score: score + kind_bias(CommandKind::Action),
+                score: score + kind_bias(CommandKind::Action) + discovery_bias,
                 availability: action_availability(action.id(), &action_context),
             });
         }
@@ -268,6 +305,37 @@ mod tests {
         assert_eq!(
             items.first().map(|item| &item.target),
             Some(&CommandTarget::Action(Action::OpenHelp))
+        );
+    }
+
+    #[test]
+    fn empty_query_starts_with_recommended_workspace_action() {
+        let items = build_command_items("", &AppState::default());
+        let first = items.first().expect("Command Center should not be empty");
+
+        assert_eq!(
+            first.target,
+            CommandTarget::Action(Action::ToggleWorkspaceComparison)
+        );
+        assert!(
+            first
+                .subtitle
+                .as_deref()
+                .is_some_and(|subtitle| subtitle.starts_with("Recommended · "))
+        );
+    }
+
+    #[test]
+    fn typed_query_does_not_keep_discovery_bias() {
+        let items = build_command_items("help", &AppState::default());
+        let first = items.first().expect("help action should be present");
+
+        assert_eq!(first.target, CommandTarget::Action(Action::OpenHelp));
+        assert!(
+            !first
+                .subtitle
+                .as_deref()
+                .is_some_and(|subtitle| subtitle.starts_with("Recommended · "))
         );
     }
 }
