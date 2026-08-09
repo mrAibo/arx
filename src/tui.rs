@@ -5,7 +5,7 @@ use arx::app::{
 };
 use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectResponse, EffectScope};
 use arx::effects::{Effect, EffectEvent};
-use arx::input::{KeyResolution, KeyRouter};
+use arx::input::{KeyResolution, KeyRouter, contextual_hints};
 use arx::services::{
     DesktopService, FileInfoService, GitService, MutationError, MutationService, PaneLoadPurpose,
     PaneLoadResponse, PaneLoader, PreviewService, SyncLaunchId, WorkspaceScanError,
@@ -1978,6 +1978,44 @@ fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> V
     }
 }
 
+fn contextual_footer_text(state: &AppState, key_router: &KeyRouter) -> Option<String> {
+    if !key_router.pending().is_empty() {
+        return None;
+    }
+
+    let hints = contextual_hints(state, key_router.keymap());
+    if hints.is_empty() {
+        return None;
+    }
+
+    Some(
+        hints
+            .into_iter()
+            .map(|hint| format!("{} {}", hint.binding, hint.label))
+            .collect::<Vec<_>>()
+            .join("    "),
+    )
+}
+
+fn render_contextual_footer(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &AppState,
+    key_router: &KeyRouter,
+) {
+    let Some(text) = contextual_footer_text(state, key_router) else {
+        return;
+    };
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            text,
+            Style::default().fg(Color::Black).bg(Color::DarkGray),
+        )),
+        area,
+    );
+}
+
 /// Check if a filename looks like an archive (tar, tgz, zip).
 fn is_archive(name: &str) -> bool {
     name.ends_with(".tar")
@@ -2511,12 +2549,9 @@ fn render(
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(status, chunks[1]);
 
-    // Bottom F-key shortcut bar
-    let shortcuts = Span::styled(
-        "1Help  2Menu  3View  4Edit  5Copy  6RenMov  7Mkdir  8Delete  9Hosts  10Quit",
-        Style::default().fg(Color::Black).bg(Color::DarkGray),
-    );
-    frame.render_widget(Paragraph::new(shortcuts), chunks[2]);
+    // Contextual footer is derived from the same runtime Keymap that owns
+    // keyboard routing. A pending chord leaves discovery to Which-Key.
+    render_contextual_footer(frame, chunks[2], state, key_router);
 
     if state.active_overlay() == Some(OverlayKind::SyncPreview) {
         render_sync_preview(frame, area, state);
@@ -4030,5 +4065,110 @@ fn truncate_message(text: &str, max_chars: usize) -> String {
         format!("{prefix}...")
     } else {
         prefix
+    }
+}
+
+#[cfg(test)]
+mod contextual_footer_tests {
+    use super::*;
+    use arx::app::{Action, InputContext};
+    use arx::input::{KeyBinding, KeyStroke, Keymap};
+
+    #[test]
+    fn footer_uses_runtime_keymap() {
+        let keymap = Keymap::new(vec![KeyBinding::new(
+            InputContext::Browser,
+            vec![KeyStroke::new(KeyCode::F(12), KeyModifiers::NONE)],
+            Action::ToggleWorkspaceComparison,
+        )]);
+        let router = KeyRouter::new(keymap);
+
+        assert_eq!(
+            contextual_footer_text(&AppState::default(), &router).as_deref(),
+            Some("F12 Compare panes")
+        );
+    }
+
+    #[test]
+    fn pending_chord_leaves_discovery_to_which_key() {
+        let mut router = KeyRouter::default();
+        let resolution = router.resolve_stroke(
+            InputContext::Browser,
+            KeyStroke::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(resolution, KeyResolution::Pending);
+        assert!(contextual_footer_text(&AppState::default(), &router).is_none());
+    }
+
+    fn file(name: &str) -> Entry {
+        Entry {
+            name: name.into(),
+            kind: EntryKind::File,
+            size: Some(1),
+        }
+    }
+
+    #[test]
+    fn footer_tracks_sync_preview_confirmation_and_running_contexts() {
+        let left = Location::Local("/left".into());
+        let right = Location::Local("/right".into());
+        let router = KeyRouter::default();
+
+        let mut preview = AppState::default();
+        preview.remote_workspace.preview_open = true;
+        preview.remote_workspace.refresh_visible(
+            left.clone(),
+            right.clone(),
+            &[file("source.txt")],
+            &[],
+        );
+        let preview_footer = contextual_footer_text(&preview, &router).unwrap_or_default();
+        assert!(preview_footer.contains("Enter Execute workspace sync"));
+        assert!(preview_footer.contains("D Reverse sync direction"));
+        assert!(preview_footer.contains("M Toggle update/mirror"));
+
+        let mut confirmation = AppState::default();
+        confirmation.left.location = left.clone();
+        confirmation.right.location = right.clone();
+        confirmation.remote_workspace.preview_open = true;
+        confirmation.remote_workspace.refresh_visible(
+            left,
+            right,
+            &[],
+            &[file("destination-only.txt")],
+        );
+        confirmation.remote_workspace.toggle_mode();
+        let plan = confirmation
+            .remote_workspace
+            .plan
+            .clone()
+            .expect("mirror preview plan");
+        let diff = confirmation
+            .remote_workspace
+            .diff
+            .clone()
+            .expect("mirror preview diff");
+        let frozen = arx::workspace_sync_execution::SyncPlanValidator::freeze(
+            &plan,
+            &diff,
+            &arx::vfs::default_registry(),
+        )
+        .expect("freeze mirror preview");
+        confirmation.remote_workspace.set_frozen_plan(frozen);
+        let confirmation_footer =
+            contextual_footer_text(&confirmation, &router).unwrap_or_default();
+        assert!(confirmation_footer.contains("Enter Confirm workspace sync"));
+        assert!(confirmation_footer.contains("Esc Back in workspace sync"));
+
+        let mut running = AppState::default();
+        running.remote_workspace.preview_open = true;
+        running.remote_workspace.ux = WorkspaceSyncUxState::Running {
+            job_id: "sync-1".into(),
+        };
+        let running_footer = contextual_footer_text(&running, &router).unwrap_or_default();
+        assert!(running_footer.contains("C Cancel workspace sync"));
+        assert!(running_footer.contains("Esc Hide workspace sync"));
+        assert!(!running_footer.contains("verification diff"));
     }
 }
