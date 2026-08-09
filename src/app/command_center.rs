@@ -126,6 +126,19 @@ fn empty_query_action_bias(id: ActionId, state: &AppState) -> i64 {
     }
 }
 
+fn discovery_bias(
+    query: &str,
+    id: ActionId,
+    state: &AppState,
+    availability: &ActionAvailability,
+) -> i64 {
+    if query.is_empty() && availability.is_available() {
+        empty_query_action_bias(id, state)
+    } else {
+        0
+    }
+}
+
 /// Build a deterministic, typed Command Center result list.
 ///
 /// The state is the single source for already-loaded hosts/bookmarks/history;
@@ -146,11 +159,8 @@ pub fn build_command_items(filter: &str, state: &AppState) -> Vec<CommandItem> {
             continue;
         };
         if let Some(score) = text_score(&query, meta.label, Some(meta.description)) {
-            let discovery_bias = if query.is_empty() {
-                empty_query_action_bias(action.id(), state)
-            } else {
-                0
-            };
+            let availability = action_availability(action.id(), &action_context);
+            let discovery_bias = discovery_bias(&query, action.id(), state, &availability);
             let subtitle = if discovery_bias > 0 {
                 format!("Recommended · {}", meta.description)
             } else {
@@ -162,7 +172,7 @@ pub fn build_command_items(filter: &str, state: &AppState) -> Vec<CommandItem> {
                 kind: CommandKind::Action,
                 target: CommandTarget::Action(action),
                 score: score + kind_bias(CommandKind::Action) + discovery_bias,
-                availability: action_availability(action.id(), &action_context),
+                availability,
             });
         }
     }
@@ -336,6 +346,24 @@ mod tests {
                 .subtitle
                 .as_deref()
                 .is_some_and(|subtitle| subtitle.starts_with("Recommended · "))
+        );
+    }
+
+    #[test]
+    fn unavailable_action_never_receives_discovery_bias() {
+        let state = AppState::default();
+        let unavailable = ActionAvailability::Disabled {
+            reason: "not available here".into(),
+        };
+
+        assert_eq!(
+            discovery_bias(
+                "",
+                ActionId::ToggleWorkspaceComparison,
+                &state,
+                &unavailable,
+            ),
+            0
         );
     }
 }
