@@ -49,6 +49,12 @@ pub enum Pane {
     Left,
     Right,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneLoadUiError {
+    pub attempted: Location,
+    pub message: String,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortMode {
     NameAsc,
@@ -151,6 +157,8 @@ pub struct AppState {
     /// Latest async VFS load generation for each pane.
     pub pending_pane_loads: BTreeMap<Pane, PaneLoadId>,
     pub pending_pane_targets: BTreeMap<Pane, (Location, PaneLoadPurpose)>,
+    /// Persistent presentation state for the latest accepted pane-load failure.
+    pub pane_load_errors: BTreeMap<Pane, PaneLoadUiError>,
     pub infrastructure_lines: Vec<String>,
     pub tree_lines: Vec<String>,
     pub glob_input: bool,
@@ -258,6 +266,7 @@ impl Default for AppState {
             pending_effects: BTreeMap::new(),
             pending_pane_loads: BTreeMap::new(),
             pending_pane_targets: BTreeMap::new(),
+            pane_load_errors: BTreeMap::new(),
             infrastructure_lines: Vec::new(),
             tree_lines: Vec::new(),
             glob_input: false,
@@ -324,6 +333,7 @@ impl AppState {
         location: Location,
         purpose: PaneLoadPurpose,
     ) {
+        self.pane_load_errors.remove(&pane);
         self.pending_pane_loads.insert(pane, id);
         self.pending_pane_targets.insert(pane, (location, purpose));
     }

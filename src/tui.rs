@@ -1,7 +1,7 @@
 use arx::app::{
     Action, ActionAvailability, ActionContext, AppState, CommandItem, CommandKind, CommandTarget,
-    OverlayKind, Pane, PaneState, PanelMode, SortMode, WorkspaceSyncUxState, action_availability,
-    action_meta, build_command_items,
+    OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SortMode, WorkspaceSyncUxState,
+    action_availability, action_meta, build_command_items,
 };
 use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectResponse, EffectScope};
 use arx::effects::{Effect, EffectEvent};
@@ -137,6 +137,8 @@ async fn event_loop(
             render(
                 frame,
                 &mut state,
+                left_entries.len(),
+                right_entries.len(),
                 &left_filtered,
                 &right_filtered,
                 &mut left_list,
@@ -1625,16 +1627,7 @@ async fn event_loop(
                             state.bookmark_cursor = 0;
                         }
                         // F9: host panel
-                        KeyCode::F(9) => {
-                            if !state.hosts.is_empty() {
-                                state.show_hosts = !state.show_hosts;
-                                state.host_cursor = 0;
-                            } else {
-                                state.message = Some(
-                                    "No hosts configured — add ~/.config/arx/hosts.toml".into(),
-                                );
-                            }
-                        }
+                        KeyCode::F(9) => toggle_hosts_overlay(&mut state),
                         // Ctrl+J: jobs panel
                         KeyCode::Delete if state.show_jobs => {
                             if let Some(job) = state.jobs.get(state.job_cursor) {
@@ -1870,6 +1863,7 @@ fn apply_pane_load_response(
 
     match response.result {
         Ok(entries) => {
+            state.pane_load_errors.remove(&response.pane);
             let entries = normalize_entries(entries, state.show_hidden, state.sort_mode);
             let active = state.active == response.pane;
             match response.pane {
@@ -1921,8 +1915,17 @@ fn apply_pane_load_response(
         }
         Err(error) => {
             // Transactional navigation: current pane location is intentionally
-            // untouched on error.
-            state.message = Some(format!("{}: {error}", response.location));
+            // untouched on error. Persist the accepted failure so the pane can
+            // explain what failed after the one-shot status message is gone.
+            let message = error.to_string();
+            state.pane_load_errors.insert(
+                response.pane,
+                PaneLoadUiError {
+                    attempted: response.location.clone(),
+                    message: message.clone(),
+                },
+            );
+            state.message = Some(format!("{}: {message}", response.location));
         }
     }
 }
@@ -1978,6 +1981,59 @@ fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> V
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneSurfaceState<'a> {
+    Loading {
+        target: &'a Location,
+        transactional: bool,
+    },
+    LoadError {
+        attempted: &'a Location,
+        message: &'a str,
+    },
+    Empty,
+    NoMatches {
+        filter: &'a str,
+    },
+    Entries,
+}
+
+fn pane_surface_state<'a>(
+    state: &'a AppState,
+    pane: Pane,
+    total_entries: usize,
+    visible_entries: usize,
+) -> PaneSurfaceState<'a> {
+    if let Some((target, purpose)) = state.pending_pane_targets.get(&pane) {
+        let transactional = *purpose != PaneLoadPurpose::Refresh;
+        if transactional || total_entries == 0 {
+            return PaneSurfaceState::Loading {
+                target,
+                transactional,
+            };
+        }
+    }
+
+    if let Some(error) = state.pane_load_errors.get(&pane) {
+        return PaneSurfaceState::LoadError {
+            attempted: &error.attempted,
+            message: &error.message,
+        };
+    }
+
+    if visible_entries == 0 {
+        if total_entries > 0 && !state.filter.is_empty() {
+            PaneSurfaceState::NoMatches {
+                filter: &state.filter,
+            }
+        } else {
+            PaneSurfaceState::Empty
+        }
+    } else {
+        PaneSurfaceState::Entries
+    }
+}
+
 fn contextual_footer_text(state: &AppState, key_router: &KeyRouter) -> Option<String> {
     if !key_router.pending().is_empty() {
         return None;
@@ -2030,6 +2086,8 @@ fn is_archive(name: &str) -> bool {
 fn render(
     frame: &mut ratatui::Frame,
     state: &mut AppState,
+    left_total_entries: usize,
+    right_total_entries: usize,
     left_entries: &[&Entry],
     right_entries: &[&Entry],
     left_list: &mut ListState,
@@ -2097,6 +2155,7 @@ fn render(
             a1,
             &state.left,
             left_entries,
+            pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
             left_list,
             act1,
             &state.selected,
@@ -2108,6 +2167,7 @@ fn render(
             a2,
             &state.left,
             left_entries,
+            pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
             split_left_list,
             act2,
             &state.selected,
@@ -2120,6 +2180,7 @@ fn render(
             panes[0],
             &state.left,
             left_entries,
+            pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
             left_list,
             state.active == Pane::Left,
             &state.selected,
@@ -2171,6 +2232,7 @@ fn render(
                 a1,
                 &state.right,
                 right_entries,
+                pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
                 right_list,
                 act1,
                 &state.selected,
@@ -2182,6 +2244,7 @@ fn render(
                 a2,
                 &state.right,
                 right_entries,
+                pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
                 split_right_list,
                 act2,
                 &state.selected,
@@ -2194,6 +2257,7 @@ fn render(
                 panes[1],
                 &state.right,
                 right_entries,
+                pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
                 right_list,
                 state.active == Pane::Right,
                 &state.selected,
@@ -3227,8 +3291,27 @@ fn render_bookmarks(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     frame.render_stateful_widget(list, popup_area, &mut list_state);
 }
 
+const HOSTS_CONFIG_PATH: &str = "~/.config/arx/hosts.toml";
+
+fn empty_hosts_text() -> String {
+    format!("No hosts configured\n\nAdd hosts to:\n{HOSTS_CONFIG_PATH}\n\nEsc Close")
+}
+
 fn render_hosts(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     if state.hosts.is_empty() {
+        let popup_area = centered_rect(60, 40, area);
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(
+            Paragraph::new(empty_hosts_text())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Remote Hosts ")
+                        .border_style(Style::default().fg(Color::Cyan)),
+                )
+                .wrap(Wrap { trim: false }),
+            popup_area,
+        );
         return;
     }
     let popup_area = centered_rect(60, 70, area);
@@ -3357,6 +3440,7 @@ fn render_pane(
     area: ratatui::layout::Rect,
     pane: &PaneState,
     entries: &[&Entry],
+    surface: PaneSurfaceState<'_>,
     list_state: &mut ListState,
     active: bool,
     selected: &std::collections::BTreeSet<String>,
@@ -3370,6 +3454,97 @@ fn render_pane(
     };
 
     let title = format!(" {} ", pane.location.label());
+
+    let banner = match surface {
+        PaneSurfaceState::Loading {
+            target,
+            transactional,
+        } => {
+            let action = if matches!(target, Location::Sftp { .. }) {
+                "Connecting…"
+            } else {
+                "Opening…"
+            };
+            let detail = if transactional {
+                "Current location stays open until this succeeds."
+            } else {
+                "Loading this location…"
+            };
+            if entries.is_empty() {
+                render_pane_state_message(
+                    frame,
+                    area,
+                    &title,
+                    border_style,
+                    vec![
+                        action.to_string(),
+                        target.to_string(),
+                        String::new(),
+                        detail.to_string(),
+                    ],
+                );
+                return;
+            }
+            Some((
+                format!("{action} {target}"),
+                detail.to_string(),
+                Style::default().fg(Color::Cyan).bg(Color::DarkGray),
+            ))
+        }
+        PaneSurfaceState::LoadError { attempted, message } => {
+            if entries.is_empty() {
+                render_pane_state_message(
+                    frame,
+                    area,
+                    &title,
+                    border_style,
+                    vec![
+                        "Could not open".into(),
+                        attempted.to_string(),
+                        String::new(),
+                        message.to_string(),
+                        String::new(),
+                        "Current location was not changed.".into(),
+                    ],
+                );
+                return;
+            }
+            Some((
+                format!("Could not open {attempted}"),
+                format!("{message} · Current location was not changed."),
+                Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+            ))
+        }
+        PaneSurfaceState::Empty => {
+            render_pane_state_message(
+                frame,
+                area,
+                &title,
+                border_style,
+                vec![
+                    "This folder is empty.".into(),
+                    String::new(),
+                    "Available actions are shown in the footer.".into(),
+                ],
+            );
+            return;
+        }
+        PaneSurfaceState::NoMatches { filter } => {
+            render_pane_state_message(
+                frame,
+                area,
+                &title,
+                border_style,
+                vec![
+                    format!("No files match \"{filter}\"."),
+                    String::new(),
+                    "Change or clear the filter to see files.".into(),
+                ],
+            );
+            return;
+        }
+        PaneSurfaceState::Entries => None,
+    };
 
     if panel_mode == PanelMode::Brief {
         // ponytail: brief mode — filenames in columns, no list state
@@ -3401,6 +3576,9 @@ fn render_pane(
                 .wrap(Wrap { trim: false }),
             area,
         );
+        if let Some((headline, detail, style)) = &banner {
+            render_pane_banner(frame, area, headline, detail, *style);
+        }
         return;
     }
 
@@ -3506,6 +3684,59 @@ fn render_pane(
         }))
         .highlight_symbol(if active { ">> " } else { "   " });
     frame.render_stateful_widget(list, area, list_state);
+    if let Some((headline, detail, style)) = &banner {
+        render_pane_banner(frame, area, headline, detail, *style);
+    }
+}
+
+fn render_pane_state_message(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    title: &str,
+    border_style: Style,
+    lines: Vec<String>,
+) {
+    let lines = lines.into_iter().map(Line::from).collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title.to_string())
+                    .border_style(border_style),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_pane_banner(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    headline: &str,
+    detail: &str,
+    style: Style,
+) {
+    if area.width <= 2 || area.height <= 3 {
+        return;
+    }
+    let height = 2.min(area.height.saturating_sub(2));
+    let banner = Rect {
+        x: area.x + 1,
+        y: area.y + area.height.saturating_sub(height + 1),
+        width: area.width.saturating_sub(2),
+        height,
+    };
+    frame.render_widget(Clear, banner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(headline.to_string()),
+            Line::from(detail.to_string()),
+        ])
+        .style(style)
+        .wrap(Wrap { trim: false }),
+        banner,
+    );
 }
 
 fn format_size(bytes: u64) -> String {
@@ -3615,6 +3846,10 @@ fn handle_job_event(ev: &arx::jobs::JobEvent, state: &mut AppState) -> bool {
     }
 }
 
+fn toggle_hosts_overlay(state: &mut AppState) {
+    state.toggle_overlay(OverlayKind::Hosts);
+}
+
 fn dispatch_ui_action(
     state: &mut AppState,
     action: Action,
@@ -3645,13 +3880,7 @@ fn dispatch_ui_action(
         }
         Action::OpenBookmarks => state.toggle_overlay(OverlayKind::Bookmarks),
         Action::OpenJobs => state.toggle_overlay(OverlayKind::Jobs),
-        Action::OpenHosts => {
-            if state.hosts.is_empty() {
-                state.message = Some("No hosts configured — add ~/.config/arx/hosts.toml".into());
-            } else {
-                state.toggle_overlay(OverlayKind::Hosts);
-            }
-        }
+        Action::OpenHosts => toggle_hosts_overlay(state),
         Action::OpenHelp => state.toggle_overlay(OverlayKind::Help),
         Action::BeginSymlink => {
             if let Some(entry) = focused {
@@ -4069,10 +4298,11 @@ fn truncate_message(text: &str, max_chars: usize) -> String {
 }
 
 #[cfg(test)]
-mod contextual_footer_tests {
+mod tests {
     use super::*;
     use arx::app::{Action, InputContext};
     use arx::input::{KeyBinding, KeyStroke, Keymap};
+    use arx::services::PaneLoadId;
 
     #[test]
     fn footer_uses_runtime_keymap() {
@@ -4170,5 +4400,139 @@ mod contextual_footer_tests {
         assert!(running_footer.contains("C Cancel workspace sync"));
         assert!(running_footer.contains("Esc Hide workspace sync"));
         assert!(!running_footer.contains("verification diff"));
+    }
+
+    #[test]
+    fn pane_surface_distinguishes_empty_filtered_loading_and_error_states() {
+        let state = AppState::default();
+        assert_eq!(
+            pane_surface_state(&state, Pane::Left, 0, 0),
+            PaneSurfaceState::Empty
+        );
+
+        let filtered = AppState {
+            filter: "xyz".into(),
+            ..AppState::default()
+        };
+        assert!(matches!(
+            pane_surface_state(&filtered, Pane::Left, 5, 0),
+            PaneSurfaceState::NoMatches { filter: "xyz" }
+        ));
+
+        let target = Location::Sftp {
+            host: "prod".into(),
+            path: "/srv/app".into(),
+        };
+        let mut loading = AppState::default();
+        loading.register_pane_load(
+            Pane::Left,
+            PaneLoadId(1),
+            target.clone(),
+            PaneLoadPurpose::Navigate {
+                remember_current: true,
+            },
+        );
+        assert!(matches!(
+            pane_surface_state(&loading, Pane::Left, 4, 4),
+            PaneSurfaceState::Loading {
+                target: pending,
+                transactional: true,
+            } if pending == &target
+        ));
+
+        loading.finish_pane_load(Pane::Left, PaneLoadId(1));
+        loading.pane_load_errors.insert(
+            Pane::Left,
+            PaneLoadUiError {
+                attempted: target.clone(),
+                message: "SSH connection failed".into(),
+            },
+        );
+        assert!(matches!(
+            pane_surface_state(&loading, Pane::Left, 4, 4),
+            PaneSurfaceState::LoadError { attempted, message }
+                if attempted == &target && message == "SSH connection failed"
+        ));
+    }
+
+    #[test]
+    fn failed_navigation_keeps_location_and_success_clears_error() {
+        let mut state = AppState::default();
+        let original = state.left.location.clone();
+        let target = Location::Local("/target".into());
+        let mut left_entries = vec![file("current.txt")];
+        let mut right_entries = Vec::new();
+
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(1),
+            target.clone(),
+            PaneLoadPurpose::Navigate {
+                remember_current: true,
+            },
+        );
+        apply_pane_load_response(
+            PaneLoadResponse {
+                id: PaneLoadId(1),
+                pane: Pane::Left,
+                location: target.clone(),
+                purpose: PaneLoadPurpose::Navigate {
+                    remember_current: true,
+                },
+                result: Err(std::io::Error::other("permission denied")),
+            },
+            &mut state,
+            &mut left_entries,
+            &mut right_entries,
+        );
+
+        assert_eq!(state.left.location, original);
+        assert_eq!(left_entries, vec![file("current.txt")]);
+        assert_eq!(
+            state
+                .pane_load_errors
+                .get(&Pane::Left)
+                .map(|error| &error.attempted),
+            Some(&target)
+        );
+
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(2),
+            target.clone(),
+            PaneLoadPurpose::Navigate {
+                remember_current: true,
+            },
+        );
+        apply_pane_load_response(
+            PaneLoadResponse {
+                id: PaneLoadId(2),
+                pane: Pane::Left,
+                location: target.clone(),
+                purpose: PaneLoadPurpose::Navigate {
+                    remember_current: true,
+                },
+                result: Ok(Vec::new()),
+            },
+            &mut state,
+            &mut left_entries,
+            &mut right_entries,
+        );
+
+        assert_eq!(state.left.location, target);
+        assert!(!state.pane_load_errors.contains_key(&Pane::Left));
+    }
+
+    #[test]
+    fn empty_hosts_overlay_is_real_and_truthful() {
+        let mut state = AppState::default();
+        state.hosts.clear();
+
+        toggle_hosts_overlay(&mut state);
+
+        assert_eq!(state.active_overlay(), Some(OverlayKind::Hosts));
+        let text = empty_hosts_text();
+        assert!(text.contains("~/.config/arx/hosts.toml"));
+        assert!(!text.contains("~/.ssh/config"));
     }
 }
