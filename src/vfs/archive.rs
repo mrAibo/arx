@@ -88,6 +88,7 @@ impl ArchiveFs {
                         name: dir_name.to_string(),
                         kind: EntryKind::Directory,
                         size: None,
+                        modified_unix_ms: None,
                     });
                 }
                 continue;
@@ -100,6 +101,7 @@ impl ArchiveFs {
                     name: relative,
                     kind: EntryKind::File,
                     size: None,
+                    modified_unix_ms: None,
                 });
             }
         }

@@ -4521,6 +4521,7 @@ mod tests {
             name: name.into(),
             kind: EntryKind::File,
             size: Some(1),
+            modified_unix_ms: None,
         }
     }
 

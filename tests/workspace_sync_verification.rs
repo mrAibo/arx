@@ -5,7 +5,7 @@ use arx::app::RemoteWorkspaceState;
 use arx::jobs::{JobEvent, JobManager, JobResult, JobStatus};
 use arx::journal::OperationJournal;
 use arx::services::{WorkspaceScanId, WorkspaceScanOptions, WorkspaceScanResponse};
-use arx::vfs::{EntryKind, Location, default_registry};
+use arx::vfs::{EntryKind, Location, default_registry, local::LocalFs};
 use arx::workspace_sync::{
     SyncPolicy, WorkspaceDiff, WorkspaceEntry, WorkspaceFingerprint, WorkspaceSide,
     WorkspaceSyncPlan,
@@ -60,9 +60,24 @@ fn test_plan_id() -> SyncPlanId {
 }
 
 fn compile_local(left: &Path, right: &Path, files: &[&str]) -> CompiledSyncPlan {
+    let listed = LocalFs::list(left).expect("local verification fixture should be listable");
     let left_entries = files
         .iter()
-        .map(|name| entry(name, fingerprint(Some(1), None, None)))
+        .map(|name| {
+            let provider_entry = listed
+                .iter()
+                .find(|item| item.name == *name)
+                .unwrap_or_else(|| panic!("missing local verification fixture entry: {name}"));
+            entry(
+                name,
+                WorkspaceFingerprint {
+                    kind: provider_entry.kind,
+                    size: provider_entry.size,
+                    modified_unix_ms: provider_entry.modified_unix_ms,
+                    content_hash: None,
+                },
+            )
+        })
         .collect::<Vec<_>>();
     let diff = WorkspaceDiff::compare(
         local(left.to_path_buf()),
@@ -291,7 +306,7 @@ async fn second_verification_supersedes_first_generation() {
 }
 
 #[tokio::test]
-async fn completed_job_stays_completed_when_verification_is_inconclusive() {
+async fn completed_job_stays_completed_when_verification_is_synchronized() {
     let left = tempfile::tempdir().unwrap();
     let right = tempfile::tempdir().unwrap();
     tokio::fs::write(left.path().join("a.txt"), b"a")
@@ -328,10 +343,7 @@ async fn completed_job_stays_completed_when_verification_is_inconclusive() {
     let SyncVerificationStatus::Finished(result) = &verification.status else {
         panic!("verification did not finish");
     };
-    assert_eq!(
-        result.verdict,
-        SyncVerificationVerdict::Inconclusive { unverified: 1 }
-    );
+    assert_eq!(result.verdict, SyncVerificationVerdict::Synchronized);
 }
 
 #[tokio::test]

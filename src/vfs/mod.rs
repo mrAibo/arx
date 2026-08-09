@@ -532,6 +532,19 @@ pub struct Entry {
     pub name: String,
     pub kind: EntryKind,
     pub size: Option<u64>,
+    /// Provider-reported modification time normalized to whole-second Unix
+    /// resolution and represented as milliseconds. Optional because not every
+    /// provider can supply trustworthy modification metadata.
+    pub modified_unix_ms: Option<u64>,
+}
+
+pub(crate) fn canonical_unix_mtime_ms(seconds: u64) -> u64 {
+    seconds.saturating_mul(1_000)
+}
+
+pub(crate) fn canonical_system_mtime_ms(time: std::time::SystemTime) -> Option<u64> {
+    let duration = time.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(canonical_unix_mtime_ms(duration.as_secs()))
 }
 
 /// Abstract VFS operations — backend-agnostic interface.

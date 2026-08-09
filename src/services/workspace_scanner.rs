@@ -136,9 +136,9 @@ pub async fn scan_workspace(
                 fingerprint: WorkspaceFingerprint {
                     kind: entry.kind,
                     size: entry.size,
-                    // Safe default: lack of mtime/hash means comparison remains
-                    // conservative (`Different`) rather than guessing equality.
-                    modified_unix_ms: None,
+                    // Providers may supply canonical mtime evidence. Hashes remain
+                    // optional; missing evidence stays conservative rather than guessing equality.
+                    modified_unix_ms: entry.modified_unix_ms,
                     content_hash: None,
                 },
             });
@@ -186,6 +186,18 @@ mod tests {
             .map(|entry| entry.relative_path.as_str())
             .collect();
         assert_eq!(paths, vec!["README.md", "src", "src/main.rs"]);
+
+        let direct_mtime = crate::vfs::local::LocalFs::list(root.path())
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name == "README.md")
+            .and_then(|entry| entry.modified_unix_ms);
+        let scanned_mtime = entries
+            .iter()
+            .find(|entry| entry.relative_path == "README.md")
+            .and_then(|entry| entry.fingerprint.modified_unix_ms);
+        assert_eq!(scanned_mtime, direct_mtime);
+        assert!(scanned_mtime.is_some());
     }
 
     #[tokio::test]

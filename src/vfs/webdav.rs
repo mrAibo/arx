@@ -61,6 +61,7 @@ impl VfsProvider for WebDavProvider {
                     EntryKind::File
                 },
                 size: None,
+                modified_unix_ms: None,
             });
         }
         Ok(entries)

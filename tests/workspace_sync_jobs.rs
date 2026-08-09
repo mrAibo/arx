@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 
 use arx::jobs::{JobEvent, JobKind, JobManager, JobProgress, JobResult, JobStatus};
 use arx::journal::OperationJournal;
-use arx::vfs::{EntryKind, Location, default_registry};
+use arx::vfs::{EntryKind, Location, default_registry, local::LocalFs};
 use arx::workspace_sync::{
     SyncPolicy, WorkspaceDiff, WorkspaceEntry, WorkspaceFingerprint, WorkspaceSyncPlan,
 };
@@ -30,7 +30,37 @@ fn file(path: &str, size: u64) -> WorkspaceEntry {
     }
 }
 
+fn with_local_evidence(root: &Path, entries: Vec<WorkspaceEntry>) -> Vec<WorkspaceEntry> {
+    entries
+        .into_iter()
+        .map(|mut item| {
+            let relative = Path::new(&item.relative_path);
+            let parent = relative
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| root.join(path))
+                .unwrap_or_else(|| root.to_path_buf());
+            let Some(name) = relative.file_name().and_then(|name| name.to_str()) else {
+                return item;
+            };
+
+            if let Ok(entries) = LocalFs::list(&parent)
+                && let Some(entry) = entries.into_iter().find(|entry| entry.name == name)
+            {
+                item.fingerprint = WorkspaceFingerprint {
+                    kind: entry.kind,
+                    size: entry.size,
+                    modified_unix_ms: entry.modified_unix_ms,
+                    content_hash: None,
+                };
+            }
+            item
+        })
+        .collect()
+}
+
 fn compile_local(left: &Path, right: &Path, left_entries: Vec<WorkspaceEntry>) -> CompiledSyncPlan {
+    let left_entries = with_local_evidence(left, left_entries);
     let diff = WorkspaceDiff::compare(
         local(left.to_path_buf()),
         local(right.to_path_buf()),

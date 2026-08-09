@@ -1,4 +1,4 @@
-use super::Entry;
+use super::{Entry, EntryKind, canonical_unix_mtime_ms};
 use crate::remote::Host;
 use anyhow::Context;
 use std::collections::BTreeSet;
@@ -56,16 +56,25 @@ fn entries_from_read_dir(read_dir: Vec<russh_sftp::client::fs::DirEntry>) -> Vec
         }
         let metadata = entry.metadata();
         let kind = if metadata.is_dir() {
-            super::EntryKind::Directory
+            EntryKind::Directory
         } else if metadata.is_symlink() {
-            super::EntryKind::Symlink
+            EntryKind::Symlink
         } else {
-            super::EntryKind::File
+            EntryKind::File
         };
+        let size = if kind == EntryKind::File {
+            Some(metadata.len())
+        } else {
+            None
+        };
+        let modified_unix_ms = metadata
+            .mtime
+            .map(|seconds| canonical_unix_mtime_ms(u64::from(seconds)));
         result.push(Entry {
             name,
             kind,
-            size: Some(metadata.len()),
+            size,
+            modified_unix_ms,
         });
     }
 
@@ -169,5 +178,22 @@ impl VfsProvider for SftpProvider {
 
     fn delete_files(&self, _dir: &str, _names: &[String]) -> std::io::Result<usize> {
         Err(std::io::Error::other("SFTP delete via transfer planner"))
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn sftp_mtime_uses_canonical_second_resolution() {
+        let mut metadata = russh_sftp::protocol::FileAttributes::empty();
+        metadata.mtime = Some(1_234);
+
+        let modified_unix_ms = metadata
+            .mtime
+            .map(|seconds| canonical_unix_mtime_ms(u64::from(seconds)));
+
+        assert_eq!(modified_unix_ms, Some(1_234_000));
     }
 }
