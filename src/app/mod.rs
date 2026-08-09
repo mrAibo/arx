@@ -55,6 +55,46 @@ pub struct PaneLoadUiError {
     pub attempted: Location,
     pub message: String,
 }
+
+/// One-process UX milestones. These intentionally reset with every AppState
+/// and do not imply persisted onboarding state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionMilestones {
+    pub compare_success_seen: bool,
+    pub verified_sync_success_seen: bool,
+}
+
+impl SessionMilestones {
+    pub fn take_compare_success(&mut self) -> bool {
+        if self.compare_success_seen {
+            false
+        } else {
+            self.compare_success_seen = true;
+            true
+        }
+    }
+
+    pub fn take_verified_sync_success(&mut self) -> bool {
+        if self.verified_sync_success_seen {
+            false
+        } else {
+            self.verified_sync_success_seen = true;
+            true
+        }
+    }
+}
+
+/// Passive presentation derived from already-accepted runtime truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCallout {
+    CompareCompleted {
+        differences: usize,
+        bytes_to_transfer: u64,
+    },
+    WorkspaceSyncVerified {
+        job_id: String,
+    },
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortMode {
     NameAsc,
@@ -152,6 +192,9 @@ pub struct AppState {
     pub git_status_location: Option<Location>,
     /// Local ↔ remote (or any provider ↔ provider) comparison/sync workspace.
     pub remote_workspace: RemoteWorkspaceState,
+    /// Session-only first-success presentation state. No config persistence.
+    pub milestones: SessionMilestones,
+    pub session_callout: Option<SessionCallout>,
     /// Latest effect per lane. Older responses are discarded deterministically.
     pub pending_effects: BTreeMap<EffectLane, EffectId>,
     /// Latest async VFS load generation for each pane.
@@ -263,6 +306,8 @@ impl Default for AppState {
             git_status: String::new(),
             git_status_location: None,
             remote_workspace: RemoteWorkspaceState::default(),
+            milestones: SessionMilestones::default(),
+            session_callout: None,
             pending_effects: BTreeMap::new(),
             pending_pane_loads: BTreeMap::new(),
             pending_pane_targets: BTreeMap::new(),
@@ -326,6 +371,10 @@ impl Default for AppState {
 }
 
 impl AppState {
+    pub fn dismiss_session_callout(&mut self) {
+        self.session_callout = None;
+    }
+
     pub fn register_pane_load(
         &mut self,
         pane: Pane,
@@ -542,5 +591,21 @@ mod tests {
             ..AppState::default()
         };
         assert!(state.cmd_prefix);
+    }
+
+    #[test]
+    fn session_milestones_are_one_shot_and_reset_with_app_state() {
+        let mut state = AppState::default();
+        assert!(!state.milestones.compare_success_seen);
+        assert!(!state.milestones.verified_sync_success_seen);
+        assert!(state.milestones.take_compare_success());
+        assert!(!state.milestones.take_compare_success());
+        assert!(state.milestones.take_verified_sync_success());
+        assert!(!state.milestones.take_verified_sync_success());
+
+        let restarted = AppState::default();
+        assert!(!restarted.milestones.compare_success_seen);
+        assert!(!restarted.milestones.verified_sync_success_seen);
+        assert!(restarted.session_callout.is_none());
     }
 }

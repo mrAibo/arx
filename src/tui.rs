@@ -1,7 +1,7 @@
 use arx::app::{
     Action, ActionAvailability, ActionContext, AppState, CommandItem, CommandKind, CommandTarget,
-    OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SortMode, WorkspaceSyncUxState,
-    action_availability, action_meta, build_command_items,
+    OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SessionCallout, SortMode,
+    WorkspaceSyncUxState, action_availability, action_meta, build_command_items,
 };
 use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectResponse, EffectScope};
 use arx::effects::{Effect, EffectEvent};
@@ -216,6 +216,9 @@ async fn event_loop(
                 // event, so its render snapshot is useful even when pane roots
                 // have moved and RemoteWorkspaceState rejects the old diff.
                 state.jobs = job_manager.snapshot();
+                if let Some(job) = job_manager.get(&event.job_id) {
+                    observe_verified_sync_success(&mut state, &job);
+                }
                 if accepted {
                     state.remote_workspace.sync_verification_stage(&event.job_id);
                 } else {
@@ -256,6 +259,9 @@ async fn event_loop(
             }
         };
         if let Some(event) = next_input {
+            if matches!(&event, Event::Key(_) | Event::Mouse(_)) {
+                state.dismiss_session_callout();
+            }
             match event {
                 Event::Key(key) if state.show_terminal && state.active == Pane::Right => {
                     use crossterm::event::KeyCode as KC;
@@ -2072,6 +2078,67 @@ fn render_contextual_footer(
     );
 }
 
+fn session_callout_text(state: &AppState, key_router: &KeyRouter) -> Option<String> {
+    let callout = state.session_callout.as_ref()?;
+    if session_callout_is_embedded(state, callout) {
+        return None;
+    }
+
+    match callout {
+        SessionCallout::CompareCompleted {
+            differences,
+            bytes_to_transfer,
+        } => {
+            if *differences == 0 {
+                return Some("✓ Workspace compared · No proven differences found.".into());
+            }
+
+            let changes = if *differences == 1 {
+                "1 change found".to_string()
+            } else {
+                format!("{differences} changes found")
+            };
+            let transfer = if *bytes_to_transfer > 0 {
+                format!(" · {} planned", format_size(*bytes_to_transfer))
+            } else {
+                String::new()
+            };
+            let next = if state.remote_workspace.preview_open {
+                String::new()
+            } else {
+                contextual_hints(state, key_router.keymap())
+                    .into_iter()
+                    .find(|hint| hint.action == Action::PreviewWorkspaceSync.id())
+                    .map(|hint| format!(" · {} {}", hint.binding, hint.label))
+                    .unwrap_or_default()
+            };
+            Some(format!("✓ Workspace compared · {changes}{transfer}{next}"))
+        }
+        SessionCallout::WorkspaceSyncVerified { .. } => Some(
+            "✓ First workspace sync verified this session · Both workspace roots are synchronized."
+                .into(),
+        ),
+    }
+}
+
+fn session_callout_is_embedded(state: &AppState, callout: &SessionCallout) -> bool {
+    let SessionCallout::WorkspaceSyncVerified { job_id } = callout else {
+        return false;
+    };
+    state.active_overlay() == Some(OverlayKind::SyncPreview)
+        && state.remote_workspace.ux.job_id() == Some(job_id.as_str())
+}
+
+fn render_session_callout(frame: &mut ratatui::Frame, area: Rect, text: &str) {
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            text.to_string(),
+            Style::default().fg(Color::Green),
+        )),
+        area,
+    );
+}
+
 /// Check if a filename looks like an archive (tar, tgz, zip).
 fn is_archive(name: &str) -> bool {
     name.ends_with(".tar")
@@ -2098,14 +2165,25 @@ fn render(
     message: Option<&str>,
 ) {
     let area = frame.area();
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    let session_callout = session_callout_text(state, key_router);
+    let constraints = if session_callout.is_some() {
+        vec![
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(1),
-        ])
+            Constraint::Length(1),
+        ]
+    } else {
+        vec![
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ]
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(area);
 
     let panes = Layout::default()
@@ -2613,9 +2691,18 @@ fn render(
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(status, chunks[1]);
 
+    // Session milestones are passive presentation. They never own backend
+    // state and disappear on the next user interaction.
+    let footer_area = if let Some(callout) = session_callout.as_deref() {
+        render_session_callout(frame, chunks[2], callout);
+        chunks[3]
+    } else {
+        chunks[2]
+    };
+
     // Contextual footer is derived from the same runtime Keymap that owns
     // keyboard routing. A pending chord leaves discovery to Which-Key.
-    render_contextual_footer(frame, chunks[2], state, key_router);
+    render_contextual_footer(frame, footer_area, state, key_router);
 
     if state.active_overlay() == Some(OverlayKind::SyncPreview) {
         render_sync_preview(frame, area, state);
@@ -2719,7 +2806,16 @@ fn render_sync_preview(frame: &mut ratatui::Frame, area: Rect, state: &AppState)
         | WorkspaceSyncUxState::Finished { job_id } => {
             if let Some(job) = state.jobs.iter().find(|job| job.id == *job_id) {
                 title = sync_job_title(job, &state.remote_workspace.ux);
-                render_sync_job_lines(job, &state.remote_workspace.ux, &mut lines);
+                let show_first_success = matches!(
+                    state.session_callout.as_ref(),
+                    Some(SessionCallout::WorkspaceSyncVerified { job_id }) if job_id == &job.id
+                );
+                render_sync_job_lines(
+                    job,
+                    &state.remote_workspace.ux,
+                    show_first_success,
+                    &mut lines,
+                );
             } else {
                 lines.push(Line::from("Waiting for JobManager snapshot…"));
             }
@@ -2868,6 +2964,7 @@ fn sync_job_title(job: &arx::jobs::Job, ux: &WorkspaceSyncUxState) -> String {
 fn render_sync_job_lines(
     job: &arx::jobs::Job,
     ux: &WorkspaceSyncUxState,
+    show_first_success: bool,
     lines: &mut Vec<Line<'static>>,
 ) {
     if let (Some(source), Some(destination)) = (job.display_source(), job.display_destination()) {
@@ -2995,6 +3092,18 @@ fn render_sync_job_lines(
         lines.push(Line::from(""));
         lines.push(sync_heading("POST-SYNC VERIFICATION", Color::Cyan));
         render_verification_lines(job, lines);
+        if show_first_success {
+            lines.push(Line::from(""));
+            lines.push(sync_heading("FIRST SUCCESS THIS SESSION", Color::Green));
+            lines.push(Line::from(Span::styled(
+                "✓ Remote Workspace workflow completed end-to-end.",
+                Style::default().fg(Color::Green),
+            )));
+            lines.push(Line::from(Span::styled(
+                "ARX executed the frozen plan and verified the result.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
 }
 fn render_sync_verification_diff_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>>) {
@@ -3817,6 +3926,61 @@ fn job_event_id(event: &arx::jobs::JobEvent) -> &str {
     }
 }
 
+fn observe_compare_success(state: &mut AppState) {
+    let Some(diff) = state.remote_workspace.diff.as_ref() else {
+        return;
+    };
+    let differences = diff.changed_count();
+    let bytes_to_transfer = state
+        .remote_workspace
+        .plan
+        .as_ref()
+        .map(|plan| plan.bytes_to_transfer)
+        .unwrap_or(0);
+    if state.milestones.take_compare_success() {
+        state.session_callout = Some(SessionCallout::CompareCompleted {
+            differences,
+            bytes_to_transfer,
+        });
+    }
+}
+
+fn is_verified_sync_success(job: &arx::jobs::Job) -> bool {
+    if job.status != arx::jobs::JobStatus::Completed {
+        return false;
+    }
+    let execution_completed = matches!(
+        &job.result,
+        Some(arx::jobs::JobResult::WorkspaceSync(outcome))
+            if matches!(
+                &outcome.terminal,
+                arx::workspace_sync_executor::SyncTerminalState::Completed
+            )
+    );
+    if !execution_completed {
+        return false;
+    }
+
+    job.verification.as_ref().is_some_and(|verification| {
+        matches!(
+            &verification.status,
+            SyncVerificationStatus::Finished(result)
+                if result.verdict == SyncVerificationVerdict::Synchronized
+        )
+    })
+}
+
+fn observe_verified_sync_success(state: &mut AppState, job: &arx::jobs::Job) {
+    if !is_verified_sync_success(job) {
+        return;
+    }
+    if state.milestones.take_verified_sync_success() {
+        state.session_callout = Some(SessionCallout::WorkspaceSyncVerified {
+            job_id: job.id.clone(),
+        });
+    }
+}
+
 /// Present an already-accepted JobManager event. Lifecycle state lives in JobManager.
 fn handle_job_event(ev: &arx::jobs::JobEvent, state: &mut AppState) -> bool {
     match ev {
@@ -4183,6 +4347,7 @@ fn handle_workspace_scan_response(response: WorkspaceScanResponse, state: &mut A
         .remote_workspace
         .try_build_recursive_diff(state.left.location.clone(), state.right.location.clone())
     {
+        observe_compare_success(state);
         state.message = Some(state.remote_workspace.summary());
     } else {
         let waiting = match side {
@@ -4311,7 +4476,18 @@ mod tests {
     use super::*;
     use arx::app::{Action, InputContext};
     use arx::input::{KeyBinding, KeyStroke, Keymap};
-    use arx::services::PaneLoadId;
+    use arx::jobs::{Job, JobKind, JobResult, JobStatus};
+    use arx::services::{PaneLoadId, WorkspaceScanId};
+    use arx::workspace_sync::{
+        WorkspaceDiff, WorkspaceEntry, WorkspaceFingerprint, WorkspaceSyncPlan,
+    };
+    use arx::workspace_sync_execution::SyncPlanValidator;
+    use arx::workspace_sync_executor::{
+        SyncExecutionOutcome, SyncJournalFinalization, SyncTerminalState,
+    };
+    use arx::workspace_sync_verification::{
+        SyncVerificationId, SyncVerificationResult, SyncVerificationSnapshot,
+    };
 
     #[test]
     fn footer_uses_runtime_keymap() {
@@ -4543,5 +4719,346 @@ mod tests {
         let text = empty_hosts_text();
         assert!(text.contains("~/.config/arx/hosts.toml"));
         assert!(!text.contains("~/.ssh/config"));
+    }
+
+    fn workspace_entry(
+        name: &str,
+        size: u64,
+        modified_unix_ms: Option<u64>,
+        content_hash: Option<&str>,
+    ) -> WorkspaceEntry {
+        WorkspaceEntry {
+            relative_path: name.into(),
+            fingerprint: WorkspaceFingerprint {
+                kind: EntryKind::File,
+                size: Some(size),
+                modified_unix_ms,
+                content_hash: content_hash.map(str::to_string),
+            },
+        }
+    }
+
+    fn accept_workspace_compare(
+        state: &mut AppState,
+        left_entries: Vec<WorkspaceEntry>,
+        right_entries: Vec<WorkspaceEntry>,
+        generation: u64,
+    ) {
+        let left = Location::Local("/left".into());
+        let right = Location::Local("/right".into());
+        state.left.location = left.clone();
+        state.right.location = right.clone();
+        state.remote_workspace.enabled = true;
+        let _ = state.remote_workspace.begin_recursive_scan();
+        let left_id = WorkspaceScanId(generation * 2 + 1);
+        let right_id = WorkspaceScanId(generation * 2 + 2);
+        state
+            .remote_workspace
+            .register_scan(WorkspaceSide::Left, left_id);
+        state
+            .remote_workspace
+            .register_scan(WorkspaceSide::Right, right_id);
+
+        handle_workspace_scan_response(
+            WorkspaceScanResponse {
+                id: left_id,
+                side: WorkspaceSide::Left,
+                root: left,
+                result: Ok(left_entries),
+            },
+            state,
+        );
+        handle_workspace_scan_response(
+            WorkspaceScanResponse {
+                id: right_id,
+                side: WorkspaceSide::Right,
+                root: right,
+                result: Ok(right_entries),
+            },
+            state,
+        );
+    }
+
+    #[test]
+    fn compare_milestone_is_one_per_session_and_uses_runtime_binding() {
+        let mut state = AppState::default();
+        accept_workspace_compare(
+            &mut state,
+            vec![workspace_entry("payload.bin", 84, None, None)],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(
+            state.session_callout,
+            Some(SessionCallout::CompareCompleted {
+                differences: 1,
+                bytes_to_transfer: 84,
+            })
+        );
+
+        let keymap = Keymap::new(vec![KeyBinding::new(
+            InputContext::Browser,
+            vec![KeyStroke::new(KeyCode::F(12), KeyModifiers::NONE)],
+            Action::PreviewWorkspaceSync,
+        )]);
+        let text = session_callout_text(&state, &KeyRouter::new(keymap)).unwrap_or_default();
+        assert!(text.contains("1 change found"));
+        assert!(text.contains("F12 Preview workspace sync"));
+
+        state.dismiss_session_callout();
+        accept_workspace_compare(
+            &mut state,
+            vec![workspace_entry("second.bin", 21, None, None)],
+            Vec::new(),
+            2,
+        );
+        assert!(state.session_callout.is_none());
+    }
+
+    #[test]
+    fn compare_milestone_never_claims_unproven_equality() {
+        let mut equal = AppState::default();
+        accept_workspace_compare(
+            &mut equal,
+            vec![workspace_entry("same.bin", 10, None, Some("same"))],
+            vec![workspace_entry("same.bin", 10, None, Some("same"))],
+            1,
+        );
+        let equal_text = session_callout_text(&equal, &KeyRouter::default()).unwrap_or_default();
+        assert!(equal_text.contains("No proven differences found."));
+        assert!(!equal_text.to_lowercase().contains("identical"));
+        assert!(!equal_text.contains("changes found"));
+
+        let mut unproven = AppState::default();
+        accept_workspace_compare(
+            &mut unproven,
+            vec![workspace_entry("unknown.bin", 10, None, None)],
+            vec![workspace_entry("unknown.bin", 10, None, None)],
+            1,
+        );
+        let unproven_text =
+            session_callout_text(&unproven, &KeyRouter::default()).unwrap_or_default();
+        assert!(unproven_text.contains("1 change found"));
+        assert!(!unproven_text.to_lowercase().contains("identical"));
+    }
+
+    fn test_plan_id() -> arx::workspace_sync_execution::SyncPlanId {
+        let diff = WorkspaceDiff::compare(
+            Location::Local("/left".into()),
+            Location::Local("/right".into()),
+            vec![workspace_entry("a.txt", 1, None, None)],
+            Vec::new(),
+        );
+        let plan = WorkspaceSyncPlan::build(&diff, arx::workspace_sync::SyncPolicy::default());
+        SyncPlanValidator::freeze(&plan, &diff, &arx::vfs::default_registry())
+            .expect("freeze test plan")
+            .id()
+    }
+
+    fn verification_snapshot(
+        plan_id: arx::workspace_sync_execution::SyncPlanId,
+        status: SyncVerificationStatus,
+    ) -> SyncVerificationSnapshot {
+        SyncVerificationSnapshot {
+            id: SyncVerificationId(1),
+            plan_id,
+            left_root: Location::Local("/left".into()),
+            right_root: Location::Local("/right".into()),
+            status,
+        }
+    }
+
+    fn synchronized_result(
+        plan_id: arx::workspace_sync_execution::SyncPlanId,
+    ) -> SyncVerificationResult {
+        SyncVerificationResult::from_diff(
+            plan_id,
+            WorkspaceDiff::compare(
+                Location::Local("/left".into()),
+                Location::Local("/right".into()),
+                Vec::new(),
+                Vec::new(),
+            ),
+        )
+    }
+
+    fn differences_result(
+        plan_id: arx::workspace_sync_execution::SyncPlanId,
+    ) -> SyncVerificationResult {
+        SyncVerificationResult::from_diff(
+            plan_id,
+            WorkspaceDiff::compare(
+                Location::Local("/left".into()),
+                Location::Local("/right".into()),
+                vec![workspace_entry("left-only", 1, None, Some("left"))],
+                Vec::new(),
+            ),
+        )
+    }
+
+    fn inconclusive_result(
+        plan_id: arx::workspace_sync_execution::SyncPlanId,
+    ) -> SyncVerificationResult {
+        SyncVerificationResult::from_diff(
+            plan_id,
+            WorkspaceDiff::compare(
+                Location::Local("/left".into()),
+                Location::Local("/right".into()),
+                vec![workspace_entry("unknown", 1, None, None)],
+                vec![workspace_entry("unknown", 1, None, None)],
+            ),
+        )
+    }
+
+    fn sync_job(
+        plan_id: arx::workspace_sync_execution::SyncPlanId,
+        id: &str,
+        job_status: JobStatus,
+        terminal: SyncTerminalState,
+        verification_status: SyncVerificationStatus,
+        journal: SyncJournalFinalization,
+    ) -> Job {
+        let manager = arx::jobs::JobManager::new();
+        let mut job = manager.create_job(
+            id,
+            JobKind::Synchronize,
+            "test sync",
+            Some(Location::Local("/left".into())),
+            Some(Location::Local("/right".into())),
+        );
+        job.status = job_status;
+        job.result = Some(JobResult::WorkspaceSync(SyncExecutionOutcome {
+            plan_id,
+            completed: Vec::new(),
+            terminal,
+            remaining: Vec::new(),
+            transferred_bytes: 0,
+            workspace_may_have_changed: true,
+            journal,
+        }));
+        job.verification = Some(verification_snapshot(plan_id, verification_status));
+        job
+    }
+
+    #[test]
+    fn verified_sync_milestone_requires_completed_and_synchronized() {
+        let plan_id = test_plan_id();
+        let cases = [
+            sync_job(
+                plan_id,
+                "diff",
+                JobStatus::Completed,
+                SyncTerminalState::Completed,
+                SyncVerificationStatus::Finished(Box::new(differences_result(plan_id))),
+                SyncJournalFinalization::Recorded,
+            ),
+            sync_job(
+                plan_id,
+                "inconclusive",
+                JobStatus::Completed,
+                SyncTerminalState::Completed,
+                SyncVerificationStatus::Finished(Box::new(inconclusive_result(plan_id))),
+                SyncJournalFinalization::Failed {
+                    error: "audit warning".into(),
+                },
+            ),
+            sync_job(
+                plan_id,
+                "verification-failed",
+                JobStatus::Completed,
+                SyncTerminalState::Completed,
+                SyncVerificationStatus::Failed {
+                    side: None,
+                    error: "scan failed".into(),
+                },
+                SyncJournalFinalization::Recorded,
+            ),
+            sync_job(
+                plan_id,
+                "cancelled",
+                JobStatus::Cancelled,
+                SyncTerminalState::Cancelled { completed_steps: 0 },
+                SyncVerificationStatus::Finished(Box::new(synchronized_result(plan_id))),
+                SyncJournalFinalization::Recorded,
+            ),
+            sync_job(
+                plan_id,
+                "failed",
+                JobStatus::Failed,
+                SyncTerminalState::Failed {
+                    step: arx::workspace_sync_executor::PhysicalStepId(1),
+                    error: arx::workspace_sync_executor::SyncExecutionError::Mutation {
+                        path: "a".into(),
+                        error: "boom".into(),
+                    },
+                },
+                SyncVerificationStatus::Finished(Box::new(synchronized_result(plan_id))),
+                SyncJournalFinalization::Recorded,
+            ),
+        ];
+
+        for job in cases {
+            let mut state = AppState::default();
+            observe_verified_sync_success(&mut state, &job);
+            assert!(
+                state.session_callout.is_none(),
+                "unexpected milestone for {}",
+                job.id
+            );
+            assert!(!state.milestones.verified_sync_success_seen);
+        }
+    }
+
+    #[test]
+    fn verified_sync_milestone_is_one_per_session_and_does_not_steal_focus() {
+        let plan_id = test_plan_id();
+        let first = sync_job(
+            plan_id,
+            "first",
+            JobStatus::Completed,
+            SyncTerminalState::Completed,
+            SyncVerificationStatus::Finished(Box::new(synchronized_result(plan_id))),
+            SyncJournalFinalization::Recorded,
+        );
+        let second = sync_job(
+            plan_id,
+            "second",
+            JobStatus::Completed,
+            SyncTerminalState::Completed,
+            SyncVerificationStatus::Finished(Box::new(synchronized_result(plan_id))),
+            SyncJournalFinalization::Recorded,
+        );
+        let mut state = AppState::default();
+        let previous_ux = state.remote_workspace.ux.clone();
+
+        observe_verified_sync_success(&mut state, &first);
+        assert_eq!(state.remote_workspace.ux, previous_ux);
+        assert_eq!(state.active_overlay(), None);
+        assert!(matches!(
+            state.session_callout,
+            Some(SessionCallout::WorkspaceSyncVerified { ref job_id }) if job_id == &first.id
+        ));
+
+        state.dismiss_session_callout();
+        observe_verified_sync_success(&mut state, &second);
+        assert!(state.session_callout.is_none());
+    }
+
+    #[test]
+    fn verified_sync_callout_embeds_only_in_its_open_finished_overlay() {
+        let mut state = AppState::default();
+        state.remote_workspace.preview_open = true;
+        state.remote_workspace.ux = WorkspaceSyncUxState::Finished {
+            job_id: "sync-1".into(),
+        };
+        state.session_callout = Some(SessionCallout::WorkspaceSyncVerified {
+            job_id: "sync-1".into(),
+        });
+
+        assert!(session_callout_text(&state, &KeyRouter::default()).is_none());
+        state.remote_workspace.ux = WorkspaceSyncUxState::Finished {
+            job_id: "sync-other".into(),
+        };
+        assert!(session_callout_text(&state, &KeyRouter::default()).is_some());
     }
 }
