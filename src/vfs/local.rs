@@ -40,11 +40,22 @@ impl LocalFs {
                     Some(ft) if ft.is_file() => EntryKind::File,
                     _ => EntryKind::Other,
                 };
-                let size = file_type
-                    .filter(|ft| ft.is_file())
-                    .and_then(|_| e.metadata().ok())
-                    .map(|m| m.len());
-                Entry { name, kind, size }
+                let metadata = e.metadata().ok();
+                let size = if kind == EntryKind::File {
+                    metadata.as_ref().map(|metadata| metadata.len())
+                } else {
+                    None
+                };
+                let modified_unix_ms = metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(crate::vfs::canonical_system_mtime_ms);
+                Entry {
+                    name,
+                    kind,
+                    size,
+                    modified_unix_ms,
+                }
             })
             .collect();
 
@@ -365,6 +376,14 @@ mod tests {
         assert_eq!(entries[1].name, "a.txt");
         assert_eq!(entries[1].kind, EntryKind::File);
         assert_eq!(entries[1].size, Some(5));
+        let mtime = entries[1]
+            .modified_unix_ms
+            .expect("local entry should expose modification time");
+        assert_eq!(
+            mtime % 1_000,
+            0,
+            "mtime is canonical whole-second milliseconds"
+        );
     }
 
     #[test]

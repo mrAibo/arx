@@ -565,7 +565,7 @@ async fn fingerprint_location(
         .map(|entry| WorkspaceFingerprint {
             kind: entry.kind,
             size: entry.size,
-            modified_unix_ms: None,
+            modified_unix_ms: entry.modified_unix_ms,
             content_hash: None,
         }))
 }

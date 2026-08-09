@@ -519,23 +519,25 @@ mod tests {
         let left = tempfile::tempdir().unwrap();
         let right = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("missing-target", left.path().join("link")).unwrap();
-        let source = WorkspaceEntry {
-            relative_path: "link".into(),
-            fingerprint: WorkspaceFingerprint {
-                kind: EntryKind::Symlink,
-                size: None,
-                modified_unix_ms: None,
-                content_hash: None,
-            },
-        };
+        let registry = default_registry();
+        let left_root = Location::Local(left.path().to_path_buf());
+        let right_root = Location::Local(right.path().to_path_buf());
+        let cancel = AtomicBool::new(false);
         let diff = WorkspaceDiff::compare(
-            Location::Local(left.path().to_path_buf()),
-            Location::Local(right.path().to_path_buf()),
-            vec![source],
+            left_root.clone(),
+            right_root.clone(),
+            scan_workspace(
+                &registry,
+                &left_root,
+                WorkspaceScanOptions::default(),
+                &cancel,
+            )
+            .await
+            .unwrap(),
             Vec::<WorkspaceEntry>::new(),
         );
         let plan = WorkspaceSyncPlan::build(&diff, SyncPolicy::default());
-        let controller = WorkspaceSyncController::new(default_registry());
+        let controller = WorkspaceSyncController::new(registry);
         let frozen = controller.freeze(&plan, &diff).unwrap();
         let jobs = JobManager::new();
         let (job_tx, _job_rx) = mpsc::unbounded_channel();
@@ -561,16 +563,27 @@ mod tests {
         tokio::fs::write(left.path().join("a.txt"), b"a")
             .await
             .unwrap();
+        let registry = default_registry();
+        let left_root = Location::Local(left.path().to_path_buf());
+        let right_root = Location::Local(right.path().to_path_buf());
+        let cancel = AtomicBool::new(false);
         let diff = WorkspaceDiff::compare(
-            Location::Local(left.path().to_path_buf()),
-            Location::Local(right.path().to_path_buf()),
-            vec![file("a.txt", 1)],
+            left_root.clone(),
+            right_root,
+            scan_workspace(
+                &registry,
+                &left_root,
+                WorkspaceScanOptions::default(),
+                &cancel,
+            )
+            .await
+            .unwrap(),
             Vec::<WorkspaceEntry>::new(),
         );
         let plan = WorkspaceSyncPlan::build(&diff, SyncPolicy::default());
         let journal_dir = tempfile::tempdir().unwrap();
         let controller = WorkspaceSyncController::with_journal(
-            default_registry(),
+            registry,
             OperationJournal::open(journal_dir.path().join("ops.jsonl")).unwrap(),
         );
         let frozen = controller.freeze(&plan, &diff).unwrap();

@@ -473,6 +473,18 @@ mod tests {
     }
 
     #[test]
+    fn equal_size_with_different_timestamp_is_not_equal() {
+        let diff = WorkspaceDiff::compare(
+            local("/left"),
+            local("/right"),
+            vec![entry("config.toml", fp(100, Some(1_000)))],
+            vec![entry("config.toml", fp(100, Some(2_000)))],
+        );
+
+        assert_eq!(diff.entries[0].state, DiffState::RightNewer);
+    }
+
+    #[test]
     fn update_mode_preserves_destination_only_entries() {
         let diff = WorkspaceDiff::compare(
             local("/left"),
