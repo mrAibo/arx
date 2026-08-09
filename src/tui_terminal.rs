@@ -100,34 +100,7 @@ impl<O: TerminalOps> TuiTerminalSession<O> {
     }
 
     pub(crate) fn suspend(&mut self) -> io::Result<()> {
-        let mut first_error = None;
-
-        if self.mouse_active {
-            match self.ops.disable_mouse() {
-                Ok(()) => self.mouse_active = false,
-                Err(error) => remember_error(&mut first_error, error),
-            }
-        }
-        if self.alternate_active {
-            match self.ops.leave_alternate() {
-                Ok(()) => self.alternate_active = false,
-                Err(error) => remember_error(&mut first_error, error),
-            }
-        }
-        if self.raw_active {
-            match self.ops.disable_raw() {
-                Ok(()) => self.raw_active = false,
-                Err(error) => remember_error(&mut first_error, error),
-            }
-        }
-        if self.cursor_restore_pending {
-            match self.ops.show_cursor() {
-                Ok(()) => self.cursor_restore_pending = false,
-                Err(error) => remember_error(&mut first_error, error),
-            }
-        }
-
-        finish_cleanup(first_error)
+        self.release()
     }
 
     pub(crate) fn resume(&mut self) -> io::Result<()> {
@@ -145,29 +118,36 @@ impl<O: TerminalOps> TuiTerminalSession<O> {
     }
 
     pub(crate) fn restore(&mut self) -> io::Result<()> {
+        self.release()
+    }
+
+    fn release(&mut self) -> io::Result<()> {
         let mut first_error = None;
 
-        if self.mouse_active {
-            match self.ops.disable_mouse() {
-                Ok(()) => self.mouse_active = false,
-                Err(error) => remember_error(&mut first_error, error),
-            }
-        }
-        if self.cursor_restore_pending {
-            match self.ops.show_cursor() {
-                Ok(()) => self.cursor_restore_pending = false,
-                Err(error) => remember_error(&mut first_error, error),
-            }
-        }
+        // The observable postcondition belongs to the main screen: after ARX leaves
+        // alternate screen, terminal mouse reporting must be disabled there. A real
+        // terminal reproduced leaked reporting when this order was reversed.
         if self.alternate_active {
             match self.ops.leave_alternate() {
                 Ok(()) => self.alternate_active = false,
                 Err(error) => remember_error(&mut first_error, error),
             }
         }
+        if self.mouse_active {
+            match self.ops.disable_mouse() {
+                Ok(()) => self.mouse_active = false,
+                Err(error) => remember_error(&mut first_error, error),
+            }
+        }
         if self.raw_active {
             match self.ops.disable_raw() {
                 Ok(()) => self.raw_active = false,
+                Err(error) => remember_error(&mut first_error, error),
+            }
+        }
+        if self.cursor_restore_pending {
+            match self.ops.show_cursor() {
+                Ok(()) => self.cursor_restore_pending = false,
                 Err(error) => remember_error(&mut first_error, error),
             }
         }
@@ -312,13 +292,13 @@ mod tests {
     }
 
     #[test]
-    fn restore_releases_mouse_cursor_alternate_and_raw() {
+    fn restore_disables_mouse_after_returning_to_main_screen() {
         let (mut session, handle) = entered();
         handle.clear_calls();
         session.restore().unwrap();
         assert_eq!(
             handle.calls(),
-            vec![DISABLE_MOUSE, SHOW_CURSOR, LEAVE_ALTERNATE, DISABLE_RAW]
+            vec![LEAVE_ALTERNATE, DISABLE_MOUSE, DISABLE_RAW, SHOW_CURSOR]
         );
         assert!(!session.raw_active);
         assert!(!session.alternate_active);
@@ -347,9 +327,9 @@ mod tests {
                 ENABLE_RAW,
                 ENTER_ALTERNATE,
                 ENABLE_MOUSE,
-                SHOW_CURSOR,
                 LEAVE_ALTERNATE,
                 DISABLE_RAW,
+                SHOW_CURSOR,
             ]
         );
     }
@@ -363,7 +343,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             handle.calls(),
-            vec![DISABLE_MOUSE, SHOW_CURSOR, LEAVE_ALTERNATE, DISABLE_RAW]
+            vec![LEAVE_ALTERNATE, DISABLE_MOUSE, DISABLE_RAW, SHOW_CURSOR]
         );
         assert!(session.mouse_active);
         assert!(!session.alternate_active);
@@ -384,18 +364,18 @@ mod tests {
         }
         assert_eq!(
             handle.calls(),
-            vec![DISABLE_MOUSE, SHOW_CURSOR, LEAVE_ALTERNATE, DISABLE_RAW]
+            vec![LEAVE_ALTERNATE, DISABLE_MOUSE, DISABLE_RAW, SHOW_CURSOR]
         );
     }
 
     #[test]
-    fn suspend_releases_and_resume_reacquires_tui_modes() {
+    fn suspend_disables_mouse_after_returning_to_main_screen() {
         let (mut session, handle) = entered();
         handle.clear_calls();
         session.suspend().unwrap();
         assert_eq!(
             handle.calls(),
-            vec![DISABLE_MOUSE, LEAVE_ALTERNATE, DISABLE_RAW, SHOW_CURSOR]
+            vec![LEAVE_ALTERNATE, DISABLE_MOUSE, DISABLE_RAW, SHOW_CURSOR]
         );
         assert!(!session.raw_active);
         assert!(!session.alternate_active);
@@ -421,8 +401,8 @@ mod tests {
         assert_eq!(
             handle.calls(),
             vec![
-                DISABLE_MOUSE,
                 LEAVE_ALTERNATE,
+                DISABLE_MOUSE,
                 DISABLE_RAW,
                 SHOW_CURSOR,
                 ENABLE_RAW,
@@ -446,9 +426,9 @@ mod tests {
                 ENABLE_RAW,
                 ENTER_ALTERNATE,
                 ENABLE_MOUSE,
-                SHOW_CURSOR,
                 LEAVE_ALTERNATE,
                 DISABLE_RAW,
+                SHOW_CURSOR,
             ]
         );
     }
