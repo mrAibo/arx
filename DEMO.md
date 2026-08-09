@@ -38,9 +38,11 @@ remote: demo-prod:/srv/arx-demo/app
 
 For the hero capture, keep the fixture to **regular files**. PR #39 proves canonical mtime evidence for Local/SFTP regular files; directory and symlink equality is still intentionally conservative where the current fingerprint model lacks enough comparable evidence. Do not design the first GIF around metadata cases that the verifier cannot yet prove equal.
 
-The source should contain several copy/update operations and the destination should contain no entry that Update would delete. Aim for a visually interesting but readable plan — roughly 5–10 changed paths and a moderate transfer size.
+For the planned changes, prefer **source-only files** that do not yet exist at the destination. Optional baseline files may already exist on both sides only when they are genuinely identical. Avoid overwriting an existing remote file in the hero fixture: the current rsync executor deliberately uses `--backup` with an `.arx-bak-*` suffix, so an overwrite can leave a truthful destination-only backup entry that prevents the final workspace from verifying as `Synchronized`.
 
-The recording must use the already-proven **rsync archive path** for Local → remote execution. Ensure rsync is available on both sides and confirm ARX selects that path. The #39 acceptance smoke demonstrated that `rsync -a` preserves the canonical file mtimes needed for a truthful post-sync `Synchronized` verdict. Do not silently fall back to SFTP streaming for the hero fixture and then assume equivalent timestamp preservation.
+Aim for a visually interesting but readable plan — roughly 5–10 planned copies, zero deletes, and a moderate transfer size. This still demonstrates Update mode and real transfer progress without making the final verification dependent on cleanup outside ARX.
+
+The recording must use the already-proven **rsync archive path** for Local → remote execution. Ensure rsync is available on both sides and confirm ARX selects that path. Workspace physical file transfers are planned as copy operations, for which the transfer planner prefers rsync but can use the SFTP copy path when rsync is unavailable. The #39 acceptance smoke demonstrated that `rsync -a` preserves the canonical file mtimes needed for a truthful post-sync `Synchronized` verdict. If the dry run does not use rsync, do not record the hero GIF.
 
 Do not hardcode “7 changes / 18 MB” into documentation before recording. The GIF should display whatever the real current ARX plan truth reports for the prepared fixture.
 
@@ -190,6 +192,7 @@ The hero asset is ready when all of these are true:
 - [ ] real ARX build from the #38 branch after it includes the #39 evidence fix from `main`;
 - [ ] disposable/test local + SFTP roots;
 - [ ] fixture uses regular files for the proven hero evidence path;
+- [ ] planned changes are source-only copies; no overwrite-created `.arx-bak-*` files remain;
 - [ ] ARX selects the rsync archive execution path for the hero Update;
 - [ ] no secrets or identifying infrastructure details;
 - [ ] Update mode, no planned deletes;
