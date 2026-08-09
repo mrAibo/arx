@@ -1,3 +1,4 @@
+use crate::tui_terminal::TuiTerminalSession;
 use arx::app::{
     Action, ActionAvailability, ActionContext, AppState, CommandItem, CommandKind, CommandTarget,
     OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SessionCallout, SortMode,
@@ -19,11 +20,7 @@ use arx::workspace_sync_execution::SyncPlanId;
 use arx::workspace_sync_verification::{
     SyncVerificationEvent, SyncVerificationStatus, SyncVerificationVerdict,
 };
-use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{
     DefaultTerminal,
     layout::{Constraint, Direction, Layout, Rect},
@@ -51,26 +48,23 @@ struct SyncLaunchResponse {
 }
 
 pub async fn run(config: arx::config::ArxConfig) -> io::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
-    )?;
+    let mut terminal_session = TuiTerminalSession::enter()?;
+    let stdout = io::stdout();
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))?;
 
-    let result = event_loop(&mut terminal, config).await;
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result
+    let result = event_loop(&mut terminal, &mut terminal_session, config).await;
+    let restore_result = terminal_session.restore();
+    match (result, restore_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 #[allow(clippy::collapsible_if)]
 async fn event_loop(
     terminal: &mut DefaultTerminal,
+    terminal_session: &mut TuiTerminalSession,
     config: arx::config::ArxConfig,
 ) -> io::Result<()> {
     let editor = config.ui.editor.clone();
@@ -1167,12 +1161,13 @@ async fn event_loop(
                         }
                         // Ctrl+O: drop to subshell, restore on exit
                         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            disable_raw_mode()?;
-                            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-                            let _ = DesktopService::run_interactive_shell(&shell).await;
-                            execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-                            enable_raw_mode()?;
+                            let shell_result = terminal_session
+                                .suspend_while(|| DesktopService::run_interactive_shell(&shell))
+                                .await?;
+                            if let Err(error) = shell_result {
+                                state.message = Some(format!("Shell failed: {error}"));
+                            }
                         }
                         KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.filter.clear();
@@ -1600,13 +1595,14 @@ async fn event_loop(
                                     .or_else(|| std::env::var("EDITOR").ok())
                                     .or_else(|| std::env::var("VISUAL").ok())
                                     .unwrap_or_else(|| "vi".into());
-                                // Leave raw mode, spawn editor, restore
-                                disable_raw_mode()?;
-                                execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                                let _ = DesktopService::open_editor(&editor_cmd, &path).await;
-                                execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-                                enable_raw_mode()?;
-                                // Refresh after edit
+                                let editor_result = terminal_session
+                                    .suspend_while(|| {
+                                        DesktopService::open_editor(&editor_cmd, &path)
+                                    })
+                                    .await?;
+                                if let Err(error) = editor_result {
+                                    state.message = Some(format!("Editor failed: {error}"));
+                                }
                                 schedule_active_pane_load(&pane_loader, &mut state);
                             }
                         }
