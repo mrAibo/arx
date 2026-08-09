@@ -46,6 +46,59 @@ The recording must use the already-proven **rsync archive path** for Local → r
 
 Do not hardcode “7 changes / 18 MB” into documentation before recording. The GIF should display whatever the real current ARX plan truth reports for the prepared fixture.
 
+### Pre-capture dry-run gates
+
+Before starting the recorder, prove that the fixture itself is compatible with the product-truth requirements.
+
+1. **No backup artifacts before ARX.** After fixture setup, the remote workspace must contain no `.arx-bak-*` files:
+
+```bash
+ssh "$ALIAS" \
+  "find '$REMOTE' -name '.arx-bak-*' -print"
+```
+
+The output must be empty.
+
+2. **Baseline metadata matches independently of ARX.** For any files intentionally present on both sides before the demo, compare size and whole-second modification time:
+
+```bash
+stat -c '%n %s %Y' \
+  "$SRC/README.txt" \
+  "$SRC/project.conf"
+
+ssh "$ALIAS" \
+  "stat -c '%n %s %Y' \
+    '$REMOTE/README.txt' \
+    '$REMOTE/project.conf'"
+```
+
+The matching baseline files must report the same size and Unix-second mtime on both sides. If they do not, fix the fixture before launching ARX.
+
+3. **Recording hygiene.** Before capture, use a neutral terminal title/prompt and a disposable alias such as `demo-prod`. Do not show real usernames, IP addresses, production hostnames, credentials, customer paths, or identifying infrastructure. This changes only the recording environment, not ARX state.
+
+Run ARX once without a recorder and accept the dry run only if the visible product path is:
+
+```text
+Compare
+  ↓
+5–10 planned copies
+0 deletes
+  ↓
+Preview UPDATE
+  ↓
+Execute
+  ↓
+visible real progress
+  ↓
+Execution completed
+  ↓
+Verifying current workspace…
+  ↓
+✓ VERIFIED
+```
+
+If execution tracing is used to prove transport selection, the trace must contain a real `rsync` invocation. After the dry run, repeat the remote backup-artifact check above; it must still produce no output. Any `Inconclusive`, `DifferencesRemain`, unexpected warning/error, wrong route, Mirror flow, or non-rsync transfer path rejects the capture fixture.
+
 ### Shot list
 
 #### 0–3 s — Establish the workspace
@@ -193,8 +246,12 @@ The hero asset is ready when all of these are true:
 - [ ] disposable/test local + SFTP roots;
 - [ ] fixture uses regular files for the proven hero evidence path;
 - [ ] planned changes are source-only copies; no overwrite-created `.arx-bak-*` files remain;
+- [ ] remote `.arx-bak-*` scan is empty both before ARX and after the dry run;
+- [ ] any pre-existing baseline files independently match on size + whole-second mtime;
 - [ ] ARX selects the rsync archive execution path for the hero Update;
+- [ ] dry-run transport evidence confirms a real rsync invocation when tracing is used;
 - [ ] no secrets or identifying infrastructure details;
+- [ ] neutral/disposable recording hostname, paths, title, and prompt are used;
 - [ ] Update mode, no planned deletes;
 - [ ] compare is visibly separate from preview;
 - [ ] preview is visibly separate from execution;
@@ -205,6 +262,7 @@ The hero asset is ready when all of these are true:
 - [ ] 20–30 seconds total;
 - [ ] readable at GitHub README width;
 - [ ] loop transition is not distracting;
+- [ ] master capture is preserved before GIF optimization;
 - [ ] README references the final asset only after it exists in the repository.
 
 ## Recommended asset layout
@@ -215,5 +273,7 @@ When the real recording exists, keep public demo assets under a predictable path
 docs/assets/
 └── remote-workspace-update.gif
 ```
+
+Preserve the unoptimized master capture separately while producing a README-sized derivative. The README version is accepted only when `Sync Preview`, the verification transition, and `✓ VERIFIED` remain readable at normal GitHub README width without opening the image separately.
 
 Then place the hero GIF directly below the README positioning/diagram so the first screen tells the same story in text and motion.
