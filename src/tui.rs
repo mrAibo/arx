@@ -1,11 +1,11 @@
 use arx::app::{
     Action, ActionAvailability, ActionContext, AppState, CommandItem, CommandKind, CommandTarget,
-    OverlayKind, Pane, PaneState, PanelMode, SortMode, WorkspaceSyncUxState, action_availability,
-    action_meta, build_command_items,
+    OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SessionCallout, SortMode,
+    WorkspaceSyncUxState, action_availability, action_meta, build_command_items,
 };
 use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectResponse, EffectScope};
 use arx::effects::{Effect, EffectEvent};
-use arx::input::{KeyResolution, KeyRouter};
+use arx::input::{KeyResolution, KeyRouter, contextual_hints};
 use arx::services::{
     DesktopService, FileInfoService, GitService, MutationError, MutationService, PaneLoadPurpose,
     PaneLoadResponse, PaneLoader, PreviewService, SyncLaunchId, WorkspaceScanError,
@@ -137,6 +137,8 @@ async fn event_loop(
             render(
                 frame,
                 &mut state,
+                left_entries.len(),
+                right_entries.len(),
                 &left_filtered,
                 &right_filtered,
                 &mut left_list,
@@ -214,6 +216,9 @@ async fn event_loop(
                 // event, so its render snapshot is useful even when pane roots
                 // have moved and RemoteWorkspaceState rejects the old diff.
                 state.jobs = job_manager.snapshot();
+                if let Some(job) = job_manager.get(&event.job_id) {
+                    observe_verified_sync_success(&mut state, &job);
+                }
                 if accepted {
                     state.remote_workspace.sync_verification_stage(&event.job_id);
                 } else {
@@ -254,6 +259,9 @@ async fn event_loop(
             }
         };
         if let Some(event) = next_input {
+            if matches!(&event, Event::Key(_) | Event::Mouse(_)) {
+                state.dismiss_session_callout();
+            }
             match event {
                 Event::Key(key) if state.show_terminal && state.active == Pane::Right => {
                     use crossterm::event::KeyCode as KC;
@@ -1625,16 +1633,7 @@ async fn event_loop(
                             state.bookmark_cursor = 0;
                         }
                         // F9: host panel
-                        KeyCode::F(9) => {
-                            if !state.hosts.is_empty() {
-                                state.show_hosts = !state.show_hosts;
-                                state.host_cursor = 0;
-                            } else {
-                                state.message = Some(
-                                    "No hosts configured — add ~/.config/arx/hosts.toml".into(),
-                                );
-                            }
-                        }
+                        KeyCode::F(9) => toggle_hosts_overlay(&mut state),
                         // Ctrl+J: jobs panel
                         KeyCode::Delete if state.show_jobs => {
                             if let Some(job) = state.jobs.get(state.job_cursor) {
@@ -1870,6 +1869,7 @@ fn apply_pane_load_response(
 
     match response.result {
         Ok(entries) => {
+            state.pane_load_errors.remove(&response.pane);
             let entries = normalize_entries(entries, state.show_hidden, state.sort_mode);
             let active = state.active == response.pane;
             match response.pane {
@@ -1921,8 +1921,17 @@ fn apply_pane_load_response(
         }
         Err(error) => {
             // Transactional navigation: current pane location is intentionally
-            // untouched on error.
-            state.message = Some(format!("{}: {error}", response.location));
+            // untouched on error. Persist the accepted failure so the pane can
+            // explain what failed after the one-shot status message is gone.
+            let message = error.to_string();
+            state.pane_load_errors.insert(
+                response.pane,
+                PaneLoadUiError {
+                    attempted: response.location.clone(),
+                    message: message.clone(),
+                },
+            );
+            state.message = Some(format!("{}: {message}", response.location));
         }
     }
 }
@@ -1978,6 +1987,158 @@ fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> V
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneSurfaceState<'a> {
+    Loading {
+        target: &'a Location,
+        transactional: bool,
+    },
+    LoadError {
+        attempted: &'a Location,
+        message: &'a str,
+    },
+    Empty,
+    NoMatches {
+        filter: &'a str,
+    },
+    Entries,
+}
+
+fn pane_surface_state<'a>(
+    state: &'a AppState,
+    pane: Pane,
+    total_entries: usize,
+    visible_entries: usize,
+) -> PaneSurfaceState<'a> {
+    if let Some((target, purpose)) = state.pending_pane_targets.get(&pane) {
+        let transactional = *purpose != PaneLoadPurpose::Refresh;
+        if transactional || total_entries == 0 {
+            return PaneSurfaceState::Loading {
+                target,
+                transactional,
+            };
+        }
+    }
+
+    if let Some(error) = state.pane_load_errors.get(&pane) {
+        return PaneSurfaceState::LoadError {
+            attempted: &error.attempted,
+            message: &error.message,
+        };
+    }
+
+    if visible_entries == 0 {
+        if total_entries > 0 && !state.filter.is_empty() {
+            PaneSurfaceState::NoMatches {
+                filter: &state.filter,
+            }
+        } else {
+            PaneSurfaceState::Empty
+        }
+    } else {
+        PaneSurfaceState::Entries
+    }
+}
+
+fn contextual_footer_text(state: &AppState, key_router: &KeyRouter) -> Option<String> {
+    if !key_router.pending().is_empty() {
+        return None;
+    }
+
+    let hints = contextual_hints(state, key_router.keymap());
+    if hints.is_empty() {
+        return None;
+    }
+
+    Some(
+        hints
+            .into_iter()
+            .map(|hint| format!("{} {}", hint.binding, hint.label))
+            .collect::<Vec<_>>()
+            .join("    "),
+    )
+}
+
+fn render_contextual_footer(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &AppState,
+    key_router: &KeyRouter,
+) {
+    let Some(text) = contextual_footer_text(state, key_router) else {
+        return;
+    };
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            text,
+            Style::default().fg(Color::Black).bg(Color::DarkGray),
+        )),
+        area,
+    );
+}
+
+fn session_callout_text(state: &AppState, key_router: &KeyRouter) -> Option<String> {
+    let callout = state.session_callout.as_ref()?;
+    if session_callout_is_embedded(state, callout) {
+        return None;
+    }
+
+    match callout {
+        SessionCallout::CompareCompleted {
+            differences,
+            bytes_to_transfer,
+        } => {
+            if *differences == 0 {
+                return Some("✓ Workspace compared · No proven differences found.".into());
+            }
+
+            let changes = if *differences == 1 {
+                "1 change found".to_string()
+            } else {
+                format!("{differences} changes found")
+            };
+            let transfer = if *bytes_to_transfer > 0 {
+                format!(" · {} planned", format_size(*bytes_to_transfer))
+            } else {
+                String::new()
+            };
+            let next = if state.remote_workspace.preview_open {
+                String::new()
+            } else {
+                contextual_hints(state, key_router.keymap())
+                    .into_iter()
+                    .find(|hint| hint.action == Action::PreviewWorkspaceSync.id())
+                    .map(|hint| format!(" · {} {}", hint.binding, hint.label))
+                    .unwrap_or_default()
+            };
+            Some(format!("✓ Workspace compared · {changes}{transfer}{next}"))
+        }
+        SessionCallout::WorkspaceSyncVerified { .. } => Some(
+            "✓ First workspace sync verified this session · Both workspace roots are synchronized."
+                .into(),
+        ),
+    }
+}
+
+fn session_callout_is_embedded(state: &AppState, callout: &SessionCallout) -> bool {
+    let SessionCallout::WorkspaceSyncVerified { job_id } = callout else {
+        return false;
+    };
+    state.active_overlay() == Some(OverlayKind::SyncPreview)
+        && state.remote_workspace.ux.job_id() == Some(job_id.as_str())
+}
+
+fn render_session_callout(frame: &mut ratatui::Frame, area: Rect, text: &str) {
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            text.to_string(),
+            Style::default().fg(Color::Green),
+        )),
+        area,
+    );
+}
+
 /// Check if a filename looks like an archive (tar, tgz, zip).
 fn is_archive(name: &str) -> bool {
     name.ends_with(".tar")
@@ -1992,6 +2153,8 @@ fn is_archive(name: &str) -> bool {
 fn render(
     frame: &mut ratatui::Frame,
     state: &mut AppState,
+    left_total_entries: usize,
+    right_total_entries: usize,
     left_entries: &[&Entry],
     right_entries: &[&Entry],
     left_list: &mut ListState,
@@ -2002,14 +2165,25 @@ fn render(
     message: Option<&str>,
 ) {
     let area = frame.area();
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    let session_callout = session_callout_text(state, key_router);
+    let constraints = if session_callout.is_some() {
+        vec![
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(1),
-        ])
+            Constraint::Length(1),
+        ]
+    } else {
+        vec![
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ]
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(area);
 
     let panes = Layout::default()
@@ -2059,6 +2233,7 @@ fn render(
             a1,
             &state.left,
             left_entries,
+            pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
             left_list,
             act1,
             &state.selected,
@@ -2070,6 +2245,7 @@ fn render(
             a2,
             &state.left,
             left_entries,
+            pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
             split_left_list,
             act2,
             &state.selected,
@@ -2082,6 +2258,7 @@ fn render(
             panes[0],
             &state.left,
             left_entries,
+            pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
             left_list,
             state.active == Pane::Left,
             &state.selected,
@@ -2133,6 +2310,7 @@ fn render(
                 a1,
                 &state.right,
                 right_entries,
+                pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
                 right_list,
                 act1,
                 &state.selected,
@@ -2144,6 +2322,7 @@ fn render(
                 a2,
                 &state.right,
                 right_entries,
+                pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
                 split_right_list,
                 act2,
                 &state.selected,
@@ -2156,6 +2335,7 @@ fn render(
                 panes[1],
                 &state.right,
                 right_entries,
+                pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
                 right_list,
                 state.active == Pane::Right,
                 &state.selected,
@@ -2511,16 +2691,26 @@ fn render(
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(status, chunks[1]);
 
-    // Bottom F-key shortcut bar
-    let shortcuts = Span::styled(
-        "1Help  2Menu  3View  4Edit  5Copy  6RenMov  7Mkdir  8Delete  9Hosts  10Quit",
-        Style::default().fg(Color::Black).bg(Color::DarkGray),
-    );
-    frame.render_widget(Paragraph::new(shortcuts), chunks[2]);
+    // Session milestones are passive presentation. They never own backend
+    // state and disappear on the next user interaction.
+    let footer_area = if let Some(callout) = session_callout.as_deref() {
+        render_session_callout(frame, chunks[2], callout);
+        chunks[3]
+    } else {
+        chunks[2]
+    };
+
+    // Contextual footer is derived from the same runtime Keymap that owns
+    // keyboard routing. A pending chord leaves discovery to Which-Key.
+    render_contextual_footer(frame, footer_area, state, key_router);
 
     if state.active_overlay() == Some(OverlayKind::SyncPreview) {
         render_sync_preview(frame, area, state);
     }
+}
+
+fn sync_heading(label: &'static str, color: Color) -> Line<'static> {
+    Line::from(Span::styled(label, Style::default().fg(color)))
 }
 
 fn render_sync_preview(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
@@ -2533,11 +2723,12 @@ fn render_sync_preview(frame: &mut ratatui::Frame, area: Rect, state: &AppState)
 
     match &state.remote_workspace.ux {
         WorkspaceSyncUxState::Idle | WorkspaceSyncUxState::Scanning => {
-            title = " Workspace Sync — SCANNING ".into();
+            title = " Workspace Sync · SCANNING ".into();
+            lines.push(sync_heading("SCAN", Color::Cyan));
             lines.push(Line::from("Scanning both workspace roots…"));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "No files will be changed. Esc hides this view.",
+                "No files will be changed while ARX builds the preview.",
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -2545,66 +2736,63 @@ fn render_sync_preview(frame: &mut ratatui::Frame, area: Rect, state: &AppState)
             render_sync_plan_lines(state, &mut lines);
             if let Some(plan) = state.remote_workspace.plan.as_ref() {
                 title = if plan.can_execute() {
-                    " Sync Preview — READY ".into()
+                    " Workspace Sync · PREVIEW READY ".into()
                 } else {
                     border = Style::default().fg(Color::Yellow);
-                    " Sync Preview — RESOLVE CONFLICTS ".into()
+                    " Workspace Sync · PREVIEW BLOCKED ".into()
                 };
             }
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "D reverse   M update/mirror   Enter execute   Esc hide",
-                Style::default().fg(Color::DarkGray),
-            )));
         }
         WorkspaceSyncUxState::ConfirmationRequired {
             digest,
             destructive_operations,
             ..
         } => {
-            title = " Confirm Mirror Sync ".into();
+            title = " Workspace Sync · CONFIRM MIRROR ".into();
             border = Style::default().fg(Color::Yellow);
+            lines.push(sync_heading("DESTRUCTIVE CONFIRMATION", Color::Red));
+            lines.push(Line::from(format!(
+                "This frozen plan contains {destructive_operations} destructive operation(s)."
+            )));
+            lines.push(Line::from(
+                "Destination-only entries in this exact plan may be removed.",
+            ));
+            lines.push(Line::from(""));
             render_sync_plan_lines(state, &mut lines);
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                format!("DELETE {destructive_operations} destructive operation(s)"),
-                Style::default().fg(Color::Red),
+                format!("Frozen preview digest  {}…", &digest.as_hex()[..8]),
+                Style::default().fg(Color::DarkGray),
             )));
-            lines.push(Line::from(
-                "Destination-only entries in this frozen plan may be removed.",
-            ));
-            lines.push(Line::from(format!(
-                "Preview digest: {}…",
-                &digest.as_hex()[..8]
-            )));
-            lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "Esc back to preview                 Enter confirm exact plan",
+                "Confirmation applies only to this exact frozen plan.",
                 Style::default().fg(Color::DarkGray),
             )));
         }
         WorkspaceSyncUxState::Launching { .. } => {
-            title = " Workspace Sync — PREPARING ".into();
+            title = " Workspace Sync · PREPARING ".into();
+            lines.push(sync_heading("PREPARING EXECUTION", Color::Cyan));
             lines.push(Line::from("Freezing transport choice and execution steps…"));
             lines.push(Line::from("No Job has been created yet."));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "Esc hides this view. A newer compare/direction/mode action supersedes preparation.",
+                "A newer compare, direction, or mode action supersedes preparation before a Job is queued.",
                 Style::default().fg(Color::DarkGray),
             )));
         }
         WorkspaceSyncUxState::Blocked { message } => {
-            title = " Workspace Sync — CANNOT EXECUTE ".into();
+            title = " Workspace Sync · CANNOT EXECUTE ".into();
             border = Style::default().fg(Color::Yellow);
+            lines.push(sync_heading("BLOCKED", Color::Yellow));
             lines.extend(message.lines().map(|line| Line::from(line.to_string())));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "Esc hide   D/M adjust preview and try again",
+                "Adjust the current preview before trying again.",
                 Style::default().fg(Color::DarkGray),
             )));
         }
         WorkspaceSyncUxState::VerificationDiff { job_id } => {
-            title = " Post-sync Verification Diff ".into();
+            title = " Workspace Sync · VERIFICATION DIFF ".into();
             if let Some(job) = state.jobs.iter().find(|job| job.id == *job_id) {
                 render_sync_verification_diff_lines(job, &mut lines);
             } else {
@@ -2618,12 +2806,14 @@ fn render_sync_preview(frame: &mut ratatui::Frame, area: Rect, state: &AppState)
         | WorkspaceSyncUxState::Finished { job_id } => {
             if let Some(job) = state.jobs.iter().find(|job| job.id == *job_id) {
                 title = sync_job_title(job, &state.remote_workspace.ux);
-                let can_return_to_preview =
-                    ActionContext::from_state(state).sync_return_preview_ready;
+                let show_first_success = matches!(
+                    state.session_callout.as_ref(),
+                    Some(SessionCallout::WorkspaceSyncVerified { job_id }) if job_id == &job.id
+                );
                 render_sync_job_lines(
                     job,
                     &state.remote_workspace.ux,
-                    can_return_to_preview,
+                    show_first_success,
                     &mut lines,
                 );
             } else {
@@ -2644,7 +2834,6 @@ fn render_sync_preview(frame: &mut ratatui::Frame, area: Rect, state: &AppState)
         popup,
     );
 }
-
 fn render_sync_plan_lines(state: &AppState, lines: &mut Vec<Line<'static>>) {
     let Some(plan) = state.remote_workspace.plan.as_ref() else {
         lines.push(Line::from("Preview is not ready yet."));
@@ -2689,16 +2878,22 @@ fn render_sync_plan_lines(state: &AppState, lines: &mut Vec<Line<'static>>) {
         })
         .unwrap_or(0);
 
+    lines.push(sync_heading("ROUTE", Color::Cyan));
     lines.push(Line::from(Span::styled(
         format!("{source}  →  {destination}"),
         Style::default().fg(Color::Cyan),
     )));
-    lines.push(Line::from(format!(
-        "{} · {}",
-        state.remote_workspace.direction_label(),
-        state.remote_workspace.mode_label()
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{} · {}",
+            state.remote_workspace.direction_label(),
+            state.remote_workspace.mode_label()
+        ),
+        Style::default().fg(Color::DarkGray),
     )));
     lines.push(Line::from(""));
+
+    lines.push(sync_heading("PLAN", Color::Cyan));
     lines.push(Line::from(format!("Copy / update     {copies}")));
     lines.push(Line::from(format!("Create dirs       {create_dirs}")));
     lines.push(Line::from(format!("Delete            {deletes}")));
@@ -2708,12 +2903,25 @@ fn render_sync_plan_lines(state: &AppState, lines: &mut Vec<Line<'static>>) {
         format_size(plan.bytes_to_transfer)
     )));
     lines.push(Line::from(""));
+
+    lines.push(sync_heading(
+        "SAFETY",
+        if plan.destructive_operations == 0 {
+            Color::Green
+        } else {
+            Color::Yellow
+        },
+    ));
     if plan.destructive_operations == 0 && plan.policy.mode == SyncMode::Update {
-        lines.push(Line::from(
+        lines.push(Line::from(Span::styled(
             "Safe update — destination-only entries are preserved.",
-        ));
+            Style::default().fg(Color::Green),
+        )));
     } else if plan.destructive_operations == 0 {
-        lines.push(Line::from("This plan is non-destructive."));
+        lines.push(Line::from(Span::styled(
+            "This plan is non-destructive.",
+            Style::default().fg(Color::Green),
+        )));
     } else {
         lines.push(Line::from(Span::styled(
             format!(
@@ -2724,7 +2932,6 @@ fn render_sync_plan_lines(state: &AppState, lines: &mut Vec<Line<'static>>) {
         )));
     }
 }
-
 fn sync_display_roots<'a>(
     left: &'a Location,
     right: &'a Location,
@@ -2742,22 +2949,26 @@ fn sync_job_title(job: &arx::jobs::Job, ux: &WorkspaceSyncUxState) -> String {
         .map(ToString::to_string)
         .unwrap_or_else(|| "destination".into());
     match ux {
-        WorkspaceSyncUxState::Queued { .. } => format!(" Sync queued → {destination} "),
-        WorkspaceSyncUxState::Running { .. } => format!(" Syncing → {destination} "),
-        WorkspaceSyncUxState::Cancelling { .. } => " Cancelling… ".into(),
-        WorkspaceSyncUxState::Verifying { .. } => " Execution finished — VERIFYING ".into(),
-        WorkspaceSyncUxState::Finished { .. } => " Workspace Sync — RESULT ".into(),
+        WorkspaceSyncUxState::Queued { .. } => {
+            format!(" Workspace Sync · QUEUED → {destination} ")
+        }
+        WorkspaceSyncUxState::Running { .. } => {
+            format!(" Workspace Sync · RUNNING → {destination} ")
+        }
+        WorkspaceSyncUxState::Cancelling { .. } => " Workspace Sync · CANCELLING ".into(),
+        WorkspaceSyncUxState::Verifying { .. } => " Workspace Sync · VERIFYING ".into(),
+        WorkspaceSyncUxState::Finished { .. } => " Workspace Sync · RESULT ".into(),
         _ => " Workspace Sync ".into(),
     }
 }
-
 fn render_sync_job_lines(
     job: &arx::jobs::Job,
     ux: &WorkspaceSyncUxState,
-    can_return_to_preview: bool,
+    show_first_success: bool,
     lines: &mut Vec<Line<'static>>,
 ) {
     if let (Some(source), Some(destination)) = (job.display_source(), job.display_destination()) {
+        lines.push(sync_heading("ROUTE", Color::Cyan));
         lines.push(Line::from(Span::styled(
             format!("{source}  →  {destination}"),
             Style::default().fg(Color::Cyan),
@@ -2768,10 +2979,14 @@ fn render_sync_job_lines(
     if let arx::jobs::JobProgress::WorkspaceSync(progress) = &job.progress {
         let percent = progress.percent().unwrap_or(0);
         let filled = usize::from(percent) / 5;
-        lines.push(Line::from(format!(
-            "[{}{}] {percent}%",
-            "█".repeat(filled),
-            "░".repeat(20usize.saturating_sub(filled))
+        lines.push(sync_heading("PROGRESS", Color::Cyan));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "[{}{}] {percent}%",
+                "█".repeat(filled),
+                "░".repeat(20usize.saturating_sub(filled))
+            ),
+            Style::default().fg(Color::Cyan),
         )));
         lines.push(Line::from(format!(
             "{} / {} physical steps",
@@ -2790,12 +3005,19 @@ fn render_sync_job_lines(
 
     match &job.result {
         Some(arx::jobs::JobResult::WorkspaceSync(outcome)) => {
+            lines.push(sync_heading("EXECUTION", Color::Cyan));
             match &outcome.terminal {
                 arx::workspace_sync_executor::SyncTerminalState::Completed => {
-                    lines.push(Line::from("✓ Execution completed"));
+                    lines.push(Line::from(Span::styled(
+                        "✓ Execution completed",
+                        Style::default().fg(Color::Green),
+                    )));
                 }
                 arx::workspace_sync_executor::SyncTerminalState::Cancelled { .. } => {
-                    lines.push(Line::from("Sync cancelled"));
+                    lines.push(Line::from(Span::styled(
+                        "Sync cancelled",
+                        Style::default().fg(Color::Yellow),
+                    )));
                     lines.push(Line::from(format!(
                         "✓ {} physical step(s) completed",
                         outcome.completed.len()
@@ -2805,7 +3027,10 @@ fn render_sync_job_lines(
                         outcome.remaining.len()
                     )));
                     if outcome.workspace_may_have_changed {
-                        lines.push(Line::from("Workspace may have changed."));
+                        lines.push(Line::from(Span::styled(
+                            "Workspace may have changed.",
+                            Style::default().fg(Color::Yellow),
+                        )));
                     }
                 }
                 arx::workspace_sync_executor::SyncTerminalState::Failed { step, error } => {
@@ -2845,6 +3070,8 @@ fn render_sync_job_lines(
     }
 
     if matches!(ux, WorkspaceSyncUxState::Cancelling { .. }) {
+        lines.push(Line::from(""));
+        lines.push(sync_heading("CANCELLATION", Color::Yellow));
         lines.push(Line::from(Span::styled(
             "Cancelling… waiting for the executor's terminal outcome.",
             Style::default().fg(Color::Yellow),
@@ -2853,45 +3080,32 @@ fn render_sync_job_lines(
 
     if matches!(ux, WorkspaceSyncUxState::Verifying { .. }) {
         lines.push(Line::from(""));
-        lines.push(Line::from("Verifying current workspace…"));
-        lines.push(Line::from("Scanning both workspace roots again."));
+        lines.push(sync_heading("POST-SYNC VERIFICATION", Color::Cyan));
+        lines.push(Line::from("Verifying the current workspace…"));
+        lines.push(Line::from(Span::styled(
+            "Scanning both workspace roots again after execution.",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     if matches!(ux, WorkspaceSyncUxState::Finished { .. }) {
         lines.push(Line::from(""));
+        lines.push(sync_heading("POST-SYNC VERIFICATION", Color::Cyan));
         render_verification_lines(job, lines);
+        if show_first_success {
+            lines.push(Line::from(""));
+            lines.push(sync_heading("FIRST SUCCESS THIS SESSION", Color::Green));
+            lines.push(Line::from(Span::styled(
+                "✓ Remote Workspace workflow completed end-to-end.",
+                Style::default().fg(Color::Green),
+            )));
+            lines.push(Line::from(Span::styled(
+                "ARX executed the frozen plan and verified the result.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
-
-    lines.push(Line::from(""));
-    let footer = match ux {
-        WorkspaceSyncUxState::Queued { .. } | WorkspaceSyncUxState::Running { .. } => {
-            "C cancel   Esc hide"
-        }
-        WorkspaceSyncUxState::Cancelling { .. } | WorkspaceSyncUxState::Verifying { .. } => {
-            "Esc hide"
-        }
-        WorkspaceSyncUxState::Finished { .. }
-            if verification_has_differences(job) && can_return_to_preview =>
-        {
-            "V verification diff   B current preview   Esc hide"
-        }
-        WorkspaceSyncUxState::Finished { .. } if verification_has_differences(job) => {
-            "V verification diff   Esc hide · current panes moved"
-        }
-        WorkspaceSyncUxState::Finished { .. } if can_return_to_preview => {
-            "B current preview   Esc hide"
-        }
-        WorkspaceSyncUxState::Finished { .. } => {
-            "Esc hide · compare current panes for a new preview"
-        }
-        _ => "Esc hide",
-    };
-    lines.push(Line::from(Span::styled(
-        footer,
-        Style::default().fg(Color::DarkGray),
-    )));
 }
-
 fn render_sync_verification_diff_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>>) {
     let Some(verification) = &job.verification else {
         lines.push(Line::from("No post-sync verification result is available."));
@@ -2911,18 +3125,21 @@ fn render_sync_verification_diff_lines(job: &arx::jobs::Job, lines: &mut Vec<Lin
         return;
     }
 
+    lines.push(sync_heading("SNAPSHOT", Color::Cyan));
     lines.push(Line::from(format!("LEFT   {}", result.left_root)));
     lines.push(Line::from(format!("RIGHT  {}", result.right_root)));
-    lines.push(Line::from(""));
-    lines.push(Line::from(format!(
-        "{} proven difference(s) · {} conflict(s) · {} unverified",
-        result.changed_entries, result.conflicts, result.unverified_entries
-    )));
     lines.push(Line::from(Span::styled(
         "This is the recursive post-sync verification snapshot for this Job.",
         Style::default().fg(Color::DarkGray),
     )));
     lines.push(Line::from(""));
+    lines.push(sync_heading("SUMMARY", Color::Yellow));
+    lines.push(Line::from(format!(
+        "{} proven difference(s) · {} conflict(s) · {} unverified",
+        result.changed_entries, result.conflicts, result.unverified_entries
+    )));
+    lines.push(Line::from(""));
+    lines.push(sync_heading("DIFFERENCES", Color::Yellow));
 
     let visible = result
         .diff
@@ -2931,15 +3148,18 @@ fn render_sync_verification_diff_lines(job: &arx::jobs::Job, lines: &mut Vec<Lin
         .filter(|entry| entry.state != DiffState::SameFingerprint)
         .collect::<Vec<_>>();
     for entry in visible.iter().take(40) {
-        let label = match entry.state {
-            DiffState::OnlyLeft => "LEFT ONLY",
-            DiffState::OnlyRight => "RIGHT ONLY",
-            DiffState::LeftNewer => "LEFT NEWER",
-            DiffState::RightNewer => "RIGHT NEWER",
-            DiffState::Different => "COMPARE",
+        let (label, color) = match entry.state {
+            DiffState::OnlyLeft => ("LEFT ONLY", Color::Yellow),
+            DiffState::OnlyRight => ("RIGHT ONLY", Color::Yellow),
+            DiffState::LeftNewer => ("LEFT NEWER", Color::Cyan),
+            DiffState::RightNewer => ("RIGHT NEWER", Color::Cyan),
+            DiffState::Different => ("COMPARE", Color::Red),
             DiffState::SameFingerprint => continue,
         };
-        lines.push(Line::from(format!("{label:>11}  {}", entry.relative_path)));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label:>11}"), Style::default().fg(color)),
+            Span::raw(format!("  {}", entry.relative_path)),
+        ]));
     }
     if visible.len() > 40 {
         lines.push(Line::from(format!(
@@ -2947,34 +3167,22 @@ fn render_sync_verification_diff_lines(job: &arx::jobs::Job, lines: &mut Vec<Lin
             visible.len() - 40
         )));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "B back to Job result   Esc hide",
-        Style::default().fg(Color::DarkGray),
-    )));
 }
-
-fn verification_has_differences(job: &arx::jobs::Job) -> bool {
-    job.verification.as_ref().is_some_and(|verification| {
-        matches!(
-            &verification.status,
-            SyncVerificationStatus::Finished(result)
-                if matches!(
-                    &result.verdict,
-                    SyncVerificationVerdict::DifferencesRemain { .. }
-                )
-        )
-    })
-}
-
 fn render_verification_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>>) {
     let Some(verification) = &job.verification else {
+        lines.push(Line::from(Span::styled(
+            "Verification result is not available.",
+            Style::default().fg(Color::DarkGray),
+        )));
         return;
     };
     match &verification.status {
         SyncVerificationStatus::Finished(result) => match &result.verdict {
             SyncVerificationVerdict::Synchronized => {
-                lines.push(Line::from("✓ Workspace verified"));
+                lines.push(Line::from(Span::styled(
+                    "✓ VERIFIED",
+                    Style::default().fg(Color::Green),
+                )));
                 lines.push(Line::from("Both workspace roots are synchronized."));
             }
             SyncVerificationVerdict::DifferencesRemain {
@@ -2983,7 +3191,7 @@ fn render_verification_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>
                 unverified,
             } => {
                 lines.push(Line::from(Span::styled(
-                    "⚠ Verification found differences",
+                    "⚠ DIFFERENCES REMAIN",
                     Style::default().fg(Color::Yellow),
                 )));
                 lines.push(Line::from(format!("{changed} entries still differ")));
@@ -2996,7 +3204,10 @@ fn render_verification_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>
                 ));
             }
             SyncVerificationVerdict::Inconclusive { unverified } => {
-                lines.push(Line::from("? Verification inconclusive"));
+                lines.push(Line::from(Span::styled(
+                    "? INCONCLUSIVE",
+                    Style::default().fg(Color::Yellow),
+                )));
                 lines.push(Line::from(format!(
                     "ARX cannot prove {unverified} entry/entries are identical."
                 )));
@@ -3005,26 +3216,32 @@ fn render_verification_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>
         },
         SyncVerificationStatus::Failed { error, .. } => {
             lines.push(Line::from(Span::styled(
-                "⚠ Workspace verification could not finish",
+                "⚠ VERIFICATION FAILED",
                 Style::default().fg(Color::Yellow),
             )));
             lines.push(Line::from(error.clone()));
             lines.push(Line::from("Execution truth above is unchanged."));
         }
         SyncVerificationStatus::Cancelled => {
-            lines.push(Line::from("Verification cancelled."));
+            lines.push(Line::from(Span::styled(
+                "Verification cancelled.",
+                Style::default().fg(Color::Yellow),
+            )));
         }
         SyncVerificationStatus::Superseded => {
-            lines.push(Line::from(
+            lines.push(Line::from(Span::styled(
                 "Verification superseded by a newer workspace state.",
-            ));
+                Style::default().fg(Color::DarkGray),
+            )));
         }
         SyncVerificationStatus::Pending | SyncVerificationStatus::Running { .. } => {
-            lines.push(Line::from("Verifying current workspace…"));
+            lines.push(Line::from(Span::styled(
+                "Verifying current workspace…",
+                Style::default().fg(Color::Cyan),
+            )));
         }
     }
 }
-
 fn render_help(frame: &mut ratatui::Frame, area: Rect) {
     let popup_area = centered_rect(68, 90, area);
     frame.render_widget(Clear, popup_area);
@@ -3192,8 +3409,27 @@ fn render_bookmarks(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     frame.render_stateful_widget(list, popup_area, &mut list_state);
 }
 
+const HOSTS_CONFIG_PATH: &str = "~/.config/arx/hosts.toml";
+
+fn empty_hosts_text() -> String {
+    format!("No hosts configured\n\nAdd hosts to:\n{HOSTS_CONFIG_PATH}\n\nEsc Close")
+}
+
 fn render_hosts(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     if state.hosts.is_empty() {
+        let popup_area = centered_rect(60, 40, area);
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(
+            Paragraph::new(empty_hosts_text())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Remote Hosts ")
+                        .border_style(Style::default().fg(Color::Cyan)),
+                )
+                .wrap(Wrap { trim: false }),
+            popup_area,
+        );
         return;
     }
     let popup_area = centered_rect(60, 70, area);
@@ -3322,6 +3558,7 @@ fn render_pane(
     area: ratatui::layout::Rect,
     pane: &PaneState,
     entries: &[&Entry],
+    surface: PaneSurfaceState<'_>,
     list_state: &mut ListState,
     active: bool,
     selected: &std::collections::BTreeSet<String>,
@@ -3335,6 +3572,97 @@ fn render_pane(
     };
 
     let title = format!(" {} ", pane.location.label());
+
+    let banner = match surface {
+        PaneSurfaceState::Loading {
+            target,
+            transactional,
+        } => {
+            let action = if matches!(target, Location::Sftp { .. }) {
+                "Connecting…"
+            } else {
+                "Opening…"
+            };
+            let detail = if transactional {
+                "Current location stays open until this succeeds."
+            } else {
+                "Loading this location…"
+            };
+            if entries.is_empty() {
+                render_pane_state_message(
+                    frame,
+                    area,
+                    &title,
+                    border_style,
+                    vec![
+                        action.to_string(),
+                        target.to_string(),
+                        String::new(),
+                        detail.to_string(),
+                    ],
+                );
+                return;
+            }
+            Some((
+                format!("{action} {target}"),
+                detail.to_string(),
+                Style::default().fg(Color::Cyan).bg(Color::DarkGray),
+            ))
+        }
+        PaneSurfaceState::LoadError { attempted, message } => {
+            if entries.is_empty() {
+                render_pane_state_message(
+                    frame,
+                    area,
+                    &title,
+                    border_style,
+                    vec![
+                        "Could not open".into(),
+                        attempted.to_string(),
+                        String::new(),
+                        message.to_string(),
+                        String::new(),
+                        "Current location was not changed.".into(),
+                    ],
+                );
+                return;
+            }
+            Some((
+                format!("Could not open {attempted}"),
+                format!("{message} · Current location was not changed."),
+                Style::default().fg(Color::Yellow).bg(Color::DarkGray),
+            ))
+        }
+        PaneSurfaceState::Empty => {
+            render_pane_state_message(
+                frame,
+                area,
+                &title,
+                border_style,
+                vec![
+                    "This folder is empty.".into(),
+                    String::new(),
+                    "Available actions are shown in the footer.".into(),
+                ],
+            );
+            return;
+        }
+        PaneSurfaceState::NoMatches { filter } => {
+            render_pane_state_message(
+                frame,
+                area,
+                &title,
+                border_style,
+                vec![
+                    format!("No files match \"{filter}\"."),
+                    String::new(),
+                    "Change or clear the filter to see files.".into(),
+                ],
+            );
+            return;
+        }
+        PaneSurfaceState::Entries => None,
+    };
 
     if panel_mode == PanelMode::Brief {
         // ponytail: brief mode — filenames in columns, no list state
@@ -3366,6 +3694,9 @@ fn render_pane(
                 .wrap(Wrap { trim: false }),
             area,
         );
+        if let Some((headline, detail, style)) = &banner {
+            render_pane_banner(frame, area, headline, detail, *style);
+        }
         return;
     }
 
@@ -3471,6 +3802,59 @@ fn render_pane(
         }))
         .highlight_symbol(if active { ">> " } else { "   " });
     frame.render_stateful_widget(list, area, list_state);
+    if let Some((headline, detail, style)) = &banner {
+        render_pane_banner(frame, area, headline, detail, *style);
+    }
+}
+
+fn render_pane_state_message(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    title: &str,
+    border_style: Style,
+    lines: Vec<String>,
+) {
+    let lines = lines.into_iter().map(Line::from).collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title.to_string())
+                    .border_style(border_style),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_pane_banner(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    headline: &str,
+    detail: &str,
+    style: Style,
+) {
+    if area.width <= 2 || area.height <= 3 {
+        return;
+    }
+    let height = 2.min(area.height.saturating_sub(2));
+    let banner = Rect {
+        x: area.x + 1,
+        y: area.y + area.height.saturating_sub(height + 1),
+        width: area.width.saturating_sub(2),
+        height,
+    };
+    frame.render_widget(Clear, banner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(headline.to_string()),
+            Line::from(detail.to_string()),
+        ])
+        .style(style)
+        .wrap(Wrap { trim: false }),
+        banner,
+    );
 }
 
 fn format_size(bytes: u64) -> String {
@@ -3542,6 +3926,61 @@ fn job_event_id(event: &arx::jobs::JobEvent) -> &str {
     }
 }
 
+fn observe_compare_success(state: &mut AppState) {
+    let Some(diff) = state.remote_workspace.diff.as_ref() else {
+        return;
+    };
+    let differences = diff.changed_count();
+    let bytes_to_transfer = state
+        .remote_workspace
+        .plan
+        .as_ref()
+        .map(|plan| plan.bytes_to_transfer)
+        .unwrap_or(0);
+    if state.milestones.take_compare_success() {
+        state.session_callout = Some(SessionCallout::CompareCompleted {
+            differences,
+            bytes_to_transfer,
+        });
+    }
+}
+
+fn is_verified_sync_success(job: &arx::jobs::Job) -> bool {
+    if job.status != arx::jobs::JobStatus::Completed {
+        return false;
+    }
+    let execution_completed = matches!(
+        &job.result,
+        Some(arx::jobs::JobResult::WorkspaceSync(outcome))
+            if matches!(
+                &outcome.terminal,
+                arx::workspace_sync_executor::SyncTerminalState::Completed
+            )
+    );
+    if !execution_completed {
+        return false;
+    }
+
+    job.verification.as_ref().is_some_and(|verification| {
+        matches!(
+            &verification.status,
+            SyncVerificationStatus::Finished(result)
+                if result.verdict == SyncVerificationVerdict::Synchronized
+        )
+    })
+}
+
+fn observe_verified_sync_success(state: &mut AppState, job: &arx::jobs::Job) {
+    if !is_verified_sync_success(job) {
+        return;
+    }
+    if state.milestones.take_verified_sync_success() {
+        state.session_callout = Some(SessionCallout::WorkspaceSyncVerified {
+            job_id: job.id.clone(),
+        });
+    }
+}
+
 /// Present an already-accepted JobManager event. Lifecycle state lives in JobManager.
 fn handle_job_event(ev: &arx::jobs::JobEvent, state: &mut AppState) -> bool {
     match ev {
@@ -3580,6 +4019,10 @@ fn handle_job_event(ev: &arx::jobs::JobEvent, state: &mut AppState) -> bool {
     }
 }
 
+fn toggle_hosts_overlay(state: &mut AppState) {
+    state.toggle_overlay(OverlayKind::Hosts);
+}
+
 fn dispatch_ui_action(
     state: &mut AppState,
     action: Action,
@@ -3610,13 +4053,7 @@ fn dispatch_ui_action(
         }
         Action::OpenBookmarks => state.toggle_overlay(OverlayKind::Bookmarks),
         Action::OpenJobs => state.toggle_overlay(OverlayKind::Jobs),
-        Action::OpenHosts => {
-            if state.hosts.is_empty() {
-                state.message = Some("No hosts configured — add ~/.config/arx/hosts.toml".into());
-            } else {
-                state.toggle_overlay(OverlayKind::Hosts);
-            }
-        }
+        Action::OpenHosts => toggle_hosts_overlay(state),
         Action::OpenHelp => state.toggle_overlay(OverlayKind::Help),
         Action::BeginSymlink => {
             if let Some(entry) = focused {
@@ -3910,6 +4347,7 @@ fn handle_workspace_scan_response(response: WorkspaceScanResponse, state: &mut A
         .remote_workspace
         .try_build_recursive_diff(state.left.location.clone(), state.right.location.clone())
     {
+        observe_compare_success(state);
         state.message = Some(state.remote_workspace.summary());
     } else {
         let waiting = match side {
@@ -4030,5 +4468,597 @@ fn truncate_message(text: &str, max_chars: usize) -> String {
         format!("{prefix}...")
     } else {
         prefix
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arx::app::{Action, InputContext};
+    use arx::input::{KeyBinding, KeyStroke, Keymap};
+    use arx::jobs::{Job, JobKind, JobResult, JobStatus};
+    use arx::services::{PaneLoadId, WorkspaceScanId};
+    use arx::workspace_sync::{
+        WorkspaceDiff, WorkspaceEntry, WorkspaceFingerprint, WorkspaceSyncPlan,
+    };
+    use arx::workspace_sync_execution::SyncPlanValidator;
+    use arx::workspace_sync_executor::{
+        SyncExecutionOutcome, SyncJournalFinalization, SyncTerminalState,
+    };
+    use arx::workspace_sync_verification::{
+        SyncVerificationId, SyncVerificationResult, SyncVerificationSnapshot,
+    };
+
+    #[test]
+    fn footer_uses_runtime_keymap() {
+        let keymap = Keymap::new(vec![KeyBinding::new(
+            InputContext::Browser,
+            vec![KeyStroke::new(KeyCode::F(12), KeyModifiers::NONE)],
+            Action::ToggleWorkspaceComparison,
+        )]);
+        let router = KeyRouter::new(keymap);
+
+        assert_eq!(
+            contextual_footer_text(&AppState::default(), &router).as_deref(),
+            Some("F12 Compare panes")
+        );
+    }
+
+    #[test]
+    fn pending_chord_leaves_discovery_to_which_key() {
+        let mut router = KeyRouter::default();
+        let resolution = router.resolve_stroke(
+            InputContext::Browser,
+            KeyStroke::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(resolution, KeyResolution::Pending);
+        assert!(contextual_footer_text(&AppState::default(), &router).is_none());
+    }
+
+    fn file(name: &str) -> Entry {
+        Entry {
+            name: name.into(),
+            kind: EntryKind::File,
+            size: Some(1),
+        }
+    }
+
+    #[test]
+    fn footer_tracks_sync_preview_confirmation_and_running_contexts() {
+        let left = Location::Local("/left".into());
+        let right = Location::Local("/right".into());
+        let router = KeyRouter::default();
+
+        let mut preview = AppState::default();
+        preview.remote_workspace.preview_open = true;
+        preview.remote_workspace.refresh_visible(
+            left.clone(),
+            right.clone(),
+            &[file("source.txt")],
+            &[],
+        );
+        let preview_footer = contextual_footer_text(&preview, &router).unwrap_or_default();
+        assert!(preview_footer.contains("Enter Execute workspace sync"));
+        assert!(preview_footer.contains("D Reverse sync direction"));
+        assert!(preview_footer.contains("M Toggle update/mirror"));
+
+        let mut confirmation = AppState::default();
+        confirmation.left.location = left.clone();
+        confirmation.right.location = right.clone();
+        confirmation.remote_workspace.preview_open = true;
+        confirmation.remote_workspace.refresh_visible(
+            left,
+            right,
+            &[],
+            &[file("destination-only.txt")],
+        );
+        confirmation.remote_workspace.toggle_mode();
+        let plan = confirmation
+            .remote_workspace
+            .plan
+            .clone()
+            .expect("mirror preview plan");
+        let diff = confirmation
+            .remote_workspace
+            .diff
+            .clone()
+            .expect("mirror preview diff");
+        let frozen = arx::workspace_sync_execution::SyncPlanValidator::freeze(
+            &plan,
+            &diff,
+            &arx::vfs::default_registry(),
+        )
+        .expect("freeze mirror preview");
+        confirmation.remote_workspace.set_frozen_plan(frozen);
+        let confirmation_footer =
+            contextual_footer_text(&confirmation, &router).unwrap_or_default();
+        assert!(confirmation_footer.contains("Enter Confirm workspace sync"));
+        assert!(confirmation_footer.contains("Esc Back in workspace sync"));
+
+        let mut running = AppState::default();
+        running.remote_workspace.preview_open = true;
+        running.remote_workspace.ux = WorkspaceSyncUxState::Running {
+            job_id: "sync-1".into(),
+        };
+        let running_footer = contextual_footer_text(&running, &router).unwrap_or_default();
+        assert!(running_footer.contains("C Cancel workspace sync"));
+        assert!(running_footer.contains("Esc Hide workspace sync"));
+        assert!(!running_footer.contains("verification diff"));
+    }
+
+    #[test]
+    fn pane_surface_distinguishes_empty_filtered_loading_and_error_states() {
+        let state = AppState::default();
+        assert_eq!(
+            pane_surface_state(&state, Pane::Left, 0, 0),
+            PaneSurfaceState::Empty
+        );
+
+        let filtered = AppState {
+            filter: "xyz".into(),
+            ..AppState::default()
+        };
+        assert!(matches!(
+            pane_surface_state(&filtered, Pane::Left, 5, 0),
+            PaneSurfaceState::NoMatches { filter: "xyz" }
+        ));
+
+        let target = Location::Sftp {
+            host: "prod".into(),
+            path: "/srv/app".into(),
+        };
+        let mut loading = AppState::default();
+        loading.register_pane_load(
+            Pane::Left,
+            PaneLoadId(1),
+            target.clone(),
+            PaneLoadPurpose::Navigate {
+                remember_current: true,
+            },
+        );
+        assert!(matches!(
+            pane_surface_state(&loading, Pane::Left, 4, 4),
+            PaneSurfaceState::Loading {
+                target: pending,
+                transactional: true,
+            } if pending == &target
+        ));
+
+        loading.finish_pane_load(Pane::Left, PaneLoadId(1));
+        loading.pane_load_errors.insert(
+            Pane::Left,
+            PaneLoadUiError {
+                attempted: target.clone(),
+                message: "SSH connection failed".into(),
+            },
+        );
+        assert!(matches!(
+            pane_surface_state(&loading, Pane::Left, 4, 4),
+            PaneSurfaceState::LoadError { attempted, message }
+                if attempted == &target && message == "SSH connection failed"
+        ));
+    }
+
+    #[test]
+    fn failed_navigation_keeps_location_and_success_clears_error() {
+        let mut state = AppState::default();
+        let original = state.left.location.clone();
+        let target = Location::Local("/target".into());
+        let mut left_entries = vec![file("current.txt")];
+        let mut right_entries = Vec::new();
+
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(1),
+            target.clone(),
+            PaneLoadPurpose::Navigate {
+                remember_current: true,
+            },
+        );
+        apply_pane_load_response(
+            PaneLoadResponse {
+                id: PaneLoadId(1),
+                pane: Pane::Left,
+                location: target.clone(),
+                purpose: PaneLoadPurpose::Navigate {
+                    remember_current: true,
+                },
+                result: Err(std::io::Error::other("permission denied")),
+            },
+            &mut state,
+            &mut left_entries,
+            &mut right_entries,
+        );
+
+        assert_eq!(state.left.location, original);
+        assert_eq!(left_entries, vec![file("current.txt")]);
+        assert_eq!(
+            state
+                .pane_load_errors
+                .get(&Pane::Left)
+                .map(|error| &error.attempted),
+            Some(&target)
+        );
+
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(2),
+            target.clone(),
+            PaneLoadPurpose::Navigate {
+                remember_current: true,
+            },
+        );
+        apply_pane_load_response(
+            PaneLoadResponse {
+                id: PaneLoadId(2),
+                pane: Pane::Left,
+                location: target.clone(),
+                purpose: PaneLoadPurpose::Navigate {
+                    remember_current: true,
+                },
+                result: Ok(Vec::new()),
+            },
+            &mut state,
+            &mut left_entries,
+            &mut right_entries,
+        );
+
+        assert_eq!(state.left.location, target);
+        assert!(!state.pane_load_errors.contains_key(&Pane::Left));
+    }
+
+    #[test]
+    fn empty_hosts_overlay_is_real_and_truthful() {
+        let mut state = AppState::default();
+        state.hosts.clear();
+
+        toggle_hosts_overlay(&mut state);
+
+        assert_eq!(state.active_overlay(), Some(OverlayKind::Hosts));
+        let text = empty_hosts_text();
+        assert!(text.contains("~/.config/arx/hosts.toml"));
+        assert!(!text.contains("~/.ssh/config"));
+    }
+
+    fn workspace_entry(
+        name: &str,
+        size: u64,
+        modified_unix_ms: Option<u64>,
+        content_hash: Option<&str>,
+    ) -> WorkspaceEntry {
+        WorkspaceEntry {
+            relative_path: name.into(),
+            fingerprint: WorkspaceFingerprint {
+                kind: EntryKind::File,
+                size: Some(size),
+                modified_unix_ms,
+                content_hash: content_hash.map(str::to_string),
+            },
+        }
+    }
+
+    fn accept_workspace_compare(
+        state: &mut AppState,
+        left_entries: Vec<WorkspaceEntry>,
+        right_entries: Vec<WorkspaceEntry>,
+        generation: u64,
+    ) {
+        let left = Location::Local("/left".into());
+        let right = Location::Local("/right".into());
+        state.left.location = left.clone();
+        state.right.location = right.clone();
+        state.remote_workspace.enabled = true;
+        let _ = state.remote_workspace.begin_recursive_scan();
+        let left_id = WorkspaceScanId(generation * 2 + 1);
+        let right_id = WorkspaceScanId(generation * 2 + 2);
+        state
+            .remote_workspace
+            .register_scan(WorkspaceSide::Left, left_id);
+        state
+            .remote_workspace
+            .register_scan(WorkspaceSide::Right, right_id);
+
+        handle_workspace_scan_response(
+            WorkspaceScanResponse {
+                id: left_id,
+                side: WorkspaceSide::Left,
+                root: left,
+                result: Ok(left_entries),
+            },
+            state,
+        );
+        handle_workspace_scan_response(
+            WorkspaceScanResponse {
+                id: right_id,
+                side: WorkspaceSide::Right,
+                root: right,
+                result: Ok(right_entries),
+            },
+            state,
+        );
+    }
+
+    #[test]
+    fn compare_milestone_is_one_per_session_and_uses_runtime_binding() {
+        let mut state = AppState::default();
+        accept_workspace_compare(
+            &mut state,
+            vec![workspace_entry("payload.bin", 84, None, None)],
+            Vec::new(),
+            1,
+        );
+        assert_eq!(
+            state.session_callout,
+            Some(SessionCallout::CompareCompleted {
+                differences: 1,
+                bytes_to_transfer: 84,
+            })
+        );
+
+        let keymap = Keymap::new(vec![KeyBinding::new(
+            InputContext::Browser,
+            vec![KeyStroke::new(KeyCode::F(12), KeyModifiers::NONE)],
+            Action::PreviewWorkspaceSync,
+        )]);
+        let text = session_callout_text(&state, &KeyRouter::new(keymap)).unwrap_or_default();
+        assert!(text.contains("1 change found"));
+        assert!(text.contains("F12 Preview workspace sync"));
+
+        state.dismiss_session_callout();
+        accept_workspace_compare(
+            &mut state,
+            vec![workspace_entry("second.bin", 21, None, None)],
+            Vec::new(),
+            2,
+        );
+        assert!(state.session_callout.is_none());
+    }
+
+    #[test]
+    fn compare_milestone_never_claims_unproven_equality() {
+        let mut equal = AppState::default();
+        accept_workspace_compare(
+            &mut equal,
+            vec![workspace_entry("same.bin", 10, None, Some("same"))],
+            vec![workspace_entry("same.bin", 10, None, Some("same"))],
+            1,
+        );
+        let equal_text = session_callout_text(&equal, &KeyRouter::default()).unwrap_or_default();
+        assert!(equal_text.contains("No proven differences found."));
+        assert!(!equal_text.to_lowercase().contains("identical"));
+        assert!(!equal_text.contains("changes found"));
+
+        let mut unproven = AppState::default();
+        accept_workspace_compare(
+            &mut unproven,
+            vec![workspace_entry("unknown.bin", 10, None, None)],
+            vec![workspace_entry("unknown.bin", 10, None, None)],
+            1,
+        );
+        let unproven_text =
+            session_callout_text(&unproven, &KeyRouter::default()).unwrap_or_default();
+        assert!(unproven_text.contains("1 change found"));
+        assert!(!unproven_text.to_lowercase().contains("identical"));
+    }
+
+    fn test_plan_id() -> arx::workspace_sync_execution::SyncPlanId {
+        let diff = WorkspaceDiff::compare(
+            Location::Local("/left".into()),
+            Location::Local("/right".into()),
+            vec![workspace_entry("a.txt", 1, None, None)],
+            Vec::new(),
+        );
+        let plan = WorkspaceSyncPlan::build(&diff, arx::workspace_sync::SyncPolicy::default());
+        SyncPlanValidator::freeze(&plan, &diff, &arx::vfs::default_registry())
+            .expect("freeze test plan")
+            .id()
+    }
+
+    fn verification_snapshot(
+        plan_id: arx::workspace_sync_execution::SyncPlanId,
+        status: SyncVerificationStatus,
+    ) -> SyncVerificationSnapshot {
+        SyncVerificationSnapshot {
+            id: SyncVerificationId(1),
+            plan_id,
+            left_root: Location::Local("/left".into()),
+            right_root: Location::Local("/right".into()),
+            status,
+        }
+    }
+
+    fn synchronized_result(
+        plan_id: arx::workspace_sync_execution::SyncPlanId,
+    ) -> SyncVerificationResult {
+        SyncVerificationResult::from_diff(
+            plan_id,
+            WorkspaceDiff::compare(
+                Location::Local("/left".into()),
+                Location::Local("/right".into()),
+                Vec::new(),
+                Vec::new(),
+            ),
+        )
+    }
+
+    fn differences_result(
+        plan_id: arx::workspace_sync_execution::SyncPlanId,
+    ) -> SyncVerificationResult {
+        SyncVerificationResult::from_diff(
+            plan_id,
+            WorkspaceDiff::compare(
+                Location::Local("/left".into()),
+                Location::Local("/right".into()),
+                vec![workspace_entry("left-only", 1, None, Some("left"))],
+                Vec::new(),
+            ),
+        )
+    }
+
+    fn inconclusive_result(
+        plan_id: arx::workspace_sync_execution::SyncPlanId,
+    ) -> SyncVerificationResult {
+        SyncVerificationResult::from_diff(
+            plan_id,
+            WorkspaceDiff::compare(
+                Location::Local("/left".into()),
+                Location::Local("/right".into()),
+                vec![workspace_entry("unknown", 1, None, None)],
+                vec![workspace_entry("unknown", 1, None, None)],
+            ),
+        )
+    }
+
+    fn sync_job(
+        plan_id: arx::workspace_sync_execution::SyncPlanId,
+        id: &str,
+        job_status: JobStatus,
+        terminal: SyncTerminalState,
+        verification_status: SyncVerificationStatus,
+        journal: SyncJournalFinalization,
+    ) -> Job {
+        let manager = arx::jobs::JobManager::new();
+        let mut job = manager.create_job(
+            id,
+            JobKind::Synchronize,
+            "test sync",
+            Some(Location::Local("/left".into())),
+            Some(Location::Local("/right".into())),
+        );
+        job.status = job_status;
+        job.result = Some(JobResult::WorkspaceSync(SyncExecutionOutcome {
+            plan_id,
+            completed: Vec::new(),
+            terminal,
+            remaining: Vec::new(),
+            transferred_bytes: 0,
+            workspace_may_have_changed: true,
+            journal,
+        }));
+        job.verification = Some(verification_snapshot(plan_id, verification_status));
+        job
+    }
+
+    #[test]
+    fn verified_sync_milestone_requires_completed_and_synchronized() {
+        let plan_id = test_plan_id();
+        let cases = [
+            sync_job(
+                plan_id,
+                "diff",
+                JobStatus::Completed,
+                SyncTerminalState::Completed,
+                SyncVerificationStatus::Finished(Box::new(differences_result(plan_id))),
+                SyncJournalFinalization::Recorded,
+            ),
+            sync_job(
+                plan_id,
+                "inconclusive",
+                JobStatus::Completed,
+                SyncTerminalState::Completed,
+                SyncVerificationStatus::Finished(Box::new(inconclusive_result(plan_id))),
+                SyncJournalFinalization::Failed {
+                    error: "audit warning".into(),
+                },
+            ),
+            sync_job(
+                plan_id,
+                "verification-failed",
+                JobStatus::Completed,
+                SyncTerminalState::Completed,
+                SyncVerificationStatus::Failed {
+                    side: None,
+                    error: "scan failed".into(),
+                },
+                SyncJournalFinalization::Recorded,
+            ),
+            sync_job(
+                plan_id,
+                "cancelled",
+                JobStatus::Cancelled,
+                SyncTerminalState::Cancelled { completed_steps: 0 },
+                SyncVerificationStatus::Finished(Box::new(synchronized_result(plan_id))),
+                SyncJournalFinalization::Recorded,
+            ),
+            sync_job(
+                plan_id,
+                "failed",
+                JobStatus::Failed,
+                SyncTerminalState::Failed {
+                    step: arx::workspace_sync_executor::PhysicalStepId(1),
+                    error: arx::workspace_sync_executor::SyncExecutionError::Mutation {
+                        path: "a".into(),
+                        error: "boom".into(),
+                    },
+                },
+                SyncVerificationStatus::Finished(Box::new(synchronized_result(plan_id))),
+                SyncJournalFinalization::Recorded,
+            ),
+        ];
+
+        for job in cases {
+            let mut state = AppState::default();
+            observe_verified_sync_success(&mut state, &job);
+            assert!(
+                state.session_callout.is_none(),
+                "unexpected milestone for {}",
+                job.id
+            );
+            assert!(!state.milestones.verified_sync_success_seen);
+        }
+    }
+
+    #[test]
+    fn verified_sync_milestone_is_one_per_session_and_does_not_steal_focus() {
+        let plan_id = test_plan_id();
+        let first = sync_job(
+            plan_id,
+            "first",
+            JobStatus::Completed,
+            SyncTerminalState::Completed,
+            SyncVerificationStatus::Finished(Box::new(synchronized_result(plan_id))),
+            SyncJournalFinalization::Recorded,
+        );
+        let second = sync_job(
+            plan_id,
+            "second",
+            JobStatus::Completed,
+            SyncTerminalState::Completed,
+            SyncVerificationStatus::Finished(Box::new(synchronized_result(plan_id))),
+            SyncJournalFinalization::Recorded,
+        );
+        let mut state = AppState::default();
+        let previous_ux = state.remote_workspace.ux.clone();
+
+        observe_verified_sync_success(&mut state, &first);
+        assert_eq!(state.remote_workspace.ux, previous_ux);
+        assert_eq!(state.active_overlay(), None);
+        assert!(matches!(
+            state.session_callout,
+            Some(SessionCallout::WorkspaceSyncVerified { ref job_id }) if job_id == &first.id
+        ));
+
+        state.dismiss_session_callout();
+        observe_verified_sync_success(&mut state, &second);
+        assert!(state.session_callout.is_none());
+    }
+
+    #[test]
+    fn verified_sync_callout_embeds_only_in_its_open_finished_overlay() {
+        let mut state = AppState::default();
+        state.remote_workspace.preview_open = true;
+        state.remote_workspace.ux = WorkspaceSyncUxState::Finished {
+            job_id: "sync-1".into(),
+        };
+        state.session_callout = Some(SessionCallout::WorkspaceSyncVerified {
+            job_id: "sync-1".into(),
+        });
+
+        assert!(session_callout_text(&state, &KeyRouter::default()).is_none());
+        state.remote_workspace.ux = WorkspaceSyncUxState::Finished {
+            job_id: "sync-other".into(),
+        };
+        assert!(session_callout_text(&state, &KeyRouter::default()).is_some());
     }
 }

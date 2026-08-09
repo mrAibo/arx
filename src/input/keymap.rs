@@ -253,6 +253,10 @@ impl KeyRouter {
         }
     }
 
+    pub fn keymap(&self) -> &Keymap {
+        &self.keymap
+    }
+
     pub fn pending(&self) -> &[KeyStroke] {
         &self.pending
     }
