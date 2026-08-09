@@ -1,101 +1,167 @@
 # ARX
 
-A keyboard-driven dual-pane terminal file manager. Local, SFTP, archives,
-background transfers, quick actions, and tmux integration — all from one
-terminal. Midnight Commander parity, built in Rust.
+**Terminal commander for local ↔ remote workspaces.**
 
-## What's new in v0.14
+Compare before touching anything. Preview the exact sync consequences. Run the frozen plan as a background job. Verify the workspace afterwards.
 
-Transfer Stack replaces the old F5/F6 handlers. When you hit copy or move,
-ARX probes what tools are available, picks the best method (native, rsync,
-or SFTP streaming), and runs the transfer through the job manager. SFTP
-copies are transactional: temp file, backup existing, commit, rollback on
-failure. 42 tests, clippy-clean.
+```text
+Local project                         remote workspace
+~/code/app                 ↔         prod:/srv/app
+      │                                  │
+      └──────────── Compare ──────────────┘
+                         ↓
+                    Sync Preview
+                         ↓
+                  Confirm when needed
+                         ↓
+                   Background sync
+                         ↓
+                      Verify
+```
+
+<!-- The real 20–30 second Remote Workspace GIF will be inserted here before #38 leaves Draft. -->
+
+ARX is also a fast keyboard-driven dual-pane file manager for local files, SFTP locations, archives, background transfers, tabs, previews, shell workflows, and tmux. Its defining workflow, however, is **Remote Workspace**: treat two locations as one operational pair and make synchronization observable from comparison through post-execution verification.
+
+## Why ARX?
+
+- **Local ↔ remote as one workspace.** Put a project on one side and an SFTP location on the other, then compare the recursive trees directly.
+- **Compare before execution.** ARX does not turn a compare into a mutation. The current workspace diff is an explicit fact of its own.
+- **Preview exact consequences.** Sync Preview shows direction, update/mirror mode, planned copies, deletes, conflicts, and transfer size before execution.
+- **Safe default.** Update mode preserves destination-only entries. Mirror is distinct and requires explicit confirmation when the frozen plan is destructive.
+- **Truthful background jobs.** Queue, running, cancelling, cancelled, failed, completed, and verification stages remain separate states instead of being flattened into one optimistic progress message.
+- **Verification after execution.** A completed job does not automatically mean the two roots are synchronized. ARX rescans both roots and reports `Synchronized`, `DifferencesRemain`, or `Inconclusive` from the available evidence.
+- **Progressive discovery.** Command Center, contextual hints, and the footer derive actions and shortcuts from the same runtime Action/Keymap truth.
+
+Current Remote Workspace execution supports local → local, local → SFTP, and SFTP → local. SFTP → SFTP synchronization is intentionally blocked rather than hidden behind an implicit relay.
 
 ## Quick start
+
+Install from the current source tree:
 
 ```bash
 cargo install --git https://github.com/mrAibo/arx
 arx
 ```
 
-## Keybindings
+ARX requires Rust 1.88+ when building from source. Remote connections use the system OpenSSH client. Tools such as `rsync`, `bat`, `chafa`, `pdftotext`, `ffprobe`, and archive utilities are used when the corresponding feature needs them and the tool is available.
 
-### Navigation
+The currently published binary release artifact is Linux x86_64. Broader release packaging is intentionally deferred to the release-readiness milestone.
 
-|| Key | Action |
-||---|---|
-|| j / ↓ / k / ↑ | Move cursor |
-|| Enter | Enter directory / archive / content diff |
-|| Backspace | Go to parent directory / exit archive |
-|| Tab | Switch active pane |
-|| Ctrl+G | Go to path |
-|| Ctrl+H | Toggle hidden files |
-|| Alt+Down | Back in directory history |
+## 60-second Remote Workspace workflow
 
-### Selection
+Default bindings are shown below. Discoverability surfaces in ARX use the runtime Keymap, so the UI remains the source of truth if bindings change.
 
-|| Key | Action |
-||---|---|
-|| Space | Toggle selection |
-|| * | Invert selection |
-|| / | Filter files by name |
-|| + | Select by glob |
-|| Right-click | Context menu (Copy/Move/Delete/View/Edit) |
-|| Left-drag | Multi-select |
+1. Put the source workspace in one pane and the destination in the other, for example `~/code/app` and an SFTP host path.
+2. Press `Ctrl+D` — **Compare panes**. ARX recursively scans both roots and builds a provider-neutral workspace diff.
+3. Press `Ctrl+Shift+S` — **Preview workspace sync**. Review `ROUTE`, `PLAN`, and `SAFETY` before anything is queued.
+4. Keep the default **Update** mode for a non-destructive first run. Press `Enter` to freeze and execute the current plan when it is safe.
+5. The sync runs through JobManager in the background. `Esc` can hide the overlay without cancelling the job; `Ctrl+J` opens Jobs.
+6. After execution reaches `Completed`, ARX performs a separate post-sync verification scan.
+7. Trust the verification verdict, not the optimistic assumption: `Synchronized`, `DifferencesRemain`, `Inconclusive`, or a verification failure.
 
-### File operations
+For a deterministic 20–30 second recording plan, see [DEMO.md](DEMO.md).
 
-|| Key | Action |
-||---|---|
-|| F5 | Copy — planner picks native/rsync/SFTP |
-|| F6 | Move — planner picks native/rsync/SFTP |
-|| F7 | Connect to tmux session |
-|| F8 | Delete selected |
-|| Shift+F6 | Rename |
-|| Ctrl+U | Swap panes |
-|| Ctrl+X C / L / O / S | chmod / hardlink / chown / symlink |
-|| Ctrl+\\ | Toggle split pane |
+## Core workflows
 
-### View & Preview
+### Remote Workspace
 
-|| Key | Action |
-||---|---|
-|| F3 | Preview (chafa for images, pdftotext, ffprobe, 7z, bat) |
-|| Shift+F3 | bat with paging |
-|| F4 | Edit in $EDITOR |
-|| Ctrl+I | File attributes |
+The Remote Workspace flow is deliberately split into independent truths:
 
-### Tools & Overlays
+```text
+Workspace scan
+      ↓
+WorkspaceDiff
+      ↓
+Sync Preview
+      ↓
+Frozen Plan
+      ↓
+Compiled execution
+      ↓
+JobManager / Executor
+      ↓
+Post-sync verification
+```
 
-|| Key | Action |
-||---|---|
-|| Ctrl+P | Command Center — fuzzy search hosts, bookmarks, history, quick actions |
-|| F7 | Attach tmux session |
-|| F9 | Host panel (SFTP) |
-|| Ctrl+B | Bookmarks |
-|| Ctrl+D | Directory diff |
-|| Ctrl+J | Job queue with progress bars |
-|| Ctrl+O | Drop to subshell |
-|| Ctrl+R | Refresh panes |
-|| : | Run shell command |
+Two invariants matter:
 
-### Tabs
+> **Preview ≠ execution.** Looking at a plan does not mutate either workspace.
 
-|| Key | Action |
-||---|---|
-|| Ctrl+T | New tab |
-|| Ctrl+W | Close tab |
-|| Ctrl+← / → | Previous / next tab |
-|| Alt+1…9 | Jump to tab |
+> **Execution completed ≠ workspace verified.** Verification is a separate result produced after the executor finishes.
 
-### Misc
+ARX also refuses to call two entries identical when the provider metadata cannot prove equality. Equal hashes are proof; where hashes are unavailable, the current comparison requires matching provider-neutral fingerprint evidence rather than treating equal size alone as equality.
 
-|| Key | Action |
-||---|---|
-|| ? | Help overlay |
-|| q | Quit |
-|| Esc | Close any popup |
+### Normal file management
+
+Remote Workspace does not replace the commander workflow. ARX still provides:
+
+- dual panes, tabs, history, bookmarks, selection, filters, and mouse support;
+- local, SFTP, and archive browsing;
+- F5/F6 copy and move through the transfer planner;
+- transactional SFTP copy with staging and rollback protection;
+- previews, `$EDITOR`, shell commands, quick actions, and tmux integration;
+- background jobs with progress and explicit cancellation.
+
+### Command Center and discoverability
+
+`Ctrl+P` opens Command Center. With an empty query it recommends the next useful action from the current application state rather than presenting an alphabetic action dump. Typed search covers actions, hosts, bookmarks, history, and configured commands.
+
+Contextual hints and the footer use the same Action Catalog, `ActionAvailability`, and runtime Keymap as input routing. ARX does not maintain a second hardcoded shortcut truth table for those surfaces.
+
+## Safety model
+
+ARX is conservative where a terminal file manager can cause damage:
+
+- **Update is the default sync mode.** Destination-only entries are preserved.
+- **Mirror is explicit.** Destination-only entries become planned deletes and destructive execution requires confirmation tied to the exact frozen plan.
+- **Frozen-plan revalidation.** The workspace roots are rescanned before a frozen sync is queued; stale destructive confirmation does not create a job.
+- **Conflicts block silent overwrite.** Differences that cannot be safely ordered are not silently converted into copies.
+- **Cancellation is a runtime fact.** `Running → Cancelling → Cancelled` is observable and partial/cancelled execution does not receive a success milestone.
+- **Post-sync verification is independent.** `DifferencesRemain` and `Inconclusive` are not rewritten as success.
+- **Host-key verification stays enabled.** Remote transport uses the user's OpenSSH behavior rather than disabling trust checks.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full ownership and execution model.
+
+## Essential bindings
+
+| Binding | Action |
+|---|---|
+| `Ctrl+D` | Compare panes as one workspace |
+| `Ctrl+Shift+S` | Preview workspace sync |
+| `D` in Sync Preview | Reverse left → right / right → left |
+| `M` in Sync Preview | Toggle Update / Mirror |
+| `Enter` in Sync Preview | Freeze and execute when safe |
+| `Enter` in confirmation | Confirm the exact destructive frozen plan |
+| `C` in active sync | Request cancellation |
+| `V` in finished sync | Show verification differences when available |
+| `Ctrl+P` | Command Center |
+| `F9` | Hosts |
+| `Ctrl+J` | Jobs |
+| `?` | Contextual help |
+
+The full application retains familiar commander bindings for navigation, selection, copy/move, preview/edit, tabs, shell commands, bookmarks, and file operations.
+
+## Remote hosts
+
+Remote hosts are configured in `~/.config/arx/hosts.toml`:
+
+```toml
+[[hosts]]
+id = "prod"
+name = "Production"
+ssh_alias = "prod"
+hostname = "prod.example.net"
+user = "deploy"
+default_path = "/srv/app"
+groups = ["production", "project-a"]
+tags = ["linux"]
+transfer_preference = "auto"
+```
+
+The Host Center (`F9`) displays this ARX inventory. It does **not** automatically import every `Host` entry from `~/.ssh/config`.
+
+Connections use OpenSSH configuration and resolution, including aliases, `ProxyJump`, `IdentityFile`, agent authentication, host-key verification, and custom ports where supported. ARX keeps host metadata separate from SSH credentials.
 
 ## Configuration
 
@@ -107,110 +173,69 @@ show_hidden = false
 editor = "hx"       # overrides $EDITOR/$VISUAL
 ```
 
-### `~/.config/arx/hosts.toml`
-
-```toml
-[[hosts]]
-id = "nuc"
-name = "Headless NUC"
-hostname = "192.168.1.10"
-user = "aibo"
-default_path = "/home/aibo"
-```
-
-Hosts resolve through `~/.ssh/config` — aliases, ProxyJump, IdentityFile, custom ports.
-
 ### `~/.config/arx/arx.menu`
 
-```toml
-# t  "Label"  command
+```text
+# key  "Label"  command
 t  "Tar home"  tar czf /tmp/home.tgz ~/
 t  "Disk usage"  df -h
 ```
 
-Menu entries appear in Command Center (Ctrl+P).
+Configured menu entries are available through Command Center.
 
-## Features at a glance
+## Architecture at a glance
 
-|| Feature | Status |
-||---|---|
-|| Dual-pane TUI with tabs, history, swap | ✅ |
-|| Local + SFTP + archive browsing | ✅ |
-|| Transfer planner — native / rsync / SFTP streaming | ✅ |
-|| Transactional SFTP copy with rollback | ✅ |
-|| ~/.ssh/config parsing (aliases, ProxyJump, keys) | ✅ |
-|| Command Center (Ctrl+P) — fuzzy search all targets | ✅ |
-|| Quick Actions — compress, chmod, touch, mkdir, symlink, sha256 | ✅ |
-|| Preview engine — chafa, pdftotext, ffprobe, 7z, bat | ✅ |
-|| Background jobs with progress bars | ✅ |
-|| tmux session attach (F7) | ✅ |
-|| Mouse — right-click menu, drag multi-select, scroll | ✅ |
-|| Directory diff + content diff (Ctrl+D) | ✅ |
-|| Split pane toggle (Ctrl+\\) | ✅ |
-|| MC-style Ctrl+X prefix (symlink, hardlink, chmod, chown) | ✅ |
-|| User menu with custom scripts | ✅ |
-|| Host Center (F9) | ✅ |
-|| Hotlist, tab switcher, batch rename | ✅ |
-|| Extension colors, heatmap, git status bar | ✅ |
-|| X11 DISPLAY auto-detect for Windows SSH clients | ✅ |
-|| S3/MinIO + WebDAV backends | stubs |
-|| Lua/WASM plugin system | stubs |
+User input is routed through typed actions rather than being owned by renderer code:
 
-## Architecture
-
-```
-arx/
-├── src/
-│   ├── main.rs              # entry point, DISPLAY auto-detect
-│   ├── tui.rs               # ratatui event loop, all keybindings, rendering
-│   ├── app/mod.rs           # AppState, PaneState, Job queue
-│   ├── vfs/
-│   │   ├── mod.rs           # VfsOps trait, Entry/Location, ProviderId, Capabilities
-│   │   ├── local.rs         # std::fs backend
-│   │   ├── sftp.rs          # OpenSSH SFTP via russh (~/.ssh/config)
-│   │   ├── archive.rs       # tar.gz/zip as directories
-│   │   ├── s3.rs            # S3/MinIO stub
-│   │   └── webdav.rs        # WebDAV stub
-│   ├── transfer/
-│   │   ├── mod.rs           # TransferPlanner, TransferPlan, TransferIntent/Method
-│   │   ├── executor.rs      # async Native/rsync/SFTP executors
-│   │   ├── probe.rs         # local & remote tool capability detection
-│   │   └── sftp_copy.rs     # transactional SFTP copy with staging + rollback
-│   ├── remote/
-│   │   ├── mod.rs           # HostInventory, HostConfig
-│   │   ├── hosts_config.rs  # hosts.toml parser
-│   │   ├── openssh_sftp.rs  # OpenSSH → SFTP transport
-│   │   ├── ssh_config.rs    # ~/.ssh/config parser
-│   │   └── watch.rs         # inotify → rsync daemon (Linux-only)
-│   ├── jobs/mod.rs          # Job, JobEvent, progress tracking
-│   ├── plugins/mod.rs       # Plugin hook stubs (Lua/WASM)
-│   ├── config.rs            # arx.toml loader
-│   ├── terminal.rs          # PTY + subshell
-│   ├── keyring.rs           # system keychain for SSH passphrases
-│   └── lib.rs
-└── tests/                   # 42 tests
+```text
+Input / Keymap
+      ↓
+    Action
+      ↓
+Controller / Dispatcher
+      ↓
+Effect / Service
+      ↓
+Provider / JobManager
 ```
 
-**VFS:** `VfsOps` trait + `Location` enum + `ProviderId` + `CapabilitySet`.
-Backends implement `list()`, `read_head()`, `copy_files()`, `move_files()`, `delete_files()`.
+Remote Workspace adds a safety pipeline on top of the same provider/job foundations:
 
-**Transfer Stack:** F5/F6 builds a `TransferRequest` (source and destination
-locations, provider IDs, capability sets, what executors are available).
-The planner picks a method — Native, rsync, or SFTP — and the executor runs
-it through the job manager. Progress, cancellation, and errors come back
-through `tokio::sync::mpsc`.
+```text
+WorkspaceScanner
+      ↓
+WorkspaceDiff
+      ↓
+Frozen Plan
+      ↓
+Execution Compiler
+      ↓
+JobManager / Executor
+      ↓
+Verification
+```
 
-**Event loop:** `tokio::select!` multiplexes keyboard events, job
-completions, and PTY output in one async loop.
+Presentation observes accepted backend truth. Hints, callouts, overlays, and first-success milestones do not start jobs or alter verification semantics.
 
-## MC parity
+Read [ARCHITECTURE.md](ARCHITECTURE.md) for module ownership, data flow, transfer execution, Remote Workspace invariants, and OpenSSH integration.
 
-All Midnight Commander features are present: dual-pane, tabs, F3–F8,
-directory diff, user menu, bookmarks, SFTP (via ~/.ssh/config), archive
-browsing, background jobs, mkdir/rename, file info, drop-to-shell,
-symlink/hardlink/chmod/chown, extension colors, shortcut bar.
-ARX adds a few things MC doesn't have: content diff (Ctrl+D+Enter runs
-`diff -u`), Quick Actions, and a fuzzy Command Center.
+## Roadmap
+
+The product-building phase is complete enough to shift the next milestones toward packaging and release:
+
+1. **#38 — Product truth + killer demo.** README/architecture/roadmap alignment and a real Remote Workspace recording.
+2. **#39 — Release readiness.** Align version metadata for the intended next release, expand the artifact matrix deliberately, add checksums, and gate packaging on tests/smoke evidence.
+3. **#40 — Next release.** Publish the Remote Workspace release with focused release notes and explicit known limitations.
+
+Package-manager distribution and promotion come after that release, not before it. See [ROADMAP.md](ROADMAP.md).
+
+## Current limitations
+
+- SFTP → SFTP workspace sync is intentionally unsupported.
+- Verification can be `Inconclusive` when available metadata cannot prove equality.
+- Host Center inventory comes from `~/.config/arx/hosts.toml`; it does not auto-discover all OpenSSH hosts.
+- Current published release packaging is Linux x86_64 only.
+- Retry, richer sync rate/ETA reporting, onboarding persistence, and automatic host discovery are not claimed as current features.
 
 ## Development
 
@@ -221,7 +246,7 @@ cargo test --all-features
 cargo run
 ```
 
-42 tests, clippy-clean, CI green on ubuntu-latest.
+CI runs formatting, clippy with warnings denied, and the full feature test suite on Ubuntu. Avoid static test-count claims in documentation; the suite changes as the product evolves.
 
 ## License
 
