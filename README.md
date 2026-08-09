@@ -224,8 +224,9 @@ Read [ARCHITECTURE.md](ARCHITECTURE.md) for module ownership, data flow, transfe
 The product-building phase is complete enough to shift the next milestones toward packaging and release:
 
 1. **#38 — Product truth + killer demo.** README/architecture/roadmap alignment and a real Remote Workspace recording.
-2. **#39 — Release readiness.** Align version metadata for the intended next release, expand the artifact matrix deliberately, add checksums, and gate packaging on tests/smoke evidence.
-3. **#40 — Next release.** Publish the Remote Workspace release with focused release notes and explicit known limitations.
+2. **#39 — Verification evidence blocker — landed.** Canonical Local/SFTP regular-file mtime evidence enables a truthful post-rsync `Synchronized` verdict without weakening conservative verification semantics.
+3. **#40 — Release readiness.** Align version metadata for the intended next release, expand the artifact matrix deliberately, add checksums, and gate packaging on tests/smoke evidence.
+4. **#41 — Next release.** Publish the Remote Workspace release with focused release notes and explicit known limitations.
 
 Package-manager distribution and promotion come after that release, not before it. See [ROADMAP.md](ROADMAP.md).
 
