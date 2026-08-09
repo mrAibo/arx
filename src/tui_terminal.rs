@@ -1,9 +1,10 @@
 use std::future::Future;
 use std::io;
+use std::time::Duration;
 
 use crossterm::{
     cursor::Show,
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{self, DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -15,6 +16,8 @@ pub(crate) trait TerminalOps {
     fn leave_alternate(&mut self) -> io::Result<()>;
     fn enable_mouse(&mut self) -> io::Result<()>;
     fn disable_mouse(&mut self) -> io::Result<()>;
+    fn reset_main_screen_mouse_reporting(&mut self) -> io::Result<()>;
+    fn drain_input(&mut self) -> io::Result<()>;
     fn show_cursor(&mut self) -> io::Result<()>;
 }
 
@@ -46,6 +49,24 @@ impl TerminalOps for CrosstermTerminalOps {
         execute!(io::stdout(), DisableMouseCapture)
     }
 
+    fn reset_main_screen_mouse_reporting(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            execute!(io::stdout(), DisableMouseCapture)
+        }
+        #[cfg(windows)]
+        {
+            Ok(())
+        }
+    }
+
+    fn drain_input(&mut self) -> io::Result<()> {
+        while event::poll(Duration::ZERO)? {
+            let _ = event::read()?;
+        }
+        Ok(())
+    }
+
     fn show_cursor(&mut self) -> io::Result<()> {
         execute!(io::stdout(), Show)
     }
@@ -56,6 +77,7 @@ pub(crate) struct TuiTerminalSession<O: TerminalOps = CrosstermTerminalOps> {
     raw_active: bool,
     alternate_active: bool,
     mouse_active: bool,
+    mouse_cleanup_pending: bool,
     cursor_restore_pending: bool,
 }
 
@@ -72,6 +94,7 @@ impl<O: TerminalOps> TuiTerminalSession<O> {
             raw_active: false,
             alternate_active: false,
             mouse_active: false,
+            mouse_cleanup_pending: false,
             cursor_restore_pending: false,
         };
         if let Err(error) = session.acquire() {
@@ -85,7 +108,12 @@ impl<O: TerminalOps> TuiTerminalSession<O> {
         if self.raw_active && self.alternate_active && self.mouse_active {
             return Ok(());
         }
-        debug_assert!(!self.raw_active && !self.alternate_active && !self.mouse_active);
+        debug_assert!(
+            !self.raw_active
+                && !self.alternate_active
+                && !self.mouse_active
+                && !self.mouse_cleanup_pending
+        );
 
         self.ops.enable_raw()?;
         self.raw_active = true;
@@ -94,6 +122,9 @@ impl<O: TerminalOps> TuiTerminalSession<O> {
         self.ops.enter_alternate()?;
         self.alternate_active = true;
 
+        // Treat mouse cleanup as pending before enabling capture so even a
+        // partial write from the backend is cleaned up by the rollback path.
+        self.mouse_cleanup_pending = true;
         self.ops.enable_mouse()?;
         self.mouse_active = true;
         Ok(())
@@ -107,7 +138,11 @@ impl<O: TerminalOps> TuiTerminalSession<O> {
         if self.raw_active && self.alternate_active && self.mouse_active {
             return Ok(());
         }
-        if self.raw_active || self.alternate_active || self.mouse_active {
+        if self.raw_active
+            || self.alternate_active
+            || self.mouse_active
+            || self.mouse_cleanup_pending
+        {
             self.restore()?;
         }
         if let Err(error) = self.acquire() {
@@ -124,21 +159,36 @@ impl<O: TerminalOps> TuiTerminalSession<O> {
     fn release(&mut self) -> io::Result<()> {
         let mut first_error = None;
 
-        // The observable postcondition belongs to the main screen: after ARX leaves
-        // alternate screen, terminal mouse reporting must be disabled there. A real
-        // terminal reproduced leaked reporting when this order was reversed.
-        if self.alternate_active {
-            match self.ops.leave_alternate() {
-                Ok(()) => self.alternate_active = false,
-                Err(error) => remember_error(&mut first_error, error),
-            }
-        }
+        // Stop generating new mouse reports as early as possible. With any-event
+        // tracking enabled, even motion during the small exit window can queue
+        // reports that would otherwise become shell input after ARX exits.
         if self.mouse_active {
             match self.ops.disable_mouse() {
                 Ok(()) => self.mouse_active = false,
                 Err(error) => remember_error(&mut first_error, error),
             }
         }
+
+        if self.alternate_active {
+            match self.ops.leave_alternate() {
+                Ok(()) => self.alternate_active = false,
+                Err(error) => remember_error(&mut first_error, error),
+            }
+        }
+
+        // Establish the observable postcondition on the main screen, then drain
+        // reports that were already queued while capture was still active. Keep
+        // raw mode until after the drain so Crossterm can parse complete events.
+        if self.mouse_cleanup_pending && !self.alternate_active {
+            match self.ops.reset_main_screen_mouse_reporting() {
+                Ok(()) => match self.ops.drain_input() {
+                    Ok(()) => self.mouse_cleanup_pending = false,
+                    Err(error) => remember_error(&mut first_error, error),
+                },
+                Err(error) => remember_error(&mut first_error, error),
+            }
+        }
+
         if self.raw_active {
             match self.ops.disable_raw() {
                 Ok(()) => self.raw_active = false,
@@ -199,6 +249,8 @@ mod tests {
     const LEAVE_ALTERNATE: &str = "leave_alternate";
     const ENABLE_MOUSE: &str = "enable_mouse";
     const DISABLE_MOUSE: &str = "disable_mouse";
+    const RESET_MAIN_MOUSE: &str = "reset_main_mouse";
+    const DRAIN_INPUT: &str = "drain_input";
     const SHOW_CURSOR: &str = "show_cursor";
 
     #[derive(Debug, Default)]
@@ -268,6 +320,12 @@ mod tests {
         fn disable_mouse(&mut self) -> io::Result<()> {
             self.call(DISABLE_MOUSE)
         }
+        fn reset_main_screen_mouse_reporting(&mut self) -> io::Result<()> {
+            self.call(RESET_MAIN_MOUSE)
+        }
+        fn drain_input(&mut self) -> io::Result<()> {
+            self.call(DRAIN_INPUT)
+        }
         fn show_cursor(&mut self) -> io::Result<()> {
             self.call(SHOW_CURSOR)
         }
@@ -285,6 +343,7 @@ mod tests {
         assert!(session.raw_active);
         assert!(session.alternate_active);
         assert!(session.mouse_active);
+        assert!(session.mouse_cleanup_pending);
         assert_eq!(
             handle.calls(),
             vec![ENABLE_RAW, ENTER_ALTERNATE, ENABLE_MOUSE]
@@ -292,17 +351,25 @@ mod tests {
     }
 
     #[test]
-    fn restore_disables_mouse_after_returning_to_main_screen() {
+    fn restore_stops_mouse_then_resets_and_drains_main_screen() {
         let (mut session, handle) = entered();
         handle.clear_calls();
         session.restore().unwrap();
         assert_eq!(
             handle.calls(),
-            vec![LEAVE_ALTERNATE, DISABLE_MOUSE, DISABLE_RAW, SHOW_CURSOR]
+            vec![
+                DISABLE_MOUSE,
+                LEAVE_ALTERNATE,
+                RESET_MAIN_MOUSE,
+                DRAIN_INPUT,
+                DISABLE_RAW,
+                SHOW_CURSOR,
+            ]
         );
         assert!(!session.raw_active);
         assert!(!session.alternate_active);
         assert!(!session.mouse_active);
+        assert!(!session.mouse_cleanup_pending);
         assert!(!session.cursor_restore_pending);
     }
 
@@ -316,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_enter_failure_rolls_back_completed_stages() {
+    fn partial_enter_failure_rolls_back_mouse_postcondition() {
         let handle = MockHandle::default();
         handle.fail(ENABLE_MOUSE);
         let result = TuiTerminalSession::enter_with(MockOps::new(handle.clone()));
@@ -328,6 +395,8 @@ mod tests {
                 ENTER_ALTERNATE,
                 ENABLE_MOUSE,
                 LEAVE_ALTERNATE,
+                RESET_MAIN_MOUSE,
+                DRAIN_INPUT,
                 DISABLE_RAW,
                 SHOW_CURSOR,
             ]
@@ -343,9 +412,17 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             handle.calls(),
-            vec![LEAVE_ALTERNATE, DISABLE_MOUSE, DISABLE_RAW, SHOW_CURSOR]
+            vec![
+                DISABLE_MOUSE,
+                LEAVE_ALTERNATE,
+                RESET_MAIN_MOUSE,
+                DRAIN_INPUT,
+                DISABLE_RAW,
+                SHOW_CURSOR,
+            ]
         );
         assert!(session.mouse_active);
+        assert!(!session.mouse_cleanup_pending);
         assert!(!session.alternate_active);
         assert!(!session.raw_active);
 
@@ -353,6 +430,59 @@ mod tests {
         handle.clear_calls();
         session.restore().unwrap();
         assert_eq!(handle.calls(), vec![DISABLE_MOUSE]);
+    }
+
+    #[test]
+    fn failed_main_mouse_reset_retries_before_drain() {
+        let (mut session, handle) = entered();
+        handle.clear_calls();
+        handle.fail(RESET_MAIN_MOUSE);
+        let result = session.restore();
+        assert!(result.is_err());
+        assert_eq!(
+            handle.calls(),
+            vec![
+                DISABLE_MOUSE,
+                LEAVE_ALTERNATE,
+                RESET_MAIN_MOUSE,
+                DISABLE_RAW,
+                SHOW_CURSOR,
+            ]
+        );
+        assert!(session.mouse_cleanup_pending);
+
+        handle.allow(RESET_MAIN_MOUSE);
+        handle.clear_calls();
+        session.restore().unwrap();
+        assert_eq!(handle.calls(), vec![RESET_MAIN_MOUSE, DRAIN_INPUT]);
+        assert!(!session.mouse_cleanup_pending);
+    }
+
+    #[test]
+    fn failed_input_drain_is_retried() {
+        let (mut session, handle) = entered();
+        handle.clear_calls();
+        handle.fail(DRAIN_INPUT);
+        let result = session.restore();
+        assert!(result.is_err());
+        assert_eq!(
+            handle.calls(),
+            vec![
+                DISABLE_MOUSE,
+                LEAVE_ALTERNATE,
+                RESET_MAIN_MOUSE,
+                DRAIN_INPUT,
+                DISABLE_RAW,
+                SHOW_CURSOR,
+            ]
+        );
+        assert!(session.mouse_cleanup_pending);
+
+        handle.allow(DRAIN_INPUT);
+        handle.clear_calls();
+        session.restore().unwrap();
+        assert_eq!(handle.calls(), vec![RESET_MAIN_MOUSE, DRAIN_INPUT]);
+        assert!(!session.mouse_cleanup_pending);
     }
 
     #[test]
@@ -364,22 +494,37 @@ mod tests {
         }
         assert_eq!(
             handle.calls(),
-            vec![LEAVE_ALTERNATE, DISABLE_MOUSE, DISABLE_RAW, SHOW_CURSOR]
+            vec![
+                DISABLE_MOUSE,
+                LEAVE_ALTERNATE,
+                RESET_MAIN_MOUSE,
+                DRAIN_INPUT,
+                DISABLE_RAW,
+                SHOW_CURSOR,
+            ]
         );
     }
 
     #[test]
-    fn suspend_disables_mouse_after_returning_to_main_screen() {
+    fn suspend_cleans_mouse_queue_before_external_program() {
         let (mut session, handle) = entered();
         handle.clear_calls();
         session.suspend().unwrap();
         assert_eq!(
             handle.calls(),
-            vec![LEAVE_ALTERNATE, DISABLE_MOUSE, DISABLE_RAW, SHOW_CURSOR]
+            vec![
+                DISABLE_MOUSE,
+                LEAVE_ALTERNATE,
+                RESET_MAIN_MOUSE,
+                DRAIN_INPUT,
+                DISABLE_RAW,
+                SHOW_CURSOR,
+            ]
         );
         assert!(!session.raw_active);
         assert!(!session.alternate_active);
         assert!(!session.mouse_active);
+        assert!(!session.mouse_cleanup_pending);
 
         handle.clear_calls();
         session.resume().unwrap();
@@ -401,8 +546,10 @@ mod tests {
         assert_eq!(
             handle.calls(),
             vec![
-                LEAVE_ALTERNATE,
                 DISABLE_MOUSE,
+                LEAVE_ALTERNATE,
+                RESET_MAIN_MOUSE,
+                DRAIN_INPUT,
                 DISABLE_RAW,
                 SHOW_CURSOR,
                 ENABLE_RAW,
@@ -427,6 +574,8 @@ mod tests {
                 ENTER_ALTERNATE,
                 ENABLE_MOUSE,
                 LEAVE_ALTERNATE,
+                RESET_MAIN_MOUSE,
+                DRAIN_INPUT,
                 DISABLE_RAW,
                 SHOW_CURSOR,
             ]
