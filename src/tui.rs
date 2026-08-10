@@ -379,15 +379,25 @@ async fn event_loop(
                                     state.show_command_center = false;
                                     state.filter.clear();
                                     state.command_matches.clear();
-                                    let focused_entry = if state.active == Pane::Left {
-                                        left_filtered.get(state.left.cursor)
-                                    } else {
-                                        right_filtered.get(state.right.cursor)
+                                    let cursor = {
+                                        let pane = state.active_pane();
+                                        if pane.split && pane.split_active {
+                                            pane.split_cursor
+                                        } else {
+                                            pane.cursor
+                                        }
                                     };
+                                    let (focused_entry, visible_count) =
+                                        if state.active == Pane::Left {
+                                            (left_filtered.get(cursor), left_filtered.len())
+                                        } else {
+                                            (right_filtered.get(cursor), right_filtered.len())
+                                        };
                                     if let Some(effect) = execute_command_target(
                                         &mut state,
                                         item.target,
                                         focused_entry.copied(),
+                                        visible_count,
                                         &workspace_scanner,
                                         &pane_loader,
                                         &sync_runtime,
@@ -741,6 +751,7 @@ async fn event_loop(
                                     &mut state,
                                     action,
                                     entries.get(cursor).copied(),
+                                    entries.len(),
                                     &workspace_scanner,
                                     &sync_runtime,
                                 ),
@@ -772,7 +783,6 @@ async fn event_loop(
                         continue;
                     }
 
-                    let active = state.active;
                     let pane = state.active_pane_mut();
 
                     match key.code {
@@ -828,12 +838,6 @@ async fn event_loop(
                                         }
                                     }
                                 }
-                            }
-                        }
-                        KeyCode::Char(' ') => {
-                            if let Some(entry) = entries.get(cursor) {
-                                let location = pane.location.clone();
-                                state.toggle_selection(active, &location, &entry.name);
                             }
                         }
                         // Alt+/ : recursive file search
@@ -1990,6 +1994,29 @@ fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> V
         vec![entry.name.clone()]
     } else {
         vec![]
+    }
+}
+
+fn toggle_selection_and_advance(
+    state: &mut AppState,
+    focused: Option<&Entry>,
+    visible_count: usize,
+) {
+    let Some(entry) = focused else {
+        return;
+    };
+    let active = state.active;
+    let location = state.active_pane().location.clone();
+    state.toggle_selection(active, &location, &entry.name);
+
+    let pane = state.active_pane_mut();
+    let cursor = if pane.split && pane.split_active {
+        &mut pane.split_cursor
+    } else {
+        &mut pane.cursor
+    };
+    if cursor.saturating_add(1) < visible_count {
+        *cursor += 1;
     }
 }
 
@@ -4042,6 +4069,7 @@ fn dispatch_ui_action(
     state: &mut AppState,
     action: Action,
     focused: Option<&Entry>,
+    visible_count: usize,
     workspace_scanner: &WorkspaceScanner,
     sync: &SyncUiRuntime,
 ) {
@@ -4070,6 +4098,9 @@ fn dispatch_ui_action(
         Action::OpenJobs => state.toggle_overlay(OverlayKind::Jobs),
         Action::OpenHosts => toggle_hosts_overlay(state),
         Action::OpenHelp => state.toggle_overlay(OverlayKind::Help),
+        Action::ToggleSelect => {
+            toggle_selection_and_advance(state, focused, visible_count);
+        }
         Action::BeginSymlink => {
             if let Some(entry) = focused {
                 state.cmd = format!("ln -s '{}' ", entry.name);
@@ -4253,13 +4284,21 @@ fn execute_command_target(
     state: &mut AppState,
     target: CommandTarget,
     focused: Option<&Entry>,
+    visible_count: usize,
     workspace_scanner: &WorkspaceScanner,
     pane_loader: &PaneLoader,
     sync: &SyncUiRuntime,
 ) -> Option<Effect> {
     match target {
         CommandTarget::Action(action) => {
-            dispatch_ui_action(state, action, focused, workspace_scanner, sync);
+            dispatch_ui_action(
+                state,
+                action,
+                focused,
+                visible_count,
+                workspace_scanner,
+                sync,
+            );
             None
         }
         CommandTarget::Location(location) => {
@@ -4564,6 +4603,50 @@ mod tests {
 
         assert_eq!(selection_or_cursor(&state, &visible, 0), vec!["bar.txt"]);
         assert_eq!(state.selection_count(Pane::Left, &state.left.location), 0);
+    }
+
+    #[test]
+    fn selection_toggle_advances_first_and_middle_but_stops_at_last() {
+        let entries = [file("first"), file("middle"), file("last")];
+
+        for (start, expected_cursor) in [(0, 1), (1, 2), (2, 2)] {
+            let mut state = AppState::default();
+            state.left.cursor = start;
+            let location = state.left.location.clone();
+
+            toggle_selection_and_advance(&mut state, entries.get(start), entries.len());
+
+            assert!(state.is_selected(Pane::Left, &location, &entries[start].name));
+            assert_eq!(state.left.cursor, expected_cursor);
+        }
+    }
+
+    #[test]
+    fn selection_toggle_advances_within_filtered_entries_only() {
+        let entries = [file("first"), file("hidden"), file("last")];
+        let visible = [&entries[0], &entries[2]];
+        let mut state = AppState::default();
+        let location = state.left.location.clone();
+
+        toggle_selection_and_advance(&mut state, visible.first().copied(), visible.len());
+        assert_eq!(state.left.cursor, 1);
+        toggle_selection_and_advance(&mut state, visible.get(1).copied(), visible.len());
+
+        assert_eq!(state.left.cursor, 1);
+        assert!(state.is_selected(Pane::Left, &location, "first"));
+        assert!(!state.is_selected(Pane::Left, &location, "hidden"));
+        assert!(state.is_selected(Pane::Left, &location, "last"));
+    }
+
+    #[test]
+    fn selection_toggle_is_a_noop_for_an_empty_list() {
+        let mut state = AppState::default();
+        let location = state.left.location.clone();
+
+        toggle_selection_and_advance(&mut state, None, 0);
+
+        assert_eq!(state.left.cursor, 0);
+        assert_eq!(state.selection_count(Pane::Left, &location), 0);
     }
 
     #[test]

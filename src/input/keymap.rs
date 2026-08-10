@@ -136,6 +136,7 @@ impl Default for Keymap {
 
         let mut bindings = vec![
             KeyBinding::new(Browser, vec![plain('q')], Action::Quit),
+            KeyBinding::new(Browser, vec![plain(' ')], Action::ToggleSelect),
             KeyBinding::new(Browser, vec![ctrl('p')], Action::OpenCommandCenter),
             KeyBinding::new(Browser, vec![ctrl('b')], Action::OpenBookmarks),
             KeyBinding::new(Browser, vec![ctrl('j')], Action::OpenJobs),
@@ -377,6 +378,15 @@ mod tests {
         assert_eq!(
             router.resolve_stroke(InputContext::Browser, plain('q')),
             KeyResolution::Action(Action::Quit)
+        );
+    }
+
+    #[test]
+    fn space_resolves_toggle_selection() {
+        let mut router = KeyRouter::default();
+        assert_eq!(
+            router.resolve_stroke(InputContext::Browser, plain(' ')),
+            KeyResolution::Action(Action::ToggleSelect)
         );
     }
 
