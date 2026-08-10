@@ -301,6 +301,10 @@ impl VfsProvider for SftpProvider {
     async fn metadata(&self, path: &str) -> std::io::Result<FileMetadata> {
         self.remote_metadata(path).await
     }
+
+    async fn read_all_capped(&self, path: &str, max_bytes: usize) -> std::io::Result<BoundedRead> {
+        self.read_all(path, max_bytes).await
+    }
 }
 
 impl SftpProvider {
@@ -358,6 +362,61 @@ impl SftpProvider {
         }
 
         unreachable!()
+    }
+
+    /// Read entire file up to max_bytes, streaming in chunks. Returns
+    /// BoundedRead with truncated=true if file was larger than max_bytes.
+    async fn read_all(&self, path: &str, max_bytes: usize) -> std::io::Result<BoundedRead> {
+        use tokio::io::AsyncReadExt;
+
+        let mut guard = self.connect_for_mutation().await?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
+
+        let mut remote = conn
+            .session
+            .open(path.to_string())
+            .await
+            .map_err(|e| std::io::Error::other(format!("SFTP open {path}: {e}")))?;
+
+        let mut buf = Vec::with_capacity(16384);
+        let mut chunk = vec![0u8; 65536];
+        loop {
+            let n = remote
+                .read(&mut chunk)
+                .await
+                .map_err(|e| std::io::Error::other(format!("SFTP read {path}: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            let remaining = max_bytes.saturating_sub(buf.len());
+            let take = n.min(remaining);
+            buf.extend_from_slice(&chunk[..take]);
+            if buf.len() >= max_bytes {
+                // Discard the rest to drain the stream, then report truncated
+                let truncated = true;
+                // drain remaining
+                loop {
+                    let n = remote
+                        .read(&mut chunk)
+                        .await
+                        .map_err(|e| std::io::Error::other(format!("SFTP read {path}: {e}")))?;
+                    if n == 0 {
+                        break;
+                    }
+                }
+                return Ok(BoundedRead {
+                    bytes: buf,
+                    truncated,
+                });
+            }
+        }
+
+        Ok(BoundedRead {
+            bytes: buf,
+            truncated: false,
+        })
     }
 
     /// Atomic write via SFTP: stage → verify → commit → rollback on failure.

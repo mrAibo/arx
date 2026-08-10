@@ -180,6 +180,10 @@ pub struct BoundedRead {
     pub truncated: bool,
 }
 
+/// Maximum bytes ARX will download for remote editing.
+/// Files larger than this are refused before editor launch.
+pub const MAX_REMOTE_EDIT_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
 /// Backend trait — each provider implements this. async deferred to F2.
 /// ponytail: sync list() kept for backward compat; list_async() is the new path.
 #[async_trait::async_trait]
@@ -241,6 +245,20 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "metadata not supported by this provider",
+        ))
+    }
+
+    /// Read entire file up to a safety cap. Returns the bytes and whether
+    /// the file is complete (false = file was larger than max_bytes and
+    /// the returned Vec is truncated).
+    async fn read_all_capped(
+        &self,
+        _path: &str,
+        _max_bytes: usize,
+    ) -> std::io::Result<BoundedRead> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "read_all_capped not supported by this provider",
         ))
     }
 }
@@ -557,6 +575,17 @@ impl ProviderRegistry {
         let (provider, parent_path) = self.provider_for_location(location)?;
         let path = format!("{}/{}", parent_path.trim_end_matches('/'), name);
         provider.metadata(&path).await
+    }
+
+    pub async fn read_all_capped_at(
+        &self,
+        location: &Location,
+        name: &str,
+        max_bytes: usize,
+    ) -> std::io::Result<BoundedRead> {
+        let (provider, parent_path) = self.provider_for_location(location)?;
+        let path = format!("{}/{}", parent_path.trim_end_matches('/'), name);
+        provider.read_all_capped(&path, max_bytes).await
     }
 }
 

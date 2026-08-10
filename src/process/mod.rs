@@ -101,9 +101,8 @@ impl ProcessService {
                 editor,
             } => {
                 let label = format!("remote download: {name}");
-                // Bounded download via read_prefix_bytes (same cap as F3)
                 let bounded = match registry
-                    .read_prefix_bytes_at(&location, &name, preview::MAX_TEXT_PREVIEW_BYTES)
+                    .read_all_capped_at(&location, &name, crate::vfs::MAX_REMOTE_EDIT_BYTES)
                     .await
                 {
                     Ok(b) => b,
@@ -114,7 +113,19 @@ impl ProcessService {
                         };
                     }
                 };
-                // Write to temp dir (ponytail: std temp, no new dependency)
+
+                // Refuse truncated files — never open editor on partial content
+                if bounded.truncated {
+                    return EffectEvent::Failed {
+                        label,
+                        error: format!(
+                            "File too large for remote editing (>{} bytes). \
+                             Use a local editor with full SFTP mount.",
+                            crate::vfs::MAX_REMOTE_EDIT_BYTES
+                        ),
+                    };
+                }
+
                 let temp_dir = std::env::temp_dir().join("arx-remote-edit");
                 let _ = tokio::fs::create_dir_all(&temp_dir).await;
                 let temp_path = temp_dir.join(&name);
@@ -379,6 +390,129 @@ mod tests {
                 .take()
                 .expect("mock: read_result already consumed")
         }
+
+        async fn read_all_capped(
+            &self,
+            _path: &str,
+            _max_bytes: usize,
+        ) -> std::io::Result<BoundedRead> {
+            self.read_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("mock: read_result already consumed")
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_download_refuses_truncated_file() {
+        let mock = MockProvider::new(Ok(BoundedRead {
+            bytes: b"abc".to_vec(),
+            truncated: true,
+        }));
+        let registry = registry_with_mock("test", mock);
+        let loc = Location::Sftp {
+            host: "test".into(),
+            path: "/srv".into(),
+        };
+        let event = ProcessService::execute_with_registry(
+            Effect::DownloadRemoteFile {
+                location: loc,
+                name: "large.txt".into(),
+                editor: "vim".into(),
+            },
+            &registry,
+        )
+        .await;
+        assert!(
+            matches!(&event, EffectEvent::Failed { error, .. } if error.contains("too large")),
+            "Truncated file should be refused, got {:?}",
+            event
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_download_accepts_complete_file() {
+        let mock = MockProvider::new(Ok(BoundedRead {
+            bytes: b"hello".to_vec(),
+            truncated: false,
+        }));
+        let registry = registry_with_mock("test", mock);
+        let loc = Location::Sftp {
+            host: "test".into(),
+            path: "/srv".into(),
+        };
+        let event = ProcessService::execute_with_registry(
+            Effect::DownloadRemoteFile {
+                location: loc,
+                name: "small.txt".into(),
+                editor: "nano".into(),
+            },
+            &registry,
+        )
+        .await;
+        assert!(
+            matches!(&event, EffectEvent::Downloaded { name, .. } if name == "small.txt"),
+            "Complete file should produce Downloaded, got {:?}",
+            event
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_download_exact_cap_passes() {
+        // ponytail: test with small cap, not 16 MiB
+        let small = b"hello world".to_vec();
+        let len = small.len();
+        let mock = MockProvider::new(Ok(BoundedRead {
+            bytes: small,
+            truncated: false,
+        }));
+        let registry = registry_with_mock("test", mock);
+        let loc = Location::Sftp {
+            host: "test".into(),
+            path: "/srv".into(),
+        };
+        let event = ProcessService::execute_with_registry(
+            Effect::DownloadRemoteFile {
+                location: loc,
+                name: "exact.txt".into(),
+                editor: "vim".into(),
+            },
+            &registry,
+        )
+        .await;
+        assert!(
+            matches!(&event, EffectEvent::Downloaded { .. }),
+            "Complete file should be accepted, got {:?}",
+            event
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_download_rejects_oversized_file() {
+        let mock = MockProvider::new(Ok(BoundedRead {
+            bytes: vec![b'x'; 1024],
+            truncated: true,
+        }));
+        let registry = registry_with_mock("test", mock);
+        let loc = Location::Sftp {
+            host: "test".into(),
+            path: "/srv".into(),
+        };
+        let event = ProcessService::execute_with_registry(
+            Effect::DownloadRemoteFile {
+                location: loc,
+                name: "too-big.txt".into(),
+                editor: "vim".into(),
+            },
+            &registry,
+        )
+        .await;
+        assert!(
+            matches!(&event, EffectEvent::Failed { error, .. } if error.contains("too large")),
+            ">cap file should be refused, got {:?}",
+            event
+        );
     }
 
     fn registry_with_mock(host: &str, mock: MockProvider) -> ProviderRegistry {
