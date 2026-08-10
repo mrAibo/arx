@@ -659,10 +659,10 @@ async fn event_loop(
                         continue;
                     }
 
-                    // Hosts panel: F9
+                    // Hosts panel: Esc to close
                     if state.show_hosts {
                         match key.code {
-                            KeyCode::Esc | KeyCode::F(9) => {
+                            KeyCode::Esc => {
                                 state.show_hosts = false;
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
@@ -812,18 +812,6 @@ async fn event_loop(
                             continue;
                         }
                         KeyResolution::Unhandled => {}
-                    }
-
-                    // F7: tmux session attach (before pane borrow)
-                    if key.code == KeyCode::F(7) && !state.show_terminal {
-                        let id = effect_dispatcher.dispatch(
-                            EffectLane::TmuxDiscovery,
-                            EffectScope::Global,
-                            Effect::ListTmuxSessions,
-                        );
-                        state.register_effect(EffectLane::TmuxDiscovery, id);
-                        state.message = Some("Discovering tmux sessions…".into());
-                        continue;
                     }
 
                     // Handle tree-filter Backspace before borrowing the active pane.
@@ -1007,11 +995,6 @@ async fn event_loop(
                             state.show_diff = false;
                             state.message = Some("Swapped".into());
                             schedule_both_pane_loads(&pane_loader, &mut state);
-                        }
-                        // F7: create directory
-                        KeyCode::F(7) => {
-                            state.cmd = "mkdir ".into();
-                            state.cmd_input = true;
                         }
                         // Shift+F6: rename file under cursor
                         KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -1199,357 +1182,6 @@ async fn event_loop(
                             });
                             schedule_both_pane_loads(&pane_loader, &mut state);
                         }
-                        // F5: copy — Detection → Planner → Executor
-                        KeyCode::F(5) => {
-                            let names = selection_or_cursor(&state, entries, cursor);
-                            if names.is_empty() {
-                                continue;
-                            }
-                            let src_loc = state.active_pane().location.clone();
-                            let dst_loc = state.other_pane().location.clone();
-                            let src_provider = src_loc.provider_id();
-                            let dst_provider = dst_loc.provider_id();
-                            let src_caps = state
-                                .registry
-                                .capabilities(&src_provider)
-                                .unwrap_or_default();
-                            let dst_caps = state
-                                .registry
-                                .capabilities(&dst_provider)
-                                .unwrap_or_default();
-                            let executors = arx::transfer::probe::local_executors(
-                                arx::transfer::probe::detect_local_tools(),
-                            );
-                            let request = arx::transfer::TransferRequest {
-                                source: src_loc.clone(),
-                                destination: dst_loc.clone(),
-                                source_provider: src_provider,
-                                destination_provider: dst_provider,
-                                source_capabilities: src_caps,
-                                destination_capabilities: dst_caps,
-                                intent: arx::transfer::TransferIntent::Copy,
-                                executors,
-                                delete_extraneous: false,
-                            };
-                            let plan = match arx::transfer::TransferPlanner::plan(request) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    state.message = Some(e.to_string());
-                                    continue;
-                                }
-                            };
-                            let job = job_manager.create_job(
-                                "copy",
-                                arx::jobs::JobKind::Copy,
-                                format!("Copy {} → {}", names.join(", "), dst_loc.label()),
-                                Some(src_loc.clone()),
-                                Some(dst_loc.clone()),
-                            );
-                            let id = job.id.clone();
-                            let cancel = job.cancel.clone();
-                            state.jobs = job_manager.snapshot();
-                            let jobs = job_manager.clone();
-                            let tx = job_tx.clone();
-                            let names2 = names.clone();
-                            let plan2 = plan.clone();
-                            let job_id = id.clone();
-                            tokio::spawn(async move {
-                                if !jobs.publish_event(
-                                    &tx,
-                                    arx::jobs::JobEvent::Running { id: job_id.clone() },
-                                ) {
-                                    return;
-                                }
-                                let tx2 = tx.clone();
-                                let jid = job_id.clone();
-                                let result = arx::transfer::executor::execute_transfer(
-                                    &plan2,
-                                    &names2,
-                                    cancel,
-                                    |p| {
-                                        let pct = p.completed.saturating_mul(100) / p.total.max(1);
-                                        let _ = jobs.publish_event(
-                                            &tx2,
-                                            arx::jobs::JobEvent::Progress {
-                                                id: jid.clone(),
-                                                progress: arx::jobs::Progress::Percent(pct as u8)
-                                                    .into(),
-                                            },
-                                        );
-                                    },
-                                )
-                                .await;
-                                match result {
-                                    Ok(outcome) => {
-                                        let _ = jobs.publish_event(
-        &tx,
-        arx::jobs::JobEvent::Completed {
-            id: job_id,
-            result: arx::jobs::JobResult::generic(
-                format!("Copied {} item(s)", outcome.completed),
-                outcome.completed,
-            ),
-        },
-    );
-                                    }
-                                    Err(
-                                        arx::transfer::executor::TransferExecutionError::Cancelled {
-                                            completed,
-                                        },
-                                    ) => {
-                                        let _ = jobs.publish_event(
-        &tx,
-        arx::jobs::JobEvent::Cancelled {
-            id: job_id,
-            result: arx::jobs::JobResult::generic(
-                format!("Cancelled after {completed} item(s)"),
-                completed,
-            ),
-        },
-    );
-                                    }
-                                    Err(e) => {
-                                        let _ = jobs.publish_event(
-        &tx,
-        arx::jobs::JobEvent::Failed {
-            id: job_id,
-            error: e.to_string(),
-            result: None,
-        },
-    );
-                                    }
-                                }
-                            });
-                            state.message = Some(format!("Copy queued ({id})"));
-                            state.clear_selection();
-                        }
-                        // F6: move — Detection → Planner → Executor
-                        KeyCode::F(6) => {
-                            let names = selection_or_cursor(&state, entries, cursor);
-                            if names.is_empty() {
-                                continue;
-                            }
-                            let src_loc = state.active_pane().location.clone();
-                            let dst_loc = state.other_pane().location.clone();
-                            let src_provider = src_loc.provider_id();
-                            let dst_provider = dst_loc.provider_id();
-                            let src_caps = state
-                                .registry
-                                .capabilities(&src_provider)
-                                .unwrap_or_default();
-                            let dst_caps = state
-                                .registry
-                                .capabilities(&dst_provider)
-                                .unwrap_or_default();
-                            let executors = arx::transfer::probe::local_executors(
-                                arx::transfer::probe::detect_local_tools(),
-                            );
-                            let request = arx::transfer::TransferRequest {
-                                source: src_loc.clone(),
-                                destination: dst_loc.clone(),
-                                source_provider: src_provider,
-                                destination_provider: dst_provider,
-                                source_capabilities: src_caps,
-                                destination_capabilities: dst_caps,
-                                intent: arx::transfer::TransferIntent::Move,
-                                executors,
-                                delete_extraneous: false,
-                            };
-                            let plan = match arx::transfer::TransferPlanner::plan(request) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    state.message = Some(e.to_string());
-                                    continue;
-                                }
-                            };
-                            let job = job_manager.create_job(
-                                "move",
-                                arx::jobs::JobKind::Move,
-                                format!("Move {} → {}", names.join(", "), dst_loc.label()),
-                                Some(src_loc.clone()),
-                                Some(dst_loc.clone()),
-                            );
-                            let id = job.id.clone();
-                            let cancel = job.cancel.clone();
-                            state.jobs = job_manager.snapshot();
-                            let jobs = job_manager.clone();
-                            let tx = job_tx.clone();
-                            let names2 = names.clone();
-                            let plan2 = plan.clone();
-                            let job_id = id.clone();
-                            tokio::spawn(async move {
-                                if !jobs.publish_event(
-                                    &tx,
-                                    arx::jobs::JobEvent::Running { id: job_id.clone() },
-                                ) {
-                                    return;
-                                }
-                                let tx2 = tx.clone();
-                                let jid = job_id.clone();
-                                let result = arx::transfer::executor::execute_transfer(
-                                    &plan2,
-                                    &names2,
-                                    cancel,
-                                    |p| {
-                                        let pct = p.completed.saturating_mul(100) / p.total.max(1);
-                                        let _ = jobs.publish_event(
-                                            &tx2,
-                                            arx::jobs::JobEvent::Progress {
-                                                id: jid.clone(),
-                                                progress: arx::jobs::Progress::Percent(pct as u8)
-                                                    .into(),
-                                            },
-                                        );
-                                    },
-                                )
-                                .await;
-                                match result {
-                                    Ok(outcome) => {
-                                        let _ = jobs.publish_event(
-        &tx,
-        arx::jobs::JobEvent::Completed {
-            id: job_id,
-            result: arx::jobs::JobResult::generic(
-                format!("Moved {} item(s)", outcome.completed),
-                outcome.completed,
-            ),
-        },
-    );
-                                    }
-                                    Err(
-                                        arx::transfer::executor::TransferExecutionError::Cancelled {
-                                            completed,
-                                        },
-                                    ) => {
-                                        let _ = jobs.publish_event(
-        &tx,
-        arx::jobs::JobEvent::Cancelled {
-            id: job_id,
-            result: arx::jobs::JobResult::generic(
-                format!("Cancelled after {completed} item(s)"),
-                completed,
-            ),
-        },
-    );
-                                    }
-                                    Err(e) => {
-                                        let _ = jobs.publish_event(
-        &tx,
-        arx::jobs::JobEvent::Failed {
-            id: job_id,
-            error: e.to_string(),
-            result: None,
-        },
-    );
-                                    }
-                                }
-                            });
-                            state.message = Some(format!("Move queued ({id})"));
-                            state.clear_selection();
-                        }
-                        // F8: delete selected (or cursor) from active pane
-                        // F8: delete selected (or cursor) from active pane
-                        KeyCode::F(8) => {
-                            let names = selection_or_cursor(&state, entries, cursor);
-                            if names.is_empty() {
-                                continue;
-                            }
-                            let Location::Local(dir) = state.active_pane().location.clone() else {
-                                state.message = Some(
-                                    "Trash is currently available for local files only".into(),
-                                );
-                                continue;
-                            };
-                            let job = job_manager.create_job(
-                                "trash",
-                                arx::jobs::JobKind::Delete,
-                                format!("Trash {}", names.join(", ")),
-                                Some(Location::Local(dir.clone())),
-                                None,
-                            );
-                            let id = job.id.clone();
-                            let cancel = job.cancel.clone();
-                            state.jobs = job_manager.snapshot();
-                            let jobs = job_manager.clone();
-                            let tx = job_tx.clone();
-                            let job_id = id.clone();
-                            tokio::spawn(async move {
-                                if !jobs.publish_event(
-                                    &tx,
-                                    arx::jobs::JobEvent::Running { id: job_id.clone() },
-                                ) {
-                                    return;
-                                }
-
-                                let tx_progress = tx.clone();
-                                let progress_id = job_id.clone();
-                                let progress_jobs = jobs.clone();
-                                let result = MutationService::trash_local(
-                                    dir,
-                                    names,
-                                    cancel,
-                                    move |progress| {
-                                        let percent = progress.completed.saturating_mul(100)
-                                            / progress.total.max(1);
-                                        let _ = progress_jobs.publish_event(
-                                            &tx_progress,
-                                            arx::jobs::JobEvent::Progress {
-                                                id: progress_id.clone(),
-                                                progress: arx::jobs::Progress::Percent(
-                                                    percent as u8,
-                                                )
-                                                .into(),
-                                            },
-                                        );
-                                    },
-                                )
-                                .await;
-
-                                match result {
-                                    Ok(outcome) => {
-                                        let _ = jobs.publish_event(
-                                            &tx,
-                                            arx::jobs::JobEvent::Completed {
-                                                id: job_id,
-                                                result: arx::jobs::JobResult::generic(
-                                                    format!(
-                                                        "Trashed {} item(s)",
-                                                        outcome.completed
-                                                    ),
-                                                    outcome.completed,
-                                                ),
-                                            },
-                                        );
-                                    }
-                                    Err(MutationError::Cancelled { completed }) => {
-                                        let _ = jobs.publish_event(
-                                            &tx,
-                                            arx::jobs::JobEvent::Cancelled {
-                                                id: job_id,
-                                                result: arx::jobs::JobResult::generic(
-                                                    format!("Cancelled after {completed} item(s)"),
-                                                    completed,
-                                                ),
-                                            },
-                                        );
-                                    }
-                                    Err(error) => {
-                                        let _ = jobs.publish_event(
-                                            &tx,
-                                            arx::jobs::JobEvent::Failed {
-                                                id: job_id,
-                                                error: error.to_string(),
-                                                result: None,
-                                            },
-                                        );
-                                    }
-                                }
-                            });
-
-                            state.clear_selection();
-                            state.message = Some(format!("Trash queued ({id})"));
-                        }
-
                         // *: invert selection on visible entries
                         KeyCode::Char('*') => {
                             let filt = if state.active == Pane::Left {
@@ -1620,8 +1252,6 @@ async fn event_loop(
                             state.show_bookmarks = !state.show_bookmarks;
                             state.bookmark_cursor = 0;
                         }
-                        // F9: host panel
-                        KeyCode::F(9) => toggle_hosts_overlay(&mut state),
                         // Ctrl+J: jobs panel
                         KeyCode::Delete if state.show_jobs => {
                             if let Some(job) = state.jobs.get(state.job_cursor) {
@@ -1990,20 +1620,6 @@ fn apply_filter_with_parent<'a>(
         visible.insert(0, parent_entry);
     }
     visible
-}
-
-fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> Vec<String> {
-    let pane = state.active_pane();
-    if let Some(selected) = state.selection_names(state.active, &pane.location) {
-        selected.iter().cloned().collect()
-    } else if let Some(entry) = entries
-        .get(cursor)
-        .filter(|entry| entry.name != VIRTUAL_PARENT_NAME)
-    {
-        vec![entry.name.clone()]
-    } else {
-        vec![]
-    }
 }
 
 fn directory_navigation_target(location: &Location, entry: &Entry) -> Option<Location> {
@@ -2582,6 +2198,7 @@ fn render(
         let items: Vec<ListItem> = [
             "Copy   F5",
             "Move   F6",
+            "Mkdir  F7",
             "Delete F8",
             "View   F3",
             "Edit   F4",
@@ -4302,6 +3919,338 @@ async fn dispatch_ui_action(
             }
         }
         Action::CloseWorkspaceSyncOverlay => state.close_overlay(OverlayKind::SyncPreview),
+        Action::Copy => {
+            let names: Vec<String> = state
+                .selection_names(state.active, &state.active_pane().location)
+                .map(|names| names.iter().cloned().collect())
+                .or_else(|| focused.map(|entry| vec![entry.name.clone()]))
+                .unwrap_or_default();
+            if names.is_empty() {
+                state.message = Some("Select a file or directory to copy".into());
+                return Ok(());
+            }
+            let src_loc = state.active_pane().location.clone();
+            let dst_loc = state.other_pane().location.clone();
+            let src_provider = src_loc.provider_id();
+            let dst_provider = dst_loc.provider_id();
+            let src_caps = state
+                .registry
+                .capabilities(&src_provider)
+                .unwrap_or_default();
+            let dst_caps = state
+                .registry
+                .capabilities(&dst_provider)
+                .unwrap_or_default();
+            let executors =
+                arx::transfer::probe::local_executors(arx::transfer::probe::detect_local_tools());
+            let request = arx::transfer::TransferRequest {
+                source: src_loc.clone(),
+                destination: dst_loc.clone(),
+                source_provider: src_provider,
+                destination_provider: dst_provider,
+                source_capabilities: src_caps,
+                destination_capabilities: dst_caps,
+                intent: arx::transfer::TransferIntent::Copy,
+                executors,
+                delete_extraneous: false,
+            };
+            let plan = match arx::transfer::TransferPlanner::plan(request) {
+                Ok(p) => p,
+                Err(e) => {
+                    state.message = Some(e.to_string());
+                    return Ok(());
+                }
+            };
+            let job = sync.jobs.create_job(
+                "copy",
+                arx::jobs::JobKind::Copy,
+                format!("Copy {} → {}", names.join(", "), dst_loc.label()),
+                Some(src_loc.clone()),
+                Some(dst_loc.clone()),
+            );
+            let id = job.id.clone();
+            let cancel = job.cancel.clone();
+            state.jobs = sync.jobs.snapshot();
+            let jobs = sync.jobs.clone();
+            let tx = sync.job_events.clone();
+            let names2 = names.clone();
+            let plan2 = plan.clone();
+            let job_id = id.clone();
+            tokio::spawn(async move {
+                if !jobs.publish_event(&tx, arx::jobs::JobEvent::Running { id: job_id.clone() }) {
+                    return;
+                }
+                let tx2 = tx.clone();
+                let jid = job_id.clone();
+                let result =
+                    arx::transfer::executor::execute_transfer(&plan2, &names2, cancel, |p| {
+                        let pct = p.completed.saturating_mul(100) / p.total.max(1);
+                        let _ = jobs.publish_event(
+                            &tx2,
+                            arx::jobs::JobEvent::Progress {
+                                id: jid.clone(),
+                                progress: arx::jobs::Progress::Percent(pct as u8).into(),
+                            },
+                        );
+                    })
+                    .await;
+                match result {
+                    Ok(outcome) => {
+                        let _ = jobs.publish_event(
+                            &tx,
+                            arx::jobs::JobEvent::Completed {
+                                id: job_id,
+                                result: arx::jobs::JobResult::generic(
+                                    format!("Copied {} item(s)", outcome.completed),
+                                    outcome.completed,
+                                ),
+                            },
+                        );
+                    }
+                    Err(arx::transfer::executor::TransferExecutionError::Cancelled {
+                        completed,
+                    }) => {
+                        let _ = jobs.publish_event(
+                            &tx,
+                            arx::jobs::JobEvent::Cancelled {
+                                id: job_id,
+                                result: arx::jobs::JobResult::generic(
+                                    format!("Cancelled after {completed} item(s)"),
+                                    completed,
+                                ),
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        let _ = jobs.publish_event(
+                            &tx,
+                            arx::jobs::JobEvent::Failed {
+                                id: job_id,
+                                error: e.to_string(),
+                                result: None,
+                            },
+                        );
+                    }
+                }
+            });
+            state.message = Some(format!("Copy queued ({id})"));
+            state.clear_selection();
+        }
+        Action::Move => {
+            let names: Vec<String> = state
+                .selection_names(state.active, &state.active_pane().location)
+                .map(|names| names.iter().cloned().collect())
+                .or_else(|| focused.map(|entry| vec![entry.name.clone()]))
+                .unwrap_or_default();
+            if names.is_empty() {
+                state.message = Some("Select a file or directory to move".into());
+                return Ok(());
+            }
+            let src_loc = state.active_pane().location.clone();
+            let dst_loc = state.other_pane().location.clone();
+            let src_provider = src_loc.provider_id();
+            let dst_provider = dst_loc.provider_id();
+            let src_caps = state
+                .registry
+                .capabilities(&src_provider)
+                .unwrap_or_default();
+            let dst_caps = state
+                .registry
+                .capabilities(&dst_provider)
+                .unwrap_or_default();
+            let executors =
+                arx::transfer::probe::local_executors(arx::transfer::probe::detect_local_tools());
+            let request = arx::transfer::TransferRequest {
+                source: src_loc.clone(),
+                destination: dst_loc.clone(),
+                source_provider: src_provider,
+                destination_provider: dst_provider,
+                source_capabilities: src_caps,
+                destination_capabilities: dst_caps,
+                intent: arx::transfer::TransferIntent::Move,
+                executors,
+                delete_extraneous: false,
+            };
+            let plan = match arx::transfer::TransferPlanner::plan(request) {
+                Ok(p) => p,
+                Err(e) => {
+                    state.message = Some(e.to_string());
+                    return Ok(());
+                }
+            };
+            let job = sync.jobs.create_job(
+                "move",
+                arx::jobs::JobKind::Move,
+                format!("Move {} → {}", names.join(", "), dst_loc.label()),
+                Some(src_loc.clone()),
+                Some(dst_loc.clone()),
+            );
+            let id = job.id.clone();
+            let cancel = job.cancel.clone();
+            state.jobs = sync.jobs.snapshot();
+            let jobs = sync.jobs.clone();
+            let tx = sync.job_events.clone();
+            let names2 = names.clone();
+            let plan2 = plan.clone();
+            let job_id = id.clone();
+            tokio::spawn(async move {
+                if !jobs.publish_event(&tx, arx::jobs::JobEvent::Running { id: job_id.clone() }) {
+                    return;
+                }
+                let tx2 = tx.clone();
+                let jid = job_id.clone();
+                let result =
+                    arx::transfer::executor::execute_transfer(&plan2, &names2, cancel, |p| {
+                        let pct = p.completed.saturating_mul(100) / p.total.max(1);
+                        let _ = jobs.publish_event(
+                            &tx2,
+                            arx::jobs::JobEvent::Progress {
+                                id: jid.clone(),
+                                progress: arx::jobs::Progress::Percent(pct as u8).into(),
+                            },
+                        );
+                    })
+                    .await;
+                match result {
+                    Ok(outcome) => {
+                        let _ = jobs.publish_event(
+                            &tx,
+                            arx::jobs::JobEvent::Completed {
+                                id: job_id,
+                                result: arx::jobs::JobResult::generic(
+                                    format!("Moved {} item(s)", outcome.completed),
+                                    outcome.completed,
+                                ),
+                            },
+                        );
+                    }
+                    Err(arx::transfer::executor::TransferExecutionError::Cancelled {
+                        completed,
+                    }) => {
+                        let _ = jobs.publish_event(
+                            &tx,
+                            arx::jobs::JobEvent::Cancelled {
+                                id: job_id,
+                                result: arx::jobs::JobResult::generic(
+                                    format!("Cancelled after {completed} item(s)"),
+                                    completed,
+                                ),
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        let _ = jobs.publish_event(
+                            &tx,
+                            arx::jobs::JobEvent::Failed {
+                                id: job_id,
+                                error: e.to_string(),
+                                result: None,
+                            },
+                        );
+                    }
+                }
+            });
+            state.message = Some(format!("Move queued ({id})"));
+            state.clear_selection();
+        }
+        Action::Mkdir => {
+            state.cmd = "mkdir ".into();
+            state.cmd_input = true;
+        }
+        Action::Delete => {
+            let names: Vec<String> = state
+                .selection_names(state.active, &state.active_pane().location)
+                .map(|names| names.iter().cloned().collect())
+                .or_else(|| focused.map(|entry| vec![entry.name.clone()]))
+                .unwrap_or_default();
+            if names.is_empty() {
+                state.message = Some("Select a file or directory to delete".into());
+                return Ok(());
+            }
+            let Location::Local(dir) = state.active_pane().location.clone() else {
+                state.message = Some("Trash is currently available for local files only".into());
+                return Ok(());
+            };
+            let job = sync.jobs.create_job(
+                "trash",
+                arx::jobs::JobKind::Delete,
+                format!("Trash {}", names.join(", ")),
+                Some(Location::Local(dir.clone())),
+                None,
+            );
+            let id = job.id.clone();
+            let cancel = job.cancel.clone();
+            state.jobs = sync.jobs.snapshot();
+            let jobs = sync.jobs.clone();
+            let tx = sync.job_events.clone();
+            let job_id = id.clone();
+            tokio::spawn(async move {
+                if !jobs.publish_event(&tx, arx::jobs::JobEvent::Running { id: job_id.clone() }) {
+                    return;
+                }
+                let tx_progress = tx.clone();
+                let progress_id = job_id.clone();
+                let progress_jobs = jobs.clone();
+                let result = MutationService::trash_local(dir, names, cancel, move |progress| {
+                    let percent = progress.completed.saturating_mul(100) / progress.total.max(1);
+                    let _ = progress_jobs.publish_event(
+                        &tx_progress,
+                        arx::jobs::JobEvent::Progress {
+                            id: progress_id.clone(),
+                            progress: arx::jobs::Progress::Percent(percent as u8).into(),
+                        },
+                    );
+                })
+                .await;
+                match result {
+                    Ok(outcome) => {
+                        let _ = jobs.publish_event(
+                            &tx,
+                            arx::jobs::JobEvent::Completed {
+                                id: job_id,
+                                result: arx::jobs::JobResult::generic(
+                                    format!("Trashed {} item(s)", outcome.completed),
+                                    outcome.completed,
+                                ),
+                            },
+                        );
+                    }
+                    Err(MutationError::Cancelled { completed }) => {
+                        let _ = jobs.publish_event(
+                            &tx,
+                            arx::jobs::JobEvent::Cancelled {
+                                id: job_id,
+                                result: arx::jobs::JobResult::generic(
+                                    format!("Cancelled after {completed} item(s)"),
+                                    completed,
+                                ),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        let _ = jobs.publish_event(
+                            &tx,
+                            arx::jobs::JobEvent::Failed {
+                                id: job_id,
+                                error: error.to_string(),
+                                result: None,
+                            },
+                        );
+                    }
+                }
+            });
+            state.clear_selection();
+            state.message = Some(format!("Trash queued ({id})"));
+        }
+        Action::ListTmuxSessions => {
+            let id = effect_dispatcher.dispatch(
+                EffectLane::TmuxDiscovery,
+                EffectScope::Global,
+                Effect::ListTmuxSessions,
+            );
+            state.register_effect(EffectLane::TmuxDiscovery, id);
+            state.message = Some("Discovering tmux sessions…".into());
+        }
         _ => state.apply(action),
     }
     Ok(())
@@ -4658,6 +4607,22 @@ fn truncate_message(text: &str, max_chars: usize) -> String {
     }
 }
 
+// ponytail: keep for test visibility; selection logic lives in dispatch_ui_action.
+#[allow(dead_code)]
+fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> Vec<String> {
+    let pane = state.active_pane();
+    if let Some(selected) = state.selection_names(state.active, &pane.location) {
+        selected.iter().cloned().collect()
+    } else if let Some(entry) = entries
+        .get(cursor)
+        .filter(|entry| entry.name != VIRTUAL_PARENT_NAME)
+    {
+        vec![entry.name.clone()]
+    } else {
+        vec![]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4737,9 +4702,12 @@ mod tests {
         let router = KeyRouter::default();
         let wide =
             contextual_footer_text(&state, &router, Some(EntryKind::File), true, u16::MAX).unwrap();
-        assert_eq!(wide.split("    ").count(), 8);
+        assert_eq!(wide.split("    ").count(), 11);
         assert!(wide.contains("F3 View file"));
         assert!(wide.contains("F4 Edit file"));
+        assert!(wide.contains("F5 Copy"));
+        assert!(wide.contains("F6 Move"));
+        assert!(wide.contains("F7 New directory"));
         assert!(wide.contains("Ctrl+J Jobs"));
         assert!(wide.contains("Ctrl+B Bookmarks"));
 

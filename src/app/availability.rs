@@ -173,6 +173,44 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
         ActionId::EditFile if !ctx.editor_available => ActionAvailability::Disabled {
             reason: "No editor configured (config.ui.editor, VISUAL, or EDITOR)".into(),
         },
+        ActionId::Copy | ActionId::Move => {
+            let has_any = ctx.selection_count > 0 || ctx.focused_kind.is_some();
+            if !has_any {
+                ActionAvailability::Disabled {
+                    reason: "Select a file or directory to copy or move".into(),
+                }
+            } else if ctx.active_provider != ProviderId::Local {
+                ActionAvailability::Disabled {
+                    reason: "Copy and move are currently local-only".into(),
+                }
+            } else {
+                ActionAvailability::Available
+            }
+        }
+        ActionId::Mkdir => {
+            if ctx.active_provider != ProviderId::Local {
+                ActionAvailability::Disabled {
+                    reason: "Directory creation is currently local-only".into(),
+                }
+            } else {
+                ActionAvailability::Available
+            }
+        }
+        ActionId::Delete => {
+            let has_any = (ctx.selection_count > 0 || ctx.focused_kind.is_some())
+                && !matches!(ctx.focused_kind, Some(EntryKind::Directory) if false); // ponytail: VIRTUAL_PARENT guard not reachable from focused_kind
+            if !has_any {
+                ActionAvailability::Disabled {
+                    reason: "Select a file or directory to delete".into(),
+                }
+            } else if ctx.active_provider != ProviderId::Local {
+                ActionAvailability::Disabled {
+                    reason: "Trash is currently local-only".into(),
+                }
+            } else {
+                ActionAvailability::Available
+            }
+        }
         // Hard links and chown do not yet have VFS capabilities. Keep them
         // local-only rather than pretending remote providers support them.
         ActionId::BeginHardLink if ctx.active_provider != ProviderId::Local => {

@@ -48,22 +48,22 @@ arx
 
 || Key | Action |
 ||---|---|
+|| F3 | View (read-only preview) |
+|| F4 | Edit in configured editor |
 || F5 | Copy — planner picks native/rsync/SFTP |
 || F6 | Move — planner picks native/rsync/SFTP |
-|| F7 | Connect to tmux session |
-|| F8 | Delete selected |
+|| F7 | Create directory |
+|| F8 | Delete (trash) |
 || Shift+F6 | Rename |
 || Ctrl+U | Swap panes |
 || Ctrl+X C / L / O / S | chmod / hardlink / chown / symlink |
-|| Ctrl+\\ | Toggle split pane |
+|| Ctrl+\\\\ | Toggle split pane |
 
 ### View & Preview
 
 || Key | Action |
 ||---|---|
 || F3 | Preview (chafa for images, pdftotext, ffprobe, 7z, bat) |
-|| Shift+F3 | bat with paging |
-|| F4 | Edit in $EDITOR |
 || Ctrl+I | File attributes |
 
 ### Tools & Overlays
@@ -71,8 +71,7 @@ arx
 || Key | Action |
 ||---|---|
 || Ctrl+P | Command Center — fuzzy search hosts, bookmarks, history, quick actions |
-|| F7 | Attach tmux session |
-|| F9 | Host panel (SFTP) |
+|| F9 | Tmux sessions |
 || Ctrl+B | Bookmarks |
 || Ctrl+D | Directory diff |
 || Ctrl+J | Job queue with progress bars |

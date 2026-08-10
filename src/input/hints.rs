@@ -84,6 +84,10 @@ fn candidate_actions(state: &AppState) -> Vec<(ActionId, HintPriority)> {
         InputContext::Browser => vec![
             (ViewFile, Primary),
             (EditFile, Primary),
+            (Copy, Primary),
+            (Move, Primary),
+            (Mkdir, Primary),
+            (Delete, Primary),
             (
                 if state.remote_workspace.plan.is_some() {
                     PreviewWorkspaceSync
@@ -97,6 +101,7 @@ fn candidate_actions(state: &AppState) -> Vec<(ActionId, HintPriority)> {
             (OpenJobs, Discovery),
             (OpenBookmarks, Discovery),
             (OpenHelp, Discovery),
+            (ListTmuxSessions, Discovery),
         ],
         InputContext::SyncPreview => vec![
             (ExecuteWorkspaceSync, Primary),
@@ -131,15 +136,21 @@ mod tests {
         let state = AppState::default();
         let hints = contextual_hints(&state, &Keymap::default());
 
-        assert_eq!(hints.len(), 6);
-        assert_eq!(hints[0].action, ActionId::ToggleWorkspaceComparison);
-        assert_eq!(hints[0].binding, "Ctrl+D");
-        assert_eq!(hints[1].action, ActionId::OpenCommandCenter);
-        assert_eq!(hints[1].binding, "Ctrl+P");
-        assert_eq!(hints[2].binding, "F9");
+        assert_eq!(hints.len(), 7);
+        assert_eq!(hints[0].action, ActionId::Mkdir);
+        assert_eq!(hints[0].binding, "F7");
+        assert_eq!(hints[1].action, ActionId::ToggleWorkspaceComparison);
+        assert_eq!(hints[1].binding, "Ctrl+D");
+        assert_eq!(hints[2].action, ActionId::OpenCommandCenter);
+        assert_eq!(hints[2].binding, "Ctrl+P");
+        assert_eq!(hints[3].action, ActionId::OpenJobs);
         assert_eq!(hints[3].binding, "Ctrl+J");
+        assert_eq!(hints[4].action, ActionId::OpenBookmarks);
         assert_eq!(hints[4].binding, "Ctrl+B");
+        assert_eq!(hints[5].action, ActionId::OpenHelp);
         assert_eq!(hints[5].binding, "?");
+        assert_eq!(hints[6].action, ActionId::ListTmuxSessions);
+        assert_eq!(hints[6].binding, "F9");
     }
 
     #[test]
