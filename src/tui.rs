@@ -2525,7 +2525,8 @@ fn render(
         // Append name lines
         let body = format!("{msg}\n\n{}", name_lines.join("\n"));
 
-        let height = (name_lines.len() + 8).min(area.height as usize) as u16;
+        // ponytail: enough room for msg (6 lines) + 2-separator + name_lines + 2-border
+        let height = (name_lines.len() + msg.lines().count() + 4).min(area.height as usize) as u16;
         let popup = centered_rect_lines(60, height, area);
         frame.render_widget(Clear, popup);
         let p = ratatui::widgets::Paragraph::new(body)
