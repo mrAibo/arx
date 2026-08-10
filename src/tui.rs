@@ -4387,11 +4387,11 @@ async fn dispatch_ui_action(
                 let mut cancelled = false;
 
                 for target in &targets {
-                    if let Some(j) = jobs.get(&job.id) {
-                        if j.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                            cancelled = true;
-                            break;
-                        }
+                    if let Some(j) = jobs.get(&job.id)
+                        && j.cancel.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        cancelled = true;
+                        break;
                     }
 
                     let Some(provider) = registry.get(&provider_id) else {

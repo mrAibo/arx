@@ -155,6 +155,7 @@ impl SftpProvider {
     }
 
     /// Reuse pooled connection without retry (mutations are not retried).
+    #[allow(dead_code)]
     async fn connect_for_mutation(
         &self,
     ) -> std::io::Result<
@@ -227,6 +228,18 @@ impl VfsProvider for SftpProvider {
 
     fn delete_files(&self, _dir: &str, _names: &[String]) -> std::io::Result<usize> {
         Err(std::io::Error::other("SFTP delete via transfer planner"))
+    }
+
+    async fn mkdir(&self, path: &str) -> std::io::Result<()> {
+        self.mkdir(path).await
+    }
+
+    async fn remove_file(&self, path: &str) -> std::io::Result<()> {
+        self.remove_file(path).await
+    }
+
+    async fn remove_dir(&self, path: &str) -> std::io::Result<()> {
+        self.remove_dir(path).await
     }
 }
 
