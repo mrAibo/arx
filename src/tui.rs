@@ -2467,14 +2467,68 @@ fn render(
 
     // Remote delete confirmation overlay
     if let Some(plan) = &state.pending_delete {
+        let file_count = plan
+            .targets
+            .iter()
+            .filter(|t| t.kind == arx::vfs::EntryKind::File)
+            .count();
+        let symlink_count = plan
+            .targets
+            .iter()
+            .filter(|t| t.kind == arx::vfs::EntryKind::Symlink)
+            .count();
+        let dir_count = plan
+            .targets
+            .iter()
+            .filter(|t| t.kind == arx::vfs::EntryKind::Directory)
+            .count();
+
+        let name_lines: Vec<String> = {
+            let max_show = 10;
+            let mut names: Vec<String> = plan
+                .targets
+                .iter()
+                .take(max_show)
+                .map(|t| format!("  {}", t.name))
+                .collect();
+            if plan.targets.len() > max_show {
+                names.push(format!("  ...and {} more", plan.targets.len() - max_show));
+            }
+            names
+        };
+
+        let breakdown = {
+            let mut parts = Vec::new();
+            if file_count > 0 {
+                parts.push(format!("{file_count} file(s)"));
+            }
+            if symlink_count > 0 {
+                parts.push(format!("{symlink_count} symlink(s)"));
+            }
+            if dir_count > 0 {
+                parts.push(format!("{dir_count} empty dir(s)"));
+            }
+            if parts.is_empty() {
+                "".into()
+            } else {
+                parts.join(", ")
+            }
+        };
+
         let msg = format!(
-            "PERMANENT REMOTE DELETE\n\n{} target(s) at {}\n\nNo Trash / Undo  Enter=Confirm  Esc=Cancel",
+            "PERMANENT REMOTE DELETE\n\n{} target(s) at {}\n{}\n\nNo Trash / Undo  Enter=Confirm  Esc=Cancel",
             plan.targets.len(),
             plan.location,
+            breakdown,
         );
-        let popup = centered_rect(50, 8, area);
+
+        // Append name lines
+        let body = format!("{msg}\n\n{}", name_lines.join("\n"));
+
+        let height = (name_lines.len() + 8).min(area.height as usize) as u16;
+        let popup = centered_rect(60, height, area);
         frame.render_widget(Clear, popup);
-        let p = ratatui::widgets::Paragraph::new(msg)
+        let p = ratatui::widgets::Paragraph::new(body)
             .block(
                 ratatui::widgets::Block::default()
                     .borders(ratatui::widgets::Borders::ALL)
