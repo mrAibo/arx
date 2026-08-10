@@ -10,7 +10,7 @@ Transfer Stack replaces the old F5/F6 handlers. When you hit copy or move,
 ARX probes what tools are available, picks the best method (native, rsync,
 or SFTP streaming), and runs the transfer through the job manager. SFTP
 copies are transactional: temp file, backup existing, commit, rollback on
-failure. 42 tests, clippy-clean.
+failure. 277 tests, clippy-clean.
 
 ## Quick start
 
@@ -51,7 +51,7 @@ arx
 || F3 | View (read-only preview) |
 || F4 | Edit in configured editor |
 || F5 | Copy — planner picks native/rsync/SFTP |
-|| F6 | Move — planner picks native/rsync/SFTP |
+|| F6 | Move — local-only |
 || F7 | Create directory |
 || F8 | Delete (trash) |
 || Shift+F6 | Rename |
@@ -142,7 +142,7 @@ Menu entries appear in Command Center (Ctrl+P).
 || Quick Actions — compress, chmod, touch, mkdir, symlink, sha256 | ✅ |
 || Preview engine — chafa, pdftotext, ffprobe, 7z, bat | ✅ |
 || Background jobs with progress bars | ✅ |
-|| tmux session attach (F7) | ✅ |
+|| tmux sessions (Command Center) | ✅ |
 || Mouse — right-click menu, drag multi-select, scroll | ✅ |
 || Directory diff + content diff (Ctrl+D) | ✅ |
 || Split pane toggle (Ctrl+\\) | ✅ |
@@ -187,7 +187,7 @@ arx/
 │   ├── terminal.rs          # PTY + subshell
 │   ├── keyring.rs           # system keychain for SSH passphrases
 │   └── lib.rs
-└── tests/                   # 42 tests
+└── tests/                   # 277 tests
 ```
 
 **VFS:** `VfsOps` trait + `Location` enum + `ProviderId` + `CapabilitySet`.
@@ -220,7 +220,7 @@ cargo test --all-features
 cargo run
 ```
 
-42 tests, clippy-clean, CI green on ubuntu-latest.
+277 tests, clippy-clean, CI green on ubuntu-latest.
 
 ## License
 
