@@ -51,7 +51,14 @@ pub fn format_bounded_preview(
     lines.insert(0, format!("[Remote Text] {display_name} — {bytes_label}"));
 
     if truncated || lines_truncated {
-        lines.push(format!("[Truncated at {} lines]", max_lines));
+        let mut parts = Vec::new();
+        if truncated {
+            parts.push(format!("{} bytes", MAX_TEXT_PREVIEW_BYTES));
+        }
+        if lines_truncated {
+            parts.push(format!("{} lines", MAX_TEXT_PREVIEW_LINES));
+        }
+        lines.push(format!("[Truncated at {}]", parts.join(" / ")));
     }
 
     Ok(lines)

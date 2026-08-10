@@ -91,7 +91,7 @@ fn entries_from_read_dir(read_dir: Vec<russh_sftp::client::fs::DirEntry>) -> Vec
     result
 }
 
-use crate::vfs::VfsProvider;
+use crate::vfs::{BoundedRead, VfsProvider};
 pub struct SftpProvider {
     pub host: crate::remote::Host,
     connection: Mutex<Option<crate::remote::openssh_sftp::OpenSshSftpConnection>>,
@@ -248,9 +248,13 @@ impl VfsProvider for SftpProvider {
                 .map_err(|e| std::io::Error::other(format!("SFTP runtime: {e}")))?;
             rt.block_on(async {
                 let provider = SftpProvider::new(host);
-                let bytes = provider.read_prefix(&path, MAX_BYTES).await?;
+                let bounded = provider.read_prefix(&path, MAX_BYTES).await?;
                 crate::services::preview::format_bounded_preview(
-                    &bytes, None, false, &path, max_lines,
+                    &bounded.bytes,
+                    None,
+                    bounded.truncated,
+                    &path,
+                    max_lines,
                 )
             })
         })
@@ -282,7 +286,11 @@ impl VfsProvider for SftpProvider {
         self.remove_dir(path).await
     }
 
-    async fn read_prefix_bytes(&self, path: &str, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    async fn read_prefix_bytes(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> std::io::Result<BoundedRead> {
         self.read_prefix(path, max_bytes).await
     }
 }
@@ -290,7 +298,7 @@ impl VfsProvider for SftpProvider {
 impl SftpProvider {
     /// Read up to `max_bytes` from the beginning of a remote file.
     /// Uses pooled connection with one retry — read is non-destructive.
-    async fn read_prefix(&self, path: &str, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    async fn read_prefix(&self, path: &str, max_bytes: usize) -> std::io::Result<BoundedRead> {
         use tokio::io::AsyncReadExt;
 
         let mut guard = self.connection.lock().await;
@@ -325,7 +333,10 @@ impl SftpProvider {
                     if truncated {
                         buf.truncate(max_bytes);
                     }
-                    return Ok(buf);
+                    return Ok(BoundedRead {
+                        bytes: buf,
+                        truncated,
+                    });
                 }
                 Err(error) => {
                     if let Some(mut broken) = guard.take() {

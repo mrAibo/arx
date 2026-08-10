@@ -69,7 +69,7 @@ impl ProcessService {
                 total_size,
             } => {
                 let label = format!("remote preview: {name}");
-                let bytes = match registry
+                let bounded = match registry
                     .read_prefix_bytes_at(&location, &name, preview::MAX_TEXT_PREVIEW_BYTES)
                     .await
                 {
@@ -82,9 +82,9 @@ impl ProcessService {
                     }
                 };
                 let lines = preview::format_bounded_preview(
-                    &bytes,
+                    &bounded.bytes,
                     total_size,
-                    bytes.len() >= preview::MAX_TEXT_PREVIEW_BYTES,
+                    bounded.truncated,
                     &name,
                     preview::MAX_TEXT_PREVIEW_LINES,
                 )
@@ -229,7 +229,7 @@ mod tests {
     use super::*;
     use crate::effect_dispatcher::{EffectDispatcher, EffectLane, EffectScope};
     use crate::vfs::capabilities;
-    use crate::vfs::{Entry, Location, VfsProvider};
+    use crate::vfs::{BoundedRead, Entry, Location, VfsProvider};
     use std::sync::Mutex;
 
     #[tokio::test]
@@ -249,11 +249,11 @@ mod tests {
     // ── VIEW-09B: error path mock provider ──
 
     struct MockProvider {
-        read_result: Mutex<Option<std::io::Result<Vec<u8>>>>,
+        read_result: Mutex<Option<std::io::Result<BoundedRead>>>,
     }
 
     impl MockProvider {
-        fn new(result: std::io::Result<Vec<u8>>) -> Self {
+        fn new(result: std::io::Result<BoundedRead>) -> Self {
             Self {
                 read_result: Mutex::new(Some(result)),
             }
@@ -287,7 +287,7 @@ mod tests {
             &self,
             _path: &str,
             _max_bytes: usize,
-        ) -> std::io::Result<Vec<u8>> {
+        ) -> std::io::Result<BoundedRead> {
             self.read_result
                 .lock()
                 .unwrap()
@@ -388,7 +388,10 @@ mod tests {
 
     #[tokio::test]
     async fn preview_location_success_returns_viewer_lines() {
-        let mock = MockProvider::new(Ok(b"hello remote\nworld\n".to_vec()));
+        let mock = MockProvider::new(Ok(BoundedRead {
+            bytes: b"hello remote\nworld\n".to_vec(),
+            truncated: false,
+        }));
         let registry = registry_with_mock("test-host", mock);
 
         let event = ProcessService::execute_with_registry(

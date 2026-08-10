@@ -173,6 +173,13 @@ impl Target {
     }
 }
 
+/// Truncation-aware bounded read result from a remote provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedRead {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
 /// Backend trait — each provider implements this. async deferred to F2.
 /// ponytail: sync list() kept for backward compat; list_async() is the new path.
 #[async_trait::async_trait]
@@ -208,8 +215,12 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
             "remove_dir not supported by this provider",
         ))
     }
-    /// Read up to `max_bytes` from a file. Default: unsupported.
-    async fn read_prefix_bytes(&self, _path: &str, _max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    /// Read bounded prefix from a file. Default: unsupported.
+    async fn read_prefix_bytes(
+        &self,
+        _path: &str,
+        _max_bytes: usize,
+    ) -> std::io::Result<BoundedRead> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "read_prefix_bytes not supported by this provider",
@@ -497,7 +508,7 @@ impl ProviderRegistry {
         location: &Location,
         name: &str,
         max_bytes: usize,
-    ) -> std::io::Result<Vec<u8>> {
+    ) -> std::io::Result<BoundedRead> {
         let (provider, parent_path) = self.provider_for_location(location)?;
         let path = format!("{}/{}", parent_path.trim_end_matches('/'), name);
         provider.read_prefix_bytes(&path, max_bytes).await
@@ -1142,7 +1153,7 @@ mod tests {
 
     struct RoutingMockProvider {
         host_label: String,
-        read_result: Mutex<Option<std::io::Result<Vec<u8>>>>,
+        read_result: Mutex<Option<std::io::Result<BoundedRead>>>,
     }
 
     impl std::fmt::Debug for RoutingMockProvider {
@@ -1174,7 +1185,7 @@ mod tests {
             &self,
             _path: &str,
             _max_bytes: usize,
-        ) -> std::io::Result<Vec<u8>> {
+        ) -> std::io::Result<BoundedRead> {
             self.read_result
                 .lock()
                 .unwrap()
@@ -1190,7 +1201,10 @@ mod tests {
             "host-a",
             Box::new(RoutingMockProvider {
                 host_label: "host-a".into(),
-                read_result: Mutex::new(Some(Ok(b"content from host-a".to_vec()))),
+                read_result: Mutex::new(Some(Ok(BoundedRead {
+                    bytes: b"content from host-a".to_vec(),
+                    truncated: false,
+                }))),
             }),
             capabilities::SFTP_CAPABILITIES,
         );
@@ -1198,7 +1212,10 @@ mod tests {
             "host-b",
             Box::new(RoutingMockProvider {
                 host_label: "host-b".into(),
-                read_result: Mutex::new(Some(Ok(b"content from host-b".to_vec()))),
+                read_result: Mutex::new(Some(Ok(BoundedRead {
+                    bytes: b"content from host-b".to_vec(),
+                    truncated: false,
+                }))),
             }),
             capabilities::SFTP_CAPABILITIES,
         );
@@ -1213,16 +1230,18 @@ mod tests {
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let bytes_a = rt
+        let bounded_a = rt
             .block_on(r.read_prefix_bytes_at(&loc_a, "data.txt", 1024))
             .unwrap();
-        let bytes_b = rt
+        let bounded_b = rt
             .block_on(r.read_prefix_bytes_at(&loc_b, "data.txt", 1024))
             .unwrap();
 
-        assert_eq!(bytes_a, b"content from host-a");
-        assert_eq!(bytes_b, b"content from host-b");
-        assert_ne!(bytes_a, bytes_b);
+        assert_eq!(bounded_a.bytes, b"content from host-a");
+        assert!(!bounded_a.truncated);
+        assert_eq!(bounded_b.bytes, b"content from host-b");
+        assert!(!bounded_b.truncated);
+        assert_ne!(bounded_a.bytes, bounded_b.bytes);
     }
 
     #[test]
