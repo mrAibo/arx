@@ -1106,4 +1106,18 @@ mod tests {
         assert_eq!(progress.completed_steps, 12);
         assert_eq!(progress.total_steps, 31);
     }
+
+    // ── REMOTE-09: JobResult retains completed count ──
+
+    #[test]
+    fn job_result_retains_completed_count() {
+        let result = JobResult::generic("done", 42);
+        assert_eq!(result.message(), Some("done"));
+        match result {
+            JobResult::Generic {
+                completed_items, ..
+            } => assert_eq!(completed_items, Some(42)),
+            _ => panic!("expected Generic variant"),
+        }
+    }
 }

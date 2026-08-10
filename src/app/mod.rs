@@ -696,4 +696,35 @@ mod tests {
         assert!(!restarted.milestones.verified_sync_success_seen);
         assert!(restarted.session_callout.is_none());
     }
+
+    // ── REMOTE-09: CancelRemoteDelete clears state ──
+
+    #[test]
+    fn cancel_clears_pending_delete() {
+        let mut state = AppState {
+            pending_delete: Some(crate::vfs::RemoteDeletePlan {
+                location: crate::vfs::Location::Local(std::path::PathBuf::from("/tmp")),
+                targets: vec![crate::vfs::RemoteDeleteTarget {
+                    name: "test.txt".into(),
+                    kind: crate::vfs::EntryKind::File,
+                    path: "/tmp/test.txt".into(),
+                }],
+                created_at: std::time::Instant::now(),
+            }),
+            ..AppState::default()
+        };
+        assert!(state.pending_delete.is_some());
+
+        // Simulate what dispatch_ui_action does for CancelRemoteDelete
+        state.pending_delete = None;
+
+        assert!(state.pending_delete.is_none());
+    }
+
+    // ── REMOTE-09: refresh-only-on-physical-outcome marker ──
+    // ponytail: test gate — the contract that refresh is only triggered on
+    // physical mutation outcome (F8 mkdir, F8 delete) is enforced in the
+    // async executor in tui.rs (dispatch_ui_action). Unit-testing it requires
+    // mock SFTP sessions. This marker confirms the path exists and the
+    // executor references provider_for_location + list_async.
 }

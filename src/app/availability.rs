@@ -547,4 +547,39 @@ mod tests {
             ActionAvailability::Disabled { .. }
         ));
     }
+
+    // ── REMOTE-09: mkdir availability ──
+
+    #[test]
+    fn mkdir_local_available() {
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        ctx.focused_kind = Some(EntryKind::File);
+        assert_eq!(
+            action_availability(ActionId::Mkdir, &ctx),
+            ActionAvailability::Available
+        );
+    }
+
+    #[test]
+    fn mkdir_sftp_available() {
+        let mut ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+        ctx.focused_kind = Some(EntryKind::File);
+        assert_eq!(
+            action_availability(ActionId::Mkdir, &ctx),
+            ActionAvailability::Available
+        );
+    }
+
+    #[test]
+    fn mkdir_archive_disabled() {
+        let mut ctx = context(
+            ProviderId::Archive,
+            crate::vfs::capabilities::ARCHIVE_CAPABILITIES,
+        );
+        ctx.focused_kind = Some(EntryKind::File);
+        assert!(matches!(
+            action_availability(ActionId::Mkdir, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
 }

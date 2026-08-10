@@ -766,4 +766,24 @@ mod tests {
             Err(SyncCompileError::RemoteToRemoteUnsupported { .. })
         ));
     }
+
+    // ── REMOTE-09: SFTP delete never reaches sync execution ──
+
+    #[test]
+    fn sftp_delete_never_reaches_sync_execution() {
+        // require_local_file_mutation() rejects any non-Local provider.
+        // This is the exact gate that prevents SFTP file mutations from
+        // being compiled into executable sync steps. The validator (in
+        // workspace_sync_execution.rs) now passes SFTP deletes because
+        // SFTP_CAPABILITIES includes Delete — the compiler is the
+        // definitive blocker.
+        let sftp_target = Location::Sftp {
+            host: "prod".into(),
+            path: "/srv/data.txt".into(),
+        };
+        let result = require_local_file_mutation(&sftp_target, "data.txt");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Sftp") || msg.contains("cannot safely delete"));
+    }
 }
