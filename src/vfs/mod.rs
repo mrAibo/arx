@@ -396,7 +396,7 @@ impl ProviderRegistry {
         }
     }
 
-    fn provider_for_location(
+    pub fn provider_for_location(
         &self,
         loc: &Location,
     ) -> std::io::Result<(Arc<dyn VfsProvider>, String)> {
@@ -594,6 +594,15 @@ impl Location {
                     inner_path: child,
                 }
             }
+        }
+    }
+
+    /// Path string suitable for passing to a provider's list/list_async.
+    pub fn path_for_listing(&self) -> &str {
+        match self {
+            Self::Local(p) => p.to_str().unwrap_or("/"),
+            Self::Sftp { path, .. } => path,
+            Self::Archive { inner_path, .. } => inner_path,
         }
     }
 

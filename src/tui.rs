@@ -4443,6 +4443,90 @@ async fn dispatch_ui_action(
                 let mut failed: usize = 0;
                 let mut cancelled = false;
 
+                // ── Preflight: revalidate all frozen targets ──────────────
+                let (provider, parent_path) = match registry.provider_for_location(&location) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = jobs.publish_event(
+                            &tx,
+                            arx::jobs::JobEvent::Failed {
+                                id: job.id.clone(),
+                                error: format!("Cannot access location: {e}"),
+                                result: None,
+                            },
+                        );
+                        return;
+                    }
+                };
+
+                let fresh_listing = match provider.list_async(&parent_path).await {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        let _ = jobs.publish_event(
+                            &tx,
+                            arx::jobs::JobEvent::Failed {
+                                id: job.id.clone(),
+                                error: format!("Cannot re-list directory: {e}"),
+                                result: None,
+                            },
+                        );
+                        return;
+                    }
+                };
+
+                for target in &targets {
+                    match fresh_listing.iter().find(|e| e.name == target.name) {
+                        None => {
+                            let _ = jobs.publish_event(
+                                &tx,
+                                arx::jobs::JobEvent::Failed {
+                                    id: job.id.clone(),
+                                    error: format!(
+                                        "Remote contents changed: '{}' no longer exists. Review selection.",
+                                        target.name
+                                    ),
+                                    result: None,
+                                },
+                            );
+                            return;
+                        }
+                        Some(entry) if entry.kind != target.kind => {
+                            let _ = jobs.publish_event(
+                                &tx,
+                                arx::jobs::JobEvent::Failed {
+                                    id: job.id.clone(),
+                                    error: format!(
+                                        "Remote contents changed: '{}' type changed. Review selection.",
+                                        target.name
+                                    ),
+                                    result: None,
+                                },
+                            );
+                            return;
+                        }
+                        Some(entry) if entry.kind == arx::vfs::EntryKind::Directory => {
+                            if let Ok(children) = provider.list_async(&target.path).await
+                                && !children.is_empty()
+                            {
+                                let _ = jobs.publish_event(
+                                    &tx,
+                                    arx::jobs::JobEvent::Failed {
+                                        id: job.id.clone(),
+                                        error: format!(
+                                            "Recursive remote delete is not supported: '{}' is not empty",
+                                            target.name
+                                        ),
+                                        result: None,
+                                    },
+                                );
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // ── All targets validated — proceed with deletion ────────
+
                 for target in &targets {
                     if let Some(j) = jobs.get(&job.id)
                         && j.cancel.load(std::sync::atomic::Ordering::Relaxed)
