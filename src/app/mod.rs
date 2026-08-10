@@ -750,4 +750,110 @@ mod tests {
     // async executor in tui.rs (dispatch_ui_action). Unit-testing it requires
     // mock SFTP sessions. This marker confirms the path exists and the
     // executor references provider_for_location + list_async.
+
+    // ── VIEW-LAST-02: latest-preview-wins contract ──
+
+    fn preview_state() -> AppState {
+        let left = Location::Local(std::path::PathBuf::from("/tmp/a"));
+        let right = Location::Local(std::path::PathBuf::from("/tmp/b"));
+        AppState {
+            left: crate::app::PaneState {
+                location: left.clone(),
+                cursor: 0,
+                tabs: vec![],
+                dir_history: vec![],
+                split: false,
+                split_cursor: 0,
+                split_active: false,
+            },
+            right: crate::app::PaneState {
+                location: right.clone(),
+                cursor: 0,
+                tabs: vec![],
+                dir_history: vec![],
+                split: false,
+                split_cursor: 0,
+                split_active: false,
+            },
+            ..AppState::default()
+        }
+    }
+
+    #[test]
+    fn b_supersedes_a_at_appstate_level() {
+        let mut state = preview_state();
+        let scope = EffectScope::Location(state.left.location.clone());
+        let lane = EffectLane::Preview;
+
+        // A registers
+        let a = EffectId(1);
+        state.register_effect(lane, a);
+        assert!(state.accepts_effect(a, lane, &scope));
+
+        // B registers — supersedes A
+        let b = EffectId(2);
+        state.register_effect(lane, b);
+
+        // A is now stale
+        assert!(!state.accepts_effect(a, lane, &scope));
+        // B is current
+        assert!(state.accepts_effect(b, lane, &scope));
+    }
+
+    #[test]
+    fn scope_change_rejects_unknown_location() {
+        let mut state = preview_state();
+        let scope_left = EffectScope::Location(state.left.location.clone());
+        let scope_other =
+            EffectScope::Location(Location::Local(std::path::PathBuf::from("/tmp/other")));
+        let lane = EffectLane::Preview;
+
+        let a = EffectId(1);
+        state.register_effect(lane, a);
+        // Left scope matches left pane (regardless of active pane)
+        assert!(state.accepts_effect(a, lane, &scope_left));
+        // Unknown location is rejected
+        assert!(!state.accepts_effect(a, lane, &scope_other));
+        // Switch active to right — left scope STILL matches left pane
+        state.active = Pane::Right;
+        assert!(state.accepts_effect(a, lane, &scope_left));
+        // Unknown location still rejected
+        assert!(!state.accepts_effect(a, lane, &scope_other));
+    }
+
+    #[test]
+    fn finish_effect_removes_pending() {
+        let mut state = preview_state();
+        let scope = EffectScope::Location(state.left.location.clone());
+        let lane = EffectLane::Preview;
+
+        let a = EffectId(1);
+        state.register_effect(lane, a);
+        assert!(state.accepts_effect(a, lane, &scope));
+
+        state.finish_effect(lane, a);
+        // After finish, effect is no longer accepted
+        assert!(!state.accepts_effect(a, lane, &scope));
+    }
+
+    #[test]
+    fn different_lanes_independent() {
+        let mut state = preview_state();
+        let scope = EffectScope::Location(state.left.location.clone());
+
+        let preview_a = EffectId(1);
+        state.register_effect(EffectLane::Preview, preview_a);
+        let process_a = EffectId(1);
+        state.register_effect(EffectLane::GlobalProcess, process_a);
+
+        // Same numeric id, different lane — both should be accepted
+        assert!(state.accepts_effect(preview_a, EffectLane::Preview, &scope));
+        assert!(state.accepts_effect(process_a, EffectLane::GlobalProcess, &scope));
+
+        // Supersede Preview lane only
+        state.register_effect(EffectLane::Preview, EffectId(2));
+        assert!(!state.accepts_effect(preview_a, EffectLane::Preview, &scope));
+        // GlobalProcess lane unchanged
+        assert!(state.accepts_effect(process_a, EffectLane::GlobalProcess, &scope));
+    }
 }

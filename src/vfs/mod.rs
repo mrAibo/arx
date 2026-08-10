@@ -173,6 +173,13 @@ impl Target {
     }
 }
 
+/// Truncation-aware bounded read result from a remote provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedRead {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
 /// Backend trait — each provider implements this. async deferred to F2.
 /// ponytail: sync list() kept for backward compat; list_async() is the new path.
 #[async_trait::async_trait]
@@ -206,6 +213,17 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "remove_dir not supported by this provider",
+        ))
+    }
+    /// Read bounded prefix from a file. Default: unsupported.
+    async fn read_prefix_bytes(
+        &self,
+        _path: &str,
+        _max_bytes: usize,
+    ) -> std::io::Result<BoundedRead> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "read_prefix_bytes not supported by this provider",
         ))
     }
 }
@@ -482,6 +500,18 @@ impl ProviderRegistry {
     pub async fn remove_dir_at(&self, location: &Location, path: &str) -> std::io::Result<()> {
         let (provider, _) = self.provider_for_location(location)?;
         provider.remove_dir(path).await
+    }
+
+    /// Read bounded prefix bytes from a file at a location.
+    pub async fn read_prefix_bytes_at(
+        &self,
+        location: &Location,
+        name: &str,
+        max_bytes: usize,
+    ) -> std::io::Result<BoundedRead> {
+        let (provider, parent_path) = self.provider_for_location(location)?;
+        let path = format!("{}/{}", parent_path.trim_end_matches('/'), name);
+        provider.read_prefix_bytes(&path, max_bytes).await
     }
 }
 
@@ -1088,5 +1118,146 @@ mod tests {
     fn fail_closed_on_non_empty_dir() {
         let plan = sftp_plan("populated", EntryKind::Directory);
         assert_eq!(plan.targets[0].kind, EntryKind::Directory);
+    }
+
+    // ── SFTP remote-view regression ──
+
+    #[test]
+    fn default_registry_reports_sftp_capabilities() {
+        let registry = default_registry();
+        let caps = registry.capabilities(&ProviderId::Sftp).unwrap();
+        assert!(caps.supports(Capability::Read));
+        assert!(caps.supports(Capability::List));
+        assert!(!caps.supports(Capability::Move));
+    }
+
+    #[test]
+    fn local_read_prefix_bytes_reports_unsupported() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        std::fs::write(&path, b"hello\nworld\n").unwrap();
+
+        let registry = default_registry();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(registry.read_prefix_bytes_at(&Location::Local(path), "", 1024));
+
+        // local provider doesn't implement read_prefix_bytes; returns Unsupported
+        assert!(result.is_err());
+    }
+
+    // ── VIEW-09B: routing ──
+
+    use std::sync::Mutex;
+
+    struct RoutingMockProvider {
+        host_label: String,
+        read_result: Mutex<Option<std::io::Result<BoundedRead>>>,
+    }
+
+    impl std::fmt::Debug for RoutingMockProvider {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RoutingMockProvider")
+                .field("host_label", &self.host_label)
+                .finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VfsProvider for RoutingMockProvider {
+        fn list(&self, _path: &str) -> std::io::Result<Vec<Entry>> {
+            panic!("mock: list not called")
+        }
+        fn read_head(&self, _path: &str, _lines: usize) -> std::io::Result<Vec<String>> {
+            panic!("mock: read_head not called")
+        }
+        fn copy_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("mock: copy_files not called")
+        }
+        fn move_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("mock: move_files not called")
+        }
+        fn delete_files(&self, _dir: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("mock: delete_files not called")
+        }
+        async fn read_prefix_bytes(
+            &self,
+            _path: &str,
+            _max_bytes: usize,
+        ) -> std::io::Result<BoundedRead> {
+            self.read_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("mock: read_result already consumed")
+        }
+    }
+
+    #[test]
+    fn two_sftp_hosts_route_to_different_providers() {
+        let r = ProviderRegistry::new();
+        r.insert_sftp(
+            "host-a",
+            Box::new(RoutingMockProvider {
+                host_label: "host-a".into(),
+                read_result: Mutex::new(Some(Ok(BoundedRead {
+                    bytes: b"content from host-a".to_vec(),
+                    truncated: false,
+                }))),
+            }),
+            capabilities::SFTP_CAPABILITIES,
+        );
+        r.insert_sftp(
+            "host-b",
+            Box::new(RoutingMockProvider {
+                host_label: "host-b".into(),
+                read_result: Mutex::new(Some(Ok(BoundedRead {
+                    bytes: b"content from host-b".to_vec(),
+                    truncated: false,
+                }))),
+            }),
+            capabilities::SFTP_CAPABILITIES,
+        );
+
+        let loc_a = Location::Sftp {
+            host: "host-a".into(),
+            path: "/data.txt".into(),
+        };
+        let loc_b = Location::Sftp {
+            host: "host-b".into(),
+            path: "/data.txt".into(),
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bounded_a = rt
+            .block_on(r.read_prefix_bytes_at(&loc_a, "data.txt", 1024))
+            .unwrap();
+        let bounded_b = rt
+            .block_on(r.read_prefix_bytes_at(&loc_b, "data.txt", 1024))
+            .unwrap();
+
+        assert_eq!(bounded_a.bytes, b"content from host-a");
+        assert!(!bounded_a.truncated);
+        assert_eq!(bounded_b.bytes, b"content from host-b");
+        assert!(!bounded_b.truncated);
+        assert_ne!(bounded_a.bytes, bounded_b.bytes);
+    }
+
+    #[test]
+    fn sftp_host_routing_is_not_singleton() {
+        // Two SFTP hosts must not resolve to the same singleton provider.
+        let key_a = ProviderRegistry::instance_key_for_location(&Location::Sftp {
+            host: "host-a".into(),
+            path: "/".into(),
+        });
+        let key_b = ProviderRegistry::instance_key_for_location(&Location::Sftp {
+            host: "host-b".into(),
+            path: "/".into(),
+        });
+
+        assert_ne!(key_a, key_b);
+        assert!(matches!(key_a, ProviderInstanceKey::SftpHost(h) if h == "host-a"));
+        assert!(matches!(key_b, ProviderInstanceKey::SftpHost(h) if h == "host-b"));
     }
 }

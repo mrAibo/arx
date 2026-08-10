@@ -58,6 +58,7 @@ pub const LOCAL_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
 /// primitives. Transfers remain delegated to the transfer layer.
 pub const SFTP_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::List)
+    .with(Capability::Read)
     .with(Capability::Mkdir)
     .with(Capability::Delete);
 
@@ -112,6 +113,25 @@ mod tests {
         assert!(ARCHIVE_CAPABILITIES.supports(Capability::List));
         assert!(WEBDAV_CAPABILITIES.supports(Capability::Read));
         assert!(!WEBDAV_CAPABILITIES.supports(Capability::Delete));
+        assert_eq!(S3_CAPABILITIES, CapabilitySet::NONE);
+    }
+
+    #[test]
+    fn sftp_has_read_capability() {
+        assert!(SFTP_CAPABILITIES.supports(Capability::Read));
+    }
+
+    #[test]
+    fn local_read_unchanged() {
+        assert!(LOCAL_CAPABILITIES.supports(Capability::Read));
+        assert!(LOCAL_CAPABILITIES.supports(Capability::List));
+        assert!(LOCAL_CAPABILITIES.supports(Capability::Move));
+    }
+
+    #[test]
+    fn s3_no_read() {
+        assert!(!S3_CAPABILITIES.supports(Capability::Read));
+        assert!(!S3_CAPABILITIES.supports(Capability::List));
         assert_eq!(S3_CAPABILITIES, CapabilitySet::NONE);
     }
 }

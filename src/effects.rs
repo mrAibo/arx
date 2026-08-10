@@ -8,17 +8,42 @@ use crate::vfs::Location;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    RunShellCapture { command: String },
-    SpawnShell { command: String },
-    AttachTmux { session: String },
-    AttachScreen { session: String },
+    RunShellCapture {
+        command: String,
+    },
+    SpawnShell {
+        command: String,
+    },
+    AttachTmux {
+        session: String,
+    },
+    AttachScreen {
+        session: String,
+    },
     ListTmuxSessions,
-    DirectoryChildrenSizes { path: PathBuf },
-    UnifiedDiff { left: PathBuf, right: PathBuf },
+    DirectoryChildrenSizes {
+        path: PathBuf,
+    },
+    UnifiedDiff {
+        left: PathBuf,
+        right: PathBuf,
+    },
     InfrastructureSnapshot,
-    TreeSnapshot { location: Location, filter: String },
-    PreviewFile { path: PathBuf },
-    OpenPath { path: PathBuf },
+    TreeSnapshot {
+        location: Location,
+        filter: String,
+    },
+    PreviewFile {
+        path: PathBuf,
+    },
+    PreviewLocation {
+        location: Location,
+        name: String,
+        total_size: Option<u64>,
+    },
+    OpenPath {
+        path: PathBuf,
+    },
 }
 
 /// Typed result sent back across the effect boundary.

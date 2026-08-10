@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 
 use crate::effects::{Effect, EffectEvent};
 use crate::process::ProcessService;
-use crate::vfs::Location;
+use crate::vfs::{Location, ProviderRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EffectId(pub u64);
@@ -55,15 +55,17 @@ pub struct EffectResponse {
 pub struct EffectDispatcher {
     next_id: Arc<AtomicU64>,
     tx: mpsc::UnboundedSender<EffectResponse>,
+    registry: ProviderRegistry,
 }
 
 impl EffectDispatcher {
-    pub fn channel() -> (Self, mpsc::UnboundedReceiver<EffectResponse>) {
+    pub fn channel(registry: ProviderRegistry) -> (Self, mpsc::UnboundedReceiver<EffectResponse>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
             Self {
                 next_id: Arc::new(AtomicU64::new(1)),
                 tx,
+                registry,
             },
             rx,
         )
@@ -78,8 +80,9 @@ impl EffectDispatcher {
             effect,
         };
         let tx = self.tx.clone();
+        let registry = self.registry.clone();
         tokio::spawn(async move {
-            let event = ProcessService::execute(request.effect).await;
+            let event = ProcessService::execute_with_registry(request.effect, &registry).await;
             let _ = tx.send(EffectResponse {
                 id: request.id,
                 lane: request.lane,
@@ -97,7 +100,8 @@ mod tests {
 
     #[tokio::test]
     async fn ids_are_monotonic() {
-        let (dispatcher, _rx) = EffectDispatcher::channel();
+        let registry = ProviderRegistry::new();
+        let (dispatcher, _rx) = EffectDispatcher::channel(registry);
         let first = dispatcher.dispatch(
             EffectLane::GlobalProcess,
             EffectScope::Global,

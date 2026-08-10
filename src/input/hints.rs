@@ -187,7 +187,12 @@ mod tests {
         assert!(
             remote_hints
                 .iter()
-                .all(|hint| !matches!(hint.action, ActionId::ViewFile | ActionId::EditFile))
+                .any(|hint| matches!(hint.action, ActionId::ViewFile))
+        );
+        assert!(
+            remote_hints
+                .iter()
+                .all(|hint| !matches!(hint.action, ActionId::EditFile))
         );
 
         let no_editor = contextual_hints_with_file_context(
