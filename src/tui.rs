@@ -369,6 +369,49 @@ async fn event_loop(
                     }
                 }
                 Event::Key(key) => {
+                    // Remote delete confirmation intercepts Enter/Escape
+                    if state.pending_delete.is_some() {
+                        match key.code {
+                            KeyCode::Enter => {
+                                dispatch_ui_action(
+                                    &mut state,
+                                    Action::ConfirmRemoteDelete,
+                                    None, // no focused entry during confirmation
+                                    &[],
+                                    0,
+                                    &workspace_scanner,
+                                    &sync_runtime,
+                                    &effect_dispatcher,
+                                    &pane_loader,
+                                    terminal_session,
+                                    editor.as_deref(),
+                                )
+                                .await?;
+                                continue;
+                            }
+                            KeyCode::Esc => {
+                                dispatch_ui_action(
+                                    &mut state,
+                                    Action::CancelRemoteDelete,
+                                    None,
+                                    &[],
+                                    0,
+                                    &workspace_scanner,
+                                    &sync_runtime,
+                                    &effect_dispatcher,
+                                    &pane_loader,
+                                    terminal_session,
+                                    editor.as_deref(),
+                                )
+                                .await?;
+                                continue;
+                            }
+                            _ => {
+                                // Ignore other keys during confirmation
+                                continue;
+                            }
+                        }
+                    }
                     // Command Center owns keyboard input while open. Keep this
                     // before generic text-input routing so Ctrl+P has a real,
                     // usable interaction model.
@@ -407,10 +450,16 @@ async fn event_loop(
                                         } else {
                                             (right_filtered.get(cursor), right_filtered.len())
                                         };
+                                    let active_entries: &[&Entry] = if state.active == Pane::Left {
+                                        &left_filtered[..]
+                                    } else {
+                                        &right_filtered[..]
+                                    };
                                     if let Some(effect) = execute_command_target(
                                         &mut state,
                                         item.target,
                                         focused_entry.copied(),
+                                        active_entries,
                                         visible_count,
                                         &workspace_scanner,
                                         &pane_loader,
@@ -539,9 +588,82 @@ async fn event_loop(
                                 }
                                 if state.cmd_input {
                                     let command = std::mem::take(&mut state.cmd);
+                                    let pending_mkdir =
+                                        std::mem::take(&mut state.pending_mkdir_location);
                                     state.cmd_input = false;
                                     if command.is_empty() {
                                         state.message = Some(": command cancelled".into());
+                                    } else if let Some(loc) = pending_mkdir {
+                                        // SFTP provider-backed mkdir
+                                        let name = command;
+                                        // ponytail: validate location type early.
+                                        if !matches!(
+                                            &loc,
+                                            Location::Local(_) | Location::Sftp { .. }
+                                        ) {
+                                            state.message =
+                                                Some("mkdir: unsupported location".into());
+                                            continue;
+                                        }
+                                        // Validate child name — reject empty, ".", "..", "/", NUL.
+                                        if let Err(e) = arx::vfs::validate_mkdir_child(&name) {
+                                            state.message = Some(e.to_string());
+                                            continue;
+                                        }
+                                        let registry = state.registry.clone();
+                                        let name_for_msg = name.clone();
+                                        let pane = state.active;
+                                        let pane_location = loc.clone();
+                                        let loader = pane_loader.clone();
+                                        let job = job_manager.create_job(
+                                            "mkdir",
+                                            arx::jobs::JobKind::RemoteCommand,
+                                            format!("mkdir {name}"),
+                                            Some(loc.clone()),
+                                            None,
+                                        );
+                                        state.jobs = job_manager.snapshot();
+                                        let jobs = job_manager.clone();
+                                        let tx = job_tx.clone();
+                                        {
+                                            let jid = job.id.clone();
+                                            let _ = jobs.publish_event(
+                                                &job_tx,
+                                                arx::jobs::JobEvent::Running { id: jid },
+                                            );
+                                        }
+                                        tokio::spawn(async move {
+                                            let result = registry.mkdir_at(&loc, &name).await;
+                                            match result {
+                                                Ok(()) => {
+                                                    let _ = jobs.publish_event(
+                                                        &tx,
+                                                        arx::jobs::JobEvent::Completed {
+                                                            id: job.id,
+                                                            result: arx::jobs::JobResult::generic(
+                                                                "created", 1,
+                                                            ),
+                                                        },
+                                                    );
+                                                    let _ = loader.load(
+                                                        pane,
+                                                        pane_location,
+                                                        PaneLoadPurpose::Refresh,
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    let _ = jobs.publish_event(
+                                                        &tx,
+                                                        arx::jobs::JobEvent::Failed {
+                                                            id: job.id,
+                                                            error: e.to_string(),
+                                                            result: None,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        });
+                                        state.message = Some(format!("mkdir {name_for_msg}…"));
                                     } else {
                                         let id = effect_dispatcher.dispatch(
                                             EffectLane::GlobalProcess,
@@ -794,6 +916,7 @@ async fn event_loop(
                                         &mut state,
                                         action,
                                         entries.get(cursor).copied(),
+                                        entries,
                                         entries.len(),
                                         &workspace_scanner,
                                         &sync_runtime,
@@ -2342,6 +2465,81 @@ fn render(
         render_menu(frame, area, state);
     }
 
+    // Remote delete confirmation overlay
+    if let Some(plan) = &state.pending_delete {
+        let file_count = plan
+            .targets
+            .iter()
+            .filter(|t| t.kind == arx::vfs::EntryKind::File)
+            .count();
+        let symlink_count = plan
+            .targets
+            .iter()
+            .filter(|t| t.kind == arx::vfs::EntryKind::Symlink)
+            .count();
+        let dir_count = plan
+            .targets
+            .iter()
+            .filter(|t| t.kind == arx::vfs::EntryKind::Directory)
+            .count();
+
+        let name_lines: Vec<String> = {
+            let max_show = 10;
+            let mut names: Vec<String> = plan
+                .targets
+                .iter()
+                .take(max_show)
+                .map(|t| format!("  {}", t.name))
+                .collect();
+            if plan.targets.len() > max_show {
+                names.push(format!("  ...and {} more", plan.targets.len() - max_show));
+            }
+            names
+        };
+
+        let breakdown = {
+            let mut parts = Vec::new();
+            if file_count > 0 {
+                parts.push(format!("{file_count} file(s)"));
+            }
+            if symlink_count > 0 {
+                parts.push(format!("{symlink_count} symlink(s)"));
+            }
+            if dir_count > 0 {
+                parts.push(format!("{dir_count} empty dir(s)"));
+            }
+            if parts.is_empty() {
+                "".into()
+            } else {
+                parts.join(", ")
+            }
+        };
+
+        let msg = format!(
+            "PERMANENT REMOTE DELETE\n\n{} target(s) at {}\n{}\n\nNo Trash / Undo  Enter=Confirm  Esc=Cancel",
+            plan.targets.len(),
+            plan.location,
+            breakdown,
+        );
+
+        // Append name lines
+        let body = format!("{msg}\n\n{}", name_lines.join("\n"));
+
+        // ponytail: enough room for msg (6 lines) + 2-separator + name_lines + 2-border
+        let height = (name_lines.len() + msg.lines().count() + 4).min(area.height as usize) as u16;
+        let popup = centered_rect_lines(60, height, area);
+        frame.render_widget(Clear, popup);
+        let p = ratatui::widgets::Paragraph::new(body)
+            .block(
+                ratatui::widgets::Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red))
+                    .title(" Confirm Remote Delete "),
+            )
+            .alignment(ratatui::layout::Alignment::Left);
+        frame.render_widget(p, popup);
+    }
+
     // Status bar
     let pane = state.active_pane();
     let loc_str = match &pane.location {
@@ -3251,6 +3449,31 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+/// Like centered_rect but height is in terminal lines instead of percent.
+/// Clamps to available area so the popup never exceeds terminal height.
+fn centered_rect_lines(percent_x: u16, lines: u16, area: Rect) -> Rect {
+    // ponytail: minimum 8 lines so deletion confirmation never collapses
+    let desired = lines.max(8);
+    let max_h = area.height.saturating_sub(2);
+    let h = desired.min(max_h);
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((area.height.saturating_sub(h)) / 2),
+            Constraint::Length(h),
+            Constraint::Length(0),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_pane(
     frame: &mut ratatui::Frame,
@@ -3728,6 +3951,7 @@ async fn dispatch_ui_action(
     state: &mut AppState,
     action: Action,
     focused: Option<&Entry>,
+    active_entries: &[&Entry],
     visible_count: usize,
     workspace_scanner: &WorkspaceScanner,
     sync: &SyncUiRuntime,
@@ -4127,19 +4351,73 @@ async fn dispatch_ui_action(
             state.clear_selection();
         }
         Action::Mkdir => {
-            state.cmd = "mkdir ".into();
-            state.cmd_input = true;
+            // SFTP: use provider-backed mkdir via frozen location
+            if state.active_pane().location.provider_id() == arx::vfs::ProviderId::Sftp {
+                state.pending_mkdir_location = Some(state.active_pane().location.clone());
+                state.cmd = String::new();
+                state.cmd_input = true;
+            } else {
+                // Local: keep existing shell-based mkdir (no regression)
+                state.cmd = "mkdir ".into();
+                state.cmd_input = true;
+            }
         }
         Action::Delete => {
             let names: Vec<String> = state
                 .selection_names(state.active, &state.active_pane().location)
-                .map(|names| names.iter().cloned().collect())
-                .or_else(|| focused.map(|entry| vec![entry.name.clone()]))
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter(|n| *n != VIRTUAL_PARENT_NAME)
+                        .cloned()
+                        .collect()
+                })
+                .or_else(|| {
+                    focused
+                        .filter(|e| e.name != VIRTUAL_PARENT_NAME)
+                        .map(|entry| vec![entry.name.clone()])
+                })
                 .unwrap_or_default();
             if names.is_empty() {
                 state.message = Some("Select a file or directory to delete".into());
                 return Ok(());
             }
+
+            // SFTP: freeze plan for confirmation (no mutation yet)
+            if state.active_pane().location.provider_id() == arx::vfs::ProviderId::Sftp {
+                let targets: Vec<arx::vfs::RemoteDeleteTarget> = names
+                    .iter()
+                    .filter_map(|name| {
+                        // Resolve real EntryKind from active pane listing
+                        let entry = active_entries.iter().find(|e| e.name == *name)?;
+                        let path = match &state.active_pane().location {
+                            arx::vfs::Location::Sftp { path: p, .. } => {
+                                format!("{p}/{name}")
+                            }
+                            _ => unreachable!(),
+                        };
+                        Some(arx::vfs::RemoteDeleteTarget {
+                            name: name.clone(),
+                            kind: entry.kind,
+                            path,
+                        })
+                    })
+                    .collect();
+                if targets.len() != names.len() {
+                    state.message = Some("Selection no longer matches directory contents".into());
+                    return Ok(());
+                }
+                state.pending_delete = Some(arx::vfs::RemoteDeletePlan {
+                    location: state.active_pane().location.clone(),
+                    targets,
+                    created_at: std::time::Instant::now(),
+                });
+                state.message =
+                    Some("Press Enter to confirm permanent deletion, Escape to cancel".into());
+                return Ok(());
+            }
+
+            // Local: existing trash path
             let Location::Local(dir) = state.active_pane().location.clone() else {
                 state.message = Some("Trash is currently available for local files only".into());
                 return Ok(());
@@ -4223,6 +4501,203 @@ async fn dispatch_ui_action(
             );
             state.register_effect(EffectLane::TmuxDiscovery, id);
             state.message = Some("Discovering tmux sessions…".into());
+        }
+        Action::ConfirmRemoteDelete => {
+            let Some(plan) = state.pending_delete.take() else {
+                return Ok(());
+            };
+            let registry = state.registry.clone();
+            let pane = state.active;
+            let loader = pane_loader.clone();
+            let location = plan.location.clone();
+            let targets = plan.targets;
+            let target_count = targets.len();
+            let jobs = sync.jobs.clone();
+            let tx = sync.job_events.clone();
+
+            let job = jobs.create_job(
+                "remote-delete",
+                arx::jobs::JobKind::Delete,
+                format!("Permanent delete {} target(s)", targets.len()),
+                Some(location.clone()),
+                None,
+            );
+
+            let _ = jobs.publish_event(&tx, arx::jobs::JobEvent::Running { id: job.id.clone() });
+
+            tokio::spawn(async move {
+                let mut completed: usize = 0;
+                let mut failed: usize = 0;
+                let mut cancelled = false;
+
+                // ── Preflight: revalidate all frozen targets ──────────────
+                let (provider, parent_path) = match registry.provider_for_location(&location) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = jobs.publish_event(
+                            &tx,
+                            arx::jobs::JobEvent::Failed {
+                                id: job.id.clone(),
+                                error: format!("Cannot access location: {e}"),
+                                result: None,
+                            },
+                        );
+                        return;
+                    }
+                };
+
+                let fresh_listing = match provider.list_async(&parent_path).await {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        let _ = jobs.publish_event(
+                            &tx,
+                            arx::jobs::JobEvent::Failed {
+                                id: job.id.clone(),
+                                error: format!("Cannot re-list directory: {e}"),
+                                result: None,
+                            },
+                        );
+                        return;
+                    }
+                };
+
+                for target in &targets {
+                    match fresh_listing.iter().find(|e| e.name == target.name) {
+                        None => {
+                            let _ = jobs.publish_event(
+                                &tx,
+                                arx::jobs::JobEvent::Failed {
+                                    id: job.id.clone(),
+                                    error: format!(
+                                        "Remote contents changed: '{}' no longer exists. Review selection.",
+                                        target.name
+                                    ),
+                                    result: None,
+                                },
+                            );
+                            return;
+                        }
+                        Some(entry) if entry.kind != target.kind => {
+                            let _ = jobs.publish_event(
+                                &tx,
+                                arx::jobs::JobEvent::Failed {
+                                    id: job.id.clone(),
+                                    error: format!(
+                                        "Remote contents changed: '{}' type changed. Review selection.",
+                                        target.name
+                                    ),
+                                    result: None,
+                                },
+                            );
+                            return;
+                        }
+                        Some(entry) if entry.kind == arx::vfs::EntryKind::Directory => {
+                            match provider.list_async(&target.path).await {
+                                Ok(children) if !children.is_empty() => {
+                                    let _ = jobs.publish_event(
+                                        &tx,
+                                        arx::jobs::JobEvent::Failed {
+                                            id: job.id.clone(),
+                                            error: format!(
+                                                "Recursive remote delete is not supported: '{}' is not empty",
+                                                target.name
+                                            ),
+                                            result: None,
+                                        },
+                                    );
+                                    return;
+                                }
+                                Ok(_) => {} // empty directory — allowed
+                                Err(e) => {
+                                    let _ = jobs.publish_event(
+                                        &tx,
+                                        arx::jobs::JobEvent::Failed {
+                                            id: job.id.clone(),
+                                            error: format!(
+                                                "Cannot verify that remote directory '{}' is empty: {}. Nothing was deleted.",
+                                                target.name, e
+                                            ),
+                                            result: None,
+                                        },
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // ── All targets validated — proceed with deletion ────────
+
+                for target in &targets {
+                    if let Some(j) = jobs.get(&job.id)
+                        && j.cancel.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        cancelled = true;
+                        break;
+                    }
+
+                    let result = match target.kind {
+                        arx::vfs::EntryKind::Directory => {
+                            registry.remove_dir_at(&location, &target.path).await
+                        }
+                        _ => registry.remove_file_at(&location, &target.path).await,
+                    };
+
+                    match result {
+                        Ok(()) => completed += 1,
+                        Err(_e) => {
+                            failed += 1;
+                        }
+                    }
+                }
+
+                // Refresh pane after any physical mutations
+                if completed > 0 || failed > 0 {
+                    let _ = loader.load(pane, location, PaneLoadPurpose::Refresh);
+                }
+
+                if cancelled {
+                    let _ = jobs.publish_event(
+                        &tx,
+                        arx::jobs::JobEvent::Cancelled {
+                            id: job.id,
+                            result: arx::jobs::JobResult::generic(
+                                format!("Cancelled after {completed} deleted, {failed} failed"),
+                                completed,
+                            ),
+                        },
+                    );
+                } else if failed > 0 {
+                    let _ = jobs.publish_event(
+                        &tx,
+                        arx::jobs::JobEvent::Failed {
+                            id: job.id,
+                            error: format!("{completed} deleted, {failed} failed"),
+                            result: Some(arx::jobs::JobResult::generic(
+                                format!("Partial: {completed} deleted, {failed} failed"),
+                                completed,
+                            )),
+                        },
+                    );
+                } else {
+                    let _ = jobs.publish_event(
+                        &tx,
+                        arx::jobs::JobEvent::Completed {
+                            id: job.id,
+                            result: arx::jobs::JobResult::generic(
+                                format!("{completed} deleted"),
+                                completed,
+                            ),
+                        },
+                    );
+                }
+            });
+            state.message = Some(format!("Remote delete: {target_count} target(s) queued"));
+        }
+        Action::CancelRemoteDelete => {
+            state.pending_delete = None;
+            state.message = Some("Remote delete cancelled".into());
         }
         Action::ToggleEmbeddedTerminal => {
             if state.show_terminal {
@@ -4352,6 +4827,7 @@ async fn execute_command_target(
     state: &mut AppState,
     target: CommandTarget,
     focused: Option<&Entry>,
+    active_entries: &[&Entry],
     visible_count: usize,
     workspace_scanner: &WorkspaceScanner,
     pane_loader: &PaneLoader,
@@ -4366,6 +4842,7 @@ async fn execute_command_target(
                 state,
                 action,
                 focused,
+                active_entries,
                 visible_count,
                 workspace_scanner,
                 sync,

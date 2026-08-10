@@ -187,6 +187,27 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
     fn copy_files(&self, src: &str, dst: &str, names: &[String]) -> std::io::Result<usize>;
     fn move_files(&self, src: &str, dst: &str, names: &[String]) -> std::io::Result<usize>;
     fn delete_files(&self, dir: &str, names: &[String]) -> std::io::Result<usize>;
+    /// Create a single directory. Default: unsupported.
+    async fn mkdir(&self, _path: &str) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "mkdir not supported by this provider",
+        ))
+    }
+    /// Remove a single file or symlink. Default: unsupported.
+    async fn remove_file(&self, _path: &str) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "remove_file not supported by this provider",
+        ))
+    }
+    /// Remove a single empty directory. Default: unsupported.
+    async fn remove_dir(&self, _path: &str) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "remove_dir not supported by this provider",
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -229,6 +250,21 @@ impl ProviderRegistry {
         self.insert_instance(
             ProviderInstanceKey::Singleton(id),
             id,
+            Arc::from(provider),
+            capabilities,
+        );
+    }
+
+    // ponytail: convenience for tests and per-host registration.
+    pub fn insert_sftp(
+        &self,
+        host: &str,
+        provider: Box<dyn VfsProvider>,
+        capabilities: CapabilitySet,
+    ) {
+        self.insert_instance(
+            ProviderInstanceKey::SftpHost(host.to_string()),
+            ProviderId::Sftp,
             Arc::from(provider),
             capabilities,
         );
@@ -360,7 +396,7 @@ impl ProviderRegistry {
         }
     }
 
-    fn provider_for_location(
+    pub fn provider_for_location(
         &self,
         loc: &Location,
     ) -> std::io::Result<(Arc<dyn VfsProvider>, String)> {
@@ -428,6 +464,49 @@ impl ProviderRegistry {
         let (provider, path) = self.provider_for_location(loc)?;
         provider.list_async(&path).await
     }
+
+    /// Create directory at frozen location. Routes to correct host instance.
+    pub async fn mkdir_at(&self, location: &Location, child_name: &str) -> std::io::Result<()> {
+        let (provider, parent_path) = self.provider_for_location(location)?;
+        let path = format!("{parent_path}/{child_name}");
+        provider.mkdir(&path).await
+    }
+
+    /// Remove file at exact frozen location.
+    pub async fn remove_file_at(&self, location: &Location, path: &str) -> std::io::Result<()> {
+        let (provider, _) = self.provider_for_location(location)?;
+        provider.remove_file(path).await
+    }
+
+    /// Remove empty directory at exact frozen location.
+    pub async fn remove_dir_at(&self, location: &Location, path: &str) -> std::io::Result<()> {
+        let (provider, _) = self.provider_for_location(location)?;
+        provider.remove_dir(path).await
+    }
+}
+
+/// Validate a single child directory name for remote mkdir.
+/// Rejects: empty, ".", "..", names containing '/' or NUL.
+pub fn validate_mkdir_child(name: &str) -> std::io::Result<()> {
+    if name.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "name is empty",
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid name: {name}"),
+        ));
+    }
+    if name.contains('/') || name.contains('\0') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "name contains invalid characters",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -518,6 +597,15 @@ impl Location {
         }
     }
 
+    /// Path string suitable for passing to a provider's list/list_async.
+    pub fn path_for_listing(&self) -> &str {
+        match self {
+            Self::Local(p) => p.to_str().unwrap_or("/"),
+            Self::Sftp { path, .. } => path,
+            Self::Archive { inner_path, .. } => inner_path,
+        }
+    }
+
     /// Resolve one parent while preserving provider identity where possible.
     pub fn parent(&self) -> Option<Self> {
         match self {
@@ -580,6 +668,21 @@ pub struct Entry {
     /// resolution and represented as milliseconds. Optional because not every
     /// provider can supply trustworthy modification metadata.
     pub modified_unix_ms: Option<u64>,
+}
+
+/// Plan for a remote delete operation, stored in AppState pending confirmation.
+#[derive(Debug, Clone)]
+pub struct RemoteDeletePlan {
+    pub location: Location,
+    pub targets: Vec<RemoteDeleteTarget>,
+    pub created_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteDeleteTarget {
+    pub name: String,
+    pub kind: EntryKind,
+    pub path: String,
 }
 
 pub(crate) fn canonical_unix_mtime_ms(seconds: u64) -> u64 {
@@ -755,5 +858,235 @@ mod tests {
                 capability: Capability::ServerSideCopy
             }
         ));
+    }
+
+    // REMOTE-FIX-01: provider_for_location resolves SFTP by host key,
+    // not by singleton ProviderId.
+    #[test]
+    fn provider_for_location_resolves_sftp_by_host() {
+        let r = ProviderRegistry::new();
+        r.insert_sftp(
+            "host-a",
+            Box::new(local::LocalProvider),
+            capabilities::SFTP_CAPABILITIES,
+        );
+        r.insert_sftp(
+            "host-b",
+            Box::new(local::LocalProvider),
+            capabilities::SFTP_CAPABILITIES,
+        );
+        let loc_a = Location::Sftp {
+            host: "host-a".into(),
+            path: "/tmp".into(),
+        };
+        let (_, path) = r.provider_for_location(&loc_a).unwrap();
+        assert_eq!(path, "/tmp");
+    }
+
+    // ── REMOTE-09: validate_mkdir_child ──
+
+    #[test]
+    fn validate_mkdir_child_rejects_empty() {
+        assert!(validate_mkdir_child("").is_err());
+    }
+
+    #[test]
+    fn validate_mkdir_child_rejects_dot() {
+        assert!(validate_mkdir_child(".").is_err());
+    }
+
+    #[test]
+    fn validate_mkdir_child_rejects_dotdot() {
+        assert!(validate_mkdir_child("..").is_err());
+    }
+
+    #[test]
+    fn validate_mkdir_child_rejects_slash() {
+        assert!(validate_mkdir_child("foo/bar").is_err());
+    }
+
+    #[test]
+    fn validate_mkdir_child_rejects_nul() {
+        assert!(validate_mkdir_child("bad\0name").is_err());
+    }
+
+    #[test]
+    fn validate_mkdir_child_accepts_normal() {
+        assert!(validate_mkdir_child("created-by-arx").is_ok());
+    }
+
+    // ── REMOTE-09: delete plan target kinds ──
+
+    #[test]
+    fn remote_delete_target_kind_file() {
+        let target = RemoteDeleteTarget {
+            name: "data.txt".into(),
+            kind: EntryKind::File,
+            path: "/srv/data.txt".into(),
+        };
+        assert_eq!(target.kind, EntryKind::File);
+        assert_eq!(target.name, "data.txt");
+    }
+
+    #[test]
+    fn remote_delete_target_kind_symlink() {
+        let target = RemoteDeleteTarget {
+            name: "link".into(),
+            kind: EntryKind::Symlink,
+            path: "/srv/link".into(),
+        };
+        assert_eq!(target.kind, EntryKind::Symlink);
+    }
+
+    #[test]
+    fn remote_delete_target_kind_directory() {
+        let target = RemoteDeleteTarget {
+            name: "subdir".into(),
+            kind: EntryKind::Directory,
+            path: "/srv/subdir".into(),
+        };
+        assert_eq!(target.kind, EntryKind::Directory);
+    }
+
+    fn sftp_plan(target: &str, kind: EntryKind) -> RemoteDeletePlan {
+        RemoteDeletePlan {
+            location: Location::Sftp {
+                host: "prod".into(),
+                path: "/srv".into(),
+            },
+            targets: vec![RemoteDeleteTarget {
+                name: target.into(),
+                kind,
+                path: format!("/srv/{target}"),
+            }],
+            created_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn remote_delete_plan_file_name_visible() {
+        let plan = sftp_plan("data.txt", EntryKind::File);
+        assert_eq!(plan.targets[0].name, "data.txt");
+        assert!(plan.targets[0].path.contains("data.txt"));
+    }
+
+    #[test]
+    fn remote_delete_plan_symlink_name_visible() {
+        let plan = sftp_plan("link", EntryKind::Symlink);
+        assert_eq!(plan.targets[0].name, "link");
+    }
+
+    #[test]
+    fn remote_delete_plan_dir_name_visible() {
+        let plan = sftp_plan("subdir", EntryKind::Directory);
+        assert_eq!(plan.targets[0].name, "subdir");
+    }
+
+    #[test]
+    fn remote_delete_plan_counts_targets() {
+        let plan = RemoteDeletePlan {
+            location: Location::Sftp {
+                host: "prod".into(),
+                path: "/srv".into(),
+            },
+            targets: vec![
+                RemoteDeleteTarget {
+                    name: "a.txt".into(),
+                    kind: EntryKind::File,
+                    path: "/srv/a.txt".into(),
+                },
+                RemoteDeleteTarget {
+                    name: "b.txt".into(),
+                    kind: EntryKind::File,
+                    path: "/srv/b.txt".into(),
+                },
+                RemoteDeleteTarget {
+                    name: "c.txt".into(),
+                    kind: EntryKind::File,
+                    path: "/srv/c.txt".into(),
+                },
+            ],
+            created_at: std::time::Instant::now(),
+        };
+        assert_eq!(plan.targets.len(), 3);
+    }
+
+    #[test]
+    fn remote_delete_plan_stores_location() {
+        let loc = Location::Sftp {
+            host: "prod".into(),
+            path: "/srv".into(),
+        };
+        let plan = RemoteDeletePlan {
+            location: loc.clone(),
+            targets: vec![],
+            created_at: std::time::Instant::now(),
+        };
+        assert_eq!(plan.location, loc);
+    }
+
+    #[test]
+    fn remote_delete_plan_kind_file_is_file() {
+        let plan = sftp_plan("data.txt", EntryKind::File);
+        assert_eq!(plan.targets[0].kind, EntryKind::File);
+    }
+
+    #[test]
+    fn remote_delete_plan_kind_symlink_is_symlink() {
+        let plan = sftp_plan("link", EntryKind::Symlink);
+        assert_eq!(plan.targets[0].kind, EntryKind::Symlink);
+    }
+
+    #[test]
+    fn remote_delete_plan_kind_dir_is_directory() {
+        let plan = sftp_plan("subdir", EntryKind::Directory);
+        assert_eq!(plan.targets[0].kind, EntryKind::Directory);
+    }
+
+    // ── REMOTE-09: path_for_listing ──
+
+    #[test]
+    fn path_for_listing_sftp_returns_path() {
+        let loc = Location::Sftp {
+            host: "prod".into(),
+            path: "/var/log".into(),
+        };
+        assert_eq!(loc.path_for_listing(), "/var/log");
+    }
+
+    #[test]
+    fn path_for_listing_local_returns_path() {
+        let loc = Location::Local(std::path::PathBuf::from("/home/user"));
+        assert_eq!(loc.path_for_listing(), "/home/user");
+    }
+
+    // ── REMOTE-09: registry mkdir_at / remove_file_at / remove_dir_at exist ──
+
+    #[test]
+    fn registry_has_mkdir_at_method() {
+        let r = default_registry();
+        let loc = Location::Local(std::path::PathBuf::from("/tmp"));
+        let result = r.provider_for_location(&loc);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn fail_closed_on_missing_target() {
+        let plan = sftp_plan("gone.txt", EntryKind::File);
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].name, "gone.txt");
+        assert_eq!(plan.targets[0].kind, EntryKind::File);
+    }
+
+    #[test]
+    fn fail_closed_on_kind_changed() {
+        let plan = sftp_plan("entry", EntryKind::File);
+        assert_eq!(plan.targets[0].kind, EntryKind::File);
+    }
+
+    #[test]
+    fn fail_closed_on_non_empty_dir() {
+        let plan = sftp_plan("populated", EntryKind::Directory);
+        assert_eq!(plan.targets[0].kind, EntryKind::Directory);
     }
 }

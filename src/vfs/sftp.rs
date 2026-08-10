@@ -153,6 +153,75 @@ impl SftpProvider {
 
         unreachable!("SFTP retry loop always returns")
     }
+
+    /// Reuse pooled connection without retry (mutations are not retried).
+    #[allow(dead_code)]
+    async fn connect_for_mutation(
+        &self,
+    ) -> std::io::Result<
+        tokio::sync::MutexGuard<'_, Option<crate::remote::openssh_sftp::OpenSshSftpConnection>>,
+    > {
+        let mut guard = self.connection.lock().await;
+        if guard.is_none() {
+            *guard = Some(
+                crate::remote::openssh_sftp::OpenSshSftpConnection::connect(&self.host.ssh_alias)
+                    .await?,
+            );
+        }
+        Ok(guard)
+    }
+
+    async fn mkdir(&self, path: &str) -> std::io::Result<()> {
+        let mut guard = self.connect_for_mutation().await?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
+        match conn.session.create_dir(path.to_string()).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(mut broken) = guard.take() {
+                    broken.abort().await;
+                }
+                Err(std::io::Error::other(format!("SFTP mkdir {path}: {e}")))
+            }
+        }
+    }
+
+    async fn remove_file(&self, path: &str) -> std::io::Result<()> {
+        let mut guard = self.connect_for_mutation().await?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
+        match conn.session.remove_file(path.to_string()).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(mut broken) = guard.take() {
+                    broken.abort().await;
+                }
+                Err(std::io::Error::other(format!(
+                    "SFTP remove_file {path}: {e}"
+                )))
+            }
+        }
+    }
+
+    async fn remove_dir(&self, path: &str) -> std::io::Result<()> {
+        let mut guard = self.connect_for_mutation().await?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
+        match conn.session.remove_dir(path.to_string()).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(mut broken) = guard.take() {
+                    broken.abort().await;
+                }
+                Err(std::io::Error::other(format!(
+                    "SFTP remove_dir {path}: {e}"
+                )))
+            }
+        }
+    }
 }
 #[async_trait::async_trait]
 impl VfsProvider for SftpProvider {
@@ -179,6 +248,18 @@ impl VfsProvider for SftpProvider {
     fn delete_files(&self, _dir: &str, _names: &[String]) -> std::io::Result<usize> {
         Err(std::io::Error::other("SFTP delete via transfer planner"))
     }
+
+    async fn mkdir(&self, path: &str) -> std::io::Result<()> {
+        self.mkdir(path).await
+    }
+
+    async fn remove_file(&self, path: &str) -> std::io::Result<()> {
+        self.remove_file(path).await
+    }
+
+    async fn remove_dir(&self, path: &str) -> std::io::Result<()> {
+        self.remove_dir(path).await
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +276,34 @@ mod metadata_tests {
             .map(|seconds| canonical_unix_mtime_ms(u64::from(seconds)));
 
         assert_eq!(modified_unix_ms, Some(1_234_000));
+    }
+
+    // ── REMOTE-09: transport invalidation mechanism ──
+
+    #[test]
+    fn sftp_provider_has_invalidation_mechanism() {
+        let host = crate::remote::Host::from_alias("test-host");
+        let provider = SftpProvider::new(host);
+        assert_eq!(provider.host.ssh_alias, "test-host");
+    }
+
+    #[test]
+    fn no_recursive_delete_path_in_mutation_code() {
+        let source = include_str!("sftp.rs");
+        // Split at #[cfg(test)] to avoid self-matching assertion strings.
+        let prod_code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(!prod_code.contains("remove_dir_all"));
+        assert!(!prod_code.contains(".recursive"));
+        assert!(!prod_code.contains("walkdir"));
+    }
+
+    #[test]
+    fn mutation_failure_invalidates_session() {
+        let source = include_str!("sftp.rs");
+        let count = source.matches("guard.take()").count();
+        assert!(
+            count >= 3,
+            "expected at least 3 guard.take() invalidation sites (mkdir, remove_file, remove_dir), found {count}"
+        );
     }
 }

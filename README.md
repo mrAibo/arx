@@ -52,8 +52,8 @@ arx
 || F4 | Edit in configured editor |
 || F5 | Copy — planner picks native/rsync/SFTP |
 || F6 | Move — local-only |
-|| F7 | Create directory |
-|| F8 | Delete (trash) |
+|| F7 | Create directory (Local + SFTP) |
+|| F8 | Delete — Local: trash, SFTP: permanent (confirmed) |
 || Shift+F6 | Rename |
 || Ctrl+U | Swap panes |
 || Ctrl+X C / L / O / S | chmod / hardlink / chown / symlink |

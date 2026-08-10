@@ -1106,4 +1106,57 @@ mod tests {
         assert_eq!(progress.completed_steps, 12);
         assert_eq!(progress.total_steps, 31);
     }
+
+    // ── REMOTE-09: JobResult retains completed count ──
+
+    #[test]
+    fn job_result_retains_completed_count() {
+        let result = JobResult::generic("done", 42);
+        assert_eq!(result.message(), Some("done"));
+        match result {
+            JobResult::Generic {
+                completed_items, ..
+            } => assert_eq!(completed_items, Some(42)),
+            _ => panic!("expected Generic variant"),
+        }
+    }
+
+    #[test]
+    fn job_result_failed_has_completed() {
+        let result = JobResult::generic("partial failure", 3);
+        let event = JobEvent::Failed {
+            id: "test-failed-1".into(),
+            error: "connection lost".into(),
+            result: Some(result.clone()),
+        };
+        match event {
+            JobEvent::Failed {
+                result: Some(r), ..
+            } => match r {
+                JobResult::Generic {
+                    completed_items, ..
+                } => assert_eq!(completed_items, Some(3)),
+                _ => panic!("expected Generic"),
+            },
+            _ => panic!("expected Failed with result"),
+        }
+    }
+
+    #[test]
+    fn job_result_cancelled_has_completed() {
+        let result = JobResult::generic("user cancelled", 7);
+        let event = JobEvent::Cancelled {
+            id: "test-cancelled-2".into(),
+            result: result.clone(),
+        };
+        match event {
+            JobEvent::Cancelled { result: r, .. } => match r {
+                JobResult::Generic {
+                    completed_items, ..
+                } => assert_eq!(completed_items, Some(7)),
+                _ => panic!("expected Generic"),
+            },
+            _ => panic!("expected Cancelled"),
+        }
+    }
 }

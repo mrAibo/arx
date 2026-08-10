@@ -42,6 +42,8 @@ pub enum ActionId {
     ShowWorkspaceSyncDetails,
     ShowWorkspaceVerificationDiff,
     ReturnToWorkspaceSyncPreview,
+    ConfirmRemoteDelete,
+    CancelRemoteDelete,
 }
 
 /// A concrete action invocation.
@@ -86,6 +88,8 @@ pub enum Action {
     ShowWorkspaceSyncDetails,
     ShowWorkspaceVerificationDiff,
     ReturnToWorkspaceSyncPreview,
+    ConfirmRemoteDelete,
+    CancelRemoteDelete,
 }
 
 impl Action {
@@ -127,6 +131,8 @@ impl Action {
             Self::ShowWorkspaceSyncDetails => ActionId::ShowWorkspaceSyncDetails,
             Self::ShowWorkspaceVerificationDiff => ActionId::ShowWorkspaceVerificationDiff,
             Self::ReturnToWorkspaceSyncPreview => ActionId::ReturnToWorkspaceSyncPreview,
+            Self::ConfirmRemoteDelete => ActionId::ConfirmRemoteDelete,
+            Self::CancelRemoteDelete => ActionId::CancelRemoteDelete,
         }
     }
 }
@@ -168,6 +174,8 @@ pub const ALL_ACTIONS: &[Action] = &[
     Action::ShowWorkspaceSyncDetails,
     Action::ShowWorkspaceVerificationDiff,
     Action::ReturnToWorkspaceSyncPreview,
+    Action::ConfirmRemoteDelete,
+    Action::CancelRemoteDelete,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -444,6 +452,20 @@ pub const ACTION_CATALOG: &[ActionMeta] = &[
         category: ActionCategory::Workspace,
         destructive: false,
     },
+    ActionMeta {
+        id: ActionId::ConfirmRemoteDelete,
+        label: "Confirm remote delete",
+        description: "Confirm permanent deletion of the selected remote files",
+        category: ActionCategory::Files,
+        destructive: true,
+    },
+    ActionMeta {
+        id: ActionId::CancelRemoteDelete,
+        label: "Cancel remote delete",
+        description: "Cancel the pending remote delete operation",
+        category: ActionCategory::Files,
+        destructive: false,
+    },
 ];
 
 pub fn action_meta(id: ActionId) -> Option<&'static ActionMeta> {
@@ -470,10 +492,14 @@ pub enum InputContext {
     Jobs,
     UserMenu,
     Browser,
+    DeleteConfirmation,
 }
 
 impl AppState {
     pub fn input_context(&self) -> InputContext {
+        if self.pending_delete.is_some() {
+            return InputContext::DeleteConfirmation;
+        }
         if self.show_terminal && self.active == Pane::Right {
             InputContext::Terminal
         } else if matches!(

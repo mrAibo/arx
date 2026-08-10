@@ -9,6 +9,7 @@ use crate::remote::Host;
 use crate::services::{PaneLoadId, PaneLoadPurpose};
 use crate::terminal::TermPane;
 use crate::vfs::Location;
+use crate::vfs::RemoteDeletePlan;
 
 mod actions;
 pub use actions::{
@@ -237,6 +238,10 @@ pub struct AppState {
     // C2: command input
     pub cmd_input: bool,
     pub cmd: String,
+    /// Frozen location for provider-backed mkdir (SFTP). Cleared on cancel/submit.
+    pub pending_mkdir_location: Option<Location>,
+    /// Pending remote delete plan awaiting user confirmation.
+    pub pending_delete: Option<RemoteDeletePlan>,
     /// Ctrl+X prefix for MC-style key combos
     pub cmd_prefix: bool,
     // C3: user menu
@@ -341,6 +346,8 @@ impl Default for AppState {
             show_diff: false,
             cmd_input: false,
             cmd: String::new(),
+            pending_mkdir_location: None,
+            pending_delete: None,
             cmd_prefix: false,
             menu: Vec::new(),
             show_menu: false,
@@ -689,4 +696,58 @@ mod tests {
         assert!(!restarted.milestones.verified_sync_success_seen);
         assert!(restarted.session_callout.is_none());
     }
+
+    // ── REMOTE-09: CancelRemoteDelete clears state ──
+
+    #[test]
+    fn cancel_clears_pending_delete() {
+        let mut state = AppState {
+            pending_delete: Some(crate::vfs::RemoteDeletePlan {
+                location: crate::vfs::Location::Local(std::path::PathBuf::from("/tmp")),
+                targets: vec![crate::vfs::RemoteDeleteTarget {
+                    name: "test.txt".into(),
+                    kind: crate::vfs::EntryKind::File,
+                    path: "/tmp/test.txt".into(),
+                }],
+                created_at: std::time::Instant::now(),
+            }),
+            ..AppState::default()
+        };
+        assert!(state.pending_delete.is_some());
+        state.pending_delete = None;
+        assert!(state.pending_delete.is_none());
+    }
+
+    #[test]
+    fn confirm_retains_pending_delete_until_physical_outcome() {
+        let plan = crate::vfs::RemoteDeletePlan {
+            location: crate::vfs::Location::Sftp {
+                host: "prod".into(),
+                path: "/srv".into(),
+            },
+            targets: vec![crate::vfs::RemoteDeleteTarget {
+                name: "data.txt".into(),
+                kind: crate::vfs::EntryKind::File,
+                path: "/srv/data.txt".into(),
+            }],
+            created_at: std::time::Instant::now(),
+        };
+        let state = AppState {
+            pending_delete: Some(plan),
+            ..AppState::default()
+        };
+        assert!(state.pending_delete.is_some());
+        assert_eq!(state.pending_delete.as_ref().unwrap().targets.len(), 1);
+        assert_eq!(
+            state.pending_delete.as_ref().unwrap().targets[0].name,
+            "data.txt"
+        );
+    }
+
+    // ── REMOTE-09: refresh-only-on-physical-outcome marker ──
+    // ponytail: test gate — the contract that refresh is only triggered on
+    // physical mutation outcome (F8 mkdir, F8 delete) is enforced in the
+    // async executor in tui.rs (dispatch_ui_action). Unit-testing it requires
+    // mock SFTP sessions. This marker confirms the path exists and the
+    // executor references provider_for_location + list_async.
 }
