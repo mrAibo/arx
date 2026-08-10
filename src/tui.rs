@@ -2526,7 +2526,7 @@ fn render(
         let body = format!("{msg}\n\n{}", name_lines.join("\n"));
 
         let height = (name_lines.len() + 8).min(area.height as usize) as u16;
-        let popup = centered_rect(60, height, area);
+        let popup = centered_rect_lines(60, height, area);
         frame.render_widget(Clear, popup);
         let p = ratatui::widgets::Paragraph::new(body)
             .block(
@@ -3438,6 +3438,31 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         ])
         .split(area);
 
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+/// Like centered_rect but height is in terminal lines instead of percent.
+/// Clamps to available area so the popup never exceeds terminal height.
+fn centered_rect_lines(percent_x: u16, lines: u16, area: Rect) -> Rect {
+    // ponytail: minimum 8 lines so deletion confirmation never collapses
+    let desired = lines.max(8);
+    let max_h = area.height.saturating_sub(2);
+    let h = desired.min(max_h);
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((area.height.saturating_sub(h)) / 2),
+            Constraint::Length(h),
+            Constraint::Length(0),
+        ])
+        .split(area);
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -4566,21 +4591,36 @@ async fn dispatch_ui_action(
                             return;
                         }
                         Some(entry) if entry.kind == arx::vfs::EntryKind::Directory => {
-                            if let Ok(children) = provider.list_async(&target.path).await
-                                && !children.is_empty()
-                            {
-                                let _ = jobs.publish_event(
-                                    &tx,
-                                    arx::jobs::JobEvent::Failed {
-                                        id: job.id.clone(),
-                                        error: format!(
-                                            "Recursive remote delete is not supported: '{}' is not empty",
-                                            target.name
-                                        ),
-                                        result: None,
-                                    },
-                                );
-                                return;
+                            match provider.list_async(&target.path).await {
+                                Ok(children) if !children.is_empty() => {
+                                    let _ = jobs.publish_event(
+                                        &tx,
+                                        arx::jobs::JobEvent::Failed {
+                                            id: job.id.clone(),
+                                            error: format!(
+                                                "Recursive remote delete is not supported: '{}' is not empty",
+                                                target.name
+                                            ),
+                                            result: None,
+                                        },
+                                    );
+                                    return;
+                                }
+                                Ok(_) => {} // empty directory — allowed
+                                Err(e) => {
+                                    let _ = jobs.publish_event(
+                                        &tx,
+                                        arx::jobs::JobEvent::Failed {
+                                            id: job.id.clone(),
+                                            error: format!(
+                                                "Cannot verify that remote directory '{}' is empty: {}. Nothing was deleted.",
+                                                target.name, e
+                                            ),
+                                            result: None,
+                                        },
+                                    );
+                                    return;
+                                }
                             }
                         }
                         _ => {}
