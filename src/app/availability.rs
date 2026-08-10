@@ -218,9 +218,10 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
             }
         }
         ActionId::Mkdir => {
-            if ctx.active_provider != ProviderId::Local {
+            let supported = ctx.active_capabilities.supports(Capability::Mkdir);
+            if !supported {
                 ActionAvailability::Disabled {
-                    reason: "Directory creation is currently local-only".into(),
+                    reason: "Directory creation is not supported for this location".into(),
                 }
             } else {
                 ActionAvailability::Available

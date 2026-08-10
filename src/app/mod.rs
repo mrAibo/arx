@@ -237,6 +237,8 @@ pub struct AppState {
     // C2: command input
     pub cmd_input: bool,
     pub cmd: String,
+    /// Frozen location for provider-backed mkdir (SFTP). Cleared on cancel/submit.
+    pub pending_mkdir_location: Option<Location>,
     /// Ctrl+X prefix for MC-style key combos
     pub cmd_prefix: bool,
     // C3: user menu
@@ -341,6 +343,7 @@ impl Default for AppState {
             show_diff: false,
             cmd_input: false,
             cmd: String::new(),
+            pending_mkdir_location: None,
             cmd_prefix: false,
             menu: Vec::new(),
             show_menu: false,

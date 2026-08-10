@@ -539,9 +539,35 @@ async fn event_loop(
                                 }
                                 if state.cmd_input {
                                     let command = std::mem::take(&mut state.cmd);
+                                    let pending_mkdir =
+                                        std::mem::take(&mut state.pending_mkdir_location);
                                     state.cmd_input = false;
                                     if command.is_empty() {
                                         state.message = Some(": command cancelled".into());
+                                    } else if let Some(loc) = pending_mkdir {
+                                        // SFTP provider-backed mkdir
+                                        let name = command;
+                                        let path = match &loc {
+                                            Location::Local(p) => {
+                                                format!("{}/{}", p.display(), name)
+                                            }
+                                            Location::Sftp { path: p, .. } => {
+                                                format!("{p}/{name}")
+                                            }
+                                            _ => {
+                                                state.message =
+                                                    Some("mkdir: unsupported location".into());
+                                                continue;
+                                            }
+                                        };
+                                        let provider = loc.provider_id();
+                                        let registry = state.registry.clone();
+                                        tokio::spawn(async move {
+                                            if let Some(p) = registry.get(&provider) {
+                                                let _ = p.mkdir(&path).await;
+                                            }
+                                        });
+                                        state.message = Some(format!("mkdir {name}…"));
                                     } else {
                                         let id = effect_dispatcher.dispatch(
                                             EffectLane::GlobalProcess,
@@ -4127,8 +4153,16 @@ async fn dispatch_ui_action(
             state.clear_selection();
         }
         Action::Mkdir => {
-            state.cmd = "mkdir ".into();
-            state.cmd_input = true;
+            // SFTP: use provider-backed mkdir via frozen location
+            if state.active_pane().location.provider_id() == arx::vfs::ProviderId::Sftp {
+                state.pending_mkdir_location = Some(state.active_pane().location.clone());
+                state.cmd = String::new();
+                state.cmd_input = true;
+            } else {
+                // Local: keep existing shell-based mkdir (no regression)
+                state.cmd = "mkdir ".into();
+                state.cmd_input = true;
+            }
         }
         Action::Delete => {
             let names: Vec<String> = state
