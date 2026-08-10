@@ -143,14 +143,14 @@ mod tests {
         assert_eq!(hints[1].binding, "Ctrl+D");
         assert_eq!(hints[2].action, ActionId::OpenCommandCenter);
         assert_eq!(hints[2].binding, "Ctrl+P");
-        assert_eq!(hints[3].action, ActionId::OpenJobs);
-        assert_eq!(hints[3].binding, "Ctrl+J");
-        assert_eq!(hints[4].action, ActionId::OpenBookmarks);
-        assert_eq!(hints[4].binding, "Ctrl+B");
-        assert_eq!(hints[5].action, ActionId::OpenHelp);
-        assert_eq!(hints[5].binding, "?");
-        assert_eq!(hints[6].action, ActionId::ListTmuxSessions);
-        assert_eq!(hints[6].binding, "F9");
+        assert_eq!(hints[3].action, ActionId::OpenHosts);
+        assert_eq!(hints[3].binding, "F9");
+        assert_eq!(hints[4].action, ActionId::OpenJobs);
+        assert_eq!(hints[4].binding, "Ctrl+J");
+        assert_eq!(hints[5].action, ActionId::OpenBookmarks);
+        assert_eq!(hints[5].binding, "Ctrl+B");
+        assert_eq!(hints[6].action, ActionId::OpenHelp);
+        assert_eq!(hints[6].binding, "?");
     }
 
     #[test]

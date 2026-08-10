@@ -71,7 +71,7 @@ arx
 || Key | Action |
 ||---|---|
 || Ctrl+P | Command Center — fuzzy search hosts, bookmarks, history, quick actions |
-|| F9 | Tmux sessions |
+|| F9 | Remote Hosts |
 || Ctrl+B | Bookmarks |
 || Ctrl+D | Directory diff |
 || Ctrl+J | Job queue with progress bars |

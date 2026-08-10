@@ -173,8 +173,9 @@ impl Default for Keymap {
             KeyBinding::new(
                 Browser,
                 vec![KeyStroke::new(F(9), KeyModifiers::NONE)],
-                Action::ListTmuxSessions,
+                Action::OpenHosts,
             ),
+            // Tmux sessions: Command Center only (Ctrl+P → "List tmux sessions")
             KeyBinding::new(Browser, vec![plain('?')], Action::OpenHelp),
             KeyBinding::new(Browser, vec![ctrl('d')], Action::ToggleWorkspaceComparison),
             KeyBinding::new(
@@ -547,6 +548,18 @@ mod tests {
                 KeyStroke::new(KeyCode::F(8), KeyModifiers::NONE)
             ),
             KeyResolution::Action(Action::Delete)
+        );
+    }
+
+    #[test]
+    fn f9_resolves_to_hosts() {
+        let mut router = KeyRouter::default();
+        assert_eq!(
+            router.resolve_stroke(
+                InputContext::Browser,
+                KeyStroke::new(KeyCode::F(9), KeyModifiers::NONE)
+            ),
+            KeyResolution::Action(Action::OpenHosts)
         );
     }
 }
