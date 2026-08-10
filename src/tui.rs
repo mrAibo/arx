@@ -377,6 +377,7 @@ async fn event_loop(
                                     &mut state,
                                     Action::ConfirmRemoteDelete,
                                     None, // no focused entry during confirmation
+                                    &[],
                                     0,
                                     &workspace_scanner,
                                     &sync_runtime,
@@ -393,6 +394,7 @@ async fn event_loop(
                                     &mut state,
                                     Action::CancelRemoteDelete,
                                     None,
+                                    &[],
                                     0,
                                     &workspace_scanner,
                                     &sync_runtime,
@@ -448,10 +450,16 @@ async fn event_loop(
                                         } else {
                                             (right_filtered.get(cursor), right_filtered.len())
                                         };
+                                    let active_entries: &[&Entry] = if state.active == Pane::Left {
+                                        &left_filtered[..]
+                                    } else {
+                                        &right_filtered[..]
+                                    };
                                     if let Some(effect) = execute_command_target(
                                         &mut state,
                                         item.target,
                                         focused_entry.copied(),
+                                        active_entries,
                                         visible_count,
                                         &workspace_scanner,
                                         &pane_loader,
@@ -903,6 +911,7 @@ async fn event_loop(
                                         &mut state,
                                         action,
                                         entries.get(cursor).copied(),
+                                        entries,
                                         entries.len(),
                                         &workspace_scanner,
                                         &sync_runtime,
@@ -3857,6 +3866,7 @@ async fn dispatch_ui_action(
     state: &mut AppState,
     action: Action,
     focused: Option<&Entry>,
+    active_entries: &[&Entry],
     visible_count: usize,
     workspace_scanner: &WorkspaceScanner,
     sync: &SyncUiRuntime,
@@ -4292,20 +4302,26 @@ async fn dispatch_ui_action(
             if state.active_pane().location.provider_id() == arx::vfs::ProviderId::Sftp {
                 let targets: Vec<arx::vfs::RemoteDeleteTarget> = names
                     .iter()
-                    .map(|name| {
+                    .filter_map(|name| {
+                        // Resolve real EntryKind from active pane listing
+                        let entry = active_entries.iter().find(|e| e.name == *name)?;
                         let path = match &state.active_pane().location {
                             arx::vfs::Location::Sftp { path: p, .. } => {
                                 format!("{p}/{name}")
                             }
                             _ => unreachable!(),
                         };
-                        arx::vfs::RemoteDeleteTarget {
+                        Some(arx::vfs::RemoteDeleteTarget {
                             name: name.clone(),
-                            kind: arx::vfs::EntryKind::File, // ponytail: kind resolved at REMOTE-06 preflight
+                            kind: entry.kind,
                             path,
-                        }
+                        })
                     })
                     .collect();
+                if targets.len() != names.len() {
+                    state.message = Some("Selection no longer matches directory contents".into());
+                    return Ok(());
+                }
                 state.pending_delete = Some(arx::vfs::RemoteDeletePlan {
                     location: state.active_pane().location.clone(),
                     targets,
@@ -4620,6 +4636,7 @@ async fn execute_command_target(
     state: &mut AppState,
     target: CommandTarget,
     focused: Option<&Entry>,
+    active_entries: &[&Entry],
     visible_count: usize,
     workspace_scanner: &WorkspaceScanner,
     pane_loader: &PaneLoader,
@@ -4634,6 +4651,7 @@ async fn execute_command_target(
                 state,
                 action,
                 focused,
+                active_entries,
                 visible_count,
                 workspace_scanner,
                 sync,
