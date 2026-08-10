@@ -48,7 +48,7 @@ arx
 
 || Key | Action |
 ||---|---|
-|| F3 | View (read-only preview) |
+||| F3 | View — Local: full preview, SFTP: bounded text (1 MiB) |
 || F4 | Edit in configured editor |
 || F5 | Copy — planner picks native/rsync/SFTP |
 || F6 | Move — local-only |
