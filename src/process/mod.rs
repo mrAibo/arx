@@ -90,7 +90,7 @@ impl ProcessService {
                 )
                 .unwrap_or_else(|e| vec![format!("Error: {e}")]);
                 EffectEvent::ViewerLines {
-                    title: format!("View: {name}"),
+                    title: format!("View: {} — {}", name, location),
                     lines,
                 }
             }
