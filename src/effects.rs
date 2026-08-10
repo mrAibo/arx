@@ -4,7 +4,7 @@
 /// such as `ProcessService` is allowed to perform the external operation.
 use std::path::PathBuf;
 
-use crate::vfs::Location;
+use crate::vfs::{Location, RemoteEditSession};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -49,9 +49,7 @@ pub enum Effect {
     },
     /// Write edited content back to a remote file (atomic staging).
     WriteBackRemoteFile {
-        location: Location,
-        name: String,
-        temp_path: PathBuf,
+        session: RemoteEditSession,
     },
     OpenPath {
         path: PathBuf,
@@ -92,9 +90,7 @@ pub enum EffectEvent {
     },
     /// Remote file downloaded to temp path for editing.
     Downloaded {
-        temp_path: PathBuf,
-        name: String,
-        editor: String,
+        session: RemoteEditSession,
     },
     /// Edited content successfully written back to remote.
     WrittenBack {

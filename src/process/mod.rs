@@ -14,7 +14,7 @@ use crate::services::{
     DesktopService, DiffService, FileInfoService, InfrastructureService, PreviewService,
     TreeService, preview,
 };
-use crate::vfs::ProviderRegistry;
+use crate::vfs::{ProviderRegistry, RemoteEditSession, RemoteEditState};
 
 pub struct ProcessService;
 
@@ -126,43 +126,63 @@ impl ProcessService {
                     };
                 }
 
-                let temp_dir = std::env::temp_dir().join("arx-remote-edit");
-                let _ = tokio::fs::create_dir_all(&temp_dir).await;
-                let temp_path = temp_dir.join(&name);
-                if let Err(e) = tokio::fs::write(&temp_path, &bounded.bytes).await {
-                    return EffectEvent::Failed {
-                        label,
-                        error: format!("write temp: {e}"),
-                    };
-                }
-                EffectEvent::Downloaded {
-                    temp_path,
-                    name,
-                    editor,
-                }
-            }
-
-            Effect::WriteBackRemoteFile {
-                location,
-                name,
-                temp_path,
-            } => {
-                let label = format!("remote write-back: {name}");
-                // Read edited content
-                let data = match tokio::fs::read(&temp_path).await {
+                let temp_dir = match tempfile::TempDir::new() {
                     Ok(d) => d,
                     Err(e) => {
                         return EffectEvent::Failed {
                             label: label.clone(),
-                            error: format!("read temp: {e}"),
+                            error: format!("create temp dir: {e}"),
                         };
                     }
                 };
-                // Revalidate remote: check metadata hasn't changed
-                let snapshot_meta = match registry.metadata_at(&location, &name).await {
-                    Ok(m) => m,
+                let original_path = temp_dir.path().join("original");
+                let working_path = temp_dir.path().join("working");
+                if let Err(e) = tokio::fs::write(&original_path, &bounded.bytes).await {
+                    return EffectEvent::Failed {
+                        label,
+                        error: format!("write original: {e}"),
+                    };
+                }
+                if let Err(e) = tokio::fs::write(&working_path, &bounded.bytes).await {
+                    return EffectEvent::Failed {
+                        label,
+                        error: format!("write working: {e}"),
+                    };
+                }
+                EffectEvent::Downloaded {
+                    session: RemoteEditSession {
+                        name,
+                        location,
+                        editor,
+                        frozen_original: bounded.bytes,
+                        temp_dir: std::sync::Arc::new(temp_dir),
+                        state: RemoteEditState::ReadyToEdit,
+                    },
+                }
+            }
+
+            Effect::WriteBackRemoteFile { session } => {
+                let name = session.name.clone();
+                let label = format!("remote write-back: {name}");
+                // Read edited content
+                let working_path = session.temp_dir.path().join("working");
+                let data = match tokio::fs::read(&working_path).await {
+                    Ok(d) => d,
                     Err(e) => {
-                        // If remote file doesn't exist, conflict
+                        return EffectEvent::Failed {
+                            label: label.clone(),
+                            error: format!("read working: {e}"),
+                        };
+                    }
+                };
+                // ponytail: quick no-change guard before network round-trip
+                if data == session.frozen_original {
+                    return EffectEvent::WrittenBack { name };
+                }
+                // Revalidate remote: check metadata hasn't changed
+                let snapshot_meta = match registry.metadata_at(&session.location, &name).await {
+                    Ok(m) => m,
+                    Err(_e) => {
                         return EffectEvent::RemoteConflict { name };
                     }
                 };
@@ -175,7 +195,10 @@ impl ProcessService {
                     };
                 }
                 // Write back atomically
-                match registry.write_file_bytes_at(&location, &name, &data).await {
+                match registry
+                    .write_file_bytes_at(&session.location, &name, &data)
+                    .await
+                {
                     Ok(()) => EffectEvent::WrittenBack { name },
                     Err(e) => EffectEvent::Failed {
                         label,
@@ -452,7 +475,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(&event, EffectEvent::Downloaded { name, .. } if name == "small.txt"),
+            matches!(&event, EffectEvent::Downloaded { session, .. } if session.name == "small.txt"),
             "Complete file should produce Downloaded, got {:?}",
             event
         );

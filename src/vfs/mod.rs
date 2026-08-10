@@ -789,13 +789,56 @@ pub struct RemoteDeleteTarget {
     pub path: String,
 }
 
-/// Phase-2 state for remote F4: download completed, editor needs launching.
-#[derive(Debug, Clone)]
-pub struct RemoteEditLaunch {
-    pub temp_path: PathBuf,
+/// Immutable snapshot of a remote file before editing.
+/// Used to detect remote changes before write-back.
+#[derive(Clone)]
+pub struct RemoteEditSession {
     pub name: String,
     pub location: Location,
     pub editor: String,
+    /// Exact original bytes, frozen at download time.
+    pub frozen_original: Vec<u8>,
+    /// Secure unique temp directory (auto-cleaned on drop).
+    /// Contains `working` (editable copy) and `original` (immutable snapshot).
+    pub temp_dir: std::sync::Arc<tempfile::TempDir>,
+    pub state: RemoteEditState,
+}
+
+impl std::fmt::Debug for RemoteEditSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteEditSession")
+            .field("name", &self.name)
+            .field("location", &self.location)
+            .field("editor", &self.editor)
+            .field("frozen_original_len", &self.frozen_original.len())
+            .field("temp_dir", &self.temp_dir.path())
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+impl PartialEq for RemoteEditSession {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.location == other.location
+            && self.editor == other.editor
+            && self.frozen_original == other.frozen_original
+            && self.state == other.state
+    }
+}
+
+impl Eq for RemoteEditSession {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteEditState {
+    Downloading,
+    ReadyToEdit,
+    Editing,
+    NoChange,
+    WritingBack,
+    Conflict,
+    Done,
+    Failed,
 }
 
 pub(crate) fn canonical_unix_mtime_ms(seconds: u64) -> u64 {

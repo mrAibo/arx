@@ -295,7 +295,8 @@ impl VfsProvider for SftpProvider {
     }
 
     async fn write_file_bytes(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
-        self.write_atomic(path, data).await
+        // ponytail: frozen_original not available through trait — caller handles revision check
+        self.write_atomic(path, data, &[]).await
     }
 
     async fn metadata(&self, path: &str) -> std::io::Result<FileMetadata> {
@@ -369,7 +370,7 @@ impl SftpProvider {
     async fn read_all(&self, path: &str, max_bytes: usize) -> std::io::Result<BoundedRead> {
         use tokio::io::AsyncReadExt;
 
-        let mut guard = self.connect_for_mutation().await?;
+        let guard = self.connect_for_mutation().await?;
         let conn = guard
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
@@ -421,53 +422,62 @@ impl SftpProvider {
 
     /// Atomic write via SFTP: stage → verify → commit → rollback on failure.
     /// Reuses the transactional pattern proven in sftp_copy::upload_file.
-    async fn write_atomic(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
+    async fn write_atomic(
+        &self,
+        path: &str,
+        data: &[u8],
+        frozen_original: &[u8],
+    ) -> std::io::Result<()> {
         use std::time::{SystemTime, UNIX_EPOCH};
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let token = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let temp = format!("{path}.arx-part-{token}");
-        let backup = format!("{path}.arx-bak-{token}");
+        let stage_path = format!("{path}.arx-part-{token}");
+        let backup_path = format!("{path}.arx-bak-{token}");
 
-        let mut guard = self.connect_for_mutation().await?;
-
-        // Stage: write to temp file
-        let mut remote = guard
+        let guard = self.connect_for_mutation().await?;
+        let session = &guard
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?
-            .session
-            .create(temp.clone())
+            .session;
+
+        // ── Stage ──
+        let mut remote = session
+            .create(stage_path.clone())
             .await
             .map_err(|e| std::io::Error::other(format!("SFTP create {path}: {e}")))?;
         if let Err(e) = remote.write_all(data).await {
-            // ponytail: connection is broken, temp file orphaned — acceptable
+            drop(remote);
+            let _ = session.remove_file(stage_path.clone()).await;
             return Err(std::io::Error::other(format!("SFTP write {path}: {e}")));
         }
         if let Err(e) = remote.flush().await {
-            return Err(e.into());
+            drop(remote);
+            let _ = session.remove_file(stage_path.clone()).await;
+            return Err(e);
         }
         if let Err(e) = remote.shutdown().await {
-            return Err(e.into());
+            drop(remote);
+            let _ = session.remove_file(stage_path.clone()).await;
+            return Err(e);
         }
         drop(remote);
 
-        // Verify staged size
-        let staged = guard
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?
-            .session
-            .metadata(temp.clone())
-            .await
-            .map_err(|e| std::io::Error::other(format!("SFTP verify {path}: {e}")))?;
+        // ── Verify staged size ──
+        let staged = {
+            match session.metadata(stage_path.clone()).await {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = session.remove_file(stage_path.clone()).await;
+                    return Err(std::io::Error::other(format!("SFTP verify {path}: {e}")));
+                }
+            }
+        };
         if staged.len() != data.len() as u64 {
-            let session = &guard
-                .as_ref()
-                .ok_or_else(|| std::io::Error::other("lost"))?
-                .session;
-            let _ = session.remove_file(temp.clone()).await;
+            let _ = session.remove_file(stage_path).await;
             return Err(std::io::Error::other(format!(
                 "SFTP write verify {path}: staged {} != expected {}",
                 staged.len(),
@@ -475,32 +485,87 @@ impl SftpProvider {
             )));
         }
 
-        // Backup existing target if present
-        let session = &guard
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?
-            .session;
+        // ── Backup existing target ──
         let had_target = session.metadata(path.to_string()).await.is_ok();
-        if had_target
-            && session
-                .rename(path.to_string(), backup.clone())
+        if had_target {
+            if session
+                .rename(path.to_string(), backup_path.clone())
                 .await
                 .is_err()
-        {
-            let _ = session.remove_file(temp.clone()).await;
-            return Err(std::io::Error::other(format!("SFTP backup {path} failed")));
+            {
+                let _ = session.remove_file(stage_path).await;
+                return Err(std::io::Error::other(format!("SFTP backup {path} failed")));
+            }
+
+            // ── Race check: verify backup matches frozen original ──
+            if !frozen_original.is_empty() {
+                if !self
+                    .verify_backup_matches(session, &backup_path, frozen_original)
+                    .await
+                {
+                    let _ = session.remove_file(stage_path).await;
+                    let _ = session.rename(backup_path, path.to_string()).await;
+                    return Err(std::io::Error::other(format!(
+                        "SFTP conflict {path}: remote modified during edit"
+                    )));
+                }
+            }
         }
 
-        // Commit
-        if let Err(e) = session.rename(temp.clone(), path.to_string()).await {
-            let _ = session.remove_file(temp).await;
+        // ── Commit ──
+        if let Err(e) = session.rename(stage_path.clone(), path.to_string()).await {
+            let _ = session.remove_file(stage_path).await;
             if had_target {
-                let _ = session.rename(backup, path.to_string()).await;
+                if session
+                    .rename(backup_path.clone(), path.to_string())
+                    .await
+                    .is_err()
+                {
+                    return Err(std::io::Error::other(format!(
+                        "SFTP FATAL {path}: commit failed AND backup restore failed. Backup: {backup_path}"
+                    )));
+                }
             }
             return Err(std::io::Error::other(format!("SFTP commit {path}: {e}")));
         }
 
+        // ── Success: remove backup ──
+        if had_target {
+            let _ = session.remove_file(backup_path).await;
+        }
+
         Ok(())
+    }
+
+    /// Verify that backup file content matches frozen_original.
+    async fn verify_backup_matches(
+        &self,
+        session: &russh_sftp::client::SftpSession,
+        backup_path: &str,
+        frozen: &[u8],
+    ) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut f = match session.open(backup_path.to_string()).await {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut buf = vec![0u8; frozen.len().min(1024 * 1024)];
+        let mut total = 0usize;
+        loop {
+            let n = match f.read(&mut buf[total..]).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => return false,
+            };
+            total += n;
+            if total > frozen.len() {
+                return false;
+            }
+            if n == buf.len() - total {
+                buf.resize(total + 65536, 0);
+            }
+        }
+        total == frozen.len() && buf[..total] == frozen[..total]
     }
 
     async fn remote_metadata(&self, path: &str) -> std::io::Result<FileMetadata> {

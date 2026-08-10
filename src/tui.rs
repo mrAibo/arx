@@ -12,7 +12,7 @@ use arx::services::{
     PaneLoadResponse, PaneLoader, SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions,
     WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
 };
-use arx::vfs::{Entry, EntryKind, Location, RemoteEditLaunch};
+use arx::vfs::{Entry, EntryKind, Location, RemoteEditSession, RemoteEditState};
 use arx::workspace_sync::{
     DiffState, SyncDirection, SyncMode, WorkspaceSide, WorkspaceSyncOperation,
 };
@@ -30,6 +30,7 @@ use ratatui::{
 };
 use std::io;
 use std::path::PathBuf;
+use tempfile;
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
@@ -188,38 +189,53 @@ async fn event_loop(
                 );
 
                 // Phase 2-3: if download completed, launch editor and dispatch write-back
-                if let Some(launch) = state.pending_remote_edit_launch.take() {
-                    if launch.temp_path.as_os_str().is_empty() {
+                if let Some(session) = state.pending_remote_edit_session.take() {
+                    if session.state == RemoteEditState::Downloading {
                         // Downloaded hasn't arrived yet or failed — skip
-                        state.pending_remote_edit_launch = Some(launch);
+                        state.pending_remote_edit_session = Some(session);
                     } else {
                         // Re-check scope: user may have navigated away
                         let same_location =
-                            state.active_pane().location == launch.location;
+                            state.active_pane().location == session.location;
                         if same_location {
                             let editor_cmd = if let Some(cfg_editor) = &editor {
                                 cfg_editor.clone()
                             } else {
-                                launch.editor.clone()
+                                session.editor.clone()
                             };
-                            // Phase 2: suspend TUI, launch editor on temp
+                            let working_path = session.temp_dir.path().join("working");
+                            // Phase 2: suspend TUI, launch editor on working copy
                             let editor_result = terminal_session
                                 .suspend_while(|| {
-                                    DesktopService::open_editor(&editor_cmd, &launch.temp_path)
+                                    DesktopService::open_editor(&editor_cmd, &working_path)
                                 })
                                 .await?;
                             if let Err(error) = editor_result {
                                 state.message = Some(format!("Editor failed: {error}"));
                             } else {
+                                // Check for no-change before dispatching write-back
+                                let working_bytes =
+                                    match tokio::fs::read(&working_path).await {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            state.message = Some(format!(
+                                                "Failed reading edited file: {e}"
+                                            ));
+                                            continue;
+                                        }
+                                    };
+                                if working_bytes == session.frozen_original {
+                                    state.message = Some(format!(
+                                        "No changes to {} — skipping write-back",
+                                        session.name
+                                    ));
+                                    continue;
+                                }
                                 // Phase 3: dispatch write-back
                                 let id = effect_dispatcher.dispatch(
                                     EffectLane::RemoteEdit,
-                                    EffectScope::Location(launch.location.clone()),
-                                    Effect::WriteBackRemoteFile {
-                                        location: launch.location,
-                                        name: launch.name,
-                                        temp_path: launch.temp_path,
-                                    },
+                                    EffectScope::Location(session.location.clone()),
+                                    Effect::WriteBackRemoteFile { session },
                                 );
                                 state.register_effect(EffectLane::RemoteEdit, id);
                             }
@@ -4104,11 +4120,13 @@ async fn dispatch_ui_action(
                     let name = entry.name.clone();
 
                     // Phase 1: download to temp, store pending state
-                    state.pending_remote_edit_launch = Some(RemoteEditLaunch {
-                        temp_path: PathBuf::new(), // filled when Downloaded arrives
+                    state.pending_remote_edit_session = Some(RemoteEditSession {
                         name: name.clone(),
                         location: location.clone(),
                         editor: editor.to_string(),
+                        frozen_original: Vec::new(),
+                        temp_dir: std::sync::Arc::new(tempfile::TempDir::new().expect("temp dir")),
+                        state: RemoteEditState::Downloading,
                     });
                     let id = effect_dispatcher.dispatch(
                         EffectLane::RemoteEdit,
@@ -5130,23 +5148,19 @@ fn apply_effect_event(state: &mut AppState, event: EffectEvent) {
         EffectEvent::PathOpened { path } => {
             state.message = Some(format!("Opened {}", path.display()));
         }
-        EffectEvent::Downloaded {
-            temp_path, name, ..
-        } => {
-            state.message = Some(format!("Downloaded: {name}"));
-            if let Some(launch) = &mut state.pending_remote_edit_launch {
-                launch.temp_path = temp_path;
-            }
+        EffectEvent::Downloaded { session } => {
+            state.message = Some(format!("Downloaded: {}", session.name));
+            state.pending_remote_edit_session = Some(session);
         }
         EffectEvent::WrittenBack { name } => {
             state.message = Some(format!("Uploaded: {name}"));
-            state.pending_remote_edit_launch = None; // cleanup
+            state.pending_remote_edit_session = None;
         }
         EffectEvent::RemoteConflict { name } => {
             state.message = Some(format!(
                 "{name} changed on remote during edit — write-back refused"
             ));
-            state.pending_remote_edit_launch = None; // cleanup
+            state.pending_remote_edit_session = None;
         }
         EffectEvent::Failed { label, error } => {
             state.message = Some(format!("{label} failed: {error}"));
