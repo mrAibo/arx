@@ -97,6 +97,7 @@ fn candidate_actions(state: &AppState) -> Vec<(ActionId, HintPriority)> {
                 Primary,
             ),
             (OpenCommandCenter, Secondary),
+            (ToggleEmbeddedTerminal, Discovery),
             (OpenHosts, Discovery),
             (OpenJobs, Discovery),
             (OpenBookmarks, Discovery),
@@ -136,21 +137,23 @@ mod tests {
         let state = AppState::default();
         let hints = contextual_hints(&state, &Keymap::default());
 
-        assert_eq!(hints.len(), 7);
+        assert_eq!(hints.len(), 8);
         assert_eq!(hints[0].action, ActionId::Mkdir);
         assert_eq!(hints[0].binding, "F7");
         assert_eq!(hints[1].action, ActionId::ToggleWorkspaceComparison);
         assert_eq!(hints[1].binding, "Ctrl+D");
         assert_eq!(hints[2].action, ActionId::OpenCommandCenter);
         assert_eq!(hints[2].binding, "Ctrl+P");
-        assert_eq!(hints[3].action, ActionId::OpenHosts);
-        assert_eq!(hints[3].binding, "F9");
-        assert_eq!(hints[4].action, ActionId::OpenJobs);
-        assert_eq!(hints[4].binding, "Ctrl+J");
-        assert_eq!(hints[5].action, ActionId::OpenBookmarks);
-        assert_eq!(hints[5].binding, "Ctrl+B");
-        assert_eq!(hints[6].action, ActionId::OpenHelp);
-        assert_eq!(hints[6].binding, "?");
+        assert_eq!(hints[3].action, ActionId::ToggleEmbeddedTerminal);
+        assert_eq!(hints[3].binding, "Ctrl+X T");
+        assert_eq!(hints[4].action, ActionId::OpenHosts);
+        assert_eq!(hints[4].binding, "F9");
+        assert_eq!(hints[5].action, ActionId::OpenJobs);
+        assert_eq!(hints[5].binding, "Ctrl+J");
+        assert_eq!(hints[6].action, ActionId::OpenBookmarks);
+        assert_eq!(hints[6].binding, "Ctrl+B");
+        assert_eq!(hints[7].action, ActionId::OpenHelp);
+        assert_eq!(hints[7].binding, "?");
     }
 
     #[test]

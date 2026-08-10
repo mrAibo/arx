@@ -168,6 +168,12 @@ impl Default for Keymap {
                 Action::Delete,
             ),
             KeyBinding::new(Browser, vec![ctrl('p')], Action::OpenCommandCenter),
+            // Ctrl+X T: embedded terminal (safe across emulators, unlike Ctrl+Shift+T)
+            KeyBinding::new(
+                Browser,
+                vec![ctrl('x'), plain('t')],
+                Action::ToggleEmbeddedTerminal,
+            ),
             KeyBinding::new(Browser, vec![ctrl('b')], Action::OpenBookmarks),
             KeyBinding::new(Browser, vec![ctrl('j')], Action::OpenJobs),
             KeyBinding::new(
@@ -178,7 +184,14 @@ impl Default for Keymap {
             // Tmux sessions: Command Center only (Ctrl+P → "List tmux sessions")
             KeyBinding::new(Browser, vec![plain('?')], Action::OpenHelp),
             KeyBinding::new(Browser, vec![ctrl('d')], Action::ToggleWorkspaceComparison),
+            // Ctrl+X P: workspace preview (safe across terminal emulators)
             KeyBinding::new(
+                Browser,
+                vec![ctrl('x'), plain('p')],
+                Action::PreviewWorkspaceSync,
+            ),
+            // Ctrl+Shift+S: compatibility alias (may be intercepted by terminal)
+            KeyBinding::alias(
                 Browser,
                 vec![KeyStroke::new(Char('s'), CONTROL | KeyModifiers::SHIFT)],
                 Action::PreviewWorkspaceSync,

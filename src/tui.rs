@@ -1118,33 +1118,6 @@ async fn event_loop(
                                 100 - state.panel_ratio
                             ));
                         }
-                        // Ctrl+Shift:T: toggle terminal in right pane
-                        KeyCode::Char('t')
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && key.modifiers.contains(KeyModifiers::SHIFT) =>
-                        {
-                            if state.show_terminal {
-                                state.show_terminal = false;
-                                if let Some(ref mut t) = state.term {
-                                    t.kill();
-                                }
-                                state.term = None;
-                                state.message = Some("Terminal closed".into());
-                            } else if let Location::Local(dir) = &state.right.location {
-                                match arx::terminal::TermPane::spawn(dir) {
-                                    Ok(t) => {
-                                        state.term = Some(t);
-                                        state.show_terminal = true;
-                                        state.active = Pane::Right;
-                                        state.message =
-                                            Some("Terminal started — Esc to close".into());
-                                    }
-                                    Err(e) => {
-                                        state.message = Some(format!("Terminal error: {e}"));
-                                    }
-                                }
-                            }
-                        }
                         // Alt+`: tab switcher
                         KeyCode::Char('`') if key.modifiers.contains(KeyModifiers::ALT) => {
                             state.show_tab_switcher = !state.show_tab_switcher;
@@ -4251,6 +4224,28 @@ async fn dispatch_ui_action(
             state.register_effect(EffectLane::TmuxDiscovery, id);
             state.message = Some("Discovering tmux sessions…".into());
         }
+        Action::ToggleEmbeddedTerminal => {
+            if state.show_terminal {
+                state.show_terminal = false;
+                if let Some(ref mut t) = state.term {
+                    t.kill();
+                }
+                state.term = None;
+                state.message = Some("Terminal closed".into());
+            } else if let Location::Local(dir) = &state.right.location {
+                match arx::terminal::TermPane::spawn(dir) {
+                    Ok(t) => {
+                        state.term = Some(t);
+                        state.show_terminal = true;
+                        state.active = Pane::Right;
+                        state.message = Some("Terminal started — Esc to close".into());
+                    }
+                    Err(e) => {
+                        state.message = Some(format!("Terminal error: {e}"));
+                    }
+                }
+            }
+        }
         _ => state.apply(action),
     }
     Ok(())
@@ -4702,7 +4697,7 @@ mod tests {
         let router = KeyRouter::default();
         let wide =
             contextual_footer_text(&state, &router, Some(EntryKind::File), true, u16::MAX).unwrap();
-        assert_eq!(wide.split("    ").count(), 12);
+        assert_eq!(wide.split("    ").count(), 13);
         assert!(wide.contains("F3 View file"));
         assert!(wide.contains("F4 Edit file"));
         assert!(wide.contains("F5 Copy"));

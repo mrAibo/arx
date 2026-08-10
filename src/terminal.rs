@@ -119,6 +119,12 @@ impl TermPane {
     }
 }
 
+impl Drop for TermPane {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 /// Strip basic ANSI escape sequences. ponytail: regex-free, covers CSI sequences.
 fn strip_ansi(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
