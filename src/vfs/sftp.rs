@@ -291,10 +291,7 @@ mod metadata_tests {
     fn no_recursive_delete_path_in_mutation_code() {
         let source = include_str!("sftp.rs");
         // Split at #[cfg(test)] to avoid self-matching assertion strings.
-        let prod_code = source
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap_or(source);
+        let prod_code = source.split("#[cfg(test)]").next().unwrap_or(source);
         assert!(!prod_code.contains("remove_dir_all"));
         assert!(!prod_code.contains(".recursive"));
         assert!(!prod_code.contains("walkdir"));
