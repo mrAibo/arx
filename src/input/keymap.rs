@@ -168,6 +168,12 @@ impl Default for Keymap {
                 Action::Delete,
             ),
             KeyBinding::new(Browser, vec![ctrl('p')], Action::OpenCommandCenter),
+            // Ctrl+X T: embedded terminal (safe across emulators, unlike Ctrl+Shift+T)
+            KeyBinding::new(
+                Browser,
+                vec![ctrl('x'), plain('t')],
+                Action::ToggleEmbeddedTerminal,
+            ),
             KeyBinding::new(Browser, vec![ctrl('b')], Action::OpenBookmarks),
             KeyBinding::new(Browser, vec![ctrl('j')], Action::OpenJobs),
             KeyBinding::new(

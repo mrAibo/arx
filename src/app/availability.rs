@@ -1,6 +1,6 @@
 use super::{ActionId, AppState, WorkspaceSyncUxState};
 use crate::vfs::{
-    Capability, CapabilitySet, EntryKind, ProviderId, capabilities::builtin_capabilities,
+    Capability, CapabilitySet, EntryKind, Location, ProviderId, capabilities::builtin_capabilities,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +23,7 @@ impl ActionAvailability {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionContext {
     pub active_provider: ProviderId,
     pub passive_provider: ProviderId,
@@ -38,6 +38,7 @@ pub struct ActionContext {
     pub sync_details_ready: bool,
     pub sync_verification_diff_ready: bool,
     pub sync_return_preview_ready: bool,
+    pub right_location: Location,
 }
 
 impl ActionContext {
@@ -111,6 +112,7 @@ impl ActionContext {
             sync_details_ready,
             sync_verification_diff_ready,
             sync_return_preview_ready,
+            right_location: state.right.location.clone(),
         }
     }
 
@@ -279,6 +281,15 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
                 reason: "No current workspace preview is available to return to".into(),
             }
         }
+        ActionId::ToggleEmbeddedTerminal => {
+            if let Location::Local(_) = &ctx.right_location {
+                ActionAvailability::Available
+            } else {
+                ActionAvailability::Disabled {
+                    reason: "Embedded terminal requires a local right pane".into(),
+                }
+            }
+        }
         _ => ActionAvailability::Available,
     }
 }
@@ -303,6 +314,7 @@ mod tests {
             sync_details_ready: false,
             sync_verification_diff_ready: false,
             sync_return_preview_ready: false,
+            right_location: Location::Local(std::path::PathBuf::from("/")),
         }
     }
 
