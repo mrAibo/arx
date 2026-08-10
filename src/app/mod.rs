@@ -18,7 +18,10 @@ pub use actions::{
 mod availability;
 pub use availability::{ActionAvailability, ActionContext, action_availability};
 mod command_center;
-pub use command_center::{CommandItem, CommandKind, CommandTarget, build_command_items};
+pub use command_center::{
+    CommandItem, CommandKind, CommandTarget, build_command_items,
+    build_command_items_with_file_context,
+};
 mod overlay;
 pub use overlay::OverlayKind;
 mod remote_workspace;

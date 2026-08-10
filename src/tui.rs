@@ -2,11 +2,11 @@ use crate::tui_terminal::TuiTerminalSession;
 use arx::app::{
     Action, ActionAvailability, ActionContext, AppState, CommandItem, CommandKind, CommandTarget,
     OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SessionCallout, SortMode,
-    WorkspaceSyncUxState, action_availability, action_meta, build_command_items,
+    WorkspaceSyncUxState, action_availability, action_meta, build_command_items_with_file_context,
 };
 use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectResponse, EffectScope};
 use arx::effects::{Effect, EffectEvent};
-use arx::input::{KeyResolution, KeyRouter, contextual_hints};
+use arx::input::{KeyResolution, KeyRouter, contextual_hints, contextual_hints_with_file_context};
 use arx::services::{
     DesktopService, FileInfoService, GitService, MutationError, MutationService, PaneLoadPurpose,
     PaneLoadResponse, PaneLoader, SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions,
@@ -67,7 +67,7 @@ async fn event_loop(
     terminal_session: &mut TuiTerminalSession,
     config: arx::config::ArxConfig,
 ) -> io::Result<()> {
-    let editor = config.ui.editor.clone();
+    let editor = DesktopService::resolve_editor(config.ui.editor.as_deref());
     let mut state = AppState {
         show_hidden: config.ui.show_hidden,
         hosts: arx::remote::hosts_config::load_hosts(),
@@ -151,6 +151,7 @@ async fn event_loop(
                 &mut split_left_list,
                 &mut split_right_list,
                 &key_router,
+                editor.is_some(),
                 msg.as_deref(),
             )
         })?;
@@ -449,7 +450,13 @@ async fn event_loop(
                             }
                             KeyCode::Backspace => {
                                 state.filter.pop();
-                                state.command_matches = build_command_items(&state.filter, &state);
+                                state.command_matches = build_command_items_with_file_context(
+                                    &state.filter,
+                                    &state,
+                                    focused_entry(&state, &left_filtered, &right_filtered)
+                                        .map(|entry| entry.kind),
+                                    editor.is_some(),
+                                );
                                 state
                                     .overlay_list_state
                                     .select((!state.command_matches.is_empty()).then_some(0));
@@ -459,7 +466,13 @@ async fn event_loop(
                                     && !key.modifiers.contains(KeyModifiers::ALT) =>
                             {
                                 state.filter.push(c);
-                                state.command_matches = build_command_items(&state.filter, &state);
+                                state.command_matches = build_command_items_with_file_context(
+                                    &state.filter,
+                                    &state,
+                                    focused_entry(&state, &left_filtered, &right_filtered)
+                                        .map(|entry| entry.kind),
+                                    editor.is_some(),
+                                );
                                 state
                                     .overlay_list_state
                                     .select((!state.command_matches.is_empty()).then_some(0));
@@ -557,11 +570,17 @@ async fn event_loop(
                                     state.filter.push(c);
                                     if state.show_command_center {
                                         state.command_matches =
-                                            build_command_items(&state.filter, &state);
-                                    }
-                                    if state.show_command_center {
-                                        state.command_matches =
-                                            build_command_items(&state.filter, &state);
+                                            build_command_items_with_file_context(
+                                                &state.filter,
+                                                &state,
+                                                focused_entry(
+                                                    &state,
+                                                    &left_filtered,
+                                                    &right_filtered,
+                                                )
+                                                .map(|entry| entry.kind),
+                                                editor.is_some(),
+                                            );
                                     }
                                 }
                             }
@@ -765,7 +784,10 @@ async fn event_loop(
                             continue;
                         }
                         KeyResolution::Action(action) => {
-                            let context = ActionContext::from_state(&state);
+                            let context = ActionContext::from_state(&state).with_file_context(
+                                entries.get(cursor).map(|entry| entry.kind),
+                                editor.is_some(),
+                            );
                             match action_availability(action.id(), &context) {
                                 ActionAvailability::Available => {
                                     dispatch_ui_action(
@@ -1994,6 +2016,23 @@ fn directory_navigation_target(location: &Location, entry: &Entry) -> Option<Loc
     }
 }
 
+fn focused_entry<'a>(
+    state: &AppState,
+    left_entries: &[&'a Entry],
+    right_entries: &[&'a Entry],
+) -> Option<&'a Entry> {
+    let pane = state.active_pane();
+    let cursor = if pane.split && pane.split_active {
+        pane.split_cursor
+    } else {
+        pane.cursor
+    };
+    match state.active {
+        Pane::Left => left_entries.get(cursor).copied(),
+        Pane::Right => right_entries.get(cursor).copied(),
+    }
+}
+
 fn toggle_selection_and_advance(
     state: &mut AppState,
     focused: Option<&Entry>,
@@ -2070,23 +2109,38 @@ fn pane_surface_state<'a>(
     }
 }
 
-fn contextual_footer_text(state: &AppState, key_router: &KeyRouter) -> Option<String> {
-    if !key_router.pending().is_empty() {
+fn contextual_footer_text(
+    state: &AppState,
+    key_router: &KeyRouter,
+    focused_kind: Option<EntryKind>,
+    editor_available: bool,
+    width: u16,
+) -> Option<String> {
+    if !key_router.pending().is_empty() || width == 0 {
         return None;
     }
 
-    let hints = contextual_hints(state, key_router.keymap());
-    if hints.is_empty() {
-        return None;
+    let hints = contextual_hints_with_file_context(
+        state,
+        key_router.keymap(),
+        focused_kind,
+        editor_available,
+    );
+    let mut text = String::new();
+    for hint in hints {
+        let item = format!("{} {}", hint.binding, hint.label);
+        let candidate = if text.is_empty() {
+            item
+        } else {
+            format!("{text}    {item}")
+        };
+        if Line::from(candidate.as_str()).width() > usize::from(width) {
+            break;
+        }
+        text = candidate;
     }
 
-    Some(
-        hints
-            .into_iter()
-            .map(|hint| format!("{} {}", hint.binding, hint.label))
-            .collect::<Vec<_>>()
-            .join("    "),
-    )
+    (!text.is_empty()).then_some(text)
 }
 
 fn render_contextual_footer(
@@ -2094,8 +2148,16 @@ fn render_contextual_footer(
     area: Rect,
     state: &AppState,
     key_router: &KeyRouter,
+    focused_kind: Option<EntryKind>,
+    editor_available: bool,
 ) {
-    let Some(text) = contextual_footer_text(state, key_router) else {
+    let Some(text) = contextual_footer_text(
+        state,
+        key_router,
+        focused_kind,
+        editor_available,
+        area.width,
+    ) else {
         return;
     };
 
@@ -2192,6 +2254,7 @@ fn render(
     split_left_list: &mut ListState,
     split_right_list: &mut ListState,
     key_router: &KeyRouter,
+    editor_available: bool,
     message: Option<&str>,
 ) {
     let area = frame.area();
@@ -2741,7 +2804,14 @@ fn render(
 
     // Contextual footer is derived from the same runtime Keymap that owns
     // keyboard routing. A pending chord leaves discovery to Which-Key.
-    render_contextual_footer(frame, footer_area, state, key_router);
+    render_contextual_footer(
+        frame,
+        footer_area,
+        state,
+        key_router,
+        focused_entry(state, left_entries, right_entries).map(|entry| entry.kind),
+        editor_available,
+    );
 
     if state.active_overlay() == Some(OverlayKind::SyncPreview) {
         render_sync_preview(frame, area, state);
@@ -4093,7 +4163,12 @@ async fn dispatch_ui_action(
         Action::OpenCommandCenter => {
             state.open_overlay(OverlayKind::CommandCenter);
             state.filter.clear();
-            state.command_matches = build_command_items("", state);
+            state.command_matches = build_command_items_with_file_context(
+                "",
+                state,
+                focused.map(|entry| entry.kind),
+                configured_editor.is_some(),
+            );
             state
                 .overlay_list_state
                 .select((!state.command_matches.is_empty()).then_some(0));
@@ -4106,8 +4181,8 @@ async fn dispatch_ui_action(
             toggle_selection_and_advance(state, focused, visible_count);
         }
         Action::ViewFile => {
-            let Some(entry) = focused.filter(|entry| entry.kind != EntryKind::Directory) else {
-                state.message = Some("Select a file to view".into());
+            let Some(entry) = focused.filter(|entry| entry.kind == EntryKind::File) else {
+                state.message = Some("Select a regular file to view".into());
                 return Ok(());
             };
             let location = state.active_pane().location.clone();
@@ -4125,8 +4200,8 @@ async fn dispatch_ui_action(
             state.message = Some(format!("Loading preview: {}", entry.name));
         }
         Action::EditFile => {
-            let Some(entry) = focused.filter(|entry| entry.kind != EntryKind::Directory) else {
-                state.message = Some("Select a file to edit".into());
+            let Some(entry) = focused.filter(|entry| entry.kind == EntryKind::File) else {
+                state.message = Some("Select a regular file to edit".into());
                 return Ok(());
             };
             let Location::Local(base) = &state.active_pane().location else {
@@ -4134,13 +4209,13 @@ async fn dispatch_ui_action(
                 return Ok(());
             };
             let path = base.join(&entry.name);
-            let editor = configured_editor
-                .map(str::to_owned)
-                .or_else(|| std::env::var("EDITOR").ok())
-                .or_else(|| std::env::var("VISUAL").ok())
-                .unwrap_or_else(|| "vi".into());
+            let Some(editor) = configured_editor else {
+                state.message =
+                    Some("No editor configured (config.ui.editor, VISUAL, or EDITOR)".into());
+                return Ok(());
+            };
             let editor_result = terminal_session
-                .suspend_while(|| DesktopService::open_editor(&editor, &path))
+                .suspend_while(|| DesktopService::open_editor(editor, &path))
                 .await?;
             if let Err(error) = editor_result {
                 state.message = Some(format!("Editor failed: {error}"));
@@ -4602,17 +4677,67 @@ mod tests {
     };
 
     #[test]
-    fn footer_uses_runtime_keymap() {
-        let keymap = Keymap::new(vec![KeyBinding::new(
-            InputContext::Browser,
-            vec![KeyStroke::new(KeyCode::F(12), KeyModifiers::NONE)],
-            Action::ToggleWorkspaceComparison,
-        )]);
+    fn footer_uses_remapped_file_action_bindings() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new(
+                InputContext::Browser,
+                vec![KeyStroke::new(KeyCode::F(12), KeyModifiers::NONE)],
+                Action::ViewFile,
+            ),
+            KeyBinding::new(
+                InputContext::Browser,
+                vec![KeyStroke::new(KeyCode::F(11), KeyModifiers::NONE)],
+                Action::EditFile,
+            ),
+        ]);
         let router = KeyRouter::new(keymap);
 
         assert_eq!(
-            contextual_footer_text(&AppState::default(), &router).as_deref(),
-            Some("F12 Compare panes")
+            contextual_footer_text(
+                &AppState::default(),
+                &router,
+                Some(EntryKind::File),
+                true,
+                u16::MAX,
+            )
+            .as_deref(),
+            Some("F12 View file    F11 Edit file")
+        );
+    }
+
+    #[test]
+    fn footer_fits_priority_prefix_to_real_width() {
+        let state = AppState::default();
+        let router = KeyRouter::default();
+        let wide =
+            contextual_footer_text(&state, &router, Some(EntryKind::File), true, u16::MAX).unwrap();
+        assert_eq!(wide.split("    ").count(), 8);
+        assert!(wide.contains("F3 View file"));
+        assert!(wide.contains("F4 Edit file"));
+        assert!(wide.contains("Ctrl+J Jobs"));
+        assert!(wide.contains("Ctrl+B Bookmarks"));
+
+        let first = wide.split("    ").next().unwrap();
+        let first_width = u16::try_from(Line::from(first).width()).unwrap();
+        assert_eq!(
+            contextual_footer_text(&state, &router, Some(EntryKind::File), true, first_width,)
+                .as_deref(),
+            Some(first)
+        );
+        assert!(
+            contextual_footer_text(
+                &state,
+                &router,
+                Some(EntryKind::File),
+                true,
+                first_width - 1,
+            )
+            .is_none()
+        );
+        assert!(
+            !contextual_footer_text(&state, &router, Some(EntryKind::Directory), true, u16::MAX,)
+                .unwrap()
+                .contains("F3 View file")
         );
     }
 
@@ -4625,7 +4750,9 @@ mod tests {
         );
 
         assert_eq!(resolution, KeyResolution::Pending);
-        assert!(contextual_footer_text(&AppState::default(), &router).is_none());
+        assert!(
+            contextual_footer_text(&AppState::default(), &router, None, false, u16::MAX).is_none()
+        );
     }
 
     fn file(name: &str) -> Entry {
@@ -4789,7 +4916,8 @@ mod tests {
             &[file("source.txt")],
             &[],
         );
-        let preview_footer = contextual_footer_text(&preview, &router).unwrap_or_default();
+        let preview_footer =
+            contextual_footer_text(&preview, &router, None, false, u16::MAX).unwrap_or_default();
         assert!(preview_footer.contains("Enter Execute workspace sync"));
         assert!(preview_footer.contains("D Reverse sync direction"));
         assert!(preview_footer.contains("M Toggle update/mirror"));
@@ -4823,7 +4951,8 @@ mod tests {
         .expect("freeze mirror preview");
         confirmation.remote_workspace.set_frozen_plan(frozen);
         let confirmation_footer =
-            contextual_footer_text(&confirmation, &router).unwrap_or_default();
+            contextual_footer_text(&confirmation, &router, None, false, u16::MAX)
+                .unwrap_or_default();
         assert!(confirmation_footer.contains("Enter Confirm workspace sync"));
         assert!(confirmation_footer.contains("Esc Back in workspace sync"));
 
@@ -4832,7 +4961,8 @@ mod tests {
         running.remote_workspace.ux = WorkspaceSyncUxState::Running {
             job_id: "sync-1".into(),
         };
-        let running_footer = contextual_footer_text(&running, &router).unwrap_or_default();
+        let running_footer =
+            contextual_footer_text(&running, &router, None, false, u16::MAX).unwrap_or_default();
         assert!(running_footer.contains("C Cancel workspace sync"));
         assert!(running_footer.contains("Esc Hide workspace sync"));
         assert!(!running_footer.contains("verification diff"));

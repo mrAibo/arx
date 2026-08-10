@@ -1,6 +1,7 @@
 use crate::app::{
     ActionContext, ActionId, AppState, InputContext, action_availability, action_meta,
 };
+use crate::vfs::EntryKind;
 
 use super::Keymap;
 
@@ -29,8 +30,18 @@ pub struct ContextHint {
 /// are filtered through the same `ActionAvailability` gate used by direct
 /// keyboard actions and Command Center.
 pub fn contextual_hints(state: &AppState, keymap: &Keymap) -> Vec<ContextHint> {
+    contextual_hints_with_file_context(state, keymap, None, false)
+}
+
+pub fn contextual_hints_with_file_context(
+    state: &AppState,
+    keymap: &Keymap,
+    focused_kind: Option<EntryKind>,
+    editor_available: bool,
+) -> Vec<ContextHint> {
     let context = state.input_context();
-    let action_context = ActionContext::from_state(state);
+    let action_context =
+        ActionContext::from_state(state).with_file_context(focused_kind, editor_available);
     let mut hints = Vec::new();
 
     for (action, priority) in candidate_actions(state) {
@@ -59,12 +70,9 @@ pub fn contextual_hints(state: &AppState, keymap: &Keymap) -> Vec<ContextHint> {
             label: meta.label,
             priority,
         });
-
-        if hints.len() == 4 {
-            break;
-        }
     }
 
+    hints.sort_by_key(|hint| hint.priority);
     hints
 }
 
@@ -74,6 +82,8 @@ fn candidate_actions(state: &AppState) -> Vec<(ActionId, HintPriority)> {
 
     match state.input_context() {
         InputContext::Browser => vec![
+            (ViewFile, Primary),
+            (EditFile, Primary),
             (
                 if state.remote_workspace.plan.is_some() {
                     PreviewWorkspaceSync
@@ -84,6 +94,8 @@ fn candidate_actions(state: &AppState) -> Vec<(ActionId, HintPriority)> {
             ),
             (OpenCommandCenter, Secondary),
             (OpenHosts, Discovery),
+            (OpenJobs, Discovery),
+            (OpenBookmarks, Discovery),
             (OpenHelp, Discovery),
         ],
         InputContext::SyncPreview => vec![
@@ -119,13 +131,67 @@ mod tests {
         let state = AppState::default();
         let hints = contextual_hints(&state, &Keymap::default());
 
-        assert_eq!(hints.len(), 4);
+        assert_eq!(hints.len(), 6);
         assert_eq!(hints[0].action, ActionId::ToggleWorkspaceComparison);
         assert_eq!(hints[0].binding, "Ctrl+D");
         assert_eq!(hints[1].action, ActionId::OpenCommandCenter);
         assert_eq!(hints[1].binding, "Ctrl+P");
         assert_eq!(hints[2].binding, "F9");
-        assert_eq!(hints[3].binding, "?");
+        assert_eq!(hints[3].binding, "Ctrl+J");
+        assert_eq!(hints[4].binding, "Ctrl+B");
+        assert_eq!(hints[5].binding, "?");
+    }
+
+    #[test]
+    fn local_file_hints_include_f3_and_f4_when_editor_exists() {
+        let hints = contextual_hints_with_file_context(
+            &AppState::default(),
+            &Keymap::default(),
+            Some(EntryKind::File),
+            true,
+        );
+
+        assert_eq!(hints[0].action, ActionId::ViewFile);
+        assert_eq!(hints[0].binding, "F3");
+        assert_eq!(hints[1].action, ActionId::EditFile);
+        assert_eq!(hints[1].binding, "F4");
+    }
+
+    #[test]
+    fn file_hints_follow_remote_and_editor_availability() {
+        let mut remote = AppState::default();
+        remote.left.location = crate::vfs::Location::Sftp {
+            host: "example".into(),
+            path: "/srv".into(),
+        };
+        let remote_hints = contextual_hints_with_file_context(
+            &remote,
+            &Keymap::default(),
+            Some(EntryKind::File),
+            true,
+        );
+        assert!(
+            remote_hints
+                .iter()
+                .all(|hint| !matches!(hint.action, ActionId::ViewFile | ActionId::EditFile))
+        );
+
+        let no_editor = contextual_hints_with_file_context(
+            &AppState::default(),
+            &Keymap::default(),
+            Some(EntryKind::File),
+            false,
+        );
+        assert!(
+            no_editor
+                .iter()
+                .any(|hint| hint.action == ActionId::ViewFile)
+        );
+        assert!(
+            no_editor
+                .iter()
+                .all(|hint| hint.action != ActionId::EditFile)
+        );
     }
 
     #[test]
