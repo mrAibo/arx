@@ -142,6 +142,11 @@ impl Default for Keymap {
                 vec![KeyStroke::new(KeyCode::F(3), KeyModifiers::NONE)],
                 Action::ViewFile,
             ),
+            KeyBinding::new(
+                Browser,
+                vec![KeyStroke::new(KeyCode::F(4), KeyModifiers::NONE)],
+                Action::EditFile,
+            ),
             KeyBinding::new(Browser, vec![ctrl('p')], Action::OpenCommandCenter),
             KeyBinding::new(Browser, vec![ctrl('b')], Action::OpenBookmarks),
             KeyBinding::new(Browser, vec![ctrl('j')], Action::OpenJobs),
@@ -404,6 +409,18 @@ mod tests {
                 KeyStroke::new(KeyCode::F(3), KeyModifiers::NONE),
             ),
             KeyResolution::Action(Action::ViewFile)
+        );
+    }
+
+    #[test]
+    fn f4_resolves_edit_file() {
+        let mut router = KeyRouter::default();
+        assert_eq!(
+            router.resolve_stroke(
+                InputContext::Browser,
+                KeyStroke::new(KeyCode::F(4), KeyModifiers::NONE),
+            ),
+            KeyResolution::Action(Action::EditFile)
         );
     }
 

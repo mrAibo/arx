@@ -27,9 +27,14 @@ impl DesktopService {
 
     pub async fn open_editor(editor: &str, path: &Path) -> std::io::Result<()> {
         let args = vec![path.to_string_lossy().into_owned()];
-        ProcessService::status(editor, &args, None)
-            .await
-            .map(|_| ())
+        let status = ProcessService::status(editor, &args, None).await?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "editor exited with {status}"
+            )))
+        }
     }
 
     pub async fn page_with_bat(path: &Path) -> std::io::Result<()> {
@@ -70,5 +75,23 @@ impl DesktopService {
             std::io::ErrorKind::NotFound,
             "no supported clipboard tool found (wl-copy/xclip)",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn editor_nonzero_exit_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        tokio::fs::write(&path, "text").await.unwrap();
+
+        let error = DesktopService::open_editor("false", &path)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("editor exited with"));
     }
 }

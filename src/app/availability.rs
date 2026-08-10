@@ -139,6 +139,11 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
                 reason: "File preview is currently local-only".into(),
             }
         }
+        ActionId::EditFile if ctx.active_provider != ProviderId::Local => {
+            ActionAvailability::Disabled {
+                reason: "File editing is currently local-only".into(),
+            }
+        }
         // Hard links and chown do not yet have VFS capabilities. Keep them
         // local-only rather than pretending remote providers support them.
         ActionId::BeginHardLink if ctx.active_provider != ProviderId::Local => {
@@ -215,6 +220,14 @@ mod tests {
     fn remote_view_is_disabled_until_provider_reads_are_wired() {
         let ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
         let availability = action_availability(ActionId::ViewFile, &ctx);
+        assert!(matches!(availability, ActionAvailability::Disabled { .. }));
+        assert!(availability.reason().is_some());
+    }
+
+    #[test]
+    fn remote_edit_is_disabled_until_provider_writes_are_wired() {
+        let ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+        let availability = action_availability(ActionId::EditFile, &ctx);
         assert!(matches!(availability, ActionAvailability::Disabled { .. }));
         assert!(availability.reason().is_some());
     }

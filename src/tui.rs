@@ -415,7 +415,11 @@ async fn event_loop(
                                         &pane_loader,
                                         &sync_runtime,
                                         &effect_dispatcher,
-                                    ) {
+                                        terminal_session,
+                                        editor.as_deref(),
+                                    )
+                                    .await?
+                                    {
                                         let id = effect_dispatcher.dispatch(
                                             EffectLane::GlobalProcess,
                                             EffectScope::Global,
@@ -763,15 +767,21 @@ async fn event_loop(
                         KeyResolution::Action(action) => {
                             let context = ActionContext::from_state(&state);
                             match action_availability(action.id(), &context) {
-                                ActionAvailability::Available => dispatch_ui_action(
-                                    &mut state,
-                                    action,
-                                    entries.get(cursor).copied(),
-                                    entries.len(),
-                                    &workspace_scanner,
-                                    &sync_runtime,
-                                    &effect_dispatcher,
-                                ),
+                                ActionAvailability::Available => {
+                                    dispatch_ui_action(
+                                        &mut state,
+                                        action,
+                                        entries.get(cursor).copied(),
+                                        entries.len(),
+                                        &workspace_scanner,
+                                        &sync_runtime,
+                                        &effect_dispatcher,
+                                        &pane_loader,
+                                        terminal_session,
+                                        editor.as_deref(),
+                                    )
+                                    .await?
+                                }
                                 ActionAvailability::Disabled { reason } => {
                                     state.message = Some(reason);
                                 }
@@ -1564,29 +1574,6 @@ async fn event_loop(
                                     };
                                     let _ = DesktopService::page_with_bat(&path).await;
                                 }
-                            }
-                        }
-                        // F4: edit file in $EDITOR
-                        KeyCode::F(4) => {
-                            if let Some(entry) = entries.get(cursor) {
-                                let path = match &pane.location {
-                                    Location::Local(dir) => dir.join(&entry.name),
-                                    _ => continue,
-                                };
-                                let editor_cmd = editor
-                                    .clone()
-                                    .or_else(|| std::env::var("EDITOR").ok())
-                                    .or_else(|| std::env::var("VISUAL").ok())
-                                    .unwrap_or_else(|| "vi".into());
-                                let editor_result = terminal_session
-                                    .suspend_while(|| {
-                                        DesktopService::open_editor(&editor_cmd, &path)
-                                    })
-                                    .await?;
-                                if let Err(error) = editor_result {
-                                    state.message = Some(format!("Editor failed: {error}"));
-                                }
-                                schedule_active_pane_load(&pane_loader, &mut state);
                             }
                         }
                         // Ctrl+C: copy filename to clipboard
@@ -4075,7 +4062,9 @@ fn toggle_hosts_overlay(state: &mut AppState) {
     state.toggle_overlay(OverlayKind::Hosts);
 }
 
-fn dispatch_ui_action(
+// ponytail: keep the one action seam instead of wrapping runtime services in a one-use context.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_ui_action(
     state: &mut AppState,
     action: Action,
     focused: Option<&Entry>,
@@ -4083,7 +4072,10 @@ fn dispatch_ui_action(
     workspace_scanner: &WorkspaceScanner,
     sync: &SyncUiRuntime,
     effect_dispatcher: &EffectDispatcher,
-) {
+    pane_loader: &PaneLoader,
+    terminal_session: &mut TuiTerminalSession,
+    configured_editor: Option<&str>,
+) -> io::Result<()> {
     let focused = focused.filter(|entry| entry.name != VIRTUAL_PARENT_NAME);
     if matches!(
         action,
@@ -4093,7 +4085,7 @@ fn dispatch_ui_action(
             | Action::ToggleWorkspaceSyncMode
     ) && !supersede_workspace_launch_for_new_action(state, sync)
     {
-        return;
+        return Ok(());
     }
 
     match action {
@@ -4116,12 +4108,12 @@ fn dispatch_ui_action(
         Action::ViewFile => {
             let Some(entry) = focused.filter(|entry| entry.kind != EntryKind::Directory) else {
                 state.message = Some("Select a file to view".into());
-                return;
+                return Ok(());
             };
             let location = state.active_pane().location.clone();
             let Location::Local(base) = &location else {
                 state.message = Some("File preview is currently local-only".into());
-                return;
+                return Ok(());
             };
             let path = base.join(&entry.name);
             let id = effect_dispatcher.dispatch(
@@ -4131,6 +4123,29 @@ fn dispatch_ui_action(
             );
             state.register_effect(EffectLane::Preview, id);
             state.message = Some(format!("Loading preview: {}", entry.name));
+        }
+        Action::EditFile => {
+            let Some(entry) = focused.filter(|entry| entry.kind != EntryKind::Directory) else {
+                state.message = Some("Select a file to edit".into());
+                return Ok(());
+            };
+            let Location::Local(base) = &state.active_pane().location else {
+                state.message = Some("File editing is currently local-only".into());
+                return Ok(());
+            };
+            let path = base.join(&entry.name);
+            let editor = configured_editor
+                .map(str::to_owned)
+                .or_else(|| std::env::var("EDITOR").ok())
+                .or_else(|| std::env::var("VISUAL").ok())
+                .unwrap_or_else(|| "vi".into());
+            let editor_result = terminal_session
+                .suspend_while(|| DesktopService::open_editor(&editor, &path))
+                .await?;
+            if let Err(error) = editor_result {
+                state.message = Some(format!("Editor failed: {error}"));
+            }
+            schedule_active_pane_load(pane_loader, state);
         }
         Action::BeginSymlink => {
             if let Some(entry) = focused {
@@ -4214,6 +4229,7 @@ fn dispatch_ui_action(
         Action::CloseWorkspaceSyncOverlay => state.close_overlay(OverlayKind::SyncPreview),
         _ => state.apply(action),
     }
+    Ok(())
 }
 
 fn supersede_workspace_launch_for_new_action(state: &mut AppState, sync: &SyncUiRuntime) -> bool {
@@ -4313,7 +4329,7 @@ fn cancel_workspace_sync(state: &mut AppState, sync: &SyncUiRuntime) {
 
 // ponytail: a context struct would only hide these already-scoped runtime services.
 #[allow(clippy::too_many_arguments)]
-fn execute_command_target(
+async fn execute_command_target(
     state: &mut AppState,
     target: CommandTarget,
     focused: Option<&Entry>,
@@ -4322,8 +4338,10 @@ fn execute_command_target(
     pane_loader: &PaneLoader,
     sync: &SyncUiRuntime,
     effect_dispatcher: &EffectDispatcher,
-) -> Option<Effect> {
-    match target {
+    terminal_session: &mut TuiTerminalSession,
+    configured_editor: Option<&str>,
+) -> io::Result<Option<Effect>> {
+    let effect = match target {
         CommandTarget::Action(action) => {
             dispatch_ui_action(
                 state,
@@ -4333,7 +4351,11 @@ fn execute_command_target(
                 workspace_scanner,
                 sync,
                 effect_dispatcher,
-            );
+                pane_loader,
+                terminal_session,
+                configured_editor,
+            )
+            .await?;
             None
         }
         CommandTarget::Location(location) => {
@@ -4374,7 +4396,8 @@ fn execute_command_target(
             Some(Effect::AttachScreen { session })
         }
         CommandTarget::ShellCommand(command) => Some(Effect::SpawnShell { command }),
-    }
+    };
+    Ok(effect)
 }
 
 fn start_workspace_scan(scanner: &WorkspaceScanner, state: &mut AppState, keep_preview_open: bool) {
