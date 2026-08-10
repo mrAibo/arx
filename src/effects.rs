@@ -17,6 +17,7 @@ pub enum Effect {
     UnifiedDiff { left: PathBuf, right: PathBuf },
     InfrastructureSnapshot,
     TreeSnapshot { location: Location, filter: String },
+    PreviewFile { path: PathBuf },
     OpenPath { path: PathBuf },
 }
 

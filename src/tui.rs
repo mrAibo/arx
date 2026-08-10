@@ -9,8 +9,8 @@ use arx::effects::{Effect, EffectEvent};
 use arx::input::{KeyResolution, KeyRouter, contextual_hints};
 use arx::services::{
     DesktopService, FileInfoService, GitService, MutationError, MutationService, PaneLoadPurpose,
-    PaneLoadResponse, PaneLoader, PreviewService, SyncLaunchId, WorkspaceScanError,
-    WorkspaceScanOptions, WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
+    PaneLoadResponse, PaneLoader, SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions,
+    WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
 };
 use arx::vfs::{Entry, EntryKind, Location};
 use arx::workspace_sync::{
@@ -414,6 +414,7 @@ async fn event_loop(
                                         &workspace_scanner,
                                         &pane_loader,
                                         &sync_runtime,
+                                        &effect_dispatcher,
                                     ) {
                                         let id = effect_dispatcher.dispatch(
                                             EffectLane::GlobalProcess,
@@ -769,6 +770,7 @@ async fn event_loop(
                                     entries.len(),
                                     &workspace_scanner,
                                     &sync_runtime,
+                                    &effect_dispatcher,
                                 ),
                                 ActionAvailability::Disabled { reason } => {
                                     state.message = Some(reason);
@@ -1552,20 +1554,15 @@ async fn event_loop(
                                 sort_entries(&mut right_entries, state.sort_mode);
                             }
                         }
-                        // F3: view file
-                        KeyCode::F(3) => {
+                        // Shift+F3: page file with bat
+                        KeyCode::F(3) if key.modifiers.contains(KeyModifiers::SHIFT) => {
                             if let Some(entry) = entries.get(cursor) {
                                 if entry.kind != EntryKind::Directory {
                                     let path = match &pane.location {
                                         Location::Local(dir) => dir.join(&entry.name),
                                         _ => continue,
                                     };
-                                    if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                        let _ = DesktopService::page_with_bat(&path).await;
-                                    } else {
-                                        state.viewer_content = PreviewService::preview(&path).await;
-                                        state.viewer_scroll = 0;
-                                    }
+                                    let _ = DesktopService::page_with_bat(&path).await;
                                 }
                             }
                         }
@@ -4085,6 +4082,7 @@ fn dispatch_ui_action(
     visible_count: usize,
     workspace_scanner: &WorkspaceScanner,
     sync: &SyncUiRuntime,
+    effect_dispatcher: &EffectDispatcher,
 ) {
     let focused = focused.filter(|entry| entry.name != VIRTUAL_PARENT_NAME);
     if matches!(
@@ -4114,6 +4112,25 @@ fn dispatch_ui_action(
         Action::OpenHelp => state.toggle_overlay(OverlayKind::Help),
         Action::ToggleSelect => {
             toggle_selection_and_advance(state, focused, visible_count);
+        }
+        Action::ViewFile => {
+            let Some(entry) = focused.filter(|entry| entry.kind != EntryKind::Directory) else {
+                state.message = Some("Select a file to view".into());
+                return;
+            };
+            let location = state.active_pane().location.clone();
+            let Location::Local(base) = &location else {
+                state.message = Some("File preview is currently local-only".into());
+                return;
+            };
+            let path = base.join(&entry.name);
+            let id = effect_dispatcher.dispatch(
+                EffectLane::Preview,
+                EffectScope::Location(location),
+                Effect::PreviewFile { path },
+            );
+            state.register_effect(EffectLane::Preview, id);
+            state.message = Some(format!("Loading preview: {}", entry.name));
         }
         Action::BeginSymlink => {
             if let Some(entry) = focused {
@@ -4294,6 +4311,8 @@ fn cancel_workspace_sync(state: &mut AppState, sync: &SyncUiRuntime) {
     }
 }
 
+// ponytail: a context struct would only hide these already-scoped runtime services.
+#[allow(clippy::too_many_arguments)]
 fn execute_command_target(
     state: &mut AppState,
     target: CommandTarget,
@@ -4302,6 +4321,7 @@ fn execute_command_target(
     workspace_scanner: &WorkspaceScanner,
     pane_loader: &PaneLoader,
     sync: &SyncUiRuntime,
+    effect_dispatcher: &EffectDispatcher,
 ) -> Option<Effect> {
     match target {
         CommandTarget::Action(action) => {
@@ -4312,6 +4332,7 @@ fn execute_command_target(
                 visible_count,
                 workspace_scanner,
                 sync,
+                effect_dispatcher,
             );
             None
         }

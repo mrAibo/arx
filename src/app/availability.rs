@@ -134,6 +134,11 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
         ActionId::BeginChmod => {
             require_active_capability(ctx, Capability::Chmod, "Permission changes")
         }
+        ActionId::ViewFile if ctx.active_provider != ProviderId::Local => {
+            ActionAvailability::Disabled {
+                reason: "File preview is currently local-only".into(),
+            }
+        }
         // Hard links and chown do not yet have VFS capabilities. Keep them
         // local-only rather than pretending remote providers support them.
         ActionId::BeginHardLink if ctx.active_provider != ProviderId::Local => {
@@ -204,6 +209,14 @@ mod tests {
             action_availability(ActionId::BeginHardLink, &ctx),
             ActionAvailability::Disabled { .. }
         ));
+    }
+
+    #[test]
+    fn remote_view_is_disabled_until_provider_reads_are_wired() {
+        let ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+        let availability = action_availability(ActionId::ViewFile, &ctx);
+        assert!(matches!(availability, ActionAvailability::Disabled { .. }));
+        assert!(availability.reason().is_some());
     }
 
     #[test]
