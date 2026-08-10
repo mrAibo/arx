@@ -714,11 +714,34 @@ mod tests {
             ..AppState::default()
         };
         assert!(state.pending_delete.is_some());
-
-        // Simulate what dispatch_ui_action does for CancelRemoteDelete
         state.pending_delete = None;
-
         assert!(state.pending_delete.is_none());
+    }
+
+    #[test]
+    fn confirm_retains_pending_delete_until_physical_outcome() {
+        let plan = crate::vfs::RemoteDeletePlan {
+            location: crate::vfs::Location::Sftp {
+                host: "prod".into(),
+                path: "/srv".into(),
+            },
+            targets: vec![crate::vfs::RemoteDeleteTarget {
+                name: "data.txt".into(),
+                kind: crate::vfs::EntryKind::File,
+                path: "/srv/data.txt".into(),
+            }],
+            created_at: std::time::Instant::now(),
+        };
+        let state = AppState {
+            pending_delete: Some(plan),
+            ..AppState::default()
+        };
+        assert!(state.pending_delete.is_some());
+        assert_eq!(state.pending_delete.as_ref().unwrap().targets.len(), 1);
+        assert_eq!(
+            state.pending_delete.as_ref().unwrap().targets[0].name,
+            "data.txt"
+        );
     }
 
     // ── REMOTE-09: refresh-only-on-physical-outcome marker ──

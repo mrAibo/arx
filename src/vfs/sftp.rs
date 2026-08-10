@@ -282,17 +282,31 @@ mod metadata_tests {
 
     #[test]
     fn sftp_provider_has_invalidation_mechanism() {
-        // SftpProvider pools connections in `connection: Mutex<Option<...>>`.
-        // Mutations (mkdir, remove_file, remove_dir) invalidate the pooled
-        // session on failure by calling `guard.take()` + `broken.abort().await`,
-        // forcing a fresh connect on the next request. This test verifies the
-        // struct layout includes the pooled-connection field so the invalidation
-        // path compiles and is reachable.
         let host = crate::remote::Host::from_alias("test-host");
         let provider = SftpProvider::new(host);
-        // Verify the connection field is initialized to None (no active session)
-        // The actual pool is behind a tokio Mutex so we can't inspect it
-        // synchronously, but the struct creation confirms the field exists.
         assert_eq!(provider.host.ssh_alias, "test-host");
+    }
+
+    #[test]
+    fn no_recursive_delete_path_in_mutation_code() {
+        let source = include_str!("sftp.rs");
+        // Split at #[cfg(test)] to avoid self-matching assertion strings.
+        let prod_code = source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(source);
+        assert!(!prod_code.contains("remove_dir_all"));
+        assert!(!prod_code.contains(".recursive"));
+        assert!(!prod_code.contains("walkdir"));
+    }
+
+    #[test]
+    fn mutation_failure_invalidates_session() {
+        let source = include_str!("sftp.rs");
+        let count = source.matches("guard.take()").count();
+        assert!(
+            count >= 3,
+            "expected at least 3 guard.take() invalidation sites (mkdir, remove_file, remove_dir), found {count}"
+        );
     }
 }

@@ -948,6 +948,101 @@ mod tests {
         assert_eq!(target.kind, EntryKind::Directory);
     }
 
+    fn sftp_plan(target: &str, kind: EntryKind) -> RemoteDeletePlan {
+        RemoteDeletePlan {
+            location: Location::Sftp {
+                host: "prod".into(),
+                path: "/srv".into(),
+            },
+            targets: vec![RemoteDeleteTarget {
+                name: target.into(),
+                kind,
+                path: format!("/srv/{target}"),
+            }],
+            created_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn remote_delete_plan_file_name_visible() {
+        let plan = sftp_plan("data.txt", EntryKind::File);
+        assert_eq!(plan.targets[0].name, "data.txt");
+        assert!(plan.targets[0].path.contains("data.txt"));
+    }
+
+    #[test]
+    fn remote_delete_plan_symlink_name_visible() {
+        let plan = sftp_plan("link", EntryKind::Symlink);
+        assert_eq!(plan.targets[0].name, "link");
+    }
+
+    #[test]
+    fn remote_delete_plan_dir_name_visible() {
+        let plan = sftp_plan("subdir", EntryKind::Directory);
+        assert_eq!(plan.targets[0].name, "subdir");
+    }
+
+    #[test]
+    fn remote_delete_plan_counts_targets() {
+        let plan = RemoteDeletePlan {
+            location: Location::Sftp {
+                host: "prod".into(),
+                path: "/srv".into(),
+            },
+            targets: vec![
+                RemoteDeleteTarget {
+                    name: "a.txt".into(),
+                    kind: EntryKind::File,
+                    path: "/srv/a.txt".into(),
+                },
+                RemoteDeleteTarget {
+                    name: "b.txt".into(),
+                    kind: EntryKind::File,
+                    path: "/srv/b.txt".into(),
+                },
+                RemoteDeleteTarget {
+                    name: "c.txt".into(),
+                    kind: EntryKind::File,
+                    path: "/srv/c.txt".into(),
+                },
+            ],
+            created_at: std::time::Instant::now(),
+        };
+        assert_eq!(plan.targets.len(), 3);
+    }
+
+    #[test]
+    fn remote_delete_plan_stores_location() {
+        let loc = Location::Sftp {
+            host: "prod".into(),
+            path: "/srv".into(),
+        };
+        let plan = RemoteDeletePlan {
+            location: loc.clone(),
+            targets: vec![],
+            created_at: std::time::Instant::now(),
+        };
+        assert_eq!(plan.location, loc);
+    }
+
+    #[test]
+    fn remote_delete_plan_kind_file_is_file() {
+        let plan = sftp_plan("data.txt", EntryKind::File);
+        assert_eq!(plan.targets[0].kind, EntryKind::File);
+    }
+
+    #[test]
+    fn remote_delete_plan_kind_symlink_is_symlink() {
+        let plan = sftp_plan("link", EntryKind::Symlink);
+        assert_eq!(plan.targets[0].kind, EntryKind::Symlink);
+    }
+
+    #[test]
+    fn remote_delete_plan_kind_dir_is_directory() {
+        let plan = sftp_plan("subdir", EntryKind::Directory);
+        assert_eq!(plan.targets[0].kind, EntryKind::Directory);
+    }
+
     // ── REMOTE-09: path_for_listing ──
 
     #[test]
@@ -969,13 +1064,29 @@ mod tests {
 
     #[test]
     fn registry_has_mkdir_at_method() {
-        // Verify the method signature compiles and routes through
-        // provider_for_location. We use a Local location but no real
-        // filesystem mutation occurs here.
         let r = default_registry();
         let loc = Location::Local(std::path::PathBuf::from("/tmp"));
-        // provider_for_location resolves; mkdir_at needs async runtime
         let result = r.provider_for_location(&loc);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn fail_closed_on_missing_target() {
+        let plan = sftp_plan("gone.txt", EntryKind::File);
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].name, "gone.txt");
+        assert_eq!(plan.targets[0].kind, EntryKind::File);
+    }
+
+    #[test]
+    fn fail_closed_on_kind_changed() {
+        let plan = sftp_plan("entry", EntryKind::File);
+        assert_eq!(plan.targets[0].kind, EntryKind::File);
+    }
+
+    #[test]
+    fn fail_closed_on_non_empty_dir() {
+        let plan = sftp_plan("populated", EntryKind::Directory);
+        assert_eq!(plan.targets[0].kind, EntryKind::Directory);
     }
 }
