@@ -61,9 +61,30 @@ impl TerminalOps for CrosstermTerminalOps {
     }
 
     fn drain_input(&mut self) -> io::Result<()> {
+        // Standard crossterm event drain
         while event::poll(Duration::ZERO)? {
             let _ = event::read()?;
         }
+
+        // ponytail: flush raw bytes that crossterm did not parse before the
+        // shell inherits stdin. Linux tcflush does this atomically.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+
+            unsafe extern "C" {
+                fn tcflush(
+                    fd: std::os::raw::c_int,
+                    queue: std::os::raw::c_int,
+                ) -> std::os::raw::c_int;
+            }
+
+            const TCIFLUSH: std::os::raw::c_int = 0;
+            if unsafe { tcflush(std::io::stdin().as_raw_fd(), TCIFLUSH) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
         Ok(())
     }
 
