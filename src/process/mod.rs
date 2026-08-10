@@ -227,6 +227,7 @@ impl ProcessService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effect_dispatcher::{EffectDispatcher, EffectLane, EffectScope};
     use crate::vfs::capabilities;
     use crate::vfs::{Entry, Location, VfsProvider};
     use std::sync::Mutex;
@@ -411,5 +412,64 @@ mod tests {
             }
             other => panic!("expected ViewerLines, got {other:?}"),
         }
+    }
+
+    // ── FIX-05: Concurrency ──
+
+    fn preview_effect(loc: &Location, name: &str) -> Effect {
+        Effect::PreviewLocation {
+            location: loc.clone(),
+            name: name.into(),
+            total_size: None,
+        }
+    }
+
+    /// C1: dispatch() returns EffectId immediately without blocking on network I/O.
+    #[tokio::test]
+    async fn preview_effect_returns_id_before_read_completes() {
+        let registry = crate::vfs::ProviderRegistry::new();
+        let (dispatcher, mut rx) = EffectDispatcher::channel(registry);
+        let loc = Location::Local(std::path::PathBuf::from("/tmp"));
+
+        // Dispatch: must return immediately
+        let id = dispatcher.dispatch(
+            EffectLane::Preview,
+            EffectScope::Location(loc.clone()),
+            preview_effect(&loc, "test.txt"),
+        );
+        assert!(id.0 > 0, "EffectId assigned before async work begins");
+
+        // Response eventually arrives through channel (spawned task)
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for preview effect response")
+            .expect("channel closed");
+        assert_eq!(response.id, id);
+    }
+
+    /// C2: Two sequential previews produce monotonic IDs.
+    #[tokio::test]
+    async fn consecutive_previews_have_monotonic_ids() {
+        let registry = crate::vfs::ProviderRegistry::new();
+        let (dispatcher, mut rx) = EffectDispatcher::channel(registry);
+        let loc = Location::Local(std::path::PathBuf::from("/tmp"));
+
+        let id_a = dispatcher.dispatch(
+            EffectLane::Preview,
+            EffectScope::Location(loc.clone()),
+            preview_effect(&loc, "a.txt"),
+        );
+        let id_b = dispatcher.dispatch(
+            EffectLane::Preview,
+            EffectScope::Location(loc.clone()),
+            preview_effect(&loc, "b.txt"),
+        );
+        assert!(id_b.0 > id_a.0);
+
+        // Drain both responses
+        let resp_a = rx.recv().await.unwrap();
+        let resp_b = rx.recv().await.unwrap();
+        assert_eq!(resp_a.id, id_a);
+        assert_eq!(resp_b.id, id_b);
     }
 }
