@@ -255,6 +255,21 @@ impl ProviderRegistry {
         );
     }
 
+    // ponytail: convenience for tests and per-host registration.
+    pub fn insert_sftp(
+        &self,
+        host: &str,
+        provider: Box<dyn VfsProvider>,
+        capabilities: CapabilitySet,
+    ) {
+        self.insert_instance(
+            ProviderInstanceKey::SftpHost(host.to_string()),
+            ProviderId::Sftp,
+            Arc::from(provider),
+            capabilities,
+        );
+    }
+
     fn insert_instance(
         &self,
         key: ProviderInstanceKey,
@@ -448,6 +463,25 @@ impl ProviderRegistry {
     pub async fn list_location_async(&self, loc: &Location) -> std::io::Result<Vec<Entry>> {
         let (provider, path) = self.provider_for_location(loc)?;
         provider.list_async(&path).await
+    }
+
+    /// Create directory at frozen location. Routes to correct host instance.
+    pub async fn mkdir_at(&self, location: &Location, child_name: &str) -> std::io::Result<()> {
+        let (provider, parent_path) = self.provider_for_location(location)?;
+        let path = format!("{parent_path}/{child_name}");
+        provider.mkdir(&path).await
+    }
+
+    /// Remove file at exact frozen location.
+    pub async fn remove_file_at(&self, location: &Location, path: &str) -> std::io::Result<()> {
+        let (provider, _) = self.provider_for_location(location)?;
+        provider.remove_file(path).await
+    }
+
+    /// Remove empty directory at exact frozen location.
+    pub async fn remove_dir_at(&self, location: &Location, path: &str) -> std::io::Result<()> {
+        let (provider, _) = self.provider_for_location(location)?;
+        provider.remove_dir(path).await
     }
 }
 
@@ -791,5 +825,28 @@ mod tests {
                 capability: Capability::ServerSideCopy
             }
         ));
+    }
+
+    // REMOTE-FIX-01: provider_for_location resolves SFTP by host key,
+    // not by singleton ProviderId.
+    #[test]
+    fn provider_for_location_resolves_sftp_by_host() {
+        let r = ProviderRegistry::new();
+        r.insert_sftp(
+            "host-a",
+            Box::new(local::LocalProvider),
+            capabilities::SFTP_CAPABILITIES,
+        );
+        r.insert_sftp(
+            "host-b",
+            Box::new(local::LocalProvider),
+            capabilities::SFTP_CAPABILITIES,
+        );
+        let loc_a = Location::Sftp {
+            host: "host-a".into(),
+            path: "/tmp".into(),
+        };
+        let (_, path) = r.provider_for_location(&loc_a).unwrap();
+        assert_eq!(path, "/tmp");
     }
 }

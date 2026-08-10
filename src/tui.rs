@@ -588,25 +588,21 @@ async fn event_loop(
                                     } else if let Some(loc) = pending_mkdir {
                                         // SFTP provider-backed mkdir
                                         let name = command;
-                                        let path = match &loc {
-                                            Location::Local(p) => {
-                                                format!("{}/{}", p.display(), name)
-                                            }
-                                            Location::Sftp { path: p, .. } => {
-                                                format!("{p}/{name}")
-                                            }
-                                            _ => {
-                                                state.message =
-                                                    Some("mkdir: unsupported location".into());
-                                                continue;
-                                            }
-                                        };
-                                        let provider = loc.provider_id();
+                                        // ponytail: validate location type early.
+                                        if !matches!(
+                                            &loc,
+                                            Location::Local(_) | Location::Sftp { .. }
+                                        ) {
+                                            state.message =
+                                                Some("mkdir: unsupported location".into());
+                                            continue;
+                                        }
                                         let registry = state.registry.clone();
+                                        let loc_clone = loc.clone();
+                                        let name_clone = name.clone();
                                         tokio::spawn(async move {
-                                            if let Some(p) = registry.get(&provider) {
-                                                let _ = p.mkdir(&path).await;
-                                            }
+                                            let _ =
+                                                registry.mkdir_at(&loc_clone, &name_clone).await;
                                         });
                                         state.message = Some(format!("mkdir {name}…"));
                                     } else {
@@ -4364,7 +4360,6 @@ async fn dispatch_ui_action(
                 return Ok(());
             };
             let registry = state.registry.clone();
-            let provider_id = plan.location.provider_id();
             let location = plan.location.clone();
             let targets = plan.targets;
             let target_count = targets.len();
@@ -4394,14 +4389,11 @@ async fn dispatch_ui_action(
                         break;
                     }
 
-                    let Some(provider) = registry.get(&provider_id) else {
-                        failed += 1;
-                        continue;
-                    };
-
                     let result = match target.kind {
-                        arx::vfs::EntryKind::Directory => provider.remove_dir(&target.path).await,
-                        _ => provider.remove_file(&target.path).await,
+                        arx::vfs::EntryKind::Directory => {
+                            registry.remove_dir_at(&location, &target.path).await
+                        }
+                        _ => registry.remove_file_at(&location, &target.path).await,
                     };
 
                     match result {
