@@ -153,6 +153,55 @@ impl SftpProvider {
 
         unreachable!("SFTP retry loop always returns")
     }
+
+    /// Reuse pooled connection without retry (mutations are not retried).
+    async fn connect_for_mutation(
+        &self,
+    ) -> std::io::Result<
+        tokio::sync::MutexGuard<'_, Option<crate::remote::openssh_sftp::OpenSshSftpConnection>>,
+    > {
+        let mut guard = self.connection.lock().await;
+        if guard.is_none() {
+            *guard = Some(
+                crate::remote::openssh_sftp::OpenSshSftpConnection::connect(&self.host.ssh_alias)
+                    .await?,
+            );
+        }
+        Ok(guard)
+    }
+
+    async fn mkdir(&self, path: &str) -> std::io::Result<()> {
+        let guard = self.connect_for_mutation().await?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
+        conn.session
+            .create_dir(path.to_string())
+            .await
+            .map_err(|e| std::io::Error::other(format!("SFTP mkdir {path}: {e}")))
+    }
+
+    async fn remove_file(&self, path: &str) -> std::io::Result<()> {
+        let guard = self.connect_for_mutation().await?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
+        conn.session
+            .remove_file(path.to_string())
+            .await
+            .map_err(|e| std::io::Error::other(format!("SFTP remove_file {path}: {e}")))
+    }
+
+    async fn remove_dir(&self, path: &str) -> std::io::Result<()> {
+        let guard = self.connect_for_mutation().await?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
+        conn.session
+            .remove_dir(path.to_string())
+            .await
+            .map_err(|e| std::io::Error::other(format!("SFTP remove_dir {path}: {e}")))
+    }
 }
 #[async_trait::async_trait]
 impl VfsProvider for SftpProvider {

@@ -913,7 +913,9 @@ mod tests {
     }
 
     #[test]
-    fn sftp_mirror_is_rejected_until_delete_executor_exists() {
+    fn sftp_mirror_passes_validator_now_that_delete_capability_exists() {
+        // SFTP_CAPABILITIES now includes Delete, so the validator accepts SFTP
+        // deletes. The compiler still requires Local (`require_local_file_mutation`).
         let preview = WorkspaceDiff::compare(
             local("/left"),
             sftp("prod", "/srv/app"),
@@ -928,13 +930,7 @@ mod tests {
             },
         );
 
-        assert!(matches!(
-            SyncPlanValidator::freeze(&plan, &preview, &default_registry()),
-            Err(SyncValidationError::UnsupportedDestinationCapability {
-                provider: ProviderId::Sftp,
-                capability: Capability::Delete
-            })
-        ));
+        assert!(SyncPlanValidator::freeze(&plan, &preview, &default_registry()).is_ok());
     }
 
     #[test]

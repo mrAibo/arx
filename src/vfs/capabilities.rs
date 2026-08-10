@@ -53,9 +53,12 @@ pub const LOCAL_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::Copy)
     .with(Capability::Move);
 
-/// SFTP currently exposes directory listing through `VfsProvider`.
-/// Transfers and mutation are intentionally delegated to the transfer layer.
-pub const SFTP_CAPABILITIES: CapabilitySet = CapabilitySet::NONE.with(Capability::List);
+/// SFTP now exposes directory creation and deletion through async VfsProvider
+/// primitives. Transfers remain delegated to the transfer layer.
+pub const SFTP_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
+    .with(Capability::List)
+    .with(Capability::Mkdir)
+    .with(Capability::Delete);
 
 /// Archive browsing currently supports listing only. Extraction/mutation stay
 /// outside the provider contract until they have transactional semantics.

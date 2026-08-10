@@ -187,6 +187,27 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
     fn copy_files(&self, src: &str, dst: &str, names: &[String]) -> std::io::Result<usize>;
     fn move_files(&self, src: &str, dst: &str, names: &[String]) -> std::io::Result<usize>;
     fn delete_files(&self, dir: &str, names: &[String]) -> std::io::Result<usize>;
+    /// Create a single directory. Default: unsupported.
+    async fn mkdir(&self, _path: &str) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "mkdir not supported by this provider",
+        ))
+    }
+    /// Remove a single file or symlink. Default: unsupported.
+    async fn remove_file(&self, _path: &str) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "remove_file not supported by this provider",
+        ))
+    }
+    /// Remove a single empty directory. Default: unsupported.
+    async fn remove_dir(&self, _path: &str) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "remove_dir not supported by this provider",
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
