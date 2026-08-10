@@ -4000,6 +4000,32 @@ async fn dispatch_ui_action(
                 return Ok(());
             };
             let location = state.active_pane().location.clone();
+            // SFTP: bounded remote preview via effect pipeline
+            if matches!(location.provider_id(), arx::vfs::ProviderId::Sftp) {
+                let name = entry.name.clone();
+                let registry = state.registry.clone();
+                let bytes = registry
+                    .read_prefix_bytes_at(
+                        &location,
+                        &name,
+                        arx::services::preview::MAX_TEXT_PREVIEW_BYTES,
+                    )
+                    .await
+                    .unwrap_or_else(|e| format!("Error reading remote file: {e}").into_bytes());
+                let total_size = entry.size;
+                let id = effect_dispatcher.dispatch(
+                    EffectLane::Preview,
+                    EffectScope::Location(location),
+                    Effect::PreviewLocationBytes {
+                        bytes,
+                        total_size,
+                        display_name: name.clone(),
+                    },
+                );
+                state.register_effect(EffectLane::Preview, id);
+                state.message = Some(format!("Loading preview: {name}"));
+                return Ok(());
+            }
             let Location::Local(base) = &location else {
                 state.message = Some("File preview is currently local-only".into());
                 return Ok(());

@@ -208,6 +208,13 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
             "remove_dir not supported by this provider",
         ))
     }
+    /// Read up to `max_bytes` from a file. Default: unsupported.
+    async fn read_prefix_bytes(&self, _path: &str, _max_bytes: usize) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "read_prefix_bytes not supported by this provider",
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -482,6 +489,18 @@ impl ProviderRegistry {
     pub async fn remove_dir_at(&self, location: &Location, path: &str) -> std::io::Result<()> {
         let (provider, _) = self.provider_for_location(location)?;
         provider.remove_dir(path).await
+    }
+
+    /// Read bounded prefix bytes from a file at a location.
+    pub async fn read_prefix_bytes_at(
+        &self,
+        location: &Location,
+        name: &str,
+        max_bytes: usize,
+    ) -> std::io::Result<Vec<u8>> {
+        let (provider, parent_path) = self.provider_for_location(location)?;
+        let path = format!("{}/{}", parent_path.trim_end_matches('/'), name);
+        provider.read_prefix_bytes(&path, max_bytes).await
     }
 }
 

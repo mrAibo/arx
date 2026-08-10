@@ -6,6 +6,52 @@ use crate::process::ProcessService;
 
 pub struct PreviewService;
 
+/// Pure function: format bounded bytes into preview lines.
+/// - NUL byte → "[Binary preview disabled]"
+/// - Invalid UTF-8 → "[Binary preview disabled]"
+/// - Valid UTF-8 → lines capped at max_lines, with truncation marker if truncated.
+/// `total_size` may be None for remote files where metadata may not include size.
+pub fn format_bounded_preview(
+    bytes: &[u8],
+    total_size: Option<u64>,
+    truncated: bool,
+    display_name: &str,
+    max_lines: usize,
+) -> std::io::Result<Vec<String>> {
+    if bytes.contains(&0) {
+        return Ok(vec![format!("[Binary preview disabled] {}", display_name)]);
+    }
+
+    let text = match std::str::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            let valid = std::str::from_utf8(&bytes[..e.valid_up_to()])
+                .map_err(|_| std::io::Error::other("UTF-8 decode failed"))?;
+            valid
+        }
+    };
+
+    let mut source_lines = text.lines();
+    let mut lines: Vec<String> = source_lines
+        .by_ref()
+        .take(max_lines)
+        .map(str::to_string)
+        .collect();
+    let lines_truncated = source_lines.next().is_some();
+
+    let bytes_label = match total_size {
+        Some(sz) => format!("{} bytes", sz),
+        None => format!("{} bytes read", bytes.len()),
+    };
+    lines.insert(0, format!("[Remote Text] {display_name} — {bytes_label}"));
+
+    if truncated || lines_truncated {
+        lines.push(format!("[Truncated at {} lines]", max_lines));
+    }
+
+    Ok(lines)
+}
+
 impl PreviewService {
     pub async fn preview(path: &Path) -> Vec<String> {
         let extension = path
@@ -97,8 +143,8 @@ async fn output_lines(program: &str, args: &[String]) -> Option<Vec<String>> {
     )
 }
 
-const MAX_TEXT_PREVIEW_BYTES: usize = 1024 * 1024;
-const MAX_TEXT_PREVIEW_LINES: usize = 500;
+pub const MAX_TEXT_PREVIEW_BYTES: usize = 1024 * 1024;
+pub const MAX_TEXT_PREVIEW_LINES: usize = 500;
 
 async fn read_text_preview(path: &Path) -> std::io::Result<Vec<String>> {
     let file = tokio::fs::File::open(path).await?;

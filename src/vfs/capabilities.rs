@@ -58,6 +58,7 @@ pub const LOCAL_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
 /// primitives. Transfers remain delegated to the transfer layer.
 pub const SFTP_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::List)
+    .with(Capability::Read)
     .with(Capability::Mkdir)
     .with(Capability::Delete);
 

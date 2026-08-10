@@ -233,8 +233,29 @@ impl VfsProvider for SftpProvider {
         self.list_pooled(path).await
     }
 
-    fn read_head(&self, _path: &str, _lines: usize) -> std::io::Result<Vec<String>> {
-        Err(std::io::Error::other("SFTP read_head not supported"))
+    fn read_head(&self, path: &str, max_lines: usize) -> std::io::Result<Vec<String>> {
+        // ponytail: sync bridge for legacy VfsProvider::read_head callers.
+        // New SFTP preview goes through read_prefix_bytes (async) in the
+        // effect pipeline.
+        const MAX_BYTES: usize = 1024 * 1024; // 1 MiB
+
+        let host = self.host.clone();
+        let path = path.to_string();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| std::io::Error::other(format!("SFTP runtime: {e}")))?;
+            rt.block_on(async {
+                let provider = SftpProvider::new(host);
+                let bytes = provider.read_prefix(&path, MAX_BYTES).await?;
+                crate::services::preview::format_bounded_preview(
+                    &bytes, None, false, &path, max_lines,
+                )
+            })
+        })
+        .join()
+        .map_err(|_| std::io::Error::other("SFTP worker thread panicked"))?
     }
 
     fn copy_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
@@ -259,6 +280,59 @@ impl VfsProvider for SftpProvider {
 
     async fn remove_dir(&self, path: &str) -> std::io::Result<()> {
         self.remove_dir(path).await
+    }
+
+    async fn read_prefix_bytes(&self, path: &str, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+        self.read_prefix(path, max_bytes).await
+    }
+}
+
+impl SftpProvider {
+    /// Read up to `max_bytes` from the beginning of a remote file.
+    /// Uses pooled connection with one retry — read is non-destructive.
+    async fn read_prefix(&self, path: &str, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+
+        let mut guard = self.connection.lock().await;
+
+        for attempt in 0..2 {
+            if guard.is_none() {
+                *guard = Some(
+                    crate::remote::openssh_sftp::OpenSshSftpConnection::connect(
+                        &self.host.ssh_alias,
+                    )
+                    .await?,
+                );
+            }
+
+            let conn = guard
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
+
+            let open_result = conn.session.open(path.to_string()).await;
+
+            match open_result {
+                Ok(mut file) => {
+                    let mut buf = vec![0u8; max_bytes];
+                    let n = file
+                        .read(&mut buf)
+                        .await
+                        .map_err(|e| std::io::Error::other(format!("SFTP read {path}: {e}")))?;
+                    buf.truncate(n);
+                    return Ok(buf);
+                }
+                Err(error) => {
+                    if let Some(mut broken) = guard.take() {
+                        broken.abort().await;
+                    }
+                    if attempt == 1 {
+                        return Err(std::io::Error::other(format!("SFTP open {path}: {error}")));
+                    }
+                }
+            }
+        }
+
+        unreachable!()
     }
 }
 

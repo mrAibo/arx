@@ -12,7 +12,7 @@ use tokio::process::Command;
 use crate::effects::{Effect, EffectEvent};
 use crate::services::{
     DesktopService, DiffService, FileInfoService, InfrastructureService, PreviewService,
-    TreeService,
+    TreeService, preview,
 };
 
 pub struct ProcessService;
@@ -140,6 +140,24 @@ impl ProcessService {
                 title: format!("View: {}", path.display()),
                 lines: PreviewService::preview(&path).await,
             },
+            Effect::PreviewLocationBytes {
+                bytes,
+                total_size,
+                display_name,
+            } => {
+                let lines = preview::format_bounded_preview(
+                    &bytes,
+                    total_size,
+                    bytes.len() >= preview::MAX_TEXT_PREVIEW_BYTES,
+                    &display_name,
+                    preview::MAX_TEXT_PREVIEW_LINES,
+                )
+                .unwrap_or_else(|e| vec![format!("Error: {e}")]);
+                EffectEvent::ViewerLines {
+                    title: format!("View: {display_name}"),
+                    lines,
+                }
+            }
             Effect::OpenPath { path } => match DesktopService::open_path(&path).await {
                 Ok(()) => EffectEvent::PathOpened { path },
                 Err(error) => EffectEvent::Failed {

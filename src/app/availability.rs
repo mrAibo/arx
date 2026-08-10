@@ -152,9 +152,20 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
         ActionId::BeginChmod => {
             require_active_capability(ctx, Capability::Chmod, "Permission changes")
         }
-        ActionId::ViewFile if ctx.active_provider != ProviderId::Local => {
+        ActionId::ViewFile
+            if ctx.active_provider != ProviderId::Local
+                && ctx.active_provider != ProviderId::Sftp =>
+        {
             ActionAvailability::Disabled {
                 reason: "Remote viewing is not supported yet".into(),
+            }
+        }
+        ActionId::ViewFile
+            if ctx.active_provider == ProviderId::Sftp
+                && !ctx.active_capabilities.supports(Capability::Read) =>
+        {
+            ActionAvailability::Disabled {
+                reason: "Read-only preview is not supported for this provider".into(),
             }
         }
         ActionId::ViewFile if ctx.focused_kind != Some(EntryKind::File) => {
@@ -329,8 +340,18 @@ mod tests {
     }
 
     #[test]
-    fn remote_view_is_disabled_until_provider_reads_are_wired() {
+    fn remote_view_is_available_when_provider_has_read_capability() {
         let ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+        let availability = action_availability(ActionId::ViewFile, &ctx);
+        assert!(
+            matches!(availability, ActionAvailability::Available),
+            "SFTP F3 should be Available when Capability::Read is present; got {availability:?}"
+        );
+    }
+
+    #[test]
+    fn remote_view_is_disabled_without_read_capability() {
+        let ctx = context(ProviderId::Sftp, CapabilitySet::NONE);
         let availability = action_availability(ActionId::ViewFile, &ctx);
         assert!(matches!(availability, ActionAvailability::Disabled { .. }));
         assert!(availability.reason().is_some());
