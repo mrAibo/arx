@@ -226,6 +226,30 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
             "read_prefix_bytes not supported by this provider",
         ))
     }
+
+    /// Write bytes atomically to a file (stage → verify → commit).
+    /// Default: unsupported.
+    async fn write_file_bytes(&self, _path: &str, _data: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "write_file_bytes not supported by this provider",
+        ))
+    }
+
+    /// Return filesystem metadata for a file. Default: unsupported.
+    async fn metadata(&self, _path: &str) -> std::io::Result<FileMetadata> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "metadata not supported by this provider",
+        ))
+    }
+}
+
+/// File metadata returned by a remote provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMetadata {
+    pub len: u64,
+    pub is_regular: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -512,6 +536,27 @@ impl ProviderRegistry {
         let (provider, parent_path) = self.provider_for_location(location)?;
         let path = format!("{}/{}", parent_path.trim_end_matches('/'), name);
         provider.read_prefix_bytes(&path, max_bytes).await
+    }
+
+    pub async fn write_file_bytes_at(
+        &self,
+        location: &Location,
+        name: &str,
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        let (provider, parent_path) = self.provider_for_location(location)?;
+        let path = format!("{}/{}", parent_path.trim_end_matches('/'), name);
+        provider.write_file_bytes(&path, data).await
+    }
+
+    pub async fn metadata_at(
+        &self,
+        location: &Location,
+        name: &str,
+    ) -> std::io::Result<FileMetadata> {
+        let (provider, parent_path) = self.provider_for_location(location)?;
+        let path = format!("{}/{}", parent_path.trim_end_matches('/'), name);
+        provider.metadata(&path).await
     }
 }
 
