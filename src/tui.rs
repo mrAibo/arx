@@ -4360,9 +4360,95 @@ async fn dispatch_ui_action(
             state.message = Some("Discovering tmux sessions…".into());
         }
         Action::ConfirmRemoteDelete => {
-            // ponytail: confirmation accepted, REMOTE-06 executor will process
-            let _plan = state.pending_delete.take();
-            state.message = Some("Remote delete queued".into());
+            let Some(plan) = state.pending_delete.take() else {
+                return Ok(());
+            };
+            let registry = state.registry.clone();
+            let provider_id = plan.location.provider_id();
+            let location = plan.location.clone();
+            let targets = plan.targets;
+            let target_count = targets.len();
+            let jobs = sync.jobs.clone();
+            let tx = sync.job_events.clone();
+
+            let job = jobs.create_job(
+                "remote-delete",
+                arx::jobs::JobKind::Delete,
+                format!("Permanent delete {} target(s)", targets.len()),
+                Some(location.clone()),
+                None,
+            );
+
+            let _ = jobs.publish_event(&tx, arx::jobs::JobEvent::Running { id: job.id.clone() });
+
+            tokio::spawn(async move {
+                let mut completed: usize = 0;
+                let mut failed: usize = 0;
+                let mut cancelled = false;
+
+                for target in &targets {
+                    if let Some(j) = jobs.get(&job.id) {
+                        if j.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            cancelled = true;
+                            break;
+                        }
+                    }
+
+                    let Some(provider) = registry.get(&provider_id) else {
+                        failed += 1;
+                        continue;
+                    };
+
+                    let result = match target.kind {
+                        arx::vfs::EntryKind::Directory => provider.remove_dir(&target.path).await,
+                        _ => provider.remove_file(&target.path).await,
+                    };
+
+                    match result {
+                        Ok(()) => completed += 1,
+                        Err(_e) => {
+                            failed += 1;
+                        }
+                    }
+                }
+
+                if cancelled {
+                    let _ = jobs.publish_event(
+                        &tx,
+                        arx::jobs::JobEvent::Cancelled {
+                            id: job.id,
+                            result: arx::jobs::JobResult::generic(
+                                format!("Cancelled after {completed} deleted, {failed} failed"),
+                                completed,
+                            ),
+                        },
+                    );
+                } else if failed > 0 {
+                    let _ = jobs.publish_event(
+                        &tx,
+                        arx::jobs::JobEvent::Failed {
+                            id: job.id,
+                            error: format!("{completed} deleted, {failed} failed"),
+                            result: Some(arx::jobs::JobResult::generic(
+                                format!("Partial: {completed} deleted, {failed} failed"),
+                                completed,
+                            )),
+                        },
+                    );
+                } else {
+                    let _ = jobs.publish_event(
+                        &tx,
+                        arx::jobs::JobEvent::Completed {
+                            id: job.id,
+                            result: arx::jobs::JobResult::generic(
+                                format!("{completed} deleted"),
+                                completed,
+                            ),
+                        },
+                    );
+                }
+            });
+            state.message = Some(format!("Remote delete: {target_count} target(s) queued"));
         }
         Action::CancelRemoteDelete => {
             state.pending_delete = None;
