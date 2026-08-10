@@ -227,6 +227,9 @@ impl ProcessService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vfs::capabilities;
+    use crate::vfs::{Entry, Location, VfsProvider};
+    use std::sync::Mutex;
 
     #[tokio::test]
     async fn preview_effect_returns_viewer_lines() {
@@ -240,5 +243,173 @@ mod tests {
         };
         assert!(title.starts_with("View:"));
         assert!(lines.iter().any(|line| line == "hello preview"));
+    }
+
+    // ── VIEW-09B: error path mock provider ──
+
+    struct MockProvider {
+        read_result: Mutex<Option<std::io::Result<Vec<u8>>>>,
+    }
+
+    impl MockProvider {
+        fn new(result: std::io::Result<Vec<u8>>) -> Self {
+            Self {
+                read_result: Mutex::new(Some(result)),
+            }
+        }
+    }
+
+    impl std::fmt::Debug for MockProvider {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("MockProvider").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VfsProvider for MockProvider {
+        fn list(&self, _path: &str) -> std::io::Result<Vec<Entry>> {
+            panic!("mock: list not called")
+        }
+        fn read_head(&self, _path: &str, _lines: usize) -> std::io::Result<Vec<String>> {
+            panic!("mock: read_head not called")
+        }
+        fn copy_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("mock: copy_files not called")
+        }
+        fn move_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("mock: move_files not called")
+        }
+        fn delete_files(&self, _dir: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("mock: delete_files not called")
+        }
+        async fn read_prefix_bytes(
+            &self,
+            _path: &str,
+            _max_bytes: usize,
+        ) -> std::io::Result<Vec<u8>> {
+            self.read_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("mock: read_result already consumed")
+        }
+    }
+
+    fn registry_with_mock(host: &str, mock: MockProvider) -> ProviderRegistry {
+        let r = ProviderRegistry::new();
+        r.insert_sftp(host, Box::new(mock), capabilities::SFTP_CAPABILITIES);
+        r
+    }
+
+    #[tokio::test]
+    async fn preview_location_notfound_returns_failed() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let mock = MockProvider::new(Err(err));
+        let registry = registry_with_mock("test-host", mock);
+
+        let event = ProcessService::execute_with_registry(
+            Effect::PreviewLocation {
+                location: Location::Sftp {
+                    host: "test-host".into(),
+                    path: "/missing.txt".into(),
+                },
+                name: "missing.txt".into(),
+                total_size: None,
+            },
+            &registry,
+        )
+        .await;
+
+        match event {
+            EffectEvent::Failed { label, error } => {
+                assert!(label.contains("remote preview"));
+                assert!(error.contains("no such file"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_location_permissiondenied_returns_failed() {
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        let mock = MockProvider::new(Err(err));
+        let registry = registry_with_mock("test-host", mock);
+
+        let event = ProcessService::execute_with_registry(
+            Effect::PreviewLocation {
+                location: Location::Sftp {
+                    host: "test-host".into(),
+                    path: "/secret.txt".into(),
+                },
+                name: "secret.txt".into(),
+                total_size: None,
+            },
+            &registry,
+        )
+        .await;
+
+        match event {
+            EffectEvent::Failed { label, error } => {
+                assert!(label.contains("remote preview"));
+                assert!(error.contains("access denied"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_location_arbitrary_io_error_returns_failed() {
+        let err = std::io::Error::other("SFTP subsystem died");
+        let mock = MockProvider::new(Err(err));
+        let registry = registry_with_mock("test-host", mock);
+
+        let event = ProcessService::execute_with_registry(
+            Effect::PreviewLocation {
+                location: Location::Sftp {
+                    host: "test-host".into(),
+                    path: "/data.txt".into(),
+                },
+                name: "data.txt".into(),
+                total_size: None,
+            },
+            &registry,
+        )
+        .await;
+
+        match event {
+            EffectEvent::Failed { label, error } => {
+                assert!(label.contains("remote preview"));
+                assert!(error.contains("SFTP subsystem died"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_location_success_returns_viewer_lines() {
+        let mock = MockProvider::new(Ok(b"hello remote\nworld\n".to_vec()));
+        let registry = registry_with_mock("test-host", mock);
+
+        let event = ProcessService::execute_with_registry(
+            Effect::PreviewLocation {
+                location: Location::Sftp {
+                    host: "test-host".into(),
+                    path: "/greeting.txt".into(),
+                },
+                name: "greeting.txt".into(),
+                total_size: Some(20),
+            },
+            &registry,
+        )
+        .await;
+
+        match event {
+            EffectEvent::ViewerLines { title, lines } => {
+                assert!(title.contains("greeting.txt"));
+                assert!(lines.iter().any(|l| l == "hello remote"));
+                assert!(lines.iter().any(|l| l == "world"));
+            }
+            other => panic!("expected ViewerLines, got {other:?}"),
+        }
     }
 }

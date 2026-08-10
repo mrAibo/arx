@@ -1135,4 +1135,110 @@ mod tests {
         // local provider doesn't implement read_prefix_bytes; returns Unsupported
         assert!(result.is_err());
     }
+
+    // ── VIEW-09B: routing ──
+
+    use std::sync::Mutex;
+
+    struct RoutingMockProvider {
+        host_label: String,
+        read_result: Mutex<Option<std::io::Result<Vec<u8>>>>,
+    }
+
+    impl std::fmt::Debug for RoutingMockProvider {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RoutingMockProvider")
+                .field("host_label", &self.host_label)
+                .finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VfsProvider for RoutingMockProvider {
+        fn list(&self, _path: &str) -> std::io::Result<Vec<Entry>> {
+            panic!("mock: list not called")
+        }
+        fn read_head(&self, _path: &str, _lines: usize) -> std::io::Result<Vec<String>> {
+            panic!("mock: read_head not called")
+        }
+        fn copy_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("mock: copy_files not called")
+        }
+        fn move_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("mock: move_files not called")
+        }
+        fn delete_files(&self, _dir: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("mock: delete_files not called")
+        }
+        async fn read_prefix_bytes(
+            &self,
+            _path: &str,
+            _max_bytes: usize,
+        ) -> std::io::Result<Vec<u8>> {
+            self.read_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("mock: read_result already consumed")
+        }
+    }
+
+    #[test]
+    fn two_sftp_hosts_route_to_different_providers() {
+        let r = ProviderRegistry::new();
+        r.insert_sftp(
+            "host-a",
+            Box::new(RoutingMockProvider {
+                host_label: "host-a".into(),
+                read_result: Mutex::new(Some(Ok(b"content from host-a".to_vec()))),
+            }),
+            capabilities::SFTP_CAPABILITIES,
+        );
+        r.insert_sftp(
+            "host-b",
+            Box::new(RoutingMockProvider {
+                host_label: "host-b".into(),
+                read_result: Mutex::new(Some(Ok(b"content from host-b".to_vec()))),
+            }),
+            capabilities::SFTP_CAPABILITIES,
+        );
+
+        let loc_a = Location::Sftp {
+            host: "host-a".into(),
+            path: "/data.txt".into(),
+        };
+        let loc_b = Location::Sftp {
+            host: "host-b".into(),
+            path: "/data.txt".into(),
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bytes_a = rt
+            .block_on(r.read_prefix_bytes_at(&loc_a, "data.txt", 1024))
+            .unwrap();
+        let bytes_b = rt
+            .block_on(r.read_prefix_bytes_at(&loc_b, "data.txt", 1024))
+            .unwrap();
+
+        assert_eq!(bytes_a, b"content from host-a");
+        assert_eq!(bytes_b, b"content from host-b");
+        assert_ne!(bytes_a, bytes_b);
+    }
+
+    #[test]
+    fn sftp_host_routing_is_not_singleton() {
+        // Two SFTP hosts must not resolve to the same singleton provider.
+        let key_a = ProviderRegistry::instance_key_for_location(&Location::Sftp {
+            host: "host-a".into(),
+            path: "/".into(),
+        });
+        let key_b = ProviderRegistry::instance_key_for_location(&Location::Sftp {
+            host: "host-b".into(),
+            path: "/".into(),
+        });
+
+        assert_ne!(key_a, key_b);
+        assert!(matches!(key_a, ProviderInstanceKey::SftpHost(h) if h == "host-a"));
+        assert!(matches!(key_b, ProviderInstanceKey::SftpHost(h) if h == "host-b"));
+    }
 }

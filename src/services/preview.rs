@@ -303,4 +303,188 @@ mod tests {
                 .is_some_and(|l| l.contains("Truncated at 500 lines"))
         );
     }
+
+    // ── VIEW-09B: bounds ──
+
+    #[test]
+    fn format_bounded_preview_1_byte() {
+        let bytes = b"x";
+        let lines = format_bounded_preview(bytes, Some(1), false, "one.txt", 500).unwrap();
+        assert!(lines[0].contains("[Remote Text]"));
+        assert!(lines.iter().any(|l| l == "x"));
+        assert_eq!(lines.len(), 2); // header + one line
+    }
+
+    #[test]
+    fn format_bounded_preview_max_minus_1() {
+        let content = "a".repeat(MAX_TEXT_PREVIEW_BYTES - 1);
+        let bytes = content.as_bytes();
+        let lines =
+            format_bounded_preview(bytes, Some(bytes.len() as u64), false, "near_max.txt", 500)
+                .unwrap();
+        assert!(lines[0].contains("[Remote Text]"));
+        assert!(!lines.iter().any(|l| l.contains("Truncated")));
+    }
+
+    #[test]
+    fn format_bounded_preview_exactly_max() {
+        let content = "a".repeat(MAX_TEXT_PREVIEW_BYTES);
+        let bytes = content.as_bytes();
+        let lines = format_bounded_preview(
+            bytes,
+            Some(MAX_TEXT_PREVIEW_BYTES as u64),
+            false,
+            "exact_max.txt",
+            500,
+        )
+        .unwrap();
+        assert!(lines[0].contains("[Remote Text]"));
+        assert!(!lines.iter().any(|l| l.contains("Truncated")));
+    }
+
+    #[test]
+    fn format_bounded_preview_max_plus_1() {
+        let content = "a".repeat(MAX_TEXT_PREVIEW_BYTES + 1);
+        let mut bytes = content.into_bytes();
+        bytes.truncate(MAX_TEXT_PREVIEW_BYTES);
+        let lines = format_bounded_preview(
+            &bytes,
+            Some((MAX_TEXT_PREVIEW_BYTES + 1) as u64),
+            true,
+            "over_max.txt",
+            500,
+        )
+        .unwrap();
+        assert!(lines[0].contains("[Remote Text]"));
+        assert!(lines.iter().any(|l| l.contains("Truncated")));
+    }
+
+    #[test]
+    fn format_bounded_preview_short_chunks() {
+        let full = "line1\nline2\nline3\n";
+        let bytes = full.as_bytes();
+        let mut assembled = Vec::new();
+        for chunk in bytes.chunks(3) {
+            assembled.extend_from_slice(chunk);
+        }
+        let lines = format_bounded_preview(
+            &assembled,
+            Some(bytes.len() as u64),
+            false,
+            "chunked.txt",
+            500,
+        )
+        .unwrap();
+        assert!(lines.iter().any(|l| l == "line1"));
+        assert!(lines.iter().any(|l| l == "line2"));
+        assert!(lines.iter().any(|l| l == "line3"));
+    }
+
+    // ── VIEW-09B: UTF-8 ──
+
+    #[test]
+    fn format_bounded_preview_unicode_content() {
+        let text = "héllo wörld — café\nline two\n";
+        let bytes = text.as_bytes();
+        let lines =
+            format_bounded_preview(bytes, Some(bytes.len() as u64), false, "unicode.txt", 500)
+                .unwrap();
+        assert!(lines.iter().any(|l| l.contains("héllo")));
+        assert!(lines.iter().any(|l| l.contains("café")));
+    }
+
+    #[test]
+    fn format_bounded_preview_unicode_display_name() {
+        let bytes = b"hello\n";
+        let lines = format_bounded_preview(bytes, Some(6), false, "日本語.txt", 500).unwrap();
+        assert!(lines[0].contains("日本語.txt"));
+    }
+
+    #[test]
+    fn format_bounded_preview_truncated_multibyte_boundary() {
+        // "a" (0x61) + truncated start of 2-byte "é" (0xC3 0xA9)
+        // Cutting after 0xC3 → valid_up_to = 1, error_len = None
+        let bytes = &[0x61, 0xC3];
+        let lines = format_bounded_preview(bytes, Some(2), true, "cut.txt", 500).unwrap();
+        assert!(lines.iter().any(|l| l == "a"));
+        assert!(lines.iter().any(|l| l.contains("Truncated")));
+    }
+
+    #[test]
+    fn format_bounded_preview_invalid_utf8_mid_stream_not_truncated() {
+        // 0xFF is never valid UTF-8 — even mid-stream, not boundary-truncated
+        let bytes = &[b'h', b'i', 0xFF, b'!'];
+        let lines = format_bounded_preview(bytes, Some(4), false, "broken.txt", 500).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("Binary preview disabled"));
+    }
+
+    // ── VIEW-09B: truncation ──
+
+    #[test]
+    fn format_bounded_preview_500_lines_no_marker() {
+        let content = (0..500)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bytes = content.as_bytes();
+        let lines = format_bounded_preview(
+            bytes,
+            Some(bytes.len() as u64),
+            false,
+            "exact_500.txt",
+            MAX_TEXT_PREVIEW_LINES,
+        )
+        .unwrap();
+        assert!(!lines.iter().any(|l| l.contains("Truncated")));
+    }
+
+    #[test]
+    fn format_bounded_preview_501_lines_marker() {
+        let content = (0..501)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bytes = content.as_bytes();
+        let lines = format_bounded_preview(
+            bytes,
+            Some(bytes.len() as u64),
+            false,
+            "over_500.txt",
+            MAX_TEXT_PREVIEW_LINES,
+        )
+        .unwrap();
+        assert!(lines.iter().any(|l| l.contains("Truncated at 500 lines")));
+    }
+
+    #[test]
+    fn format_bounded_preview_1mib_exact_not_truncated() {
+        let content = "x".repeat(MAX_TEXT_PREVIEW_BYTES);
+        let bytes = content.as_bytes();
+        let lines = format_bounded_preview(
+            bytes,
+            Some(MAX_TEXT_PREVIEW_BYTES as u64),
+            false,
+            "1mib_exact.txt",
+            500,
+        )
+        .unwrap();
+        assert!(!lines.iter().any(|l| l.contains("Truncated")));
+    }
+
+    #[test]
+    fn format_bounded_preview_over_1mib_truncated() {
+        let content = "x".repeat(MAX_TEXT_PREVIEW_BYTES + 100);
+        let mut bytes = content.into_bytes();
+        bytes.truncate(MAX_TEXT_PREVIEW_BYTES);
+        let lines = format_bounded_preview(
+            &bytes,
+            Some((MAX_TEXT_PREVIEW_BYTES + 100) as u64),
+            true,
+            "over_1mib.txt",
+            500,
+        )
+        .unwrap();
+        assert!(lines.iter().any(|l| l.contains("Truncated")));
+    }
 }
