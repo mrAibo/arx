@@ -4736,6 +4736,40 @@ mod tests {
     }
 
     #[test]
+    fn footer_derives_file_action_from_keymap_not_hardcoded() {
+        // Remap Copy to F10; footer must follow runtime Keymap, not hardcoded F5.
+        let state = AppState::default();
+        let base = Keymap::default();
+        let mut bindings: Vec<_> = base
+            .bindings()
+            .iter()
+            .filter(|b| {
+                !(b.context == InputContext::Browser
+                    && b.action == Action::Copy
+                    && b.sequence.len() == 1
+                    && matches!(b.sequence[0].code, KeyCode::F(5)))
+            })
+            .cloned()
+            .collect();
+        bindings.push(KeyBinding::new(
+            InputContext::Browser,
+            vec![KeyStroke::new(KeyCode::F(10), KeyModifiers::NONE)],
+            Action::Copy,
+        ));
+        let router = KeyRouter::new(Keymap::new(bindings));
+        let wide =
+            contextual_footer_text(&state, &router, Some(EntryKind::File), true, u16::MAX).unwrap();
+        assert!(
+            wide.contains("F10 Copy"),
+            "footer must derive copy key from remapped Keymap: {wide}"
+        );
+        assert!(
+            !wide.contains("F5 Copy"),
+            "footer must not show old F5 for Copy after remap: {wide}"
+        );
+    }
+
+    #[test]
     fn pending_chord_leaves_discovery_to_which_key() {
         let mut router = KeyRouter::default();
         let resolution = router.resolve_stroke(
