@@ -4702,7 +4702,7 @@ mod tests {
         let router = KeyRouter::default();
         let wide =
             contextual_footer_text(&state, &router, Some(EntryKind::File), true, u16::MAX).unwrap();
-        assert_eq!(wide.split("    ").count(), 11);
+        assert_eq!(wide.split("    ").count(), 12);
         assert!(wide.contains("F3 View file"));
         assert!(wide.contains("F4 Edit file"));
         assert!(wide.contains("F5 Copy"));

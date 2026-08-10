@@ -162,6 +162,11 @@ impl Default for Keymap {
                 vec![KeyStroke::new(KeyCode::F(7), KeyModifiers::NONE)],
                 Action::Mkdir,
             ),
+            KeyBinding::new(
+                Browser,
+                vec![KeyStroke::new(KeyCode::F(8), KeyModifiers::NONE)],
+                Action::Delete,
+            ),
             KeyBinding::new(Browser, vec![ctrl('p')], Action::OpenCommandCenter),
             KeyBinding::new(Browser, vec![ctrl('b')], Action::OpenBookmarks),
             KeyBinding::new(Browser, vec![ctrl('j')], Action::OpenJobs),
@@ -531,5 +536,17 @@ mod tests {
         assert!(labels.contains(&"L".to_string()));
         assert!(labels.contains(&"O".to_string()));
         assert!(labels.contains(&"S".to_string()));
+    }
+
+    #[test]
+    fn f8_resolves_to_delete() {
+        let mut router = KeyRouter::default();
+        assert_eq!(
+            router.resolve_stroke(
+                InputContext::Browser,
+                KeyStroke::new(KeyCode::F(8), KeyModifiers::NONE)
+            ),
+            KeyResolution::Action(Action::Delete)
+        );
     }
 }
