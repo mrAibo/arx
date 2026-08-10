@@ -14,6 +14,7 @@ use crate::services::{
     DesktopService, DiffService, FileInfoService, InfrastructureService, PreviewService,
     TreeService, preview,
 };
+use crate::vfs::ProviderRegistry;
 
 pub struct ProcessService;
 
@@ -45,6 +46,55 @@ impl ProcessService {
             command.current_dir(current_dir);
         }
         command.status().await
+    }
+
+    pub async fn execute_with_registry(effect: Effect, registry: &ProviderRegistry) -> EffectEvent {
+        match effect {
+            // Effects that don't need registry delegate to the existing handler
+            e @ (Effect::RunShellCapture { .. }
+            | Effect::SpawnShell { .. }
+            | Effect::AttachTmux { .. }
+            | Effect::AttachScreen { .. }
+            | Effect::ListTmuxSessions
+            | Effect::DirectoryChildrenSizes { .. }
+            | Effect::UnifiedDiff { .. }
+            | Effect::InfrastructureSnapshot
+            | Effect::TreeSnapshot { .. }
+            | Effect::PreviewFile { .. }
+            | Effect::OpenPath { .. }) => Self::execute(e).await,
+
+            Effect::PreviewLocation {
+                location,
+                name,
+                total_size,
+            } => {
+                let label = format!("remote preview: {name}");
+                let bytes = match registry
+                    .read_prefix_bytes_at(&location, &name, preview::MAX_TEXT_PREVIEW_BYTES)
+                    .await
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return EffectEvent::Failed {
+                            label,
+                            error: e.to_string(),
+                        };
+                    }
+                };
+                let lines = preview::format_bounded_preview(
+                    &bytes,
+                    total_size,
+                    bytes.len() >= preview::MAX_TEXT_PREVIEW_BYTES,
+                    &name,
+                    preview::MAX_TEXT_PREVIEW_LINES,
+                )
+                .unwrap_or_else(|e| vec![format!("Error: {e}")]);
+                EffectEvent::ViewerLines {
+                    title: format!("View: {name}"),
+                    lines,
+                }
+            }
+        }
     }
 
     pub async fn execute(effect: Effect) -> EffectEvent {
@@ -140,24 +190,10 @@ impl ProcessService {
                 title: format!("View: {}", path.display()),
                 lines: PreviewService::preview(&path).await,
             },
-            Effect::PreviewLocationBytes {
-                bytes,
-                total_size,
-                display_name,
-            } => {
-                let lines = preview::format_bounded_preview(
-                    &bytes,
-                    total_size,
-                    bytes.len() >= preview::MAX_TEXT_PREVIEW_BYTES,
-                    &display_name,
-                    preview::MAX_TEXT_PREVIEW_LINES,
-                )
-                .unwrap_or_else(|e| vec![format!("Error: {e}")]);
-                EffectEvent::ViewerLines {
-                    title: format!("View: {display_name}"),
-                    lines,
-                }
-            }
+            Effect::PreviewLocation { .. } => EffectEvent::Failed {
+                label: "remote preview".into(),
+                error: "PreviewLocation must be dispatched with a ProviderRegistry".into(),
+            },
             Effect::OpenPath { path } => match DesktopService::open_path(&path).await {
                 Ok(()) => EffectEvent::PathOpened { path },
                 Err(error) => EffectEvent::Failed {

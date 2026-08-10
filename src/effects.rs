@@ -36,10 +36,10 @@ pub enum Effect {
     PreviewFile {
         path: PathBuf,
     },
-    PreviewLocationBytes {
-        bytes: Vec<u8>,
+    PreviewLocation {
+        location: Location,
+        name: String,
         total_size: Option<u64>,
-        display_name: String,
     },
     OpenPath {
         path: PathBuf,

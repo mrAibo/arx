@@ -24,8 +24,16 @@ pub fn format_bounded_preview(
 
     let text = match std::str::from_utf8(bytes) {
         Ok(t) => t,
-        Err(e) => std::str::from_utf8(&bytes[..e.valid_up_to()])
-            .map_err(|_| std::io::Error::other("UTF-8 decode failed"))?,
+        Err(e) if truncated && e.error_len().is_none() => {
+            // Only allow partial prefix when truncated at multi-byte boundary
+            std::str::from_utf8(&bytes[..e.valid_up_to()]).map_err(|_| {
+                std::io::Error::other("UTF-8 decode failed after boundary truncation")
+            })?
+        }
+        Err(_) => {
+            // Invalid UTF-8 not caused by truncation → binary
+            return Ok(vec![format!("[Binary preview disabled] {display_name}")]);
+        }
     };
 
     let mut source_lines = text.lines();
@@ -261,12 +269,13 @@ mod tests {
 
     #[test]
     fn format_bounded_preview_invalid_utf8() {
-        // Valid "hel" prefix followed by invalid continuation byte
+        // 0xC0 is an invalid start byte not at a truncation boundary
         let bytes = &[b'h', b'e', b'l', 0xC0, b'o'];
         let lines = format_bounded_preview(bytes, Some(5), false, "broken.txt", 500).unwrap();
 
-        assert!(lines[0].contains("[Remote Text]"));
-        assert!(lines.iter().any(|l| l == "hel"));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("Binary preview disabled"));
+        assert!(!lines.iter().any(|l| l == "hel"));
     }
 
     #[test]

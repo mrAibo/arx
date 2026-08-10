@@ -313,12 +313,18 @@ impl SftpProvider {
 
             match open_result {
                 Ok(mut file) => {
-                    let mut buf = vec![0u8; max_bytes];
-                    let n = file
-                        .read(&mut buf)
+                    // ponytail: read bounded prefix, loops on short chunks
+                    let cap = max_bytes + 1; // +1 for truncation detection
+                    let mut buf = Vec::new();
+                    // read_to_end is bounded by take(cap)
+                    tokio::io::AsyncReadExt::take(&mut file, cap as u64)
+                        .read_to_end(&mut buf)
                         .await
                         .map_err(|e| std::io::Error::other(format!("SFTP read {path}: {e}")))?;
-                    buf.truncate(n);
+                    let truncated = buf.len() > max_bytes;
+                    if truncated {
+                        buf.truncate(max_bytes);
+                    }
                     return Ok(buf);
                 }
                 Err(error) => {

@@ -86,7 +86,7 @@ async fn event_loop(
     let mut split_left_list = ListState::default();
     let mut split_right_list = ListState::default();
     let mut key_router = KeyRouter::default();
-    let (effect_dispatcher, mut effect_rx) = EffectDispatcher::channel();
+    let (effect_dispatcher, mut effect_rx) = EffectDispatcher::channel(state.registry.clone());
     // JobManager is the runtime source of truth. AppState.jobs is only a render snapshot.
     let job_manager = arx::jobs::JobManager::new();
     let (job_tx, mut job_rx) = mpsc::unbounded_channel::<arx::jobs::JobEvent>();
@@ -4000,26 +4000,17 @@ async fn dispatch_ui_action(
                 return Ok(());
             };
             let location = state.active_pane().location.clone();
-            // SFTP: bounded remote preview via effect pipeline
+            // SFTP: dispatch preview intent, network I/O runs inside effect lane
             if matches!(location.provider_id(), arx::vfs::ProviderId::Sftp) {
                 let name = entry.name.clone();
-                let registry = state.registry.clone();
-                let bytes = registry
-                    .read_prefix_bytes_at(
-                        &location,
-                        &name,
-                        arx::services::preview::MAX_TEXT_PREVIEW_BYTES,
-                    )
-                    .await
-                    .unwrap_or_else(|e| format!("Error reading remote file: {e}").into_bytes());
                 let total_size = entry.size;
                 let id = effect_dispatcher.dispatch(
                     EffectLane::Preview,
-                    EffectScope::Location(location),
-                    Effect::PreviewLocationBytes {
-                        bytes,
+                    EffectScope::Location(location.clone()),
+                    Effect::PreviewLocation {
+                        location,
+                        name: name.clone(),
                         total_size,
-                        display_name: name.clone(),
                     },
                 );
                 state.register_effect(EffectLane::Preview, id);
