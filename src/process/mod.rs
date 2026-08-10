@@ -126,6 +126,27 @@ impl ProcessService {
                     };
                 }
 
+                // Reject binary files
+                if bounded.bytes.contains(&0) {
+                    return EffectEvent::Failed {
+                        label,
+                        error: "File contains NUL bytes — refusing to edit binary".into(),
+                    };
+                }
+                // Validate UTF-8
+                if std::str::from_utf8(&bounded.bytes).is_err() {
+                    return EffectEvent::Failed {
+                        label,
+                        error: format!("File is not valid UTF-8 — refusing to edit. ({name})"),
+                    };
+                }
+
+                // Capture original metadata for mode preservation on write-back
+                let original_metadata = registry
+                    .metadata_at(&location, &name)
+                    .await
+                    .unwrap_or_default();
+
                 let temp_dir = match tempfile::TempDir::new() {
                     Ok(d) => d,
                     Err(e) => {
@@ -155,6 +176,7 @@ impl ProcessService {
                         location,
                         editor,
                         frozen_original: bounded.bytes,
+                        original_metadata,
                         temp_dir: std::sync::Arc::new(temp_dir),
                         state: RemoteEditState::ReadyToEdit,
                     },
@@ -195,8 +217,9 @@ impl ProcessService {
                     };
                 }
                 // Write back atomically
+                let unix_mode = session.original_metadata.unix_mode;
                 match registry
-                    .write_file_bytes_at(&session.location, &name, &data)
+                    .write_file_bytes_at(&session.location, &name, &data, unix_mode)
                     .await
                 {
                     Ok(()) => EffectEvent::WrittenBack { name },
@@ -534,6 +557,116 @@ mod tests {
         assert!(
             matches!(&event, EffectEvent::Failed { error, .. } if error.contains("too large")),
             ">cap file should be refused, got {:?}",
+            event
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_download_refuses_nul() {
+        let mut bytes = b"hello world".to_vec();
+        bytes[5] = 0x00;
+        let mock = MockProvider::new(Ok(BoundedRead {
+            bytes,
+            truncated: false,
+        }));
+        let registry = registry_with_mock("test", mock);
+        let loc = Location::Sftp {
+            host: "test".into(),
+            path: "/srv".into(),
+        };
+        let event = ProcessService::execute_with_registry(
+            Effect::DownloadRemoteFile {
+                location: loc,
+                name: "bin.txt".into(),
+                editor: "vim".into(),
+            },
+            &registry,
+        )
+        .await;
+        assert!(
+            matches!(&event, EffectEvent::Failed { error, .. } if error.contains("NUL")),
+            "NUL bytes should be refused, got {:?}",
+            event
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_download_refuses_invalid_utf8() {
+        let mock = MockProvider::new(Ok(BoundedRead {
+            bytes: vec![0xFF, 0xFE],
+            truncated: false,
+        }));
+        let registry = registry_with_mock("test", mock);
+        let loc = Location::Sftp {
+            host: "test".into(),
+            path: "/srv".into(),
+        };
+        let event = ProcessService::execute_with_registry(
+            Effect::DownloadRemoteFile {
+                location: loc,
+                name: "utf16.txt".into(),
+                editor: "vim".into(),
+            },
+            &registry,
+        )
+        .await;
+        assert!(
+            matches!(&event, EffectEvent::Failed { error, .. } if error.contains("UTF-8")),
+            "Invalid UTF-8 should be refused, got {:?}",
+            event
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_download_accepts_valid_utf8() {
+        let mock = MockProvider::new(Ok(BoundedRead {
+            bytes: b"hello world".to_vec(),
+            truncated: false,
+        }));
+        let registry = registry_with_mock("test", mock);
+        let loc = Location::Sftp {
+            host: "test".into(),
+            path: "/srv".into(),
+        };
+        let event = ProcessService::execute_with_registry(
+            Effect::DownloadRemoteFile {
+                location: loc,
+                name: "ok.txt".into(),
+                editor: "vim".into(),
+            },
+            &registry,
+        )
+        .await;
+        assert!(
+            matches!(&event, EffectEvent::Downloaded { .. }),
+            "Valid UTF-8 should be accepted, got {:?}",
+            event
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_download_accepts_empty() {
+        let mock = MockProvider::new(Ok(BoundedRead {
+            bytes: vec![],
+            truncated: false,
+        }));
+        let registry = registry_with_mock("test", mock);
+        let loc = Location::Sftp {
+            host: "test".into(),
+            path: "/srv".into(),
+        };
+        let event = ProcessService::execute_with_registry(
+            Effect::DownloadRemoteFile {
+                location: loc,
+                name: "empty.txt".into(),
+                editor: "vim".into(),
+            },
+            &registry,
+        )
+        .await;
+        assert!(
+            matches!(&event, EffectEvent::Downloaded { .. }),
+            "Empty file should be accepted, got {:?}",
             event
         );
     }

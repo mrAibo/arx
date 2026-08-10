@@ -294,9 +294,13 @@ impl VfsProvider for SftpProvider {
         self.read_prefix(path, max_bytes).await
     }
 
-    async fn write_file_bytes(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
-        // ponytail: frozen_original not available through trait — caller handles revision check
-        self.write_atomic(path, data, &[]).await
+    async fn write_file_bytes(
+        &self,
+        path: &str,
+        data: &[u8],
+        unix_mode: Option<u32>,
+    ) -> std::io::Result<()> {
+        self.write_atomic(path, data, &[], unix_mode).await
     }
 
     async fn metadata(&self, path: &str) -> std::io::Result<FileMetadata> {
@@ -427,6 +431,7 @@ impl SftpProvider {
         path: &str,
         data: &[u8],
         frozen_original: &[u8],
+        original_unix_mode: Option<u32>,
     ) -> std::io::Result<()> {
         use std::time::{SystemTime, UNIX_EPOCH};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -465,6 +470,13 @@ impl SftpProvider {
             return Err(e);
         }
         drop(remote);
+
+        // ── Preserve original Unix mode ──
+        if let Some(mode) = original_unix_mode {
+            let mut attrs = russh_sftp::protocol::FileAttributes::empty();
+            attrs.permissions = Some(mode);
+            let _ = session.set_metadata(stage_path.clone(), attrs).await;
+        }
 
         // ── Verify staged size ──
         let staged = {
@@ -581,6 +593,7 @@ impl SftpProvider {
         Ok(FileMetadata {
             len: meta.len(),
             is_regular: meta.is_regular(),
+            unix_mode: meta.permissions,
         })
     }
 }

@@ -12,7 +12,7 @@ use arx::services::{
     PaneLoadResponse, PaneLoader, SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions,
     WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
 };
-use arx::vfs::{Entry, EntryKind, Location, RemoteEditSession, RemoteEditState};
+use arx::vfs::{Entry, EntryKind, FileMetadata, Location, RemoteEditSession, RemoteEditState};
 use arx::workspace_sync::{
     DiffState, SyncDirection, SyncMode, WorkspaceSide, WorkspaceSyncOperation,
 };
@@ -4125,6 +4125,7 @@ async fn dispatch_ui_action(
                         location: location.clone(),
                         editor: editor.to_string(),
                         frozen_original: Vec::new(),
+                        original_metadata: FileMetadata::default(),
                         temp_dir: std::sync::Arc::new(tempfile::TempDir::new().expect("temp dir")),
                         state: RemoteEditState::Downloading,
                     });
@@ -5189,10 +5190,6 @@ fn handle_effect_response(
         }
         EffectLane::RightPane => {
             schedule_pane_load(pane_loader, state, Pane::Right);
-        }
-        EffectLane::RemoteEdit => {
-            // After write-back, reload the active pane to see changes
-            schedule_active_pane_load(pane_loader, state);
         }
         _ => {}
     }

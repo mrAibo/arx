@@ -233,7 +233,12 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
 
     /// Write bytes atomically to a file (stage → verify → commit).
     /// Default: unsupported.
-    async fn write_file_bytes(&self, _path: &str, _data: &[u8]) -> std::io::Result<()> {
+    async fn write_file_bytes(
+        &self,
+        _path: &str,
+        _data: &[u8],
+        _unix_mode: Option<u32>,
+    ) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "write_file_bytes not supported by this provider",
@@ -264,10 +269,12 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
 }
 
 /// File metadata returned by a remote provider.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FileMetadata {
     pub len: u64,
     pub is_regular: bool,
+    /// Unix permission bits (e.g. 0o644). None if unavailable.
+    pub unix_mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -561,10 +568,11 @@ impl ProviderRegistry {
         location: &Location,
         name: &str,
         data: &[u8],
+        unix_mode: Option<u32>,
     ) -> std::io::Result<()> {
         let (provider, parent_path) = self.provider_for_location(location)?;
         let path = format!("{}/{}", parent_path.trim_end_matches('/'), name);
-        provider.write_file_bytes(&path, data).await
+        provider.write_file_bytes(&path, data, unix_mode).await
     }
 
     pub async fn metadata_at(
@@ -798,6 +806,8 @@ pub struct RemoteEditSession {
     pub editor: String,
     /// Exact original bytes, frozen at download time.
     pub frozen_original: Vec<u8>,
+    /// File metadata captured before download (mode, size, type).
+    pub original_metadata: FileMetadata,
     /// Secure unique temp directory (auto-cleaned on drop).
     /// Contains `working` (editable copy) and `original` (immutable snapshot).
     pub temp_dir: std::sync::Arc<tempfile::TempDir>,
