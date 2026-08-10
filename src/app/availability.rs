@@ -173,6 +173,74 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
         ActionId::EditFile if !ctx.editor_available => ActionAvailability::Disabled {
             reason: "No editor configured (config.ui.editor, VISUAL, or EDITOR)".into(),
         },
+        ActionId::Copy => {
+            let has_target = ctx.selection_count > 0 || ctx.focused_kind.is_some();
+            if !has_target {
+                ActionAvailability::Disabled {
+                    reason: "Select a file or directory to copy".into(),
+                }
+            } else if ctx.active_provider == ProviderId::Local
+                || ctx.passive_provider == ProviderId::Local
+            {
+                // TransferPlanner supports Copy with one Local side:
+                // Local→Local, Local→SFTP, SFTP→Local.
+                ActionAvailability::Available
+            } else {
+                ActionAvailability::Disabled {
+                    reason: "Copy is not supported between these providers".into(),
+                }
+            }
+        }
+        ActionId::Move => {
+            let has_target = ctx.selection_count > 0 || ctx.focused_kind.is_some();
+            if !has_target {
+                ActionAvailability::Disabled {
+                    reason: "Select a file or directory to move".into(),
+                }
+            } else if ctx.active_provider == ProviderId::Local
+                && ctx.passive_provider == ProviderId::Local
+            {
+                // TransferPlanner currently supports Move only for Local→Local.
+                // Cross-backend Move is blocked until transactional copy→verify→delete exists.
+                ActionAvailability::Available
+            } else if ctx.active_provider == ProviderId::Local
+                || ctx.passive_provider == ProviderId::Local
+            {
+                ActionAvailability::Disabled {
+                    reason: "Cross-backend move is not supported safely yet".into(),
+                }
+            } else {
+                ActionAvailability::Disabled {
+                    reason: "Move is not supported between these providers".into(),
+                }
+            }
+        }
+        ActionId::Mkdir => {
+            if ctx.active_provider != ProviderId::Local {
+                ActionAvailability::Disabled {
+                    reason: "Directory creation is currently local-only".into(),
+                }
+            } else {
+                ActionAvailability::Available
+            }
+        }
+        ActionId::Delete => {
+            // Virtual Parent ("..") is filtered at the dispatch layer and never
+            // reaches availability as a focused_kind. Availability only guards
+            // provider, selection, and target existence.
+            let has_target = ctx.selection_count > 0 || ctx.focused_kind.is_some();
+            if !has_target {
+                ActionAvailability::Disabled {
+                    reason: "Select a file or directory to delete".into(),
+                }
+            } else if ctx.active_provider != ProviderId::Local {
+                ActionAvailability::Disabled {
+                    reason: "Trash is currently local-only".into(),
+                }
+            } else {
+                ActionAvailability::Available
+            }
+        }
         // Hard links and chown do not yet have VFS capabilities. Keep them
         // local-only rather than pretending remote providers support them.
         ActionId::BeginHardLink if ctx.active_provider != ProviderId::Local => {
@@ -341,5 +409,116 @@ mod tests {
             action_availability(ActionId::Enter, &ctx),
             ActionAvailability::Available
         );
+    }
+
+    #[test]
+    fn copy_available_when_one_side_is_local() {
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        ctx.focused_kind = Some(EntryKind::File);
+
+        // Local → Local
+        assert_eq!(
+            action_availability(ActionId::Copy, &ctx),
+            ActionAvailability::Available
+        );
+
+        // Local → SFTP
+        ctx.passive_provider = ProviderId::Sftp;
+        assert_eq!(
+            action_availability(ActionId::Copy, &ctx),
+            ActionAvailability::Available
+        );
+
+        // SFTP → Local
+        ctx.active_provider = ProviderId::Sftp;
+        ctx.passive_provider = ProviderId::Local;
+        ctx.active_capabilities = SFTP_CAPABILITIES;
+        assert_eq!(
+            action_availability(ActionId::Copy, &ctx),
+            ActionAvailability::Available
+        );
+
+        // SFTP → SFTP
+        ctx.passive_provider = ProviderId::Sftp;
+        assert!(matches!(
+            action_availability(ActionId::Copy, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn move_only_available_local_to_local() {
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        ctx.focused_kind = Some(EntryKind::File);
+
+        // Local → Local
+        assert_eq!(
+            action_availability(ActionId::Move, &ctx),
+            ActionAvailability::Available
+        );
+
+        // Local → SFTP — blocked
+        ctx.passive_provider = ProviderId::Sftp;
+        let availability = action_availability(ActionId::Move, &ctx);
+        assert!(matches!(availability, ActionAvailability::Disabled { .. }));
+        assert!(availability.reason().unwrap().contains("Cross-backend"));
+
+        // SFTP → Local — blocked
+        ctx.active_provider = ProviderId::Sftp;
+        ctx.passive_provider = ProviderId::Local;
+        ctx.active_capabilities = SFTP_CAPABILITIES;
+        assert!(matches!(
+            action_availability(ActionId::Move, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+
+        // SFTP → SFTP — blocked
+        ctx.passive_provider = ProviderId::Sftp;
+        assert!(matches!(
+            action_availability(ActionId::Move, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn delete_disabled_for_empty_pane() {
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        ctx.focused_kind = None;
+        assert!(matches!(
+            action_availability(ActionId::Delete, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn delete_available_for_local_file() {
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        ctx.focused_kind = Some(EntryKind::File);
+        assert_eq!(
+            action_availability(ActionId::Delete, &ctx),
+            ActionAvailability::Available
+        );
+    }
+
+    #[test]
+    fn delete_disabled_for_sftp() {
+        let mut ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+        ctx.focused_kind = Some(EntryKind::File);
+        assert!(matches!(
+            action_availability(ActionId::Delete, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn delete_disabled_when_parent_row_focused() {
+        // ".." is filtered before dispatch_ui_action. Without focused_kind
+        // and without selection, Delete is disabled.
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        ctx.focused_kind = None;
+        assert!(matches!(
+            action_availability(ActionId::Delete, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
     }
 }

@@ -147,6 +147,26 @@ impl Default for Keymap {
                 vec![KeyStroke::new(KeyCode::F(4), KeyModifiers::NONE)],
                 Action::EditFile,
             ),
+            KeyBinding::new(
+                Browser,
+                vec![KeyStroke::new(KeyCode::F(5), KeyModifiers::NONE)],
+                Action::Copy,
+            ),
+            KeyBinding::new(
+                Browser,
+                vec![KeyStroke::new(KeyCode::F(6), KeyModifiers::NONE)],
+                Action::Move,
+            ),
+            KeyBinding::new(
+                Browser,
+                vec![KeyStroke::new(KeyCode::F(7), KeyModifiers::NONE)],
+                Action::Mkdir,
+            ),
+            KeyBinding::new(
+                Browser,
+                vec![KeyStroke::new(KeyCode::F(8), KeyModifiers::NONE)],
+                Action::Delete,
+            ),
             KeyBinding::new(Browser, vec![ctrl('p')], Action::OpenCommandCenter),
             KeyBinding::new(Browser, vec![ctrl('b')], Action::OpenBookmarks),
             KeyBinding::new(Browser, vec![ctrl('j')], Action::OpenJobs),
@@ -155,6 +175,7 @@ impl Default for Keymap {
                 vec![KeyStroke::new(F(9), KeyModifiers::NONE)],
                 Action::OpenHosts,
             ),
+            // Tmux sessions: Command Center only (Ctrl+P → "List tmux sessions")
             KeyBinding::new(Browser, vec![plain('?')], Action::OpenHelp),
             KeyBinding::new(Browser, vec![ctrl('d')], Action::ToggleWorkspaceComparison),
             KeyBinding::new(
@@ -516,5 +537,29 @@ mod tests {
         assert!(labels.contains(&"L".to_string()));
         assert!(labels.contains(&"O".to_string()));
         assert!(labels.contains(&"S".to_string()));
+    }
+
+    #[test]
+    fn f8_resolves_to_delete() {
+        let mut router = KeyRouter::default();
+        assert_eq!(
+            router.resolve_stroke(
+                InputContext::Browser,
+                KeyStroke::new(KeyCode::F(8), KeyModifiers::NONE)
+            ),
+            KeyResolution::Action(Action::Delete)
+        );
+    }
+
+    #[test]
+    fn f9_resolves_to_hosts() {
+        let mut router = KeyRouter::default();
+        assert_eq!(
+            router.resolve_stroke(
+                InputContext::Browser,
+                KeyStroke::new(KeyCode::F(9), KeyModifiers::NONE)
+            ),
+            KeyResolution::Action(Action::OpenHosts)
+        );
     }
 }
