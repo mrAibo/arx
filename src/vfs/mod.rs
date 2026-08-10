@@ -517,6 +517,50 @@ impl Location {
             }
         }
     }
+
+    /// Resolve one parent while preserving provider identity where possible.
+    pub fn parent(&self) -> Option<Self> {
+        match self {
+            Self::Local(path) => path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(|parent| Self::Local(parent.to_path_buf())),
+            Self::Sftp { host, path } => {
+                let current = path.trim_end_matches('/');
+                if current.is_empty() {
+                    return None;
+                }
+                let parent = current
+                    .rsplit_once('/')
+                    .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
+                    .unwrap_or("/");
+                Some(Self::Sftp {
+                    host: host.clone(),
+                    path: parent.to_string(),
+                })
+            }
+            Self::Archive {
+                archive,
+                inner_path,
+            } => {
+                let current = inner_path.trim_end_matches('/');
+                if current.is_empty() {
+                    return archive
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .map(|parent| Self::Local(parent.to_path_buf()));
+                }
+                let parent = current
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent)
+                    .unwrap_or_default();
+                Some(Self::Archive {
+                    archive: archive.clone(),
+                    inner_path: parent.to_string(),
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -634,6 +678,59 @@ mod tests {
                 host: "prod".into(),
                 path: "/srv/app".into(),
             }
+        );
+    }
+
+    #[test]
+    fn parent_preserves_provider_identity_and_stops_at_roots() {
+        assert_eq!(
+            Location::Local("/srv/app".into()).parent(),
+            Some(Location::Local("/srv".into()))
+        );
+        assert_eq!(
+            Location::Local("/srv/app/".into()).parent(),
+            Some(Location::Local("/srv".into()))
+        );
+        assert_eq!(Location::Local("/".into()).parent(), None);
+
+        let remote = |path: &str| Location::Sftp {
+            host: "prod".into(),
+            path: path.into(),
+        };
+        assert_eq!(remote("/srv/app/").parent(), Some(remote("/srv")));
+        assert_eq!(remote("/srv").parent(), Some(remote("/")));
+        assert_eq!(remote("/").parent(), None);
+
+        let archive = PathBuf::from("/tmp/data.zip");
+        assert_eq!(
+            Location::Archive {
+                archive: archive.clone(),
+                inner_path: "one/two/".into(),
+            }
+            .parent(),
+            Some(Location::Archive {
+                archive: archive.clone(),
+                inner_path: "one".into(),
+            })
+        );
+        assert_eq!(
+            Location::Archive {
+                archive: archive.clone(),
+                inner_path: "one".into(),
+            }
+            .parent(),
+            Some(Location::Archive {
+                archive: archive.clone(),
+                inner_path: String::new(),
+            })
+        );
+        assert_eq!(
+            Location::Archive {
+                archive,
+                inner_path: String::new(),
+            }
+            .parent(),
+            Some(Location::Local("/tmp".into()))
         );
     }
 

@@ -100,6 +100,7 @@ async fn event_loop(
         launch_events: sync_launch_tx,
     };
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    let parent_entry = virtual_parent_entry();
 
     loop {
         if state.should_quit {
@@ -112,8 +113,18 @@ async fn event_loop(
             state.git_status = GitService::status_suffix(&active_location).await;
             state.git_status_location = Some(active_location);
         }
-        let left_filtered = apply_filter(&left_entries, &state.filter);
-        let right_filtered = apply_filter(&right_entries, &state.filter);
+        let left_filtered = apply_filter_with_parent(
+            &left_entries,
+            &state.filter,
+            &state.left.location,
+            &parent_entry,
+        );
+        let right_filtered = apply_filter_with_parent(
+            &right_entries,
+            &state.filter,
+            &state.right.location,
+            &parent_entry,
+        );
         // clamp cursors
         state.left.cursor = state.left.cursor.min(left_filtered.len().saturating_sub(1));
         state.right.cursor = state
@@ -325,15 +336,17 @@ async fn event_loop(
                             } else {
                                 &right_filtered
                             };
-                            if row < filt.len() {
-                                let name = &filt[row].name;
+                            if let Some(entry) = filt
+                                .get(row)
+                                .filter(|entry| entry.name != VIRTUAL_PARENT_NAME)
+                            {
                                 let pane = if is_left { Pane::Left } else { Pane::Right };
                                 let location = if is_left {
                                     state.left.location.clone()
                                 } else {
                                     state.right.location.clone()
                                 };
-                                state.toggle_selection(pane, &location, name);
+                                state.toggle_selection(pane, &location, &entry.name);
                             }
                         }
                         MouseEventKind::Down(_) => {
@@ -471,7 +484,9 @@ async fn event_loop(
                                     let active = state.active;
                                     let location = state.active_pane().location.clone();
                                     for e in filt {
-                                        if !state.is_selected(active, &location, &e.name) {
+                                        if e.name != VIRTUAL_PARENT_NAME
+                                            && !state.is_selected(active, &location, &e.name)
+                                        {
                                             state.toggle_selection(active, &location, &e.name);
                                         }
                                     }
@@ -871,8 +886,9 @@ async fn event_loop(
                         }
                         KeyCode::Enter => {
                             if let Some(entry) = entries.get(cursor) {
-                                if entry.kind == EntryKind::Directory {
-                                    let new_location = pane.location.child(&entry.name);
+                                if let Some(new_location) =
+                                    directory_navigation_target(&pane.location, entry)
+                                {
                                     let active = state.active;
                                     schedule_pane_navigation(
                                         &pane_loader,
@@ -880,7 +896,7 @@ async fn event_loop(
                                         active,
                                         new_location,
                                         PaneLoadPurpose::Navigate {
-                                            remember_current: true,
+                                            remember_current: entry.name != VIRTUAL_PARENT_NAME,
                                         },
                                     );
                                     state.message = Some("Opening directory…".into());
@@ -930,53 +946,7 @@ async fn event_loop(
                             }
                         }
                         KeyCode::Backspace => {
-                            let go_back = match &pane.location {
-                                Location::Local(p) => {
-                                    let parent = p
-                                        .parent()
-                                        .map(|p| p.to_path_buf())
-                                        .unwrap_or_else(|| p.to_path_buf());
-                                    if parent != *p {
-                                        Some(Location::Local(parent))
-                                    } else {
-                                        None
-                                    }
-                                }
-                                Location::Sftp { host, path } => {
-                                    // Go to parent directory
-                                    if path == "/" {
-                                        None
-                                    } else {
-                                        let parent = path
-                                            .rsplit_once('/')
-                                            .map(|(p, _)| p.to_string())
-                                            .unwrap_or_else(|| "/".to_string());
-                                        Some(Location::Sftp {
-                                            host: host.clone(),
-                                            path: parent,
-                                        })
-                                    }
-                                }
-                                Location::Archive {
-                                    archive,
-                                    inner_path,
-                                } => {
-                                    if inner_path.is_empty() {
-                                        archive.parent().map(|p| Location::Local(p.to_path_buf()))
-                                    } else {
-                                        // Go up one level
-                                        let parent = inner_path
-                                            .rsplit_once('/')
-                                            .map(|(p, _)| p.to_string())
-                                            .unwrap_or_default();
-                                        Some(Location::Archive {
-                                            archive: archive.clone(),
-                                            inner_path: parent,
-                                        })
-                                    }
-                                }
-                            };
-                            if let Some(new_loc) = go_back {
+                            if let Some(new_loc) = pane.location.parent() {
                                 let active = state.active;
                                 schedule_pane_navigation(
                                     &pane_loader,
@@ -1011,7 +981,10 @@ async fn event_loop(
                         }
                         // Shift+F6: rename file under cursor
                         KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            if let Some(entry) = entries.get(cursor) {
+                            if let Some(entry) = entries
+                                .get(cursor)
+                                .filter(|entry| entry.name != VIRTUAL_PARENT_NAME)
+                            {
                                 state.cmd = format!("mv '{}' ", entry.name);
                                 state.cmd_input = true;
                             }
@@ -1553,7 +1526,9 @@ async fn event_loop(
                             let active = state.active;
                             let location = state.active_pane().location.clone();
                             for e in filt {
-                                state.toggle_selection(active, &location, &e.name);
+                                if e.name != VIRTUAL_PARENT_NAME {
+                                    state.toggle_selection(active, &location, &e.name);
+                                }
                             }
                             state.message = Some(format!(
                                 "Selected {}",
@@ -1986,14 +1961,52 @@ fn apply_filter<'a>(entries: &'a [Entry], filter: &str) -> Vec<&'a Entry> {
     }
 }
 
+const VIRTUAL_PARENT_NAME: &str = "..";
+
+fn virtual_parent_entry() -> Entry {
+    Entry {
+        name: VIRTUAL_PARENT_NAME.into(),
+        kind: EntryKind::Directory,
+        size: None,
+        modified_unix_ms: None,
+    }
+}
+
+fn apply_filter_with_parent<'a>(
+    entries: &'a [Entry],
+    filter: &str,
+    location: &Location,
+    parent_entry: &'a Entry,
+) -> Vec<&'a Entry> {
+    let mut visible = apply_filter(entries, filter);
+    visible.retain(|entry| entry.name != VIRTUAL_PARENT_NAME);
+    if location.parent().is_some() {
+        visible.insert(0, parent_entry);
+    }
+    visible
+}
+
 fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> Vec<String> {
     let pane = state.active_pane();
     if let Some(selected) = state.selection_names(state.active, &pane.location) {
         selected.iter().cloned().collect()
-    } else if let Some(entry) = entries.get(cursor) {
+    } else if let Some(entry) = entries
+        .get(cursor)
+        .filter(|entry| entry.name != VIRTUAL_PARENT_NAME)
+    {
         vec![entry.name.clone()]
     } else {
         vec![]
+    }
+}
+
+fn directory_navigation_target(location: &Location, entry: &Entry) -> Option<Location> {
+    if entry.name == VIRTUAL_PARENT_NAME {
+        location.parent()
+    } else if entry.kind == EntryKind::Directory {
+        Some(location.child(&entry.name))
+    } else {
+        None
     }
 }
 
@@ -2002,7 +2015,7 @@ fn toggle_selection_and_advance(
     focused: Option<&Entry>,
     visible_count: usize,
 ) {
-    let Some(entry) = focused else {
+    let Some(entry) = focused.filter(|entry| entry.name != VIRTUAL_PARENT_NAME) else {
         return;
     };
     let active = state.active;
@@ -4073,6 +4086,7 @@ fn dispatch_ui_action(
     workspace_scanner: &WorkspaceScanner,
     sync: &SyncUiRuntime,
 ) {
+    let focused = focused.filter(|entry| entry.name != VIRTUAL_PARENT_NAME);
     if matches!(
         action,
         Action::ToggleWorkspaceComparison
@@ -4646,6 +4660,74 @@ mod tests {
         toggle_selection_and_advance(&mut state, None, 0);
 
         assert_eq!(state.left.cursor, 0);
+        assert_eq!(state.selection_count(Pane::Left, &location), 0);
+    }
+
+    #[test]
+    fn virtual_parent_is_always_visible_exactly_once_away_from_root() {
+        let entries = [
+            Entry {
+                name: "..".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            file("child.txt"),
+        ];
+        let parent = virtual_parent_entry();
+
+        let non_roots = [
+            Location::Local("/tmp/work".into()),
+            Location::Sftp {
+                host: "prod".into(),
+                path: "/srv".into(),
+            },
+            Location::Archive {
+                archive: "/tmp/data.zip".into(),
+                inner_path: String::new(),
+            },
+            Location::Archive {
+                archive: "/tmp/data.zip".into(),
+                inner_path: "nested".into(),
+            },
+        ];
+        for location in non_roots {
+            let visible = apply_filter_with_parent(&entries, "does-not-match", &location, &parent);
+            assert_eq!(
+                visible
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec![".."]
+            );
+        }
+
+        let roots = [
+            Location::Local("/".into()),
+            Location::Sftp {
+                host: "prod".into(),
+                path: "/".into(),
+            },
+        ];
+        for location in roots {
+            let visible = apply_filter_with_parent(&entries, "", &location, &parent);
+            assert!(!visible.iter().any(|entry| entry.name == ".."));
+        }
+    }
+
+    #[test]
+    fn virtual_parent_navigates_but_is_not_a_mutation_target() {
+        let parent = virtual_parent_entry();
+        let location = Location::Local("/tmp/work".into());
+        let mut state = AppState::default();
+        state.left.location = location.clone();
+
+        assert_eq!(
+            directory_navigation_target(&location, &parent),
+            Some(Location::Local("/tmp".into()))
+        );
+        assert!(selection_or_cursor(&state, &[&parent], 0).is_empty());
+        toggle_selection_and_advance(&mut state, Some(&parent), 1);
         assert_eq!(state.selection_count(Pane::Left, &location), 0);
     }
 
