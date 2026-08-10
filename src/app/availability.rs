@@ -225,9 +225,11 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
             }
         }
         ActionId::Delete => {
-            let has_any = (ctx.selection_count > 0 || ctx.focused_kind.is_some())
-                && !matches!(ctx.focused_kind, Some(EntryKind::Directory) if false); // ponytail: VIRTUAL_PARENT guard not reachable from focused_kind
-            if !has_any {
+            // Virtual Parent ("..") is filtered at the dispatch layer and never
+            // reaches availability as a focused_kind. Availability only guards
+            // provider, selection, and target existence.
+            let has_target = ctx.selection_count > 0 || ctx.focused_kind.is_some();
+            if !has_target {
                 ActionAvailability::Disabled {
                     reason: "Select a file or directory to delete".into(),
                 }
@@ -474,6 +476,48 @@ mod tests {
         ctx.passive_provider = ProviderId::Sftp;
         assert!(matches!(
             action_availability(ActionId::Move, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn delete_disabled_for_empty_pane() {
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        ctx.focused_kind = None;
+        assert!(matches!(
+            action_availability(ActionId::Delete, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn delete_available_for_local_file() {
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        ctx.focused_kind = Some(EntryKind::File);
+        assert_eq!(
+            action_availability(ActionId::Delete, &ctx),
+            ActionAvailability::Available
+        );
+    }
+
+    #[test]
+    fn delete_disabled_for_sftp() {
+        let mut ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+        ctx.focused_kind = Some(EntryKind::File);
+        assert!(matches!(
+            action_availability(ActionId::Delete, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn delete_disabled_when_parent_row_focused() {
+        // ".." is filtered before dispatch_ui_action. Without focused_kind
+        // and without selection, Delete is disabled.
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        ctx.focused_kind = None;
+        assert!(matches!(
+            action_availability(ActionId::Delete, &ctx),
             ActionAvailability::Disabled { .. }
         ));
     }
