@@ -4689,8 +4689,16 @@ mod tests {
                 vec![KeyStroke::new(KeyCode::F(11), KeyModifiers::NONE)],
                 Action::EditFile,
             ),
+            KeyBinding::new(
+                InputContext::Browser,
+                vec![
+                    KeyStroke::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                    KeyStroke::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                ],
+                Action::BeginChmod,
+            ),
         ]);
-        let router = KeyRouter::new(keymap);
+        let mut router = KeyRouter::new(keymap);
 
         assert_eq!(
             contextual_footer_text(
@@ -4702,6 +4710,24 @@ mod tests {
             )
             .as_deref(),
             Some("F12 View file    F11 Edit file")
+        );
+
+        assert_eq!(
+            router.resolve_stroke(
+                InputContext::Browser,
+                KeyStroke::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            ),
+            KeyResolution::Pending
+        );
+        assert!(
+            contextual_footer_text(
+                &AppState::default(),
+                &router,
+                Some(EntryKind::File),
+                true,
+                u16::MAX,
+            )
+            .is_none()
         );
     }
 
