@@ -184,6 +184,7 @@ pub struct AppState {
     pub right: PaneState,
     pub active: Pane,
     pub selected: BTreeSet<String>,
+    pub selection_scope: Option<(Pane, Location)>,
     pub filter: String,
     pub filtering: bool,
     pub message: Option<String>,
@@ -300,6 +301,7 @@ impl Default for AppState {
             },
             active: Pane::Left,
             selected: BTreeSet::new(),
+            selection_scope: None,
             filter: String::new(),
             filtering: false,
             message: None,
@@ -371,6 +373,55 @@ impl Default for AppState {
 }
 
 impl AppState {
+    fn selection_matches(&self, pane: Pane, location: &Location) -> bool {
+        matches!(
+            &self.selection_scope,
+            Some((selected_pane, selected_location))
+                if *selected_pane == pane && selected_location == location
+        )
+    }
+
+    pub fn toggle_selection(&mut self, pane: Pane, location: &Location, name: &str) {
+        if !self.selection_matches(pane, location) {
+            self.selected.clear();
+            self.selection_scope = Some((pane, location.clone()));
+        }
+        if !self.selected.remove(name) {
+            self.selected.insert(name.to_owned());
+        }
+        if self.selected.is_empty() {
+            self.selection_scope = None;
+        }
+    }
+
+    pub fn is_selected(&self, pane: Pane, location: &Location, name: &str) -> bool {
+        self.selection_matches(pane, location) && self.selected.contains(name)
+    }
+
+    pub fn selection_count(&self, pane: Pane, location: &Location) -> usize {
+        if self.selection_matches(pane, location) {
+            self.selected.len()
+        } else {
+            0
+        }
+    }
+
+    pub fn selection_names(&self, pane: Pane, location: &Location) -> Option<&BTreeSet<String>> {
+        (self.selection_matches(pane, location) && !self.selected.is_empty())
+            .then_some(&self.selected)
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.selection_scope = None;
+    }
+
+    pub fn clear_selection_for_pane(&mut self, pane: Pane) {
+        if matches!(&self.selection_scope, Some((selected_pane, _)) if *selected_pane == pane) {
+            self.clear_selection();
+        }
+    }
+
     pub fn dismiss_session_callout(&mut self) {
         self.session_callout = None;
     }
@@ -561,6 +612,33 @@ mod tests {
         assert!(state.viewer_content.is_empty());
         assert_eq!(state.panel_mode, PanelMode::Full);
         assert_eq!(state.sort_mode, SortMode::NameAsc);
+    }
+
+    #[test]
+    fn selection_is_bound_to_its_pane_and_location() {
+        let mut state = AppState::default();
+        let left_location = state.left.location.clone();
+        let right_location = state.right.location.clone();
+
+        state.toggle_selection(Pane::Left, &left_location, "foo.txt");
+
+        assert!(state.is_selected(Pane::Left, &left_location, "foo.txt"));
+        assert!(!state.is_selected(Pane::Right, &right_location, "foo.txt"));
+        assert_eq!(state.selection_count(Pane::Left, &left_location), 1);
+        assert_eq!(state.selection_count(Pane::Right, &right_location), 0);
+    }
+
+    #[test]
+    fn clearing_selection_only_affects_the_matching_pane() {
+        let mut state = AppState::default();
+        let left_location = state.left.location.clone();
+        state.toggle_selection(Pane::Left, &left_location, "foo.txt");
+
+        state.clear_selection_for_pane(Pane::Right);
+        assert!(state.is_selected(Pane::Left, &left_location, "foo.txt"));
+
+        state.clear_selection_for_pane(Pane::Left);
+        assert_eq!(state.selection_count(Pane::Left, &left_location), 0);
     }
 
     #[test]

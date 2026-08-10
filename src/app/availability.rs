@@ -98,7 +98,7 @@ impl ActionContext {
             passive_provider,
             active_capabilities,
             passive_capabilities,
-            selection_count: state.selected.len(),
+            selection_count: state.selection_count(state.active, &state.active_pane().location),
             sync_execute_ready,
             sync_confirmation_ready,
             sync_cancel_ready,

@@ -327,11 +327,13 @@ async fn event_loop(
                             };
                             if row < filt.len() {
                                 let name = &filt[row].name;
-                                if state.selected.contains(name) {
-                                    state.selected.remove(name);
+                                let pane = if is_left { Pane::Left } else { Pane::Right };
+                                let location = if is_left {
+                                    state.left.location.clone()
                                 } else {
-                                    state.selected.insert(name.clone());
-                                }
+                                    state.right.location.clone()
+                                };
+                                state.toggle_selection(pane, &location, name);
                             }
                         }
                         MouseEventKind::Down(_) => {
@@ -456,11 +458,17 @@ async fn event_loop(
                                     } else {
                                         &right_filtered
                                     };
+                                    let active = state.active;
+                                    let location = state.active_pane().location.clone();
                                     for e in filt {
-                                        state.selected.insert(e.name.clone());
+                                        if !state.is_selected(active, &location, &e.name) {
+                                            state.toggle_selection(active, &location, &e.name);
+                                        }
                                     }
-                                    state.message =
-                                        Some(format!("Selected {}", state.selected.len()));
+                                    state.message = Some(format!(
+                                        "Selected {}",
+                                        state.selection_count(active, &location)
+                                    ));
                                     state.filter.clear();
                                 } else if state.go_input && !state.filter.is_empty() {
                                     // Navigate to typed path
@@ -764,6 +772,7 @@ async fn event_loop(
                         continue;
                     }
 
+                    let active = state.active;
                     let pane = state.active_pane_mut();
 
                     match key.code {
@@ -823,11 +832,8 @@ async fn event_loop(
                         }
                         KeyCode::Char(' ') => {
                             if let Some(entry) = entries.get(cursor) {
-                                if state.selected.contains(&entry.name) {
-                                    state.selected.remove(&entry.name);
-                                } else {
-                                    state.selected.insert(entry.name.clone());
-                                }
+                                let location = pane.location.clone();
+                                state.toggle_selection(active, &location, &entry.name);
                             }
                         }
                         // Alt+/ : recursive file search
@@ -988,7 +994,7 @@ async fn event_loop(
                         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             std::mem::swap(&mut state.left, &mut state.right);
                             std::mem::swap(&mut left_entries, &mut right_entries);
-                            state.selected.clear();
+                            state.clear_selection();
                             state.remote_workspace.disable();
                             state.show_diff = false;
                             state.message = Some("Swapped".into());
@@ -1304,7 +1310,7 @@ async fn event_loop(
                                 }
                             });
                             state.message = Some(format!("Copy queued ({id})"));
-                            state.selected.clear();
+                            state.clear_selection();
                         }
                         // F6: move — Detection → Planner → Executor
                         KeyCode::F(6) => {
@@ -1428,7 +1434,7 @@ async fn event_loop(
                                 }
                             });
                             state.message = Some(format!("Move queued ({id})"));
-                            state.selected.clear();
+                            state.clear_selection();
                         }
                         // F8: delete selected (or cursor) from active pane
                         // F8: delete selected (or cursor) from active pane
@@ -1529,7 +1535,7 @@ async fn event_loop(
                                 }
                             });
 
-                            state.selected.clear();
+                            state.clear_selection();
                             state.message = Some(format!("Trash queued ({id})"));
                         }
 
@@ -1540,14 +1546,15 @@ async fn event_loop(
                             } else {
                                 &right_filtered
                             };
+                            let active = state.active;
+                            let location = state.active_pane().location.clone();
                             for e in filt {
-                                if state.selected.contains(&e.name) {
-                                    state.selected.remove(&e.name);
-                                } else {
-                                    state.selected.insert(e.name.clone());
-                                }
+                                state.toggle_selection(active, &location, &e.name);
                             }
-                            state.message = Some(format!("Selected {}", state.selected.len()));
+                            state.message = Some(format!(
+                                "Selected {}",
+                                state.selection_count(active, &location)
+                            ));
                         }
                         // +: enter glob-select mode (uses filter buffer)
                         KeyCode::Char('+') => {
@@ -1751,7 +1758,7 @@ async fn event_loop(
                                 }
                                 let n = pane.tabs.len() + 1;
                                 state.message = Some(format!("Tab {}/{n}", idx + 1));
-                                state.selected.clear();
+                                state.clear_selection();
                                 state.remote_workspace.disable();
                                 state.show_diff = false;
                                 schedule_active_pane_load(&pane_loader, &mut state);
@@ -1761,7 +1768,7 @@ async fn event_loop(
                         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.active_pane_mut().new_tab();
                             let tabs = state.active_pane().tabs.len() + 1;
-                            state.selected.clear();
+                            state.clear_selection();
                             state.remote_workspace.disable();
                             state.show_diff = false;
                             schedule_active_pane_load(&pane_loader, &mut state);
@@ -1771,7 +1778,7 @@ async fn event_loop(
                         KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.active_pane_mut().close_tab();
                             let tabs = state.active_pane().tabs.len() + 1;
-                            state.selected.clear();
+                            state.clear_selection();
                             state.remote_workspace.disable();
                             state.show_diff = false;
                             schedule_active_pane_load(&pane_loader, &mut state);
@@ -1782,7 +1789,7 @@ async fn event_loop(
                             let tabs_len = state.active_pane().tabs.len();
                             if tabs_len > 0 {
                                 state.active_pane_mut().switch_tab(tabs_len - 1);
-                                state.selected.clear();
+                                state.clear_selection();
                                 state.remote_workspace.disable();
                                 state.show_diff = false;
                                 schedule_active_pane_load(&pane_loader, &mut state);
@@ -1795,7 +1802,7 @@ async fn event_loop(
                                 && state.active_pane().tabs.len() >= 2 =>
                         {
                             state.active_pane_mut().switch_tab(0);
-                            state.selected.clear();
+                            state.clear_selection();
                             state.remote_workspace.disable();
                             state.show_diff = false;
                             schedule_active_pane_load(&pane_loader, &mut state);
@@ -1909,8 +1916,10 @@ fn apply_pane_load_response(
                         .min(right_entries.len().saturating_sub(1));
                 }
             }
+            if response.purpose != PaneLoadPurpose::Refresh {
+                state.clear_selection_for_pane(response.pane);
+            }
             if active && response.purpose != PaneLoadPurpose::Refresh {
-                state.selected.clear();
                 state.remote_workspace.disable();
                 state.show_diff = false;
             }
@@ -1974,8 +1983,9 @@ fn apply_filter<'a>(entries: &'a [Entry], filter: &str) -> Vec<&'a Entry> {
 }
 
 fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> Vec<String> {
-    if !state.selected.is_empty() {
-        state.selected.iter().cloned().collect()
+    let pane = state.active_pane();
+    if let Some(selected) = state.selection_names(state.active, &pane.location) {
+        selected.iter().cloned().collect()
     } else if let Some(entry) = entries.get(cursor) {
         vec![entry.name.clone()]
     } else {
@@ -2211,6 +2221,14 @@ fn render(
         (Default::default(), Default::default())
     };
 
+    let empty_selection = std::collections::BTreeSet::new();
+    let left_selection = state
+        .selection_names(Pane::Left, &state.left.location)
+        .unwrap_or(&empty_selection);
+    let right_selection = state
+        .selection_names(Pane::Right, &state.right.location)
+        .unwrap_or(&empty_selection);
+
     if state.left.split {
         let mid = panes[0].width / 2;
         let a1 = ratatui::layout::Rect::new(panes[0].x, panes[0].y, mid, panes[0].height);
@@ -2232,7 +2250,7 @@ fn render(
             pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
             left_list,
             act1,
-            &state.selected,
+            left_selection,
             &left_only,
             state.panel_mode,
         );
@@ -2244,7 +2262,7 @@ fn render(
             pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
             split_left_list,
             act2,
-            &state.selected,
+            left_selection,
             &left_only,
             state.panel_mode,
         );
@@ -2257,7 +2275,7 @@ fn render(
             pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
             left_list,
             state.active == Pane::Left,
-            &state.selected,
+            left_selection,
             &left_only,
             state.panel_mode,
         );
@@ -2309,7 +2327,7 @@ fn render(
                 pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
                 right_list,
                 act1,
-                &state.selected,
+                right_selection,
                 &right_only,
                 state.panel_mode,
             );
@@ -2321,7 +2339,7 @@ fn render(
                 pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
                 split_right_list,
                 act2,
-                &state.selected,
+                right_selection,
                 &right_only,
                 state.panel_mode,
             );
@@ -2334,7 +2352,7 @@ fn render(
                 pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
                 right_list,
                 state.active == Pane::Right,
-                &state.selected,
+                right_selection,
                 &right_only,
                 state.panel_mode,
             );
@@ -2653,6 +2671,7 @@ fn render(
         Location::Local(p) => p.display().to_string(),
         other => other.to_string(),
     };
+    let selection_count = state.selection_count(state.active, &pane.location);
     let hint = if state.cmd_input {
         format!(" :{}_", state.cmd)
     } else if state.go_input {
@@ -2682,7 +2701,7 @@ fn render(
     let status = Paragraph::new(Line::from(format!(
         "ARX v0.1.0 | {}{hidden}{tab_info} | sel: {} |{hint}{msg_hint}{git_info}{workspace_hint} | ?: help",
         loc_str,
-        state.selected.len(),
+        selection_count,
     )))
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(status, chunks[1]);
@@ -4522,6 +4541,32 @@ mod tests {
     }
 
     #[test]
+    fn selection_from_other_pane_is_not_a_mutation_target() {
+        let mut state = AppState::default();
+        let left_location = state.left.location.clone();
+        state.toggle_selection(Pane::Left, &left_location, "left-only.txt");
+        state.active = Pane::Right;
+        let right_entries = [file("right.txt")];
+        let visible = right_entries.iter().collect::<Vec<_>>();
+
+        assert_eq!(selection_or_cursor(&state, &visible, 0), vec!["right.txt"]);
+    }
+
+    #[test]
+    fn selection_from_previous_location_is_not_a_mutation_target() {
+        let mut state = AppState::default();
+        state.left.location = Location::Local("/a".into());
+        let original = state.left.location.clone();
+        state.toggle_selection(Pane::Left, &original, "foo.txt");
+        state.left.location = Location::Local("/b".into());
+        let current_entries = [file("bar.txt")];
+        let visible = current_entries.iter().collect::<Vec<_>>();
+
+        assert_eq!(selection_or_cursor(&state, &visible, 0), vec!["bar.txt"]);
+        assert_eq!(state.selection_count(Pane::Left, &state.left.location), 0);
+    }
+
+    #[test]
     fn footer_tracks_sync_preview_confirmation_and_running_contexts() {
         let left = Location::Local("/left".into());
         let right = Location::Local("/right".into());
@@ -4635,6 +4680,44 @@ mod tests {
             PaneSurfaceState::LoadError { attempted, message }
                 if attempted == &target && message == "SSH connection failed"
         ));
+    }
+
+    #[test]
+    fn navigation_completion_clears_selection_even_if_pane_became_inactive() {
+        let mut state = AppState::default();
+        let original = state.left.location.clone();
+        let target = Location::Local("/target".into());
+        state.toggle_selection(Pane::Left, &original, "foo.txt");
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(1),
+            target.clone(),
+            PaneLoadPurpose::Navigate {
+                remember_current: true,
+            },
+        );
+        state.active = Pane::Right;
+        let mut left_entries = vec![file("current.txt")];
+        let mut right_entries = Vec::new();
+
+        apply_pane_load_response(
+            PaneLoadResponse {
+                id: PaneLoadId(1),
+                pane: Pane::Left,
+                location: target.clone(),
+                purpose: PaneLoadPurpose::Navigate {
+                    remember_current: true,
+                },
+                result: Ok(vec![file("foo.txt")]),
+            },
+            &mut state,
+            &mut left_entries,
+            &mut right_entries,
+        );
+
+        assert_eq!(state.left.location, target);
+        assert_eq!(state.selection_count(Pane::Left, &original), 0);
+        assert!(state.selected.is_empty());
     }
 
     #[test]
