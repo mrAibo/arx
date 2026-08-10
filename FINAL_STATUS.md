@@ -8,36 +8,36 @@
 
 ## PR #40 — Commander UX Hardening: MERGED
 
-**Merge:** `c035f1a` (squash)  
-**CI:** SUCCESS · **Tests:** 268 · **Files:** 16, +2215/−254  
-**Review:** 0 blockers
-
-F3 View, F4 Edit, terminal lifecycle, scoped selections, Space→Next, virtual parent, responsive footer.
+**Merge:** `c035f1a` (squash) · **Tests:** 268 · **Files:** 16, +2215/−254
 
 ---
 
-## ARX-FILEOPS: DONE
+## PR #42 — Action-driven F5-F8 file operations: OPEN
 
-**Branch:** `feature/fileops` · **Commit:** `a1231a8`  
-**CI:** pending · **Tests:** 268 · **Files:** 6, +487/−401
+**Branch:** `feature/fileops` · **Head:** `721f1dc`  
+**Base:** `main` (`c035f1a`) · **Tests:** 276 · **Files:** 7, +703/−403
 
-| Key | Action | Driven by |
+| Key | Action | Truth |
 |---:|---|---|
-| F5 | Copy | Action pipeline |
-| F6 | Move | Action pipeline |
-| F7 | Mkdir (was tmux) | Action pipeline |
-| F8 | Delete (trash) | Action pipeline |
-| F9 | Tmux sessions (was Hosts) | Action pipeline |
+| F5 | Copy | TransferPlanner |
+| F6 | Move | TransferPlanner |
+| F7 | Mkdir | State |
+| F8 | Delete | MutationService |
+| F9 | Remote Hosts | Toggle |
 
-**Removed:** 350 lines of legacy direct handlers.  
-**Added:** 4 FileOperation ActionIds + ListTmuxSessions.  
-**Context menu:** updated (Mkdir F7 added).  
-**README:** documented F3–F8, F9=tmux.
+### Corrections applied:
+- `4d5b1d3` — F8→Delete binding (was missing)
+- `9ee23f0` — Copy/Move availability aligned with TransferPlanner
+- `a1f5ccd` — Delete cleanup, phantom guard removed, parent safety tests
+- `721f1dc` — F9=Hosts (product decision), Tmux in Command Center
+
+### Parity review: PASS (0 BLOCKER, 0 MAJOR)
+Selection clearing, pane refresh, messages, parent exclusion, job creation, locations, planner inputs, error handling — all match legacy.
 
 ---
 
 ## Что дальше
-
-- Открыть PR на `feature/fileops` → `main`
-- Запустить CI на `a1231a8`
-- После merge: ARX-FILEOPS acceptance review (08-серия для fileops)
+- **CI на PR #42** — ожидание
+- **ARX-FILEOPS-06** — Automated acceptance matrix (после CI)
+- **ARX-FILEOPS-07** — Real interactive acceptance (после 06)
+- **ARX-KEYS-01** — Emulator-safe shortcut architecture
