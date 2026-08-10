@@ -4,7 +4,7 @@ use super::{
     ALL_ACTIONS, Action, ActionAvailability, ActionContext, ActionId, AppState,
     action_availability, action_meta,
 };
-use crate::vfs::Location;
+use crate::vfs::{EntryKind, Location};
 
 /// Typed destination of a Command Center entry.
 ///
@@ -144,9 +144,19 @@ fn discovery_bias(
 /// The state is the single source for already-loaded hosts/bookmarks/history;
 /// opening Command Center must not re-read configuration from disk.
 pub fn build_command_items(filter: &str, state: &AppState) -> Vec<CommandItem> {
+    build_command_items_with_file_context(filter, state, None, false)
+}
+
+pub fn build_command_items_with_file_context(
+    filter: &str,
+    state: &AppState,
+    focused_kind: Option<EntryKind>,
+    editor_available: bool,
+) -> Vec<CommandItem> {
     let query = filter.trim().to_lowercase();
     let mut items = Vec::new();
-    let action_context = ActionContext::from_state(state);
+    let action_context =
+        ActionContext::from_state(state).with_file_context(focused_kind, editor_available);
 
     for action in ALL_ACTIONS.iter().copied() {
         // Invoking Command Center from inside itself adds no value and creates
@@ -346,6 +356,45 @@ mod tests {
                 .subtitle
                 .as_deref()
                 .is_some_and(|subtitle| subtitle.starts_with("Recommended · "))
+        );
+    }
+
+    #[test]
+    fn file_actions_use_the_shared_target_availability() {
+        let state = AppState::default();
+        let local_file =
+            build_command_items_with_file_context("", &state, Some(EntryKind::File), true);
+        for action in [Action::ViewFile, Action::EditFile] {
+            assert!(
+                local_file
+                    .iter()
+                    .find(|item| item.target == CommandTarget::Action(action))
+                    .unwrap()
+                    .availability
+                    .is_available()
+            );
+        }
+
+        let directory =
+            build_command_items_with_file_context("", &state, Some(EntryKind::Directory), true);
+        assert!(
+            !directory
+                .iter()
+                .find(|item| item.target == CommandTarget::Action(Action::ViewFile))
+                .unwrap()
+                .availability
+                .is_available()
+        );
+
+        let no_editor =
+            build_command_items_with_file_context("", &state, Some(EntryKind::File), false);
+        assert!(
+            !no_editor
+                .iter()
+                .find(|item| item.target == CommandTarget::Action(Action::EditFile))
+                .unwrap()
+                .availability
+                .is_available()
         );
     }
 

@@ -9,5 +9,5 @@
 mod hints;
 mod keymap;
 
-pub use hints::{ContextHint, HintPriority, contextual_hints};
+pub use hints::{ContextHint, HintPriority, contextual_hints, contextual_hints_with_file_context};
 pub use keymap::{KeyBinding, KeyContinuation, KeyResolution, KeyRouter, KeyStroke, Keymap};

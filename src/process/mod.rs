@@ -11,7 +11,8 @@ use tokio::process::Command;
 
 use crate::effects::{Effect, EffectEvent};
 use crate::services::{
-    DesktopService, DiffService, FileInfoService, InfrastructureService, TreeService,
+    DesktopService, DiffService, FileInfoService, InfrastructureService, PreviewService,
+    TreeService,
 };
 
 pub struct ProcessService;
@@ -135,6 +136,10 @@ impl ProcessService {
             Effect::TreeSnapshot { location, filter } => EffectEvent::TreeLines {
                 lines: TreeService::snapshot(&location, &filter).await,
             },
+            Effect::PreviewFile { path } => EffectEvent::ViewerLines {
+                title: format!("View: {}", path.display()),
+                lines: PreviewService::preview(&path).await,
+            },
             Effect::OpenPath { path } => match DesktopService::open_path(&path).await {
                 Ok(()) => EffectEvent::PathOpened { path },
                 Err(error) => EffectEvent::Failed {
@@ -162,5 +167,24 @@ impl ProcessService {
             .filter(|name| !name.is_empty())
             .map(str::to_string)
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn preview_effect_returns_viewer_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        tokio::fs::write(&path, "hello preview\n").await.unwrap();
+
+        let event = ProcessService::execute(Effect::PreviewFile { path }).await;
+        let EffectEvent::ViewerLines { title, lines } = event else {
+            panic!("expected viewer lines");
+        };
+        assert!(title.starts_with("View:"));
+        assert!(lines.iter().any(|line| line == "hello preview"));
     }
 }

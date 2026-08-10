@@ -1,15 +1,16 @@
+use crate::tui_terminal::TuiTerminalSession;
 use arx::app::{
     Action, ActionAvailability, ActionContext, AppState, CommandItem, CommandKind, CommandTarget,
     OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SessionCallout, SortMode,
-    WorkspaceSyncUxState, action_availability, action_meta, build_command_items,
+    WorkspaceSyncUxState, action_availability, action_meta, build_command_items_with_file_context,
 };
 use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectResponse, EffectScope};
 use arx::effects::{Effect, EffectEvent};
-use arx::input::{KeyResolution, KeyRouter, contextual_hints};
+use arx::input::{KeyResolution, KeyRouter, contextual_hints, contextual_hints_with_file_context};
 use arx::services::{
     DesktopService, FileInfoService, GitService, MutationError, MutationService, PaneLoadPurpose,
-    PaneLoadResponse, PaneLoader, PreviewService, SyncLaunchId, WorkspaceScanError,
-    WorkspaceScanOptions, WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
+    PaneLoadResponse, PaneLoader, SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions,
+    WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
 };
 use arx::vfs::{Entry, EntryKind, Location};
 use arx::workspace_sync::{
@@ -19,11 +20,7 @@ use arx::workspace_sync_execution::SyncPlanId;
 use arx::workspace_sync_verification::{
     SyncVerificationEvent, SyncVerificationStatus, SyncVerificationVerdict,
 };
-use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{
     DefaultTerminal,
     layout::{Constraint, Direction, Layout, Rect},
@@ -51,29 +48,26 @@ struct SyncLaunchResponse {
 }
 
 pub async fn run(config: arx::config::ArxConfig) -> io::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
-    )?;
+    let mut terminal_session = TuiTerminalSession::enter()?;
+    let stdout = io::stdout();
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))?;
 
-    let result = event_loop(&mut terminal, config).await;
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result
+    let result = event_loop(&mut terminal, &mut terminal_session, config).await;
+    let restore_result = terminal_session.restore();
+    match (result, restore_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 #[allow(clippy::collapsible_if)]
 async fn event_loop(
     terminal: &mut DefaultTerminal,
+    terminal_session: &mut TuiTerminalSession,
     config: arx::config::ArxConfig,
 ) -> io::Result<()> {
-    let editor = config.ui.editor.clone();
+    let editor = DesktopService::resolve_editor(config.ui.editor.as_deref());
     let mut state = AppState {
         show_hidden: config.ui.show_hidden,
         hosts: arx::remote::hosts_config::load_hosts(),
@@ -106,6 +100,7 @@ async fn event_loop(
         launch_events: sync_launch_tx,
     };
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    let parent_entry = virtual_parent_entry();
 
     loop {
         if state.should_quit {
@@ -118,8 +113,18 @@ async fn event_loop(
             state.git_status = GitService::status_suffix(&active_location).await;
             state.git_status_location = Some(active_location);
         }
-        let left_filtered = apply_filter(&left_entries, &state.filter);
-        let right_filtered = apply_filter(&right_entries, &state.filter);
+        let left_filtered = apply_filter_with_parent(
+            &left_entries,
+            &state.filter,
+            &state.left.location,
+            &parent_entry,
+        );
+        let right_filtered = apply_filter_with_parent(
+            &right_entries,
+            &state.filter,
+            &state.right.location,
+            &parent_entry,
+        );
         // clamp cursors
         state.left.cursor = state.left.cursor.min(left_filtered.len().saturating_sub(1));
         state.right.cursor = state
@@ -146,6 +151,7 @@ async fn event_loop(
                 &mut split_left_list,
                 &mut split_right_list,
                 &key_router,
+                editor.is_some(),
                 msg.as_deref(),
             )
         })?;
@@ -331,13 +337,17 @@ async fn event_loop(
                             } else {
                                 &right_filtered
                             };
-                            if row < filt.len() {
-                                let name = &filt[row].name;
-                                if state.selected.contains(name) {
-                                    state.selected.remove(name);
+                            if let Some(entry) = filt
+                                .get(row)
+                                .filter(|entry| entry.name != VIRTUAL_PARENT_NAME)
+                            {
+                                let pane = if is_left { Pane::Left } else { Pane::Right };
+                                let location = if is_left {
+                                    state.left.location.clone()
                                 } else {
-                                    state.selected.insert(name.clone());
-                                }
+                                    state.right.location.clone()
+                                };
+                                state.toggle_selection(pane, &location, &entry.name);
                             }
                         }
                         MouseEventKind::Down(_) => {
@@ -383,19 +393,34 @@ async fn event_loop(
                                     state.show_command_center = false;
                                     state.filter.clear();
                                     state.command_matches.clear();
-                                    let focused_entry = if state.active == Pane::Left {
-                                        left_filtered.get(state.left.cursor)
-                                    } else {
-                                        right_filtered.get(state.right.cursor)
+                                    let cursor = {
+                                        let pane = state.active_pane();
+                                        if pane.split && pane.split_active {
+                                            pane.split_cursor
+                                        } else {
+                                            pane.cursor
+                                        }
                                     };
+                                    let (focused_entry, visible_count) =
+                                        if state.active == Pane::Left {
+                                            (left_filtered.get(cursor), left_filtered.len())
+                                        } else {
+                                            (right_filtered.get(cursor), right_filtered.len())
+                                        };
                                     if let Some(effect) = execute_command_target(
                                         &mut state,
                                         item.target,
                                         focused_entry.copied(),
+                                        visible_count,
                                         &workspace_scanner,
                                         &pane_loader,
                                         &sync_runtime,
-                                    ) {
+                                        &effect_dispatcher,
+                                        terminal_session,
+                                        editor.as_deref(),
+                                    )
+                                    .await?
+                                    {
                                         let id = effect_dispatcher.dispatch(
                                             EffectLane::GlobalProcess,
                                             EffectScope::Global,
@@ -425,7 +450,13 @@ async fn event_loop(
                             }
                             KeyCode::Backspace => {
                                 state.filter.pop();
-                                state.command_matches = build_command_items(&state.filter, &state);
+                                state.command_matches = build_command_items_with_file_context(
+                                    &state.filter,
+                                    &state,
+                                    focused_entry(&state, &left_filtered, &right_filtered)
+                                        .map(|entry| entry.kind),
+                                    editor.is_some(),
+                                );
                                 state
                                     .overlay_list_state
                                     .select((!state.command_matches.is_empty()).then_some(0));
@@ -435,7 +466,13 @@ async fn event_loop(
                                     && !key.modifiers.contains(KeyModifiers::ALT) =>
                             {
                                 state.filter.push(c);
-                                state.command_matches = build_command_items(&state.filter, &state);
+                                state.command_matches = build_command_items_with_file_context(
+                                    &state.filter,
+                                    &state,
+                                    focused_entry(&state, &left_filtered, &right_filtered)
+                                        .map(|entry| entry.kind),
+                                    editor.is_some(),
+                                );
                                 state
                                     .overlay_list_state
                                     .select((!state.command_matches.is_empty()).then_some(0));
@@ -462,11 +499,19 @@ async fn event_loop(
                                     } else {
                                         &right_filtered
                                     };
+                                    let active = state.active;
+                                    let location = state.active_pane().location.clone();
                                     for e in filt {
-                                        state.selected.insert(e.name.clone());
+                                        if e.name != VIRTUAL_PARENT_NAME
+                                            && !state.is_selected(active, &location, &e.name)
+                                        {
+                                            state.toggle_selection(active, &location, &e.name);
+                                        }
                                     }
-                                    state.message =
-                                        Some(format!("Selected {}", state.selected.len()));
+                                    state.message = Some(format!(
+                                        "Selected {}",
+                                        state.selection_count(active, &location)
+                                    ));
                                     state.filter.clear();
                                 } else if state.go_input && !state.filter.is_empty() {
                                     // Navigate to typed path
@@ -525,11 +570,17 @@ async fn event_loop(
                                     state.filter.push(c);
                                     if state.show_command_center {
                                         state.command_matches =
-                                            build_command_items(&state.filter, &state);
-                                    }
-                                    if state.show_command_center {
-                                        state.command_matches =
-                                            build_command_items(&state.filter, &state);
+                                            build_command_items_with_file_context(
+                                                &state.filter,
+                                                &state,
+                                                focused_entry(
+                                                    &state,
+                                                    &left_filtered,
+                                                    &right_filtered,
+                                                )
+                                                .map(|entry| entry.kind),
+                                                editor.is_some(),
+                                            );
                                     }
                                 }
                             }
@@ -733,15 +784,26 @@ async fn event_loop(
                             continue;
                         }
                         KeyResolution::Action(action) => {
-                            let context = ActionContext::from_state(&state);
+                            let context = ActionContext::from_state(&state).with_file_context(
+                                entries.get(cursor).map(|entry| entry.kind),
+                                editor.is_some(),
+                            );
                             match action_availability(action.id(), &context) {
-                                ActionAvailability::Available => dispatch_ui_action(
-                                    &mut state,
-                                    action,
-                                    entries.get(cursor).copied(),
-                                    &workspace_scanner,
-                                    &sync_runtime,
-                                ),
+                                ActionAvailability::Available => {
+                                    dispatch_ui_action(
+                                        &mut state,
+                                        action,
+                                        entries.get(cursor).copied(),
+                                        entries.len(),
+                                        &workspace_scanner,
+                                        &sync_runtime,
+                                        &effect_dispatcher,
+                                        &pane_loader,
+                                        terminal_session,
+                                        editor.as_deref(),
+                                    )
+                                    .await?
+                                }
                                 ActionAvailability::Disabled { reason } => {
                                     state.message = Some(reason);
                                 }
@@ -827,15 +889,6 @@ async fn event_loop(
                                 }
                             }
                         }
-                        KeyCode::Char(' ') => {
-                            if let Some(entry) = entries.get(cursor) {
-                                if state.selected.contains(&entry.name) {
-                                    state.selected.remove(&entry.name);
-                                } else {
-                                    state.selected.insert(entry.name.clone());
-                                }
-                            }
-                        }
                         // Alt+/ : recursive file search
                         KeyCode::Char('/') if key.modifiers.contains(KeyModifiers::ALT) => {
                             if let Location::Local(dir) = &state.active_pane().location {
@@ -867,8 +920,9 @@ async fn event_loop(
                         }
                         KeyCode::Enter => {
                             if let Some(entry) = entries.get(cursor) {
-                                if entry.kind == EntryKind::Directory {
-                                    let new_location = pane.location.child(&entry.name);
+                                if let Some(new_location) =
+                                    directory_navigation_target(&pane.location, entry)
+                                {
                                     let active = state.active;
                                     schedule_pane_navigation(
                                         &pane_loader,
@@ -876,7 +930,7 @@ async fn event_loop(
                                         active,
                                         new_location,
                                         PaneLoadPurpose::Navigate {
-                                            remember_current: true,
+                                            remember_current: entry.name != VIRTUAL_PARENT_NAME,
                                         },
                                     );
                                     state.message = Some("Opening directory…".into());
@@ -926,53 +980,7 @@ async fn event_loop(
                             }
                         }
                         KeyCode::Backspace => {
-                            let go_back = match &pane.location {
-                                Location::Local(p) => {
-                                    let parent = p
-                                        .parent()
-                                        .map(|p| p.to_path_buf())
-                                        .unwrap_or_else(|| p.to_path_buf());
-                                    if parent != *p {
-                                        Some(Location::Local(parent))
-                                    } else {
-                                        None
-                                    }
-                                }
-                                Location::Sftp { host, path } => {
-                                    // Go to parent directory
-                                    if path == "/" {
-                                        None
-                                    } else {
-                                        let parent = path
-                                            .rsplit_once('/')
-                                            .map(|(p, _)| p.to_string())
-                                            .unwrap_or_else(|| "/".to_string());
-                                        Some(Location::Sftp {
-                                            host: host.clone(),
-                                            path: parent,
-                                        })
-                                    }
-                                }
-                                Location::Archive {
-                                    archive,
-                                    inner_path,
-                                } => {
-                                    if inner_path.is_empty() {
-                                        archive.parent().map(|p| Location::Local(p.to_path_buf()))
-                                    } else {
-                                        // Go up one level
-                                        let parent = inner_path
-                                            .rsplit_once('/')
-                                            .map(|(p, _)| p.to_string())
-                                            .unwrap_or_default();
-                                        Some(Location::Archive {
-                                            archive: archive.clone(),
-                                            inner_path: parent,
-                                        })
-                                    }
-                                }
-                            };
-                            if let Some(new_loc) = go_back {
+                            if let Some(new_loc) = pane.location.parent() {
                                 let active = state.active;
                                 schedule_pane_navigation(
                                     &pane_loader,
@@ -994,7 +1002,7 @@ async fn event_loop(
                         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             std::mem::swap(&mut state.left, &mut state.right);
                             std::mem::swap(&mut left_entries, &mut right_entries);
-                            state.selected.clear();
+                            state.clear_selection();
                             state.remote_workspace.disable();
                             state.show_diff = false;
                             state.message = Some("Swapped".into());
@@ -1007,7 +1015,10 @@ async fn event_loop(
                         }
                         // Shift+F6: rename file under cursor
                         KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            if let Some(entry) = entries.get(cursor) {
+                            if let Some(entry) = entries
+                                .get(cursor)
+                                .filter(|entry| entry.name != VIRTUAL_PARENT_NAME)
+                            {
                                 state.cmd = format!("mv '{}' ", entry.name);
                                 state.cmd_input = true;
                             }
@@ -1167,12 +1178,13 @@ async fn event_loop(
                         }
                         // Ctrl+O: drop to subshell, restore on exit
                         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            disable_raw_mode()?;
-                            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-                            let _ = DesktopService::run_interactive_shell(&shell).await;
-                            execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-                            enable_raw_mode()?;
+                            let shell_result = terminal_session
+                                .suspend_while(|| DesktopService::run_interactive_shell(&shell))
+                                .await?;
+                            if let Err(error) = shell_result {
+                                state.message = Some(format!("Shell failed: {error}"));
+                            }
                         }
                         KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.filter.clear();
@@ -1309,7 +1321,7 @@ async fn event_loop(
                                 }
                             });
                             state.message = Some(format!("Copy queued ({id})"));
-                            state.selected.clear();
+                            state.clear_selection();
                         }
                         // F6: move — Detection → Planner → Executor
                         KeyCode::F(6) => {
@@ -1433,7 +1445,7 @@ async fn event_loop(
                                 }
                             });
                             state.message = Some(format!("Move queued ({id})"));
-                            state.selected.clear();
+                            state.clear_selection();
                         }
                         // F8: delete selected (or cursor) from active pane
                         // F8: delete selected (or cursor) from active pane
@@ -1534,7 +1546,7 @@ async fn event_loop(
                                 }
                             });
 
-                            state.selected.clear();
+                            state.clear_selection();
                             state.message = Some(format!("Trash queued ({id})"));
                         }
 
@@ -1545,14 +1557,17 @@ async fn event_loop(
                             } else {
                                 &right_filtered
                             };
+                            let active = state.active;
+                            let location = state.active_pane().location.clone();
                             for e in filt {
-                                if state.selected.contains(&e.name) {
-                                    state.selected.remove(&e.name);
-                                } else {
-                                    state.selected.insert(e.name.clone());
+                                if e.name != VIRTUAL_PARENT_NAME {
+                                    state.toggle_selection(active, &location, &e.name);
                                 }
                             }
-                            state.message = Some(format!("Selected {}", state.selected.len()));
+                            state.message = Some(format!(
+                                "Selected {}",
+                                state.selection_count(active, &location)
+                            ));
                         }
                         // +: enter glob-select mode (uses filter buffer)
                         KeyCode::Char('+') => {
@@ -1571,43 +1586,16 @@ async fn event_loop(
                                 sort_entries(&mut right_entries, state.sort_mode);
                             }
                         }
-                        // F3: view file
-                        KeyCode::F(3) => {
+                        // Shift+F3: page file with bat
+                        KeyCode::F(3) if key.modifiers.contains(KeyModifiers::SHIFT) => {
                             if let Some(entry) = entries.get(cursor) {
                                 if entry.kind != EntryKind::Directory {
                                     let path = match &pane.location {
                                         Location::Local(dir) => dir.join(&entry.name),
                                         _ => continue,
                                     };
-                                    if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                        let _ = DesktopService::page_with_bat(&path).await;
-                                    } else {
-                                        state.viewer_content = PreviewService::preview(&path).await;
-                                        state.viewer_scroll = 0;
-                                    }
+                                    let _ = DesktopService::page_with_bat(&path).await;
                                 }
-                            }
-                        }
-                        // F4: edit file in $EDITOR
-                        KeyCode::F(4) => {
-                            if let Some(entry) = entries.get(cursor) {
-                                let path = match &pane.location {
-                                    Location::Local(dir) => dir.join(&entry.name),
-                                    _ => continue,
-                                };
-                                let editor_cmd = editor
-                                    .clone()
-                                    .or_else(|| std::env::var("EDITOR").ok())
-                                    .or_else(|| std::env::var("VISUAL").ok())
-                                    .unwrap_or_else(|| "vi".into());
-                                // Leave raw mode, spawn editor, restore
-                                disable_raw_mode()?;
-                                execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                                let _ = DesktopService::open_editor(&editor_cmd, &path).await;
-                                execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-                                enable_raw_mode()?;
-                                // Refresh after edit
-                                schedule_active_pane_load(&pane_loader, &mut state);
                             }
                         }
                         // Ctrl+C: copy filename to clipboard
@@ -1755,7 +1743,7 @@ async fn event_loop(
                                 }
                                 let n = pane.tabs.len() + 1;
                                 state.message = Some(format!("Tab {}/{n}", idx + 1));
-                                state.selected.clear();
+                                state.clear_selection();
                                 state.remote_workspace.disable();
                                 state.show_diff = false;
                                 schedule_active_pane_load(&pane_loader, &mut state);
@@ -1765,7 +1753,7 @@ async fn event_loop(
                         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.active_pane_mut().new_tab();
                             let tabs = state.active_pane().tabs.len() + 1;
-                            state.selected.clear();
+                            state.clear_selection();
                             state.remote_workspace.disable();
                             state.show_diff = false;
                             schedule_active_pane_load(&pane_loader, &mut state);
@@ -1775,7 +1763,7 @@ async fn event_loop(
                         KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.active_pane_mut().close_tab();
                             let tabs = state.active_pane().tabs.len() + 1;
-                            state.selected.clear();
+                            state.clear_selection();
                             state.remote_workspace.disable();
                             state.show_diff = false;
                             schedule_active_pane_load(&pane_loader, &mut state);
@@ -1786,7 +1774,7 @@ async fn event_loop(
                             let tabs_len = state.active_pane().tabs.len();
                             if tabs_len > 0 {
                                 state.active_pane_mut().switch_tab(tabs_len - 1);
-                                state.selected.clear();
+                                state.clear_selection();
                                 state.remote_workspace.disable();
                                 state.show_diff = false;
                                 schedule_active_pane_load(&pane_loader, &mut state);
@@ -1799,7 +1787,7 @@ async fn event_loop(
                                 && state.active_pane().tabs.len() >= 2 =>
                         {
                             state.active_pane_mut().switch_tab(0);
-                            state.selected.clear();
+                            state.clear_selection();
                             state.remote_workspace.disable();
                             state.show_diff = false;
                             schedule_active_pane_load(&pane_loader, &mut state);
@@ -1913,8 +1901,10 @@ fn apply_pane_load_response(
                         .min(right_entries.len().saturating_sub(1));
                 }
             }
+            if response.purpose != PaneLoadPurpose::Refresh {
+                state.clear_selection_for_pane(response.pane);
+            }
             if active && response.purpose != PaneLoadPurpose::Refresh {
-                state.selected.clear();
                 state.remote_workspace.disable();
                 state.show_diff = false;
             }
@@ -1977,13 +1967,92 @@ fn apply_filter<'a>(entries: &'a [Entry], filter: &str) -> Vec<&'a Entry> {
     }
 }
 
+const VIRTUAL_PARENT_NAME: &str = "..";
+
+fn virtual_parent_entry() -> Entry {
+    Entry {
+        name: VIRTUAL_PARENT_NAME.into(),
+        kind: EntryKind::Directory,
+        size: None,
+        modified_unix_ms: None,
+    }
+}
+
+fn apply_filter_with_parent<'a>(
+    entries: &'a [Entry],
+    filter: &str,
+    location: &Location,
+    parent_entry: &'a Entry,
+) -> Vec<&'a Entry> {
+    let mut visible = apply_filter(entries, filter);
+    visible.retain(|entry| entry.name != VIRTUAL_PARENT_NAME);
+    if location.parent().is_some() {
+        visible.insert(0, parent_entry);
+    }
+    visible
+}
+
 fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> Vec<String> {
-    if !state.selected.is_empty() {
-        state.selected.iter().cloned().collect()
-    } else if let Some(entry) = entries.get(cursor) {
+    let pane = state.active_pane();
+    if let Some(selected) = state.selection_names(state.active, &pane.location) {
+        selected.iter().cloned().collect()
+    } else if let Some(entry) = entries
+        .get(cursor)
+        .filter(|entry| entry.name != VIRTUAL_PARENT_NAME)
+    {
         vec![entry.name.clone()]
     } else {
         vec![]
+    }
+}
+
+fn directory_navigation_target(location: &Location, entry: &Entry) -> Option<Location> {
+    if entry.name == VIRTUAL_PARENT_NAME {
+        location.parent()
+    } else if entry.kind == EntryKind::Directory {
+        Some(location.child(&entry.name))
+    } else {
+        None
+    }
+}
+
+fn focused_entry<'a>(
+    state: &AppState,
+    left_entries: &[&'a Entry],
+    right_entries: &[&'a Entry],
+) -> Option<&'a Entry> {
+    let pane = state.active_pane();
+    let cursor = if pane.split && pane.split_active {
+        pane.split_cursor
+    } else {
+        pane.cursor
+    };
+    match state.active {
+        Pane::Left => left_entries.get(cursor).copied(),
+        Pane::Right => right_entries.get(cursor).copied(),
+    }
+}
+
+fn toggle_selection_and_advance(
+    state: &mut AppState,
+    focused: Option<&Entry>,
+    visible_count: usize,
+) {
+    let Some(entry) = focused.filter(|entry| entry.name != VIRTUAL_PARENT_NAME) else {
+        return;
+    };
+    let active = state.active;
+    let location = state.active_pane().location.clone();
+    state.toggle_selection(active, &location, &entry.name);
+
+    let pane = state.active_pane_mut();
+    let cursor = if pane.split && pane.split_active {
+        &mut pane.split_cursor
+    } else {
+        &mut pane.cursor
+    };
+    if cursor.saturating_add(1) < visible_count {
+        *cursor += 1;
     }
 }
 
@@ -2040,23 +2109,38 @@ fn pane_surface_state<'a>(
     }
 }
 
-fn contextual_footer_text(state: &AppState, key_router: &KeyRouter) -> Option<String> {
-    if !key_router.pending().is_empty() {
+fn contextual_footer_text(
+    state: &AppState,
+    key_router: &KeyRouter,
+    focused_kind: Option<EntryKind>,
+    editor_available: bool,
+    width: u16,
+) -> Option<String> {
+    if !key_router.pending().is_empty() || width == 0 {
         return None;
     }
 
-    let hints = contextual_hints(state, key_router.keymap());
-    if hints.is_empty() {
-        return None;
+    let hints = contextual_hints_with_file_context(
+        state,
+        key_router.keymap(),
+        focused_kind,
+        editor_available,
+    );
+    let mut text = String::new();
+    for hint in hints {
+        let item = format!("{} {}", hint.binding, hint.label);
+        let candidate = if text.is_empty() {
+            item
+        } else {
+            format!("{text}    {item}")
+        };
+        if Line::from(candidate.as_str()).width() > usize::from(width) {
+            break;
+        }
+        text = candidate;
     }
 
-    Some(
-        hints
-            .into_iter()
-            .map(|hint| format!("{} {}", hint.binding, hint.label))
-            .collect::<Vec<_>>()
-            .join("    "),
-    )
+    (!text.is_empty()).then_some(text)
 }
 
 fn render_contextual_footer(
@@ -2064,8 +2148,16 @@ fn render_contextual_footer(
     area: Rect,
     state: &AppState,
     key_router: &KeyRouter,
+    focused_kind: Option<EntryKind>,
+    editor_available: bool,
 ) {
-    let Some(text) = contextual_footer_text(state, key_router) else {
+    let Some(text) = contextual_footer_text(
+        state,
+        key_router,
+        focused_kind,
+        editor_available,
+        area.width,
+    ) else {
         return;
     };
 
@@ -2162,6 +2254,7 @@ fn render(
     split_left_list: &mut ListState,
     split_right_list: &mut ListState,
     key_router: &KeyRouter,
+    editor_available: bool,
     message: Option<&str>,
 ) {
     let area = frame.area();
@@ -2215,6 +2308,14 @@ fn render(
         (Default::default(), Default::default())
     };
 
+    let empty_selection = std::collections::BTreeSet::new();
+    let left_selection = state
+        .selection_names(Pane::Left, &state.left.location)
+        .unwrap_or(&empty_selection);
+    let right_selection = state
+        .selection_names(Pane::Right, &state.right.location)
+        .unwrap_or(&empty_selection);
+
     if state.left.split {
         let mid = panes[0].width / 2;
         let a1 = ratatui::layout::Rect::new(panes[0].x, panes[0].y, mid, panes[0].height);
@@ -2236,7 +2337,7 @@ fn render(
             pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
             left_list,
             act1,
-            &state.selected,
+            left_selection,
             &left_only,
             state.panel_mode,
         );
@@ -2248,7 +2349,7 @@ fn render(
             pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
             split_left_list,
             act2,
-            &state.selected,
+            left_selection,
             &left_only,
             state.panel_mode,
         );
@@ -2261,7 +2362,7 @@ fn render(
             pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
             left_list,
             state.active == Pane::Left,
-            &state.selected,
+            left_selection,
             &left_only,
             state.panel_mode,
         );
@@ -2313,7 +2414,7 @@ fn render(
                 pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
                 right_list,
                 act1,
-                &state.selected,
+                right_selection,
                 &right_only,
                 state.panel_mode,
             );
@@ -2325,7 +2426,7 @@ fn render(
                 pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
                 split_right_list,
                 act2,
-                &state.selected,
+                right_selection,
                 &right_only,
                 state.panel_mode,
             );
@@ -2338,7 +2439,7 @@ fn render(
                 pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
                 right_list,
                 state.active == Pane::Right,
-                &state.selected,
+                right_selection,
                 &right_only,
                 state.panel_mode,
             );
@@ -2657,6 +2758,7 @@ fn render(
         Location::Local(p) => p.display().to_string(),
         other => other.to_string(),
     };
+    let selection_count = state.selection_count(state.active, &pane.location);
     let hint = if state.cmd_input {
         format!(" :{}_", state.cmd)
     } else if state.go_input {
@@ -2686,7 +2788,7 @@ fn render(
     let status = Paragraph::new(Line::from(format!(
         "ARX v0.1.0 | {}{hidden}{tab_info} | sel: {} |{hint}{msg_hint}{git_info}{workspace_hint} | ?: help",
         loc_str,
-        state.selected.len(),
+        selection_count,
     )))
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(status, chunks[1]);
@@ -2702,7 +2804,14 @@ fn render(
 
     // Contextual footer is derived from the same runtime Keymap that owns
     // keyboard routing. A pending chord leaves discovery to Which-Key.
-    render_contextual_footer(frame, footer_area, state, key_router);
+    render_contextual_footer(
+        frame,
+        footer_area,
+        state,
+        key_router,
+        focused_entry(state, left_entries, right_entries).map(|entry| entry.kind),
+        editor_available,
+    );
 
     if state.active_overlay() == Some(OverlayKind::SyncPreview) {
         render_sync_preview(frame, area, state);
@@ -4023,13 +4132,21 @@ fn toggle_hosts_overlay(state: &mut AppState) {
     state.toggle_overlay(OverlayKind::Hosts);
 }
 
-fn dispatch_ui_action(
+// ponytail: keep the one action seam instead of wrapping runtime services in a one-use context.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_ui_action(
     state: &mut AppState,
     action: Action,
     focused: Option<&Entry>,
+    visible_count: usize,
     workspace_scanner: &WorkspaceScanner,
     sync: &SyncUiRuntime,
-) {
+    effect_dispatcher: &EffectDispatcher,
+    pane_loader: &PaneLoader,
+    terminal_session: &mut TuiTerminalSession,
+    configured_editor: Option<&str>,
+) -> io::Result<()> {
+    let focused = focused.filter(|entry| entry.name != VIRTUAL_PARENT_NAME);
     if matches!(
         action,
         Action::ToggleWorkspaceComparison
@@ -4038,7 +4155,7 @@ fn dispatch_ui_action(
             | Action::ToggleWorkspaceSyncMode
     ) && !supersede_workspace_launch_for_new_action(state, sync)
     {
-        return;
+        return Ok(());
     }
 
     match action {
@@ -4046,7 +4163,12 @@ fn dispatch_ui_action(
         Action::OpenCommandCenter => {
             state.open_overlay(OverlayKind::CommandCenter);
             state.filter.clear();
-            state.command_matches = build_command_items("", state);
+            state.command_matches = build_command_items_with_file_context(
+                "",
+                state,
+                focused.map(|entry| entry.kind),
+                configured_editor.is_some(),
+            );
             state
                 .overlay_list_state
                 .select((!state.command_matches.is_empty()).then_some(0));
@@ -4055,6 +4177,51 @@ fn dispatch_ui_action(
         Action::OpenJobs => state.toggle_overlay(OverlayKind::Jobs),
         Action::OpenHosts => toggle_hosts_overlay(state),
         Action::OpenHelp => state.toggle_overlay(OverlayKind::Help),
+        Action::ToggleSelect => {
+            toggle_selection_and_advance(state, focused, visible_count);
+        }
+        Action::ViewFile => {
+            let Some(entry) = focused.filter(|entry| entry.kind == EntryKind::File) else {
+                state.message = Some("Select a regular file to view".into());
+                return Ok(());
+            };
+            let location = state.active_pane().location.clone();
+            let Location::Local(base) = &location else {
+                state.message = Some("File preview is currently local-only".into());
+                return Ok(());
+            };
+            let path = base.join(&entry.name);
+            let id = effect_dispatcher.dispatch(
+                EffectLane::Preview,
+                EffectScope::Location(location),
+                Effect::PreviewFile { path },
+            );
+            state.register_effect(EffectLane::Preview, id);
+            state.message = Some(format!("Loading preview: {}", entry.name));
+        }
+        Action::EditFile => {
+            let Some(entry) = focused.filter(|entry| entry.kind == EntryKind::File) else {
+                state.message = Some("Select a regular file to edit".into());
+                return Ok(());
+            };
+            let Location::Local(base) = &state.active_pane().location else {
+                state.message = Some("File editing is currently local-only".into());
+                return Ok(());
+            };
+            let path = base.join(&entry.name);
+            let Some(editor) = configured_editor else {
+                state.message =
+                    Some("No editor configured (config.ui.editor, VISUAL, or EDITOR)".into());
+                return Ok(());
+            };
+            let editor_result = terminal_session
+                .suspend_while(|| DesktopService::open_editor(editor, &path))
+                .await?;
+            if let Err(error) = editor_result {
+                state.message = Some(format!("Editor failed: {error}"));
+            }
+            schedule_active_pane_load(pane_loader, state);
+        }
         Action::BeginSymlink => {
             if let Some(entry) = focused {
                 state.cmd = format!("ln -s '{}' ", entry.name);
@@ -4137,6 +4304,7 @@ fn dispatch_ui_action(
         Action::CloseWorkspaceSyncOverlay => state.close_overlay(OverlayKind::SyncPreview),
         _ => state.apply(action),
     }
+    Ok(())
 }
 
 fn supersede_workspace_launch_for_new_action(state: &mut AppState, sync: &SyncUiRuntime) -> bool {
@@ -4234,17 +4402,35 @@ fn cancel_workspace_sync(state: &mut AppState, sync: &SyncUiRuntime) {
     }
 }
 
-fn execute_command_target(
+// ponytail: a context struct would only hide these already-scoped runtime services.
+#[allow(clippy::too_many_arguments)]
+async fn execute_command_target(
     state: &mut AppState,
     target: CommandTarget,
     focused: Option<&Entry>,
+    visible_count: usize,
     workspace_scanner: &WorkspaceScanner,
     pane_loader: &PaneLoader,
     sync: &SyncUiRuntime,
-) -> Option<Effect> {
-    match target {
+    effect_dispatcher: &EffectDispatcher,
+    terminal_session: &mut TuiTerminalSession,
+    configured_editor: Option<&str>,
+) -> io::Result<Option<Effect>> {
+    let effect = match target {
         CommandTarget::Action(action) => {
-            dispatch_ui_action(state, action, focused, workspace_scanner, sync);
+            dispatch_ui_action(
+                state,
+                action,
+                focused,
+                visible_count,
+                workspace_scanner,
+                sync,
+                effect_dispatcher,
+                pane_loader,
+                terminal_session,
+                configured_editor,
+            )
+            .await?;
             None
         }
         CommandTarget::Location(location) => {
@@ -4285,7 +4471,8 @@ fn execute_command_target(
             Some(Effect::AttachScreen { session })
         }
         CommandTarget::ShellCommand(command) => Some(Effect::SpawnShell { command }),
-    }
+    };
+    Ok(effect)
 }
 
 fn start_workspace_scan(scanner: &WorkspaceScanner, state: &mut AppState, keep_preview_open: bool) {
@@ -4490,17 +4677,93 @@ mod tests {
     };
 
     #[test]
-    fn footer_uses_runtime_keymap() {
-        let keymap = Keymap::new(vec![KeyBinding::new(
-            InputContext::Browser,
-            vec![KeyStroke::new(KeyCode::F(12), KeyModifiers::NONE)],
-            Action::ToggleWorkspaceComparison,
-        )]);
-        let router = KeyRouter::new(keymap);
+    fn footer_uses_remapped_file_action_bindings() {
+        let keymap = Keymap::new(vec![
+            KeyBinding::new(
+                InputContext::Browser,
+                vec![KeyStroke::new(KeyCode::F(12), KeyModifiers::NONE)],
+                Action::ViewFile,
+            ),
+            KeyBinding::new(
+                InputContext::Browser,
+                vec![KeyStroke::new(KeyCode::F(11), KeyModifiers::NONE)],
+                Action::EditFile,
+            ),
+            KeyBinding::new(
+                InputContext::Browser,
+                vec![
+                    KeyStroke::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                    KeyStroke::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                ],
+                Action::BeginChmod,
+            ),
+        ]);
+        let mut router = KeyRouter::new(keymap);
 
         assert_eq!(
-            contextual_footer_text(&AppState::default(), &router).as_deref(),
-            Some("F12 Compare panes")
+            contextual_footer_text(
+                &AppState::default(),
+                &router,
+                Some(EntryKind::File),
+                true,
+                u16::MAX,
+            )
+            .as_deref(),
+            Some("F12 View file    F11 Edit file")
+        );
+
+        assert_eq!(
+            router.resolve_stroke(
+                InputContext::Browser,
+                KeyStroke::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            ),
+            KeyResolution::Pending
+        );
+        assert!(
+            contextual_footer_text(
+                &AppState::default(),
+                &router,
+                Some(EntryKind::File),
+                true,
+                u16::MAX,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn footer_fits_priority_prefix_to_real_width() {
+        let state = AppState::default();
+        let router = KeyRouter::default();
+        let wide =
+            contextual_footer_text(&state, &router, Some(EntryKind::File), true, u16::MAX).unwrap();
+        assert_eq!(wide.split("    ").count(), 8);
+        assert!(wide.contains("F3 View file"));
+        assert!(wide.contains("F4 Edit file"));
+        assert!(wide.contains("Ctrl+J Jobs"));
+        assert!(wide.contains("Ctrl+B Bookmarks"));
+
+        let first = wide.split("    ").next().unwrap();
+        let first_width = u16::try_from(Line::from(first).width()).unwrap();
+        assert_eq!(
+            contextual_footer_text(&state, &router, Some(EntryKind::File), true, first_width,)
+                .as_deref(),
+            Some(first)
+        );
+        assert!(
+            contextual_footer_text(
+                &state,
+                &router,
+                Some(EntryKind::File),
+                true,
+                first_width - 1,
+            )
+            .is_none()
+        );
+        assert!(
+            !contextual_footer_text(&state, &router, Some(EntryKind::Directory), true, u16::MAX,)
+                .unwrap()
+                .contains("F3 View file")
         );
     }
 
@@ -4513,7 +4776,9 @@ mod tests {
         );
 
         assert_eq!(resolution, KeyResolution::Pending);
-        assert!(contextual_footer_text(&AppState::default(), &router).is_none());
+        assert!(
+            contextual_footer_text(&AppState::default(), &router, None, false, u16::MAX).is_none()
+        );
     }
 
     fn file(name: &str) -> Entry {
@@ -4523,6 +4788,144 @@ mod tests {
             size: Some(1),
             modified_unix_ms: None,
         }
+    }
+
+    #[test]
+    fn selection_from_other_pane_is_not_a_mutation_target() {
+        let mut state = AppState::default();
+        let left_location = state.left.location.clone();
+        state.toggle_selection(Pane::Left, &left_location, "left-only.txt");
+        state.active = Pane::Right;
+        let right_entries = [file("right.txt")];
+        let visible = right_entries.iter().collect::<Vec<_>>();
+
+        assert_eq!(selection_or_cursor(&state, &visible, 0), vec!["right.txt"]);
+    }
+
+    #[test]
+    fn selection_from_previous_location_is_not_a_mutation_target() {
+        let mut state = AppState::default();
+        state.left.location = Location::Local("/a".into());
+        let original = state.left.location.clone();
+        state.toggle_selection(Pane::Left, &original, "foo.txt");
+        state.left.location = Location::Local("/b".into());
+        let current_entries = [file("bar.txt")];
+        let visible = current_entries.iter().collect::<Vec<_>>();
+
+        assert_eq!(selection_or_cursor(&state, &visible, 0), vec!["bar.txt"]);
+        assert_eq!(state.selection_count(Pane::Left, &state.left.location), 0);
+    }
+
+    #[test]
+    fn selection_toggle_advances_first_and_middle_but_stops_at_last() {
+        let entries = [file("first"), file("middle"), file("last")];
+
+        for (start, expected_cursor) in [(0, 1), (1, 2), (2, 2)] {
+            let mut state = AppState::default();
+            state.left.cursor = start;
+            let location = state.left.location.clone();
+
+            toggle_selection_and_advance(&mut state, entries.get(start), entries.len());
+
+            assert!(state.is_selected(Pane::Left, &location, &entries[start].name));
+            assert_eq!(state.left.cursor, expected_cursor);
+        }
+    }
+
+    #[test]
+    fn selection_toggle_advances_within_filtered_entries_only() {
+        let entries = [file("first"), file("hidden"), file("last")];
+        let visible = [&entries[0], &entries[2]];
+        let mut state = AppState::default();
+        let location = state.left.location.clone();
+
+        toggle_selection_and_advance(&mut state, visible.first().copied(), visible.len());
+        assert_eq!(state.left.cursor, 1);
+        toggle_selection_and_advance(&mut state, visible.get(1).copied(), visible.len());
+
+        assert_eq!(state.left.cursor, 1);
+        assert!(state.is_selected(Pane::Left, &location, "first"));
+        assert!(!state.is_selected(Pane::Left, &location, "hidden"));
+        assert!(state.is_selected(Pane::Left, &location, "last"));
+    }
+
+    #[test]
+    fn selection_toggle_is_a_noop_for_an_empty_list() {
+        let mut state = AppState::default();
+        let location = state.left.location.clone();
+
+        toggle_selection_and_advance(&mut state, None, 0);
+
+        assert_eq!(state.left.cursor, 0);
+        assert_eq!(state.selection_count(Pane::Left, &location), 0);
+    }
+
+    #[test]
+    fn virtual_parent_is_always_visible_exactly_once_away_from_root() {
+        let entries = [
+            Entry {
+                name: "..".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            file("child.txt"),
+        ];
+        let parent = virtual_parent_entry();
+
+        let non_roots = [
+            Location::Local("/tmp/work".into()),
+            Location::Sftp {
+                host: "prod".into(),
+                path: "/srv".into(),
+            },
+            Location::Archive {
+                archive: "/tmp/data.zip".into(),
+                inner_path: String::new(),
+            },
+            Location::Archive {
+                archive: "/tmp/data.zip".into(),
+                inner_path: "nested".into(),
+            },
+        ];
+        for location in non_roots {
+            let visible = apply_filter_with_parent(&entries, "does-not-match", &location, &parent);
+            assert_eq!(
+                visible
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec![".."]
+            );
+        }
+
+        let roots = [
+            Location::Local("/".into()),
+            Location::Sftp {
+                host: "prod".into(),
+                path: "/".into(),
+            },
+        ];
+        for location in roots {
+            let visible = apply_filter_with_parent(&entries, "", &location, &parent);
+            assert!(!visible.iter().any(|entry| entry.name == ".."));
+        }
+    }
+
+    #[test]
+    fn virtual_parent_navigates_but_is_not_a_mutation_target() {
+        let parent = virtual_parent_entry();
+        let location = Location::Local("/tmp/work".into());
+        let mut state = AppState::default();
+        state.left.location = location.clone();
+
+        assert_eq!(
+            directory_navigation_target(&location, &parent),
+            Some(Location::Local("/tmp".into()))
+        );
+        assert!(selection_or_cursor(&state, &[&parent], 0).is_empty());
+        toggle_selection_and_advance(&mut state, Some(&parent), 1);
+        assert_eq!(state.selection_count(Pane::Left, &location), 0);
     }
 
     #[test]
@@ -4539,7 +4942,8 @@ mod tests {
             &[file("source.txt")],
             &[],
         );
-        let preview_footer = contextual_footer_text(&preview, &router).unwrap_or_default();
+        let preview_footer =
+            contextual_footer_text(&preview, &router, None, false, u16::MAX).unwrap_or_default();
         assert!(preview_footer.contains("Enter Execute workspace sync"));
         assert!(preview_footer.contains("D Reverse sync direction"));
         assert!(preview_footer.contains("M Toggle update/mirror"));
@@ -4573,7 +4977,8 @@ mod tests {
         .expect("freeze mirror preview");
         confirmation.remote_workspace.set_frozen_plan(frozen);
         let confirmation_footer =
-            contextual_footer_text(&confirmation, &router).unwrap_or_default();
+            contextual_footer_text(&confirmation, &router, None, false, u16::MAX)
+                .unwrap_or_default();
         assert!(confirmation_footer.contains("Enter Confirm workspace sync"));
         assert!(confirmation_footer.contains("Esc Back in workspace sync"));
 
@@ -4582,7 +4987,8 @@ mod tests {
         running.remote_workspace.ux = WorkspaceSyncUxState::Running {
             job_id: "sync-1".into(),
         };
-        let running_footer = contextual_footer_text(&running, &router).unwrap_or_default();
+        let running_footer =
+            contextual_footer_text(&running, &router, None, false, u16::MAX).unwrap_or_default();
         assert!(running_footer.contains("C Cancel workspace sync"));
         assert!(running_footer.contains("Esc Hide workspace sync"));
         assert!(!running_footer.contains("verification diff"));
@@ -4639,6 +5045,44 @@ mod tests {
             PaneSurfaceState::LoadError { attempted, message }
                 if attempted == &target && message == "SSH connection failed"
         ));
+    }
+
+    #[test]
+    fn navigation_completion_clears_selection_even_if_pane_became_inactive() {
+        let mut state = AppState::default();
+        let original = state.left.location.clone();
+        let target = Location::Local("/target".into());
+        state.toggle_selection(Pane::Left, &original, "foo.txt");
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(1),
+            target.clone(),
+            PaneLoadPurpose::Navigate {
+                remember_current: true,
+            },
+        );
+        state.active = Pane::Right;
+        let mut left_entries = vec![file("current.txt")];
+        let mut right_entries = Vec::new();
+
+        apply_pane_load_response(
+            PaneLoadResponse {
+                id: PaneLoadId(1),
+                pane: Pane::Left,
+                location: target.clone(),
+                purpose: PaneLoadPurpose::Navigate {
+                    remember_current: true,
+                },
+                result: Ok(vec![file("foo.txt")]),
+            },
+            &mut state,
+            &mut left_entries,
+            &mut right_entries,
+        );
+
+        assert_eq!(state.left.location, target);
+        assert_eq!(state.selection_count(Pane::Left, &original), 0);
+        assert!(state.selected.is_empty());
     }
 
     #[test]

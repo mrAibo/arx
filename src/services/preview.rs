@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 
 use crate::process::ProcessService;
 
@@ -78,23 +78,7 @@ impl PreviewService {
             }
         }
 
-        let bat_args = vec![
-            "--style=plain".into(),
-            "--color=never".into(),
-            "--paging=never".into(),
-            "--line-range=:200".into(),
-            path_string,
-        ];
-        if let Some(mut lines) = output_lines("bat", &bat_args).await {
-            let total = tokio::fs::metadata(path)
-                .await
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
-            lines.insert(0, format!("[Code] {} — {total} bytes", path.display()));
-            return lines;
-        }
-
-        read_head(path, 500)
+        read_text_preview(path)
             .await
             .unwrap_or_else(|error| vec![format!("Error: {error}")])
     }
@@ -113,15 +97,100 @@ async fn output_lines(program: &str, args: &[String]) -> Option<Vec<String>> {
     )
 }
 
-async fn read_head(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>> {
+const MAX_TEXT_PREVIEW_BYTES: usize = 1024 * 1024;
+const MAX_TEXT_PREVIEW_LINES: usize = 500;
+
+async fn read_text_preview(path: &Path) -> std::io::Result<Vec<String>> {
     let file = tokio::fs::File::open(path).await?;
-    let mut lines = BufReader::new(file).lines();
-    let mut result = Vec::new();
-    while result.len() < max_lines {
-        match lines.next_line().await? {
-            Some(line) => result.push(line),
-            None => break,
-        }
+    let total_bytes = file.metadata().await?.len();
+    let mut limited = file.take((MAX_TEXT_PREVIEW_BYTES + 1) as u64);
+    let mut bytes = Vec::new();
+    limited.read_to_end(&mut bytes).await?;
+
+    let bytes_truncated = bytes.len() > MAX_TEXT_PREVIEW_BYTES;
+    bytes.truncate(MAX_TEXT_PREVIEW_BYTES);
+    if bytes.contains(&0) {
+        return Ok(vec![format!(
+            "[Binary preview disabled] {}",
+            path.display()
+        )]);
     }
-    Ok(result)
+
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(error) if bytes_truncated && error.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..error.valid_up_to()]).expect("valid UTF-8 prefix")
+        }
+        Err(_) => {
+            return Ok(vec![format!(
+                "[Binary preview disabled] {}",
+                path.display()
+            )]);
+        }
+    };
+
+    let mut source_lines = text.lines();
+    let mut lines = source_lines
+        .by_ref()
+        .take(MAX_TEXT_PREVIEW_LINES)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let lines_truncated = source_lines.next().is_some();
+    lines.insert(
+        0,
+        format!("[Text] {} — {total_bytes} bytes", path.display()),
+    );
+    if bytes_truncated || lines_truncated {
+        lines.push(format!(
+            "[Truncated at {} bytes / {} lines]",
+            MAX_TEXT_PREVIEW_BYTES, MAX_TEXT_PREVIEW_LINES
+        ));
+    }
+    Ok(lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn previews_small_utf8_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        tokio::fs::write(&path, "hello\nworld\n").await.unwrap();
+
+        let lines = PreviewService::preview(&path).await;
+
+        assert!(lines[0].starts_with("[Text]"));
+        assert!(lines.iter().any(|line| line == "hello"));
+        assert!(lines.iter().any(|line| line == "world"));
+    }
+
+    #[tokio::test]
+    async fn rejects_binary_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary.txt");
+        tokio::fs::write(&path, [b'a', 0, b'b']).await.unwrap();
+
+        let lines = PreviewService::preview(&path).await;
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("Binary preview disabled"));
+    }
+
+    #[tokio::test]
+    async fn truncates_large_text_with_an_explicit_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let content = (0..600)
+            .map(|line| format!("line-{line}-{}", "x".repeat(2048)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        tokio::fs::write(&path, content).await.unwrap();
+
+        let lines = PreviewService::preview(&path).await;
+
+        assert!(lines.len() <= 502);
+        assert!(lines.last().is_some_and(|line| line.contains("Truncated")));
+    }
 }

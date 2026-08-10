@@ -1,5 +1,7 @@
 use super::{ActionId, AppState, WorkspaceSyncUxState};
-use crate::vfs::{Capability, CapabilitySet, ProviderId, capabilities::builtin_capabilities};
+use crate::vfs::{
+    Capability, CapabilitySet, EntryKind, ProviderId, capabilities::builtin_capabilities,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionAvailability {
@@ -28,6 +30,8 @@ pub struct ActionContext {
     pub active_capabilities: CapabilitySet,
     pub passive_capabilities: CapabilitySet,
     pub selection_count: usize,
+    pub focused_kind: Option<EntryKind>,
+    pub editor_available: bool,
     pub sync_execute_ready: bool,
     pub sync_confirmation_ready: bool,
     pub sync_cancel_ready: bool,
@@ -98,7 +102,9 @@ impl ActionContext {
             passive_provider,
             active_capabilities,
             passive_capabilities,
-            selection_count: state.selected.len(),
+            selection_count: state.selection_count(state.active, &state.active_pane().location),
+            focused_kind: None,
+            editor_available: false,
             sync_execute_ready,
             sync_confirmation_ready,
             sync_cancel_ready,
@@ -106,6 +112,16 @@ impl ActionContext {
             sync_verification_diff_ready,
             sync_return_preview_ready,
         }
+    }
+
+    pub fn with_file_context(
+        mut self,
+        focused_kind: Option<EntryKind>,
+        editor_available: bool,
+    ) -> Self {
+        self.focused_kind = focused_kind;
+        self.editor_available = editor_available;
+        self
     }
 }
 
@@ -134,6 +150,29 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
         ActionId::BeginChmod => {
             require_active_capability(ctx, Capability::Chmod, "Permission changes")
         }
+        ActionId::ViewFile if ctx.active_provider != ProviderId::Local => {
+            ActionAvailability::Disabled {
+                reason: "Remote viewing is not supported yet".into(),
+            }
+        }
+        ActionId::ViewFile if ctx.focused_kind != Some(EntryKind::File) => {
+            ActionAvailability::Disabled {
+                reason: "Select a regular file to view".into(),
+            }
+        }
+        ActionId::EditFile if ctx.active_provider != ProviderId::Local => {
+            ActionAvailability::Disabled {
+                reason: "Remote editing is not supported yet".into(),
+            }
+        }
+        ActionId::EditFile if ctx.focused_kind != Some(EntryKind::File) => {
+            ActionAvailability::Disabled {
+                reason: "Select a regular file to edit".into(),
+            }
+        }
+        ActionId::EditFile if !ctx.editor_available => ActionAvailability::Disabled {
+            reason: "No editor configured (config.ui.editor, VISUAL, or EDITOR)".into(),
+        },
         // Hard links and chown do not yet have VFS capabilities. Keep them
         // local-only rather than pretending remote providers support them.
         ActionId::BeginHardLink if ctx.active_provider != ProviderId::Local => {
@@ -188,6 +227,8 @@ mod tests {
             active_capabilities,
             passive_capabilities: LOCAL_CAPABILITIES,
             selection_count: 0,
+            focused_kind: Some(EntryKind::File),
+            editor_available: true,
             sync_execute_ready: false,
             sync_confirmation_ready: false,
             sync_cancel_ready: false,
@@ -202,6 +243,43 @@ mod tests {
         let ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
         assert!(matches!(
             action_availability(ActionId::BeginHardLink, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn remote_view_is_disabled_until_provider_reads_are_wired() {
+        let ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+        let availability = action_availability(ActionId::ViewFile, &ctx);
+        assert!(matches!(availability, ActionAvailability::Disabled { .. }));
+        assert!(availability.reason().is_some());
+    }
+
+    #[test]
+    fn remote_edit_is_disabled_until_provider_writes_are_wired() {
+        let ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+        let availability = action_availability(ActionId::EditFile, &ctx);
+        assert!(matches!(availability, ActionAvailability::Disabled { .. }));
+        assert!(availability.reason().is_some());
+    }
+
+    #[test]
+    fn file_actions_require_a_regular_file_and_edit_requires_an_editor() {
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        ctx.focused_kind = Some(EntryKind::Directory);
+        assert!(matches!(
+            action_availability(ActionId::ViewFile, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+        assert!(matches!(
+            action_availability(ActionId::EditFile, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+
+        ctx.focused_kind = Some(EntryKind::File);
+        ctx.editor_available = false;
+        assert!(matches!(
+            action_availability(ActionId::EditFile, &ctx),
             ActionAvailability::Disabled { .. }
         ));
     }
