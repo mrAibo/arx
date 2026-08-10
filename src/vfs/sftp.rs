@@ -172,36 +172,55 @@ impl SftpProvider {
     }
 
     async fn mkdir(&self, path: &str) -> std::io::Result<()> {
-        let guard = self.connect_for_mutation().await?;
+        let mut guard = self.connect_for_mutation().await?;
         let conn = guard
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
-        conn.session
-            .create_dir(path.to_string())
-            .await
-            .map_err(|e| std::io::Error::other(format!("SFTP mkdir {path}: {e}")))
+        match conn.session.create_dir(path.to_string()).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(mut broken) = guard.take() {
+                    broken.abort().await;
+                }
+                Err(std::io::Error::other(format!("SFTP mkdir {path}: {e}")))
+            }
+        }
     }
 
     async fn remove_file(&self, path: &str) -> std::io::Result<()> {
-        let guard = self.connect_for_mutation().await?;
+        let mut guard = self.connect_for_mutation().await?;
         let conn = guard
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
-        conn.session
-            .remove_file(path.to_string())
-            .await
-            .map_err(|e| std::io::Error::other(format!("SFTP remove_file {path}: {e}")))
+        match conn.session.remove_file(path.to_string()).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(mut broken) = guard.take() {
+                    broken.abort().await;
+                }
+                Err(std::io::Error::other(format!(
+                    "SFTP remove_file {path}: {e}"
+                )))
+            }
+        }
     }
 
     async fn remove_dir(&self, path: &str) -> std::io::Result<()> {
-        let guard = self.connect_for_mutation().await?;
+        let mut guard = self.connect_for_mutation().await?;
         let conn = guard
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
-        conn.session
-            .remove_dir(path.to_string())
-            .await
-            .map_err(|e| std::io::Error::other(format!("SFTP remove_dir {path}: {e}")))
+        match conn.session.remove_dir(path.to_string()).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(mut broken) = guard.take() {
+                    broken.abort().await;
+                }
+                Err(std::io::Error::other(format!(
+                    "SFTP remove_dir {path}: {e}"
+                )))
+            }
+        }
     }
 }
 #[async_trait::async_trait]
