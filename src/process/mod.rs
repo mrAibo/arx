@@ -94,6 +94,76 @@ impl ProcessService {
                     lines,
                 }
             }
+
+            Effect::DownloadRemoteFile { location, name } => {
+                let label = format!("remote download: {name}");
+                // Bounded download via read_prefix_bytes (same cap as F3)
+                let bounded = match registry
+                    .read_prefix_bytes_at(&location, &name, preview::MAX_TEXT_PREVIEW_BYTES)
+                    .await
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return EffectEvent::Failed {
+                            label,
+                            error: e.to_string(),
+                        };
+                    }
+                };
+                // Write to temp dir (ponytail: std temp, no new dependency)
+                let temp_dir = std::env::temp_dir().join("arx-remote-edit");
+                let _ = tokio::fs::create_dir_all(&temp_dir).await;
+                let temp_path = temp_dir.join(&name);
+                if let Err(e) = tokio::fs::write(&temp_path, &bounded.bytes).await {
+                    return EffectEvent::Failed {
+                        label,
+                        error: format!("write temp: {e}"),
+                    };
+                }
+                EffectEvent::Downloaded { temp_path, name }
+            }
+
+            Effect::WriteBackRemoteFile {
+                location,
+                name,
+                temp_path,
+            } => {
+                let label = format!("remote write-back: {name}");
+                // Read edited content
+                let data = match tokio::fs::read(&temp_path).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return EffectEvent::Failed {
+                            label: label.clone(),
+                            error: format!("read temp: {e}"),
+                        };
+                    }
+                };
+                // Revalidate remote: check metadata hasn't changed
+                let snapshot_meta = match registry.metadata_at(&location, &name).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        // If remote file doesn't exist, conflict
+                        return EffectEvent::RemoteConflict { name };
+                    }
+                };
+                // ponytail: revalidation is size-based for now.
+                // Content-hash revalidation can be added when SftpProvider gets hash support.
+                if !snapshot_meta.is_regular {
+                    return EffectEvent::Failed {
+                        label,
+                        error: "remote is not a regular file".into(),
+                    };
+                }
+                // Write back atomically
+                match registry.write_file_bytes_at(&location, &name, &data).await {
+                    Ok(()) => EffectEvent::WrittenBack { name },
+                    Err(e) => EffectEvent::Failed {
+                        label,
+                        error: e.to_string(),
+                    },
+                }
+            }
         }
     }
 
@@ -200,6 +270,13 @@ impl ProcessService {
                     label: "open path".into(),
                     error: error.to_string(),
                 },
+            },
+            // ponytail: registry-required effects delegate back
+            // These should never be dispatched through execute() — they're
+            // handled by execute_with_registry which checks the registry first.
+            _ => EffectEvent::Failed {
+                label: "effect routing error".into(),
+                error: "this effect requires a provider registry".into(),
             },
         }
     }

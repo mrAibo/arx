@@ -5054,6 +5054,18 @@ fn apply_effect_event(state: &mut AppState, event: EffectEvent) {
         EffectEvent::PathOpened { path } => {
             state.message = Some(format!("Opened {}", path.display()));
         }
+        EffectEvent::Downloaded { temp_path, name } => {
+            state.message = Some(format!("Downloaded: {name}"));
+            // Temp path is returned to caller (dispatch_ui_action) for editor launch
+        }
+        EffectEvent::WrittenBack { name } => {
+            state.message = Some(format!("Uploaded: {name}"));
+        }
+        EffectEvent::RemoteConflict { name } => {
+            state.message = Some(format!(
+                "{name} changed on remote during edit — write-back refused"
+            ));
+        }
         EffectEvent::Failed { label, error } => {
             state.message = Some(format!("{label} failed: {error}"));
         }

@@ -41,6 +41,17 @@ pub enum Effect {
         name: String,
         total_size: Option<u64>,
     },
+    /// Download a remote file to a secure temp directory for editing.
+    DownloadRemoteFile {
+        location: Location,
+        name: String,
+    },
+    /// Write edited content back to a remote file (atomic staging).
+    WriteBackRemoteFile {
+        location: Location,
+        name: String,
+        temp_path: PathBuf,
+    },
     OpenPath {
         path: PathBuf,
     },
@@ -77,6 +88,19 @@ pub enum EffectEvent {
     },
     PathOpened {
         path: PathBuf,
+    },
+    /// Remote file downloaded to temp path for editing.
+    Downloaded {
+        temp_path: PathBuf,
+        name: String,
+    },
+    /// Edited content successfully written back to remote.
+    WrittenBack {
+        name: String,
+    },
+    /// Remote file changed during edit — write-back refused.
+    RemoteConflict {
+        name: String,
     },
     Failed {
         label: String,

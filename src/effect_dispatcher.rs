@@ -20,6 +20,7 @@ pub enum EffectLane {
     TmuxDiscovery,
     GitStatus,
     Preview,
+    RemoteEdit,
     Workspace,
     LeftPane,
     RightPane,
