@@ -612,6 +612,9 @@ async fn event_loop(
                                         }
                                         let registry = state.registry.clone();
                                         let name_for_msg = name.clone();
+                                        let pane = state.active;
+                                        let pane_location = loc.clone();
+                                        let loader = pane_loader.clone();
                                         let job = job_manager.create_job(
                                             "mkdir",
                                             arx::jobs::JobKind::RemoteCommand,
@@ -642,6 +645,11 @@ async fn event_loop(
                                                             ),
                                                         },
                                                     );
+                                                    let _ = loader.load(
+                                                        pane,
+                                                        pane_location,
+                                                        PaneLoadPurpose::Refresh,
+                                                    );
                                                 }
                                                 Err(e) => {
                                                     let _ = jobs.publish_event(
@@ -654,9 +662,6 @@ async fn event_loop(
                                                     );
                                                 }
                                             }
-                                            // ponytail: skip pane refresh — user presses F2.
-                                            // PaneLoader is Clone but refreshing before server fsync
-                                            // risks showing stale listing.
                                         });
                                         state.message = Some(format!("mkdir {name_for_msg}…"));
                                     } else {
@@ -4422,6 +4427,8 @@ async fn dispatch_ui_action(
                 return Ok(());
             };
             let registry = state.registry.clone();
+            let pane = state.active;
+            let loader = pane_loader.clone();
             let location = plan.location.clone();
             let targets = plan.targets;
             let target_count = targets.len();
@@ -4548,6 +4555,11 @@ async fn dispatch_ui_action(
                             failed += 1;
                         }
                     }
+                }
+
+                // Refresh pane after any physical mutations
+                if completed > 0 || failed > 0 {
+                    let _ = loader.load(pane, location, PaneLoadPurpose::Refresh);
                 }
 
                 if cancelled {
