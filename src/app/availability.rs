@@ -236,9 +236,9 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
                 ActionAvailability::Disabled {
                     reason: "Select a file or directory to delete".into(),
                 }
-            } else if ctx.active_provider != ProviderId::Local {
+            } else if !ctx.active_capabilities.supports(Capability::Delete) {
                 ActionAvailability::Disabled {
-                    reason: "Trash is currently local-only".into(),
+                    reason: "Delete is not supported for this location".into(),
                 }
             } else {
                 ActionAvailability::Available
@@ -514,8 +514,21 @@ mod tests {
     }
 
     #[test]
-    fn delete_disabled_for_sftp() {
+    fn delete_available_for_sftp_now() {
         let mut ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+        ctx.focused_kind = Some(EntryKind::File);
+        assert_eq!(
+            action_availability(ActionId::Delete, &ctx),
+            ActionAvailability::Available
+        );
+    }
+
+    #[test]
+    fn delete_disabled_for_archive() {
+        let mut ctx = context(
+            ProviderId::Archive,
+            crate::vfs::capabilities::ARCHIVE_CAPABILITIES,
+        );
         ctx.focused_kind = Some(EntryKind::File);
         assert!(matches!(
             action_availability(ActionId::Delete, &ctx),
