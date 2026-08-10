@@ -4035,23 +4035,50 @@ async fn dispatch_ui_action(
                 state.message = Some("Select a regular file to edit".into());
                 return Ok(());
             };
-            let Location::Local(base) = &state.active_pane().location else {
-                state.message = Some("File editing is currently local-only".into());
-                return Ok(());
-            };
-            let path = base.join(&entry.name);
             let Some(editor) = configured_editor else {
                 state.message =
                     Some("No editor configured (config.ui.editor, VISUAL, or EDITOR)".into());
                 return Ok(());
             };
-            let editor_result = terminal_session
-                .suspend_while(|| DesktopService::open_editor(editor, &path))
-                .await?;
-            if let Err(error) = editor_result {
-                state.message = Some(format!("Editor failed: {error}"));
+
+            match &state.active_pane().location {
+                Location::Local(base) => {
+                    // Local: direct editor on original file
+                    let path = base.join(&entry.name);
+                    let editor_result = terminal_session
+                        .suspend_while(|| DesktopService::open_editor(editor, &path))
+                        .await?;
+                    if let Err(error) = editor_result {
+                        state.message = Some(format!("Editor failed: {error}"));
+                    }
+                    schedule_active_pane_load(pane_loader, state);
+                }
+                Location::Sftp { .. } => {
+                    // Remote: download → edit → write-back
+                    let location = state.active_pane().location.clone();
+                    let name = entry.name.clone();
+
+                    // Phase 1: download to temp
+                    let id = effect_dispatcher.dispatch(
+                        EffectLane::RemoteEdit,
+                        EffectScope::Location(location.clone()),
+                        Effect::DownloadRemoteFile {
+                            location: location.clone(),
+                            name: name.clone(),
+                        },
+                    );
+                    state.register_effect(EffectLane::RemoteEdit, id);
+                    state.message = Some(format!("Downloading: {name}..."));
+
+                    // ponytail: FIXME — phase 2+3 needs async state machine.
+                    // For now, the download completes asynchronously and
+                    // handle_effect_response picks up Downloaded.
+                    // Phase 2 (editor) and Phase 3 (write-back) are NOT wired yet.
+                }
+                _ => {
+                    state.message = Some("File editing is not supported for this location".into());
+                }
             }
-            schedule_active_pane_load(pane_loader, state);
         }
         Action::BeginSymlink => {
             if let Some(entry) = focused {

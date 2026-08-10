@@ -173,9 +173,15 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
                 reason: "Select a regular file to view".into(),
             }
         }
-        ActionId::EditFile if ctx.active_provider != ProviderId::Local => {
+        ActionId::EditFile
+            if !ctx.active_capabilities.contains_all(
+                CapabilitySet::NONE
+                    .with(Capability::Read)
+                    .with(Capability::Write),
+            ) =>
+        {
             ActionAvailability::Disabled {
-                reason: "Remote editing is not supported yet".into(),
+                reason: "Remote editing requires Read + Write capability".into(),
             }
         }
         ActionId::EditFile if ctx.focused_kind != Some(EntryKind::File) => {
@@ -309,7 +315,7 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vfs::capabilities::{LOCAL_CAPABILITIES, SFTP_CAPABILITIES};
+    use crate::vfs::capabilities::{ARCHIVE_CAPABILITIES, LOCAL_CAPABILITIES, SFTP_CAPABILITIES};
 
     fn context(active_provider: ProviderId, active_capabilities: CapabilitySet) -> ActionContext {
         ActionContext {
@@ -358,11 +364,24 @@ mod tests {
     }
 
     #[test]
-    fn remote_edit_is_disabled_until_provider_writes_are_wired() {
-        let ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+    fn sftp_edit_is_available_when_read_write_present() {
+        let mut ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+        ctx.editor_available = true;
+        ctx.focused_kind = Some(EntryKind::File);
+        let availability = action_availability(ActionId::EditFile, &ctx);
+        assert!(
+            matches!(availability, ActionAvailability::Available),
+            "SFTP with Read+Write+editor should be Available, got {:?}",
+            availability
+        );
+    }
+
+    #[test]
+    fn edit_disabled_when_provider_lacks_write() {
+        // Archive has List only — no Read+Write
+        let ctx = context(ProviderId::Archive, ARCHIVE_CAPABILITIES);
         let availability = action_availability(ActionId::EditFile, &ctx);
         assert!(matches!(availability, ActionAvailability::Disabled { .. }));
-        assert!(availability.reason().is_some());
     }
 
     #[test]

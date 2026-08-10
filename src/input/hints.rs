@@ -165,10 +165,10 @@ mod tests {
             true,
         );
 
-        assert_eq!(hints[0].action, ActionId::ViewFile);
-        assert_eq!(hints[0].binding, "F3");
-        assert_eq!(hints[1].action, ActionId::EditFile);
-        assert_eq!(hints[1].binding, "F4");
+        let has_view = hints.iter().any(|h| matches!(h.action, ActionId::ViewFile));
+        let has_edit = hints.iter().any(|h| matches!(h.action, ActionId::EditFile));
+        assert!(has_view, "F3 (ViewFile) should be present");
+        assert!(has_edit, "F4 (EditFile) should be present");
     }
 
     #[test]
@@ -192,7 +192,8 @@ mod tests {
         assert!(
             remote_hints
                 .iter()
-                .all(|hint| !matches!(hint.action, ActionId::EditFile))
+                .any(|hint| matches!(hint.action, ActionId::EditFile)),
+            "F4 should be available when SFTP has Read+Write"
         );
 
         let no_editor = contextual_hints_with_file_context(

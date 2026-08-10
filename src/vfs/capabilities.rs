@@ -49,6 +49,7 @@ impl CapabilitySet {
 pub const LOCAL_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::List)
     .with(Capability::Read)
+    .with(Capability::Write)
     .with(Capability::Mkdir)
     .with(Capability::Delete)
     .with(Capability::Copy)
