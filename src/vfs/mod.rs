@@ -1108,4 +1108,31 @@ mod tests {
         let plan = sftp_plan("populated", EntryKind::Directory);
         assert_eq!(plan.targets[0].kind, EntryKind::Directory);
     }
+
+    // ── SFTP remote-view regression ──
+
+    #[test]
+    fn default_registry_reports_sftp_capabilities() {
+        let registry = default_registry();
+        let caps = registry.capabilities(&ProviderId::Sftp).unwrap();
+        assert!(caps.supports(Capability::Read));
+        assert!(caps.supports(Capability::List));
+        assert!(!caps.supports(Capability::Move));
+    }
+
+    #[test]
+    fn local_read_prefix_bytes_reports_unsupported() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        std::fs::write(&path, b"hello\nworld\n").unwrap();
+
+        let registry = default_registry();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(registry.read_prefix_bytes_at(&Location::Local(path), "", 1024));
+
+        // local provider doesn't implement read_prefix_bytes; returns Unsupported
+        assert!(result.is_err());
+    }
 }

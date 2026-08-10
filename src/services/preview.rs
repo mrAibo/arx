@@ -10,7 +10,7 @@ pub struct PreviewService;
 /// - NUL byte → "[Binary preview disabled]"
 /// - Invalid UTF-8 → "[Binary preview disabled]"
 /// - Valid UTF-8 → lines capped at max_lines, with truncation marker if truncated.
-/// `total_size` may be None for remote files where metadata may not include size.
+///   `total_size` may be None for remote files where metadata may not include size.
 pub fn format_bounded_preview(
     bytes: &[u8],
     total_size: Option<u64>,
@@ -24,11 +24,8 @@ pub fn format_bounded_preview(
 
     let text = match std::str::from_utf8(bytes) {
         Ok(t) => t,
-        Err(e) => {
-            let valid = std::str::from_utf8(&bytes[..e.valid_up_to()])
-                .map_err(|_| std::io::Error::other("UTF-8 decode failed"))?;
-            valid
-        }
+        Err(e) => std::str::from_utf8(&bytes[..e.valid_up_to()])
+            .map_err(|_| std::io::Error::other("UTF-8 decode failed"))?,
     };
 
     let mut source_lines = text.lines();
@@ -238,5 +235,63 @@ mod tests {
 
         assert!(lines.len() <= 502);
         assert!(lines.last().is_some_and(|line| line.contains("Truncated")));
+    }
+
+    // ── format_bounded_preview unit tests ──
+
+    #[test]
+    fn format_bounded_preview_small_utf8() {
+        let bytes = b"hello\nworld\n";
+        let lines = format_bounded_preview(bytes, Some(13), false, "test.txt", 500).unwrap();
+
+        assert!(lines[0].contains("[Remote Text]"));
+        assert!(lines.iter().any(|l| l == "hello"));
+        assert!(lines.iter().any(|l| l == "world"));
+        assert!(!lines.iter().any(|l| l.contains("Truncated")));
+    }
+
+    #[test]
+    fn format_bounded_preview_binary_nul() {
+        let bytes = &[b'a', 0, b'b'];
+        let lines = format_bounded_preview(bytes, Some(3), false, "data.bin", 500).unwrap();
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("Binary preview disabled"));
+    }
+
+    #[test]
+    fn format_bounded_preview_invalid_utf8() {
+        // Valid "hel" prefix followed by invalid continuation byte
+        let bytes = &[b'h', b'e', b'l', 0xC0, b'o'];
+        let lines = format_bounded_preview(bytes, Some(5), false, "broken.txt", 500).unwrap();
+
+        assert!(lines[0].contains("[Remote Text]"));
+        assert!(lines.iter().any(|l| l == "hel"));
+    }
+
+    #[test]
+    fn format_bounded_preview_empty() {
+        let lines = format_bounded_preview(b"", Some(0), false, "empty.txt", 500).unwrap();
+
+        assert!(lines[0].contains("[Remote Text]"));
+        assert_eq!(lines.len(), 1); // header only, no content lines, no truncation
+    }
+
+    #[test]
+    fn format_bounded_preview_truncated_lines() {
+        let content = (0..600)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bytes = content.as_bytes();
+        let lines = format_bounded_preview(bytes, Some(bytes.len() as u64), false, "long.txt", 500)
+            .unwrap();
+
+        assert!(lines[0].contains("[Remote Text]"));
+        assert!(
+            lines
+                .last()
+                .is_some_and(|l| l.contains("Truncated at 500 lines"))
+        );
     }
 }

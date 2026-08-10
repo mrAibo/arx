@@ -115,4 +115,23 @@ mod tests {
         assert!(!WEBDAV_CAPABILITIES.supports(Capability::Delete));
         assert_eq!(S3_CAPABILITIES, CapabilitySet::NONE);
     }
+
+    #[test]
+    fn sftp_has_read_capability() {
+        assert!(SFTP_CAPABILITIES.supports(Capability::Read));
+    }
+
+    #[test]
+    fn local_read_unchanged() {
+        assert!(LOCAL_CAPABILITIES.supports(Capability::Read));
+        assert!(LOCAL_CAPABILITIES.supports(Capability::List));
+        assert!(LOCAL_CAPABILITIES.supports(Capability::Move));
+    }
+
+    #[test]
+    fn s3_no_read() {
+        assert!(!S3_CAPABILITIES.supports(Capability::Read));
+        assert!(!S3_CAPABILITIES.supports(Capability::List));
+        assert_eq!(S3_CAPABILITIES, CapabilitySet::NONE);
+    }
 }

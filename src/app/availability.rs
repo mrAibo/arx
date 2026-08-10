@@ -603,4 +603,32 @@ mod tests {
             ActionAvailability::Disabled { .. }
         ));
     }
+
+    #[test]
+    fn viewfile_available_sftp_file() {
+        let mut ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+        ctx.focused_kind = Some(EntryKind::File);
+        assert_eq!(
+            action_availability(ActionId::ViewFile, &ctx),
+            ActionAvailability::Available
+        );
+    }
+
+    #[test]
+    fn viewfile_disabled_sftp_dir() {
+        let mut ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+        ctx.focused_kind = Some(EntryKind::Directory);
+        let availability = action_availability(ActionId::ViewFile, &ctx);
+        assert!(matches!(availability, ActionAvailability::Disabled { .. }));
+        assert!(availability.reason().unwrap().contains("regular file"));
+    }
+
+    #[test]
+    fn viewfile_disabled_parent() {
+        let mut ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+        ctx.focused_kind = None;
+        let availability = action_availability(ActionId::ViewFile, &ctx);
+        assert!(matches!(availability, ActionAvailability::Disabled { .. }));
+        assert!(availability.reason().unwrap().contains("regular file"));
+    }
 }
