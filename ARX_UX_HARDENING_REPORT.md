@@ -4,8 +4,8 @@
 **Дата проверки:** 10 августа 2026  
 **Репозиторий:** `mrAibo/arx`  
 **Ветка:** `feature/commander-ux-hardening`  
-**Pull request:** [#40 — Commander UX hardening: terminal lifecycle](https://github.com/mrAibo/arx/pull/40)  
-**Базовый SHA:** `681089a17372dd797d9c45c35989a830fb36c69f`  
+**Pull request:** [#40 — Commander UX hardening](https://github.com/mrAibo/arx/pull/40)  
+**Terminal-lifecycle checkpoint SHA:** `681089a17372dd797d9c45c35989a830fb36c69f`  
 **Проверенный implementation HEAD:** `90ee248119c6b7518917db05c915bbb090346eb5`
 
 ## Итог
