@@ -369,6 +369,47 @@ async fn event_loop(
                     }
                 }
                 Event::Key(key) => {
+                    // Remote delete confirmation intercepts Enter/Escape
+                    if state.pending_delete.is_some() {
+                        match key.code {
+                            KeyCode::Enter => {
+                                dispatch_ui_action(
+                                    &mut state,
+                                    Action::ConfirmRemoteDelete,
+                                    None, // no focused entry during confirmation
+                                    0,
+                                    &workspace_scanner,
+                                    &sync_runtime,
+                                    &effect_dispatcher,
+                                    &pane_loader,
+                                    terminal_session,
+                                    editor.as_deref(),
+                                )
+                                .await?;
+                                continue;
+                            }
+                            KeyCode::Esc => {
+                                dispatch_ui_action(
+                                    &mut state,
+                                    Action::CancelRemoteDelete,
+                                    None,
+                                    0,
+                                    &workspace_scanner,
+                                    &sync_runtime,
+                                    &effect_dispatcher,
+                                    &pane_loader,
+                                    terminal_session,
+                                    editor.as_deref(),
+                                )
+                                .await?;
+                                continue;
+                            }
+                            _ => {
+                                // Ignore other keys during confirmation
+                                continue;
+                            }
+                        }
+                    }
                     // Command Center owns keyboard input while open. Keep this
                     // before generic text-input routing so Ctrl+P has a real,
                     // usable interaction model.
@@ -2368,6 +2409,26 @@ fn render(
         render_menu(frame, area, state);
     }
 
+    // Remote delete confirmation overlay
+    if let Some(plan) = &state.pending_delete {
+        let msg = format!(
+            "PERMANENT REMOTE DELETE\n\n{} target(s) at {}\n\nNo Trash / Undo  Enter=Confirm  Esc=Cancel",
+            plan.targets.len(),
+            plan.location,
+        );
+        let popup = centered_rect(50, 8, area);
+        frame.render_widget(Clear, popup);
+        let p = ratatui::widgets::Paragraph::new(msg)
+            .block(
+                ratatui::widgets::Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red))
+                    .title(" Confirm Remote Delete "),
+            )
+            .alignment(ratatui::layout::Alignment::Left);
+        frame.render_widget(p, popup);
+    }
+
     // Status bar
     let pane = state.active_pane();
     let loc_str = match &pane.location {
@@ -4167,13 +4228,53 @@ async fn dispatch_ui_action(
         Action::Delete => {
             let names: Vec<String> = state
                 .selection_names(state.active, &state.active_pane().location)
-                .map(|names| names.iter().cloned().collect())
-                .or_else(|| focused.map(|entry| vec![entry.name.clone()]))
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter(|n| *n != VIRTUAL_PARENT_NAME)
+                        .cloned()
+                        .collect()
+                })
+                .or_else(|| {
+                    focused
+                        .filter(|e| e.name != VIRTUAL_PARENT_NAME)
+                        .map(|entry| vec![entry.name.clone()])
+                })
                 .unwrap_or_default();
             if names.is_empty() {
                 state.message = Some("Select a file or directory to delete".into());
                 return Ok(());
             }
+
+            // SFTP: freeze plan for confirmation (no mutation yet)
+            if state.active_pane().location.provider_id() == arx::vfs::ProviderId::Sftp {
+                let targets: Vec<arx::vfs::RemoteDeleteTarget> = names
+                    .iter()
+                    .map(|name| {
+                        let path = match &state.active_pane().location {
+                            arx::vfs::Location::Sftp { path: p, .. } => {
+                                format!("{p}/{name}")
+                            }
+                            _ => unreachable!(),
+                        };
+                        arx::vfs::RemoteDeleteTarget {
+                            name: name.clone(),
+                            kind: arx::vfs::EntryKind::File, // ponytail: kind resolved at REMOTE-06 preflight
+                            path,
+                        }
+                    })
+                    .collect();
+                state.pending_delete = Some(arx::vfs::RemoteDeletePlan {
+                    location: state.active_pane().location.clone(),
+                    targets,
+                    created_at: std::time::Instant::now(),
+                });
+                state.message =
+                    Some("Press Enter to confirm permanent deletion, Escape to cancel".into());
+                return Ok(());
+            }
+
+            // Local: existing trash path
             let Location::Local(dir) = state.active_pane().location.clone() else {
                 state.message = Some("Trash is currently available for local files only".into());
                 return Ok(());
@@ -4257,6 +4358,15 @@ async fn dispatch_ui_action(
             );
             state.register_effect(EffectLane::TmuxDiscovery, id);
             state.message = Some("Discovering tmux sessions…".into());
+        }
+        Action::ConfirmRemoteDelete => {
+            // ponytail: confirmation accepted, REMOTE-06 executor will process
+            let _plan = state.pending_delete.take();
+            state.message = Some("Remote delete queued".into());
+        }
+        Action::CancelRemoteDelete => {
+            state.pending_delete = None;
+            state.message = Some("Remote delete cancelled".into());
         }
         Action::ToggleEmbeddedTerminal => {
             if state.show_terminal {

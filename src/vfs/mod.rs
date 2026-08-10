@@ -603,6 +603,21 @@ pub struct Entry {
     pub modified_unix_ms: Option<u64>,
 }
 
+/// Plan for a remote delete operation, stored in AppState pending confirmation.
+#[derive(Debug, Clone)]
+pub struct RemoteDeletePlan {
+    pub location: Location,
+    pub targets: Vec<RemoteDeleteTarget>,
+    pub created_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteDeleteTarget {
+    pub name: String,
+    pub kind: EntryKind,
+    pub path: String,
+}
+
 pub(crate) fn canonical_unix_mtime_ms(seconds: u64) -> u64 {
     seconds.saturating_mul(1_000)
 }

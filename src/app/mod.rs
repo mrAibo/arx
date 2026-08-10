@@ -9,6 +9,7 @@ use crate::remote::Host;
 use crate::services::{PaneLoadId, PaneLoadPurpose};
 use crate::terminal::TermPane;
 use crate::vfs::Location;
+use crate::vfs::RemoteDeletePlan;
 
 mod actions;
 pub use actions::{
@@ -239,6 +240,8 @@ pub struct AppState {
     pub cmd: String,
     /// Frozen location for provider-backed mkdir (SFTP). Cleared on cancel/submit.
     pub pending_mkdir_location: Option<Location>,
+    /// Pending remote delete plan awaiting user confirmation.
+    pub pending_delete: Option<RemoteDeletePlan>,
     /// Ctrl+X prefix for MC-style key combos
     pub cmd_prefix: bool,
     // C3: user menu
@@ -344,6 +347,7 @@ impl Default for AppState {
             cmd_input: false,
             cmd: String::new(),
             pending_mkdir_location: None,
+            pending_delete: None,
             cmd_prefix: false,
             menu: Vec::new(),
             show_menu: false,
