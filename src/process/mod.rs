@@ -95,7 +95,11 @@ impl ProcessService {
                 }
             }
 
-            Effect::DownloadRemoteFile { location, name } => {
+            Effect::DownloadRemoteFile {
+                location,
+                name,
+                editor,
+            } => {
                 let label = format!("remote download: {name}");
                 // Bounded download via read_prefix_bytes (same cap as F3)
                 let bounded = match registry
@@ -120,7 +124,11 @@ impl ProcessService {
                         error: format!("write temp: {e}"),
                     };
                 }
-                EffectEvent::Downloaded { temp_path, name }
+                EffectEvent::Downloaded {
+                    temp_path,
+                    name,
+                    editor,
+                }
             }
 
             Effect::WriteBackRemoteFile {

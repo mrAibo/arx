@@ -760,6 +760,15 @@ pub struct RemoteDeleteTarget {
     pub path: String,
 }
 
+/// Phase-2 state for remote F4: download completed, editor needs launching.
+#[derive(Debug, Clone)]
+pub struct RemoteEditLaunch {
+    pub temp_path: PathBuf,
+    pub name: String,
+    pub location: Location,
+    pub editor: String,
+}
+
 pub(crate) fn canonical_unix_mtime_ms(seconds: u64) -> u64 {
     seconds.saturating_mul(1_000)
 }

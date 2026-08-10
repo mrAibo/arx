@@ -45,6 +45,7 @@ pub enum Effect {
     DownloadRemoteFile {
         location: Location,
         name: String,
+        editor: String,
     },
     /// Write edited content back to a remote file (atomic staging).
     WriteBackRemoteFile {
@@ -93,6 +94,7 @@ pub enum EffectEvent {
     Downloaded {
         temp_path: PathBuf,
         name: String,
+        editor: String,
     },
     /// Edited content successfully written back to remote.
     WrittenBack {

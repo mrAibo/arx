@@ -12,7 +12,7 @@ use arx::services::{
     PaneLoadResponse, PaneLoader, SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions,
     WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
 };
-use arx::vfs::{Entry, EntryKind, Location};
+use arx::vfs::{Entry, EntryKind, Location, RemoteEditLaunch};
 use arx::workspace_sync::{
     DiffState, SyncDirection, SyncMode, WorkspaceSide, WorkspaceSyncOperation,
 };
@@ -186,6 +186,51 @@ async fn event_loop(
                     &mut right_entries,
                     &pane_loader,
                 );
+
+                // Phase 2-3: if download completed, launch editor and dispatch write-back
+                if let Some(launch) = state.pending_remote_edit_launch.take() {
+                    if launch.temp_path.as_os_str().is_empty() {
+                        // Downloaded hasn't arrived yet or failed — skip
+                        state.pending_remote_edit_launch = Some(launch);
+                    } else {
+                        // Re-check scope: user may have navigated away
+                        let same_location =
+                            state.active_pane().location == launch.location;
+                        if same_location {
+                            let editor_cmd = if let Some(cfg_editor) = &editor {
+                                cfg_editor.clone()
+                            } else {
+                                launch.editor.clone()
+                            };
+                            // Phase 2: suspend TUI, launch editor on temp
+                            let editor_result = terminal_session
+                                .suspend_while(|| {
+                                    DesktopService::open_editor(&editor_cmd, &launch.temp_path)
+                                })
+                                .await?;
+                            if let Err(error) = editor_result {
+                                state.message = Some(format!("Editor failed: {error}"));
+                            } else {
+                                // Phase 3: dispatch write-back
+                                let id = effect_dispatcher.dispatch(
+                                    EffectLane::RemoteEdit,
+                                    EffectScope::Location(launch.location.clone()),
+                                    Effect::WriteBackRemoteFile {
+                                        location: launch.location,
+                                        name: launch.name,
+                                        temp_path: launch.temp_path,
+                                    },
+                                );
+                                state.register_effect(EffectLane::RemoteEdit, id);
+                            }
+                        } else {
+                            state.message = Some(
+                                "Edit cancelled — you navigated away".into(),
+                            );
+                        }
+                    }
+                }
+
                 continue;
             }
             Some(response) = sync_launch_rx.recv() => {
@@ -4058,22 +4103,26 @@ async fn dispatch_ui_action(
                     let location = state.active_pane().location.clone();
                     let name = entry.name.clone();
 
-                    // Phase 1: download to temp
+                    // Phase 1: download to temp, store pending state
+                    state.pending_remote_edit_launch = Some(RemoteEditLaunch {
+                        temp_path: PathBuf::new(), // filled when Downloaded arrives
+                        name: name.clone(),
+                        location: location.clone(),
+                        editor: editor.to_string(),
+                    });
                     let id = effect_dispatcher.dispatch(
                         EffectLane::RemoteEdit,
                         EffectScope::Location(location.clone()),
                         Effect::DownloadRemoteFile {
                             location: location.clone(),
                             name: name.clone(),
+                            editor: editor.to_string(),
                         },
                     );
                     state.register_effect(EffectLane::RemoteEdit, id);
                     state.message = Some(format!("Downloading: {name}..."));
 
-                    // ponytail: FIXME — phase 2+3 needs async state machine.
-                    // For now, the download completes asynchronously and
-                    // handle_effect_response picks up Downloaded.
-                    // Phase 2 (editor) and Phase 3 (write-back) are NOT wired yet.
+                    // ponytail: Phase 2+3 handled in select! when Downloaded arrives
                 }
                 _ => {
                     state.message = Some("File editing is not supported for this location".into());
@@ -5081,17 +5130,23 @@ fn apply_effect_event(state: &mut AppState, event: EffectEvent) {
         EffectEvent::PathOpened { path } => {
             state.message = Some(format!("Opened {}", path.display()));
         }
-        EffectEvent::Downloaded { temp_path, name } => {
+        EffectEvent::Downloaded {
+            temp_path, name, ..
+        } => {
             state.message = Some(format!("Downloaded: {name}"));
-            // Temp path is returned to caller (dispatch_ui_action) for editor launch
+            if let Some(launch) = &mut state.pending_remote_edit_launch {
+                launch.temp_path = temp_path;
+            }
         }
         EffectEvent::WrittenBack { name } => {
             state.message = Some(format!("Uploaded: {name}"));
+            state.pending_remote_edit_launch = None; // cleanup
         }
         EffectEvent::RemoteConflict { name } => {
             state.message = Some(format!(
                 "{name} changed on remote during edit — write-back refused"
             ));
+            state.pending_remote_edit_launch = None; // cleanup
         }
         EffectEvent::Failed { label, error } => {
             state.message = Some(format!("{label} failed: {error}"));
@@ -5120,6 +5175,10 @@ fn handle_effect_response(
         }
         EffectLane::RightPane => {
             schedule_pane_load(pane_loader, state, Pane::Right);
+        }
+        EffectLane::RemoteEdit => {
+            // After write-back, reload the active pane to see changes
+            schedule_active_pane_load(pane_loader, state);
         }
         _ => {}
     }

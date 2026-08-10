@@ -9,7 +9,7 @@ use crate::remote::Host;
 use crate::services::{PaneLoadId, PaneLoadPurpose};
 use crate::terminal::TermPane;
 use crate::vfs::Location;
-use crate::vfs::RemoteDeletePlan;
+use crate::vfs::{RemoteDeletePlan, RemoteEditLaunch};
 
 mod actions;
 pub use actions::{
@@ -244,6 +244,8 @@ pub struct AppState {
     pub pending_delete: Option<RemoteDeletePlan>,
     /// Ctrl+X prefix for MC-style key combos
     pub cmd_prefix: bool,
+    /// Phase-2 remote edit: Download landed, editor needs launching.
+    pub pending_remote_edit_launch: Option<RemoteEditLaunch>,
     // C3: user menu
     pub menu: Vec<MenuEntry>,
     pub show_menu: bool,
@@ -349,6 +351,7 @@ impl Default for AppState {
             pending_mkdir_location: None,
             pending_delete: None,
             cmd_prefix: false,
+            pending_remote_edit_launch: None,
             menu: Vec::new(),
             show_menu: false,
             menu_cursor: 0,
