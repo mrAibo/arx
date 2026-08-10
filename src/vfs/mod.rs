@@ -485,6 +485,30 @@ impl ProviderRegistry {
     }
 }
 
+/// Validate a single child directory name for remote mkdir.
+/// Rejects: empty, ".", "..", names containing '/' or NUL.
+pub fn validate_mkdir_child(name: &str) -> std::io::Result<()> {
+    if name.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "name is empty",
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid name: {name}"),
+        ));
+    }
+    if name.contains('/') || name.contains('\0') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "name contains invalid characters",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Location {
     Local(PathBuf),

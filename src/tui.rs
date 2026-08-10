@@ -597,14 +597,60 @@ async fn event_loop(
                                                 Some("mkdir: unsupported location".into());
                                             continue;
                                         }
+                                        // Validate child name — reject empty, ".", "..", "/", NUL.
+                                        if let Err(e) = arx::vfs::validate_mkdir_child(&name) {
+                                            state.message = Some(e.to_string());
+                                            continue;
+                                        }
                                         let registry = state.registry.clone();
-                                        let loc_clone = loc.clone();
-                                        let name_clone = name.clone();
+                                        let name_for_msg = name.clone();
+                                        let job = job_manager.create_job(
+                                            "mkdir",
+                                            arx::jobs::JobKind::RemoteCommand,
+                                            format!("mkdir {name}"),
+                                            Some(loc.clone()),
+                                            None,
+                                        );
+                                        state.jobs = job_manager.snapshot();
+                                        let jobs = job_manager.clone();
+                                        let tx = job_tx.clone();
+                                        {
+                                            let jid = job.id.clone();
+                                            let _ = jobs.publish_event(
+                                                &job_tx,
+                                                arx::jobs::JobEvent::Running { id: jid },
+                                            );
+                                        }
                                         tokio::spawn(async move {
-                                            let _ =
-                                                registry.mkdir_at(&loc_clone, &name_clone).await;
+                                            let result = registry.mkdir_at(&loc, &name).await;
+                                            match result {
+                                                Ok(()) => {
+                                                    let _ = jobs.publish_event(
+                                                        &tx,
+                                                        arx::jobs::JobEvent::Completed {
+                                                            id: job.id,
+                                                            result: arx::jobs::JobResult::generic(
+                                                                "created", 1,
+                                                            ),
+                                                        },
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    let _ = jobs.publish_event(
+                                                        &tx,
+                                                        arx::jobs::JobEvent::Failed {
+                                                            id: job.id,
+                                                            error: e.to_string(),
+                                                            result: None,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                            // ponytail: skip pane refresh — user presses F2.
+                                            // PaneLoader is Clone but refreshing before server fsync
+                                            // risks showing stale listing.
                                         });
-                                        state.message = Some(format!("mkdir {name}…"));
+                                        state.message = Some(format!("mkdir {name_for_msg}…"));
                                     } else {
                                         let id = effect_dispatcher.dispatch(
                                             EffectLane::GlobalProcess,
