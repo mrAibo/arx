@@ -332,23 +332,47 @@ async fn event_loop(
                                 && mouse.row >= hb.rect.y
                                 && mouse.row < hb.rect.y + hb.rect.height
                             {
+                                // Clear any pending keyboard chord on explicit mouse command
+                                key_router.clear_pending();
+
+                                // Derive the SAME active context as keyboard dispatch
+                                let entries = if state.active == Pane::Left {
+                                    &left_filtered
+                                } else {
+                                    &right_filtered
+                                };
+                                let cursor = {
+                                    let pane = state.active_pane();
+                                    if pane.split && pane.split_active {
+                                        pane.split_cursor
+                                    } else {
+                                        pane.cursor
+                                    }
+                                };
+                                let focused = entries.get(cursor).copied();
+                                let visible_count = entries.len();
+
                                 if hb.available {
                                     dispatch_ui_action(
                                         &mut state,
                                         hb.action,
-                                        None,
-                                        &[],
-                                        0,
+                                        focused,
+                                        entries,
+                                        visible_count,
                                         &workspace_scanner,
                                         &sync_runtime,
                                         &effect_dispatcher,
                                         &pane_loader,
                                         terminal_session,
                                         editor.as_deref(),
+                                        &mut key_router,
                                     )
                                     .await?;
                                 } else {
-                                    let ctx = ActionContext::from_state(&state);
+                                    let ctx = ActionContext::from_state(&state).with_file_context(
+                                        focused.map(|e| e.kind),
+                                        editor.is_some(),
+                                    );
                                     let action_id = action_to_id(hb.action);
                                     let avail = action_availability(action_id, &ctx);
                                     state.message =
@@ -450,6 +474,7 @@ async fn event_loop(
                                     &pane_loader,
                                     terminal_session,
                                     editor.as_deref(),
+                                    &mut key_router,
                                 )
                                 .await?;
                                 continue;
@@ -467,6 +492,7 @@ async fn event_loop(
                                     &pane_loader,
                                     terminal_session,
                                     editor.as_deref(),
+                                    &mut key_router,
                                 )
                                 .await?;
                                 continue;
@@ -532,6 +558,7 @@ async fn event_loop(
                                         &effect_dispatcher,
                                         terminal_session,
                                         editor.as_deref(),
+                                        &mut key_router,
                                     )
                                     .await?
                                     {
@@ -969,6 +996,7 @@ async fn event_loop(
                             | KeyCode::F(1)
                             | KeyCode::Char('?')
                             | KeyCode::Char('q') => {
+                                key_router.clear_pending();
                                 state.show_help = false;
                                 state.help_scroll = 0;
                                 continue;
@@ -1028,6 +1056,7 @@ async fn event_loop(
                                         &pane_loader,
                                         terminal_session,
                                         editor.as_deref(),
+                                        &mut key_router,
                                     )
                                     .await?
                                 }
@@ -2108,32 +2137,36 @@ fn render_command_bar(
     // Single layout model for both rendering and hitboxes.
     if !row_b.is_empty() && row_b_area.width > 0 {
         #[derive(Debug)]
+        #[allow(dead_code)]
         struct PositionedChip {
             text: String,
+            rect: Rect,
             available: bool,
         }
 
         let mut chips = Vec::new();
-        let mut col = row_b_area.x;
+        let mut cursor = row_b_area.x;
         let spacing = 3u16; // matches format_command_row spacing
 
         for hint in row_b {
             let chip_text = format!("{} {}", hint.binding, hint.label);
             let chip_width = Line::from(chip_text.as_str()).width() as u16;
-            let required = if chips.is_empty() {
-                chip_width
+
+            let chip_x = if chips.is_empty() {
+                cursor
             } else {
-                chip_width + spacing
+                cursor + spacing
             };
 
-            if col + required > row_b_area.x + row_b_area.width {
+            if chip_x + chip_width > row_b_area.x + row_b_area.width {
                 break; // stop at first overflow — same as format_command_row
             }
 
             if let Some(action) = action_id_to_action(hint.action) {
-                let rect = Rect::new(col, row_b_area.y, chip_width, 1);
+                let rect = Rect::new(chip_x, row_b_area.y, chip_width, 1);
                 chips.push(PositionedChip {
                     text: chip_text,
+                    rect,
                     available: hint.available,
                 });
                 hitboxes.push(arx::app::CommandHitbox {
@@ -2143,7 +2176,7 @@ fn render_command_bar(
                 });
             }
 
-            col += required;
+            cursor = chip_x + chip_width;
         }
 
         // Render from the same computed layout
@@ -2151,7 +2184,7 @@ fn render_command_bar(
             let mut spans: Vec<Span> = Vec::new();
             for (i, chip) in chips.iter().enumerate() {
                 if i > 0 {
-                    spans.push(Span::raw("   "));
+                    // spacing already encoded in chip.rect.x; just render in order
                 }
                 let style = if !chip.available {
                     Style::default()
@@ -4537,6 +4570,7 @@ async fn dispatch_ui_action(
     pane_loader: &PaneLoader,
     terminal_session: &mut TuiTerminalSession,
     configured_editor: Option<&str>,
+    key_router: &mut KeyRouter,
 ) -> io::Result<()> {
     let focused = focused.filter(|entry| entry.name != VIRTUAL_PARENT_NAME);
     if matches!(
@@ -4568,7 +4602,11 @@ async fn dispatch_ui_action(
         Action::OpenBookmarks => state.toggle_overlay(OverlayKind::Bookmarks),
         Action::OpenJobs => state.toggle_overlay(OverlayKind::Jobs),
         Action::OpenHosts => toggle_hosts_overlay(state),
-        Action::OpenHelp => state.toggle_overlay(OverlayKind::Help),
+        Action::OpenHelp => {
+            key_router.clear_pending();
+            state.help_scroll = 0;
+            state.toggle_overlay(OverlayKind::Help);
+        }
         Action::ToggleSelect => {
             toggle_selection_and_advance(state, focused, visible_count);
         }
@@ -5462,6 +5500,7 @@ async fn execute_command_target(
     effect_dispatcher: &EffectDispatcher,
     terminal_session: &mut TuiTerminalSession,
     configured_editor: Option<&str>,
+    key_router: &mut KeyRouter,
 ) -> io::Result<Option<Effect>> {
     let effect = match target {
         CommandTarget::Action(action) => {
@@ -5477,6 +5516,7 @@ async fn execute_command_target(
                 pane_loader,
                 terminal_session,
                 configured_editor,
+                key_router,
             )
             .await?;
             None
