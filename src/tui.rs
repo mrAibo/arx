@@ -2169,17 +2169,19 @@ fn render(
     let constraints = if session_callout.is_some() {
         vec![
             Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(1),  // workspace ribbon
+            Constraint::Length(1),  // status line
+            Constraint::Length(1),  // session callout
+            Constraint::Length(1),  // Row A
+            Constraint::Length(1),  // Row B
         ]
     } else {
         vec![
             Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(1),  // workspace ribbon
+            Constraint::Length(1),  // status line
+            Constraint::Length(1),  // Row A
+            Constraint::Length(1),  // Row B
         ]
     };
 
@@ -2757,27 +2759,34 @@ fn render(
     } else {
         String::new()
     };
-    let hidden = if state.show_hidden { " [dot]" } else { "" };
-    let tab_info = format!(
-        " | LT:{} RT:{}",
-        state.left.tabs.len() + 1,
-        state.right.tabs.len() + 1
-    );
     let git_info = state.git_status.as_str();
     let msg_hint = message.map(|m| format!(" | {m}")).unwrap_or_default();
-    let workspace_hint = if state.remote_workspace.enabled {
-        format!(" | {}", state.remote_workspace.summary())
+
+    // Workspace Ribbon — Local ⇄ Remote identity at a glance
+    let ribbon_text = if state.remote_workspace.enabled {
+        let left_label = state.left.location.label();
+        let right_label = state.right.location.label();
+        let summary = state.remote_workspace.summary();
+        format!("WORKSPACE [LOCAL] {} ⇄ {} · {}", left_label, right_label, summary)
     } else {
-        String::new()
+        let left_label = state.left.location.label();
+        let right_label = state.right.location.label();
+        format!("WORKSPACE [LOCAL] {} ⇄ {} · Not compared · Ctrl+D Compare", left_label, right_label)
     };
+    let ribbon = Paragraph::new(Line::from(Span::styled(
+        ribbon_text,
+        Style::default().fg(Color::Cyan),
+    )));
+    frame.render_widget(ribbon, chunks[1]);
+
+    // Status line — lean, no duplicate path info
     let status = Paragraph::new(Line::from(format!(
-        "ARX v{} | {}{hidden}{tab_info} | sel: {} |{hint}{msg_hint}{git_info}{workspace_hint}",
+        "ARX v{} | sel: {} |{hint}{msg_hint}{git_info}",
         env!("CARGO_PKG_VERSION"),
-        loc_str,
         selection_count,
     )))
     .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(status, chunks[1]);
+    frame.render_widget(status, chunks[2]);
 
     // Session milestones are passive presentation. They never own backend
     // state and disappear on the next user interaction.
