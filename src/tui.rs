@@ -17,11 +17,16 @@ use arx::services::{
 };
 use arx::vfs::{Entry, EntryKind, Location, ProviderId, RemoteEditSession, RemoteEditState};
 use arx::workspace_sync::{
-    DiffState, SyncDirection, SyncMode, WorkspaceSide, WorkspaceSyncOperation,
+    DiffState, SyncDirection, SyncMode, WorkspaceDiff, WorkspaceSide, WorkspaceSyncOperation,
+    WorkspaceSyncPlan,
 };
 use arx::workspace_sync_execution::SyncPlanId;
 use arx::workspace_sync_verification::{
     SyncVerificationEvent, SyncVerificationStatus, SyncVerificationVerdict,
+    SyncVerificationVerdict::{
+        DifferencesRemain as VerifyDifferencesRemain, Inconclusive as VerifyInconclusive,
+        Synchronized as VerifySynchronized,
+    },
 };
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{
@@ -2170,6 +2175,160 @@ fn is_archive(name: &str) -> bool {
         || name.ends_with(".zip")
 }
 
+// ponytail: presentation-only model for workspace ribbon.
+// Reads runtime truth from `state` but never mutates backend semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RibbonPhase {
+    Commander,
+    Ready,
+    Scanning,
+    Differences,
+    Preview,
+    Running,
+    Verifying,
+    Synchronized,
+    DifferencesRemain,
+    Inconclusive,
+    Blocked,
+}
+
+fn ribbon_phase(state: &AppState) -> RibbonPhase {
+    use RibbonPhase::*;
+    if !state.remote_workspace.enabled {
+        return Commander;
+    }
+    match state.remote_workspace.ux {
+        WorkspaceSyncUxState::Scanning => Scanning,
+        WorkspaceSyncUxState::Preview { .. }
+        | WorkspaceSyncUxState::ConfirmationRequired { .. } => Preview,
+        WorkspaceSyncUxState::Launching { .. }
+        | WorkspaceSyncUxState::Queued { .. }
+        | WorkspaceSyncUxState::Cancelling { .. }
+        | WorkspaceSyncUxState::Running { .. } => Running,
+        WorkspaceSyncUxState::Verifying { .. } => Verifying,
+        WorkspaceSyncUxState::Finished { .. } | WorkspaceSyncUxState::VerificationDiff { .. } => {
+            if let Some(snap) = &state.remote_workspace.verification {
+                match &snap.status {
+                    SyncVerificationStatus::Finished(result) => match result.verdict {
+                        VerifySynchronized => Synchronized,
+                        VerifyDifferencesRemain { .. } => DifferencesRemain,
+                        VerifyInconclusive { .. } => Inconclusive,
+                    },
+                    _ => DifferencesRemain,
+                }
+            } else {
+                DifferencesRemain
+            }
+        }
+        WorkspaceSyncUxState::Blocked { .. } => Blocked,
+        _ => {
+            if state.remote_workspace.diff.is_some() {
+                Differences
+            } else {
+                Ready
+            }
+        }
+    }
+}
+
+fn workspace_ribbon_text(state: &AppState) -> String {
+    let left_id = provider_identity(&state.left.location);
+    let right_id = provider_identity(&state.right.location);
+    let phase = ribbon_phase(state);
+
+    let action_hint = if !state.remote_workspace.enabled {
+        "Ctrl+D Compare".into()
+    } else {
+        match phase {
+            RibbonPhase::Commander => "Ctrl+D Compare".into(),
+            RibbonPhase::Ready => "Ctrl+D Compare".into(),
+            RibbonPhase::Scanning => "Comparing…".into(),
+            RibbonPhase::Differences => {
+                let count = state
+                    .remote_workspace
+                    .diff
+                    .as_ref()
+                    .map(diff_metric_summary)
+                    .unwrap_or_default();
+                format!("{} · Ctrl+X P Preview", count)
+            }
+            RibbonPhase::Preview => {
+                if let Some(plan) = &state.remote_workspace.plan {
+                    let ops = plan_metric_summary(plan);
+                    format!("{} · Enter Execute", ops)
+                } else {
+                    "Preview · Enter Execute".into()
+                }
+            }
+            RibbonPhase::Running => {
+                if let Some(job) = state.jobs.last() {
+                    #[allow(clippy::collapsible_if)]
+                    if let arx::jobs::JobProgress::WorkspaceSync(sync_prog) = &job.progress {
+                        if let Some(pct) = sync_prog.percent() {
+                            return format!("{} → {} · Syncing… {}%", left_id, right_id, pct);
+                        }
+                    }
+                }
+                "Syncing…".into()
+            }
+            RibbonPhase::Verifying => "Verifying…".into(),
+            RibbonPhase::Synchronized => "✓ SYNCHRONIZED".into(),
+            RibbonPhase::DifferencesRemain => "⚠ DIFFERENCES REMAIN".into(),
+            RibbonPhase::Inconclusive => "? INCONCLUSIVE".into(),
+            RibbonPhase::Blocked => "BLOCKED".into(),
+        }
+    };
+
+    if state.remote_workspace.enabled {
+        format!("WORKSPACE {} → {} · {}", left_id, right_id, action_hint)
+    } else {
+        format!("COMMANDER {} ⇄ {} · {}", left_id, right_id, action_hint)
+    }
+}
+
+fn provider_identity(location: &Location) -> &'static str {
+    match location.provider_id() {
+        ProviderId::Local => "[LOCAL]",
+        ProviderId::Sftp => "[SSH]",
+        ProviderId::Archive => "[ARCHIVE]",
+        _ => "[?]",
+    }
+}
+
+fn diff_metric_summary(diff: &WorkspaceDiff) -> String {
+    let changes = diff.entries.len();
+    let bytes: u64 = diff
+        .entries
+        .iter()
+        .filter_map(|e| {
+            e.left
+                .as_ref()
+                .and_then(|f| f.size)
+                .or_else(|| e.right.as_ref().and_then(|f| f.size))
+        })
+        .sum();
+    format!("{} changes · {} B", changes, bytes)
+}
+
+fn plan_metric_summary(plan: &WorkspaceSyncPlan) -> String {
+    let copies = plan
+        .operations
+        .iter()
+        .filter(|o| matches!(o, arx::workspace_sync::WorkspaceSyncOperation::Copy { .. }))
+        .count();
+    let deletes = plan
+        .operations
+        .iter()
+        .filter(|o| {
+            matches!(
+                o,
+                arx::workspace_sync::WorkspaceSyncOperation::Delete { .. }
+            )
+        })
+        .count();
+    format!("{} copies · {} deletes", copies, deletes)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render(
     frame: &mut ratatui::Frame,
@@ -2780,23 +2939,8 @@ fn render(
     let git_info = state.git_status.as_str();
     let msg_hint = message.map(|m| format!(" | {m}")).unwrap_or_default();
 
-    // Workspace Ribbon — Local ⇄ Remote identity at a glance
-    let ribbon_text = if state.remote_workspace.enabled {
-        let left_label = state.left.location.label();
-        let right_label = state.right.location.label();
-        let summary = state.remote_workspace.summary();
-        format!(
-            "WORKSPACE [LOCAL] {} ⇄ {} · {}",
-            left_label, right_label, summary
-        )
-    } else {
-        let left_label = state.left.location.label();
-        let right_label = state.right.location.label();
-        format!(
-            "WORKSPACE [LOCAL] {} ⇄ {} · Not compared · Ctrl+D Compare",
-            left_label, right_label
-        )
-    };
+    // Workspace Ribbon — provider-truthful identity + workflow phase
+    let ribbon_text = workspace_ribbon_text(state);
     let ribbon = Paragraph::new(Line::from(Span::styled(
         ribbon_text,
         Style::default().fg(Color::Cyan),
