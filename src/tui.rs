@@ -2636,7 +2636,8 @@ fn render(
         String::new()
     };
     let status = Paragraph::new(Line::from(format!(
-        "ARX v0.1.0 | {}{hidden}{tab_info} | sel: {} |{hint}{msg_hint}{git_info}{workspace_hint} | ?: help",
+        "ARX v{} | {}{hidden}{tab_info} | sel: {} |{hint}{msg_hint}{git_info}{workspace_hint} | ?: help",
+        env!("CARGO_PKG_VERSION"),
         loc_str,
         selection_count,
     )))
