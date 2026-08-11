@@ -1,4 +1,5 @@
 use crate::tui_terminal::TuiTerminalSession;
+use arx::app::InputContext;
 use arx::app::{
     Action, ActionAvailability, ActionContext, ActionId, AppState, CommandItem, CommandKind,
     CommandTarget, OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SessionCallout,
@@ -1001,6 +1002,37 @@ async fn event_loop(
                         KeyResolution::Unhandled => {}
                     }
 
+                    // Help overlay owns navigation keys when open
+                    if matches!(state.input_context(), InputContext::Help) {
+                        match key.code {
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                state.help_scroll = state.help_scroll.saturating_add(1);
+                                continue;
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                state.help_scroll = state.help_scroll.saturating_sub(1);
+                                continue;
+                            }
+                            KeyCode::PageDown => {
+                                state.help_scroll = state.help_scroll.saturating_add(20);
+                                continue;
+                            }
+                            KeyCode::PageUp => {
+                                state.help_scroll = state.help_scroll.saturating_sub(20);
+                                continue;
+                            }
+                            KeyCode::Home => {
+                                state.help_scroll = 0;
+                                continue;
+                            }
+                            KeyCode::End => {
+                                state.help_scroll = usize::MAX;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     // Handle tree-filter Backspace before borrowing the active pane.
                     if key.code == KeyCode::Backspace && state.show_tree {
                         state.tree_filter.pop();
@@ -1077,6 +1109,10 @@ async fn event_loop(
                         }
                         KeyCode::Char('?') => {
                             state.show_help = !state.show_help;
+                        }
+                        KeyCode::F(1) => {
+                            state.show_help = !state.show_help;
+                            state.help_scroll = 0;
                         }
                         KeyCode::Enter
                             if key.modifiers.contains(KeyModifiers::ALT)
@@ -1945,6 +1981,12 @@ fn action_id_to_action(id: ActionId) -> Option<Action> {
         ActionId::Mkdir => Action::Mkdir,
         ActionId::Delete => Action::Delete,
         ActionId::OpenHosts => Action::OpenHosts,
+        ActionId::OpenCommandCenter => Action::OpenCommandCenter,
+        ActionId::ToggleWorkspaceComparison => Action::ToggleWorkspaceComparison,
+        ActionId::PreviewWorkspaceSync => Action::PreviewWorkspaceSync,
+        ActionId::ToggleEmbeddedTerminal => Action::ToggleEmbeddedTerminal,
+        ActionId::OpenHelp => Action::OpenHelp,
+        ActionId::Quit => Action::Quit,
         _ => return None,
     })
 }
@@ -1958,6 +2000,12 @@ fn action_to_id(a: Action) -> ActionId {
         Action::Mkdir => ActionId::Mkdir,
         Action::Delete => ActionId::Delete,
         Action::OpenHosts => ActionId::OpenHosts,
+        Action::OpenCommandCenter => ActionId::OpenCommandCenter,
+        Action::ToggleWorkspaceComparison => ActionId::ToggleWorkspaceComparison,
+        Action::PreviewWorkspaceSync => ActionId::PreviewWorkspaceSync,
+        Action::ToggleEmbeddedTerminal => ActionId::ToggleEmbeddedTerminal,
+        Action::OpenHelp => ActionId::OpenHelp,
+        Action::Quit => ActionId::Quit,
         _ => unreachable!("only commander core actions reach hitboxes"),
     }
 }
@@ -1971,6 +2019,12 @@ fn compact_action_label(action: ActionId) -> &'static str {
         ActionId::Mkdir => "MkDir",
         ActionId::Delete => "Del",
         ActionId::OpenHosts => "Hosts",
+        ActionId::OpenCommandCenter => "Cmd",
+        ActionId::ToggleWorkspaceComparison => "Diff",
+        ActionId::PreviewWorkspaceSync => "Sync",
+        ActionId::ToggleEmbeddedTerminal => "Term",
+        ActionId::OpenHelp => "Help",
+        ActionId::Quit => "Quit",
         _ => "",
     }
 }
@@ -2053,11 +2107,10 @@ fn render_command_bar(
                 row_b_area,
             );
         }
-        // Row B hitboxes — reuse same formatted widths.
+        // Row B hitboxes — match exact rendered chip text from format_command_row.
         let mut col = row_b_area.x;
         for hint in row_b {
-            let label = compact_action_label(hint.action);
-            let chip_text = format!("{} {}", hint.binding, label);
+            let chip_text = format!("{} {}", hint.binding, hint.label);
             let chip_width = Line::from(chip_text.as_str()).width() as u16;
             if let Some(action) = action_id_to_action(hint.action) {
                 hitboxes.push(arx::app::CommandHitbox {
@@ -2189,6 +2242,9 @@ enum RibbonPhase {
     Synchronized,
     DifferencesRemain,
     Inconclusive,
+    VerificationFailed,
+    VerificationCancelled,
+    VerificationSuperseded,
     Blocked,
 }
 
@@ -2214,10 +2270,13 @@ fn ribbon_phase(state: &AppState) -> RibbonPhase {
                         VerifyDifferencesRemain { .. } => DifferencesRemain,
                         VerifyInconclusive { .. } => Inconclusive,
                     },
-                    _ => DifferencesRemain,
+                    SyncVerificationStatus::Failed { .. } => VerificationFailed,
+                    SyncVerificationStatus::Cancelled => VerificationCancelled,
+                    SyncVerificationStatus::Superseded => VerificationSuperseded,
+                    _ => Inconclusive,
                 }
             } else {
-                DifferencesRemain
+                Inconclusive
             }
         }
         WorkspaceSyncUxState::Blocked { .. } => Blocked,
@@ -2232,11 +2291,21 @@ fn ribbon_phase(state: &AppState) -> RibbonPhase {
 }
 
 fn workspace_ribbon_text(state: &AppState) -> String {
-    let left_id = provider_identity(&state.left.location);
-    let right_id = provider_identity(&state.right.location);
+    let enabled = state.remote_workspace.enabled;
+    let direction = state.remote_workspace.policy.direction;
+    let (src_id, dst_id) = match direction {
+        arx::workspace_sync::SyncDirection::LeftToRight => (
+            provider_identity(&state.left.location),
+            provider_identity(&state.right.location),
+        ),
+        arx::workspace_sync::SyncDirection::RightToLeft => (
+            provider_identity(&state.right.location),
+            provider_identity(&state.left.location),
+        ),
+    };
     let phase = ribbon_phase(state);
 
-    let action_hint = if !state.remote_workspace.enabled {
+    let action_hint = if !enabled {
         "Ctrl+D Compare".into()
     } else {
         match phase {
@@ -2261,11 +2330,13 @@ fn workspace_ribbon_text(state: &AppState) -> String {
                 }
             }
             RibbonPhase::Running => {
-                if let Some(job) = state.jobs.last() {
-                    #[allow(clippy::collapsible_if)]
-                    if let arx::jobs::JobProgress::WorkspaceSync(sync_prog) = &job.progress {
-                        if let Some(pct) = sync_prog.percent() {
-                            return format!("{} → {} · Syncing… {}%", left_id, right_id, pct);
+                #[allow(clippy::collapsible_if)]
+                if let Some(current_job_id) = state.remote_workspace.ux.job_id() {
+                    if let Some(job) = state.jobs.iter().find(|j| j.id == current_job_id) {
+                        if let arx::jobs::JobProgress::WorkspaceSync(sync_prog) = &job.progress {
+                            if let Some(pct) = sync_prog.percent() {
+                                return format!("{} → {} · Syncing… {}%", src_id, dst_id, pct);
+                            }
                         }
                     }
                 }
@@ -2275,14 +2346,17 @@ fn workspace_ribbon_text(state: &AppState) -> String {
             RibbonPhase::Synchronized => "✓ SYNCHRONIZED".into(),
             RibbonPhase::DifferencesRemain => "⚠ DIFFERENCES REMAIN".into(),
             RibbonPhase::Inconclusive => "? INCONCLUSIVE".into(),
+            RibbonPhase::VerificationFailed => "! VERIFICATION FAILED".into(),
+            RibbonPhase::VerificationCancelled => "✗ VERIFICATION CANCELLED".into(),
+            RibbonPhase::VerificationSuperseded => "… VERIFICATION SUPERSEDED".into(),
             RibbonPhase::Blocked => "BLOCKED".into(),
         }
     };
 
-    if state.remote_workspace.enabled {
-        format!("WORKSPACE {} → {} · {}", left_id, right_id, action_hint)
+    if enabled {
+        format!("WORKSPACE {} → {} · {}", src_id, dst_id, action_hint)
     } else {
-        format!("COMMANDER {} ⇄ {} · {}", left_id, right_id, action_hint)
+        format!("COMMANDER {} ⇄ {} · {}", src_id, dst_id, action_hint)
     }
 }
 
@@ -2540,7 +2614,7 @@ fn render(
 
     // Help overlay
     if state.show_help {
-        render_help(frame, area);
+        render_help(frame, area, state);
     }
 
     // Viewer overlay
@@ -3517,28 +3591,96 @@ fn render_verification_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>
         }
     }
 }
-fn render_help(frame: &mut ratatui::Frame, area: Rect) {
+fn render_help(frame: &mut ratatui::Frame, area: Rect, state: &mut AppState) {
     let popup_area = centered_rect(68, 90, area);
     frame.render_widget(Clear, popup_area);
 
-    let text = vec![
-        Line::from(Span::styled("ARX Help", Style::default().fg(Color::Yellow))),
+    // Full help content (Getting Started first, then full reference)
+    let full_lines = help_full_lines();
+
+    // Compute visible slice
+    let content_height = popup_area.height.saturating_sub(2) as usize; // minus borders
+    let total = full_lines.len();
+    let scroll = state.help_scroll.min(total.saturating_sub(content_height));
+    state.help_scroll = scroll;
+    let visible: Vec<Line> = full_lines
+        .iter()
+        .skip(scroll)
+        .take(content_height)
+        .cloned()
+        .collect();
+
+    // Scroll hint
+    let scroll_hint = if total > content_height {
+        format!(
+            " {}/{} | j/k/↑↓:scroll PgUp/PgDn:page Home/End:jump q/Esc/F1:close ",
+            scroll + visible.len().min(total - scroll),
+            total
+        )
+    } else {
+        " q/Esc/F1/?:close ".into()
+    };
+
+    let help = Paragraph::new(visible)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Help ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .style(Style::default().fg(Color::White))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(help, popup_area);
+
+    // Scroll hint at bottom
+    let hint_area = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(popup_area);
+    let hint = Paragraph::new(Line::from(scroll_hint))
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(hint, hint_area[1]);
+}
+
+fn help_full_lines() -> Vec<Line<'static>> {
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+
+    vec![
+        // Getting Started (short, first)
         Line::from(Span::styled(
-            "F1/? or Esc to close",
+            "ARX Help — Getting Started",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "F1/? or Esc to close  |  j/k/↑↓/PgUp/PgDn/Home/End to scroll",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
+        Line::from(Span::styled(
+            "Core Workflow",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from("  Tab           Switch pane (left ↔ right)"),
+        Line::from("  F9            Hosts / SFTP (connect remote)"),
+        Line::from("  Ctrl+D        Compare workspace (diff)"),
+        Line::from("  Ctrl+X P      Sync Preview (after compare)"),
+        Line::from("  Enter         Execute preview"),
+        Line::from("  Ctrl+P        Command Center"),
+        Line::from("  F1/?          This help"),
+        Line::from("  F10 / q       Quit"),
+        Line::from(""),
         Line::from(Span::styled("Navigation", Style::default().fg(Color::Cyan))),
-        Line::from("  j/↓ k/↑       Move cursor"),
-        Line::from("  Enter          Enter directory / content diff"),
-        Line::from("  Backspace      Parent directory"),
-        Line::from("  Tab            Switch pane (left ↔ right)"),
-        Line::from("  Ctrl+G         Go to path"),
-        Line::from("  Ctrl+U         Swap panes"),
-        Line::from("  Alt+O          Sync other pane to active"),
-        Line::from("  Alt+Down       Go back in directory history"),
-        Line::from("  Alt+/          Recursive file search (find)"),
-        Line::from("  Ctrl+\\        Open in file manager"),
+        Line::from("  j / ↓ / k / ↑      Move cursor"),
+        Line::from("  Enter              Enter directory / content diff"),
+        Line::from("  Backspace          Parent directory"),
+        Line::from("  Ctrl+G             Go to path"),
+        Line::from("  Ctrl+U             Swap panes"),
+        Line::from("  Alt+O              Sync other pane to active"),
+        Line::from("  Alt+Down           Go back in directory history"),
+        Line::from("  Alt+/              Recursive file search (find)"),
+        Line::from("  Ctrl+\\\\             Open in file manager"),
         Line::from(""),
         Line::from(Span::styled("Tabs", Style::default().fg(Color::Cyan))),
         Line::from("  Ctrl+T         New tab"),
@@ -3590,9 +3732,7 @@ fn render_help(frame: &mut ratatui::Frame, area: Rect) {
             "Panels & Tools",
             Style::default().fg(Color::Cyan),
         )),
-        Line::from("  Ctrl+D         Toggle directory diff"),
         Line::from("  F2             User menu (arx.menu)"),
-        Line::from("  F9             Hosts / SFTP"),
         Line::from("  Ctrl+B         Bookmarks"),
         Line::from("  Ctrl+J         Background jobs"),
         Line::from("  Ctrl+O         Shell (drop to subshell)"),
@@ -3602,13 +3742,7 @@ fn render_help(frame: &mut ratatui::Frame, area: Rect) {
         Line::from("  Ctrl+R         Refresh"),
         Line::from("  q              Quit"),
         Line::from("  F1 / ?         This help"),
-    ];
-
-    let help = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title(" Help "))
-        .style(Style::default().fg(Color::White))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(help, popup_area);
+    ]
 }
 
 fn render_viewer(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {

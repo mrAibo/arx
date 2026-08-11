@@ -227,6 +227,8 @@ pub struct AppState {
     // A1: file viewer
     pub viewer_content: Vec<String>,
     pub viewer_scroll: usize,
+    // UI15-FIX-07: scrollable F1 Help
+    pub help_scroll: usize,
     pub left_area: Option<Rect>,
     pub right_area: Option<Rect>,
     // A4: bookmarks
@@ -348,6 +350,7 @@ impl Default for AppState {
             panel_mode: PanelMode::Full,
             viewer_content: Vec::new(),
             viewer_scroll: 0,
+            help_scroll: 0,
             left_area: None,
             right_area: None,
             bookmarks,
