@@ -12,13 +12,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
+  # Quality gates: fmt, clippy, tests on the intentional quality toolchain.
+  # Clippy is pinned so a new release cannot turn an unchanged commit red.
+  quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      # Pin the quality toolchain so a new stable Clippy release cannot turn
-      # an unchanged commit red overnight. Bump intentionally in a dedicated PR.
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
@@ -33,3 +33,17 @@ jobs:
 
       - name: Test
         run: cargo test --all-features
+
+  # MSRV gate: proves the declared rust-version in Cargo.toml is truthful.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.88
+        # No rustfmt/clippy — MSRV check is compile-only.
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check MSRV
+        run: cargo check --locked --all-features

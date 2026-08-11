@@ -50,16 +50,33 @@ and SFTP → local. SFTP → SFTP synchronization is intentionally blocked.
 
 ## Quick start
 
+### From source
+
+Rust 1.88+ and system OpenSSH are required.
+
 ```bash
 cargo install --git https://github.com/mrAibo/arx
 arx
 ```
 
-ARX requires Rust 1.88+ when building from source. Remote connections use
-the system OpenSSH client. Preview features use `bat`, `chafa`,
-`pdftotext`, `ffprobe`, and archive utilities when available.
+### Binary release (Linux x86_64)
 
-The currently published binary release artifact is Linux x86_64.
+Download the archive and SHA256SUMS from the [latest GitHub Release](https://github.com/mrAibo/arx/releases/latest).
+
+```bash
+# Verify checksum
+sha256sum -c SHA256SUMS
+
+# Extract
+tar xzf arx-v0.15.0-x86_64-unknown-linux-gnu.tar.gz
+cd arx-v0.15.0-x86_64-unknown-linux-gnu
+
+# Place on PATH
+sudo install -m 755 arx /usr/local/bin/arx
+arx --version
+```
+
+Preview features use `bat`, `chafa`, `pdftotext`, `ffprobe`, and archive utilities when available. No other packages are required for the published binary.
 
 ## 60-second Remote Workspace workflow
 

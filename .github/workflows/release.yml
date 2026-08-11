@@ -3,35 +3,172 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
-
-permissions:
-  contents: write
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/package-release.sh'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to dry-run (e.g. 0.15.0)'
+        required: false
+        default: ''
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  # Quality gates + build + package + smoke.
+  # Runs on every trigger. No write permissions.
+  validate:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - name: Derive version
+        id: ver
+        run: |
+          IS_TAG=false
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            IS_TAG=true
+            TAG="${GITHUB_REF#refs/tags/}"
+            TAG_VER="${TAG#v}"
+            echo "version=${TAG_VER}" >> $GITHUB_OUTPUT
+          elif [[ -n "${{ github.event.inputs.version }}" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            CARGO_VER=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+              | python3 -c 'import json,sys; [print(p["version"]) for p in json.load(sys.stdin)["packages"] if p["name"]=="arx"]')
+            echo "version=${CARGO_VER}" >> $GITHUB_OUTPUT
+          fi
+          echo "is_tag=${IS_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Set version env
+        run: echo "version=${{ steps.ver.outputs.version }}" >> $GITHUB_ENV
+
+      - name: Gate tag ↔ Cargo version (tag only)
+        if: steps.ver.outputs.is_tag == 'true'
+        run: |
+          CARGO_VER=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+            | python3 -c 'import json,sys; [print(p["version"]) for p in json.load(sys.stdin)["packages"] if p["name"]=="arx"]')
+          TAG_VER="${{ steps.ver.outputs.version }}"
+          if [ "${TAG_VER}" != "${CARGO_VER}" ]; then
+            echo "FAIL: tag version '${TAG_VER}' != Cargo version '${CARGO_VER}'"
+            exit 1
+          fi
+
+      - name: Gate release notes (tag only)
+        if: steps.ver.outputs.is_tag == 'true'
+        run: |
+          NOTES="docs/releases/v${{ steps.ver.outputs.version }}.md"
+          if [ ! -f "$NOTES" ]; then
+            echo "FAIL: release notes missing: $NOTES"
+            exit 1
+          fi
+          if [ ! -s "$NOTES" ]; then
+            echo "FAIL: release notes empty: $NOTES"
+            exit 1
+          fi
+          echo "release_notes=${NOTES}" >> $GITHUB_ENV
+
+      - name: Require hero asset (tag only)
+        if: steps.ver.outputs.is_tag == 'true'
+        run: |
+          if [ ! -f docs/assets/remote-workspace-update.gif ]; then
+            echo "FAIL: Product hero GIF is missing. Merge PR #55 before tagging a release."
+            exit 1
+          fi
 
       - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --all-features
+
+      - name: MSRV check
+        run: |
+          rustup toolchain install 1.88 --no-self-update --profile minimal
+          cargo +1.88 check --locked --all-features
+
       - name: Build
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Package
         run: |
-          cd target/release
-          tar czf /tmp/arx-x86_64-unknown-linux-gnu.tar.gz arx
+          scripts/package-release.sh \
+            "${{ env.version }}" \
+            x86_64-unknown-linux-gnu \
+            target/release/arx \
+            dist
 
-      - name: Release
-        uses: softprops/action-gh-release@v2
+      - name: Smoke packaged binary
+        run: |
+          mkdir -p /tmp/arx-release-smoke
+          tar xzf "dist/arx-v${{ env.version }}-x86_64-unknown-linux-gnu.tar.gz" -C /tmp/arx-release-smoke
+          SMOKE_DIR="/tmp/arx-release-smoke/arx-v${{ env.version }}-x86_64-unknown-linux-gnu"
+          "$SMOKE_DIR/arx" --version | grep -q "${{ env.version }}" || {
+            echo "FAIL: packaged binary version mismatch"
+            exit 1
+          }
+          "$SMOKE_DIR/arx" --help > /dev/null
+          echo "Packaged binary smoke: OK"
+
+      - name: Verify checksum
+        run: ( cd dist && sha256sum -c SHA256SUMS )
+
+      - name: Upload validated artifacts
+        uses: actions/upload-artifact@v7
         with:
-          files: /tmp/arx-x86_64-unknown-linux-gnu.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: release-artifacts
+          path: dist/
+          retention-days: 1
+
+  # Publication — tag only. Reuses artifacts from validate, no rebuild.
+  publish:
+    needs: validate
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: docs/releases
+
+      - name: Download validated artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: release-artifacts
+          path: dist
+
+      - name: Derive version
+        id: ver
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          TAG_VER="${TAG#v}"
+          echo "version=${TAG_VER}" >> $GITHUB_OUTPUT
+          echo "notes=docs/releases/v${TAG_VER}.md" >> $GITHUB_OUTPUT
+
+      - name: Publish
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/arx-*.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          make_latest: true
+          body_path: ${{ steps.ver.outputs.notes }}
