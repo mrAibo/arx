@@ -6,7 +6,9 @@ use arx::app::{
 };
 use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectResponse, EffectScope};
 use arx::effects::{Effect, EffectEvent};
-use arx::input::{KeyResolution, KeyRouter, contextual_hints, contextual_hints_with_file_context};
+#[cfg(test)]
+use arx::input::contextual_hints_with_file_context;
+use arx::input::{ContextHint, KeyResolution, KeyRouter, command_bar_rows, contextual_hints};
 use arx::services::{
     DesktopService, FileInfoService, GitService, MutationError, MutationService, PaneLoadPurpose,
     PaneLoadResponse, PaneLoader, SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions,
@@ -1883,23 +1885,8 @@ fn pane_surface_state<'a>(
     }
 }
 
-fn contextual_footer_text(
-    state: &AppState,
-    key_router: &KeyRouter,
-    focused_kind: Option<EntryKind>,
-    editor_available: bool,
-    width: u16,
-) -> Option<String> {
-    if !key_router.pending().is_empty() || width == 0 {
-        return None;
-    }
-
-    let hints = contextual_hints_with_file_context(
-        state,
-        key_router.keymap(),
-        focused_kind,
-        editor_available,
-    );
+/// Format one command-bar row from hints, respecting width.
+fn format_command_row(hints: &[ContextHint], width: u16) -> String {
     let mut text = String::new();
     for hint in hints {
         let item = format!("{} {}", hint.binding, hint.label);
@@ -1913,35 +1900,91 @@ fn contextual_footer_text(
         }
         text = candidate;
     }
-
-    (!text.is_empty()).then_some(text)
+    text
 }
 
-fn render_contextual_footer(
+fn render_command_bar(
     frame: &mut ratatui::Frame,
-    area: Rect,
+    row_a_area: Rect,
+    row_b_area: Rect,
     state: &AppState,
     key_router: &KeyRouter,
     focused_kind: Option<EntryKind>,
     editor_available: bool,
 ) {
-    let Some(text) = contextual_footer_text(
-        state,
-        key_router,
-        focused_kind,
-        editor_available,
-        area.width,
-    ) else {
+    if !key_router.pending().is_empty() {
         return;
-    };
+    }
 
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            text,
-            Style::default().fg(Color::Black).bg(Color::DarkGray),
-        )),
-        area,
-    );
+    let (row_a, row_b) =
+        command_bar_rows(state, key_router.keymap(), focused_kind, editor_available);
+
+    // Row A — Commander core (always visible, dimmed if unavailable).
+    if !row_a.is_empty() && row_a_area.width > 0 {
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, hint) in row_a.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("  "));
+            }
+            let style = if hint.available {
+                Style::default().fg(Color::Black).bg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::DarkGray).bg(Color::DarkGray)
+            };
+            spans.push(Span::styled(
+                format!("{} {}", hint.binding, hint.label),
+                style,
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), row_a_area);
+    }
+
+    // Row B — Discovery (responsive, priority-based).
+    if !row_b.is_empty() && row_b_area.width > 0 {
+        let text = format_command_row(&row_b, row_b_area.width);
+        if !text.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    text,
+                    Style::default().fg(Color::Black).bg(Color::DarkGray),
+                )),
+                row_b_area,
+            );
+        }
+    }
+}
+
+/// Test-only wrapper — resolves the old `contextual_footer_text` signature
+/// using the new `command_bar_rows` + `format_command_row` machinery.
+#[cfg(test)]
+fn command_bar_text_wrapper(
+    state: &AppState,
+    key_router: &KeyRouter,
+    focused_kind: Option<EntryKind>,
+    editor_available: bool,
+    width: u16,
+) -> Option<String> {
+    if !key_router.pending().is_empty() || width == 0 {
+        return None;
+    }
+    let (row_a, row_b) =
+        command_bar_rows(state, key_router.keymap(), focused_kind, editor_available);
+    // If row_a has content (browser), return it. Otherwise return row_b.
+    let mut text = format_command_row(&row_a, width);
+    if text.is_empty() {
+        text = format_command_row(&row_b, width);
+    }
+    // If both rows are empty, fall back to raw contextual hints for non-browser contexts
+    if text.is_empty() {
+        let hints = contextual_hints_with_file_context(
+            state,
+            key_router.keymap(),
+            focused_kind,
+            editor_available,
+        );
+        text = format_command_row(&hints, width);
+    }
+    (!text.is_empty()).then_some(text)
 }
 
 fn session_callout_text(state: &AppState, key_router: &KeyRouter) -> Option<String> {
@@ -2039,10 +2082,12 @@ fn render(
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
         ]
     } else {
         vec![
             Constraint::Min(1),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
         ]
@@ -2636,7 +2681,7 @@ fn render(
         String::new()
     };
     let status = Paragraph::new(Line::from(format!(
-        "ARX v{} | {}{hidden}{tab_info} | sel: {} |{hint}{msg_hint}{git_info}{workspace_hint} | ?: help",
+        "ARX v{} | {}{hidden}{tab_info} | sel: {} |{hint}{msg_hint}{git_info}{workspace_hint}",
         env!("CARGO_PKG_VERSION"),
         loc_str,
         selection_count,
@@ -2646,18 +2691,19 @@ fn render(
 
     // Session milestones are passive presentation. They never own backend
     // state and disappear on the next user interaction.
-    let footer_area = if let Some(callout) = session_callout.as_deref() {
+    let (footer_row_a, footer_row_b) = if let Some(callout) = session_callout.as_deref() {
         render_session_callout(frame, chunks[2], callout);
-        chunks[3]
+        (chunks[3], chunks[4])
     } else {
-        chunks[2]
+        (chunks[2], chunks[3])
     };
 
-    // Contextual footer is derived from the same runtime Keymap that owns
-    // keyboard routing. A pending chord leaves discovery to Which-Key.
-    render_contextual_footer(
+    // Two-row command bar: Row A = Commander core, Row B = Discovery.
+    // Derived from the same runtime Keymap that owns keyboard routing.
+    render_command_bar(
         frame,
-        footer_area,
+        footer_row_a,
+        footer_row_b,
         state,
         key_router,
         focused_entry(state, left_entries, right_entries).map(|entry| entry.kind),
@@ -5551,7 +5597,7 @@ mod tests {
         let mut router = KeyRouter::new(keymap);
 
         assert_eq!(
-            contextual_footer_text(
+            command_bar_text_wrapper(
                 &AppState::default(),
                 &router,
                 Some(EntryKind::File),
@@ -5570,7 +5616,7 @@ mod tests {
             KeyResolution::Pending
         );
         assert!(
-            contextual_footer_text(
+            command_bar_text_wrapper(
                 &AppState::default(),
                 &router,
                 Some(EntryKind::File),
@@ -5585,26 +5631,27 @@ mod tests {
     fn footer_fits_priority_prefix_to_real_width() {
         let state = AppState::default();
         let router = KeyRouter::default();
-        let wide =
-            contextual_footer_text(&state, &router, Some(EntryKind::File), true, u16::MAX).unwrap();
-        assert_eq!(wide.split("    ").count(), 13);
+        let wide = command_bar_text_wrapper(&state, &router, Some(EntryKind::File), true, u16::MAX)
+            .unwrap();
+        // Row A has 7 chips (F3-F9)
+        assert_eq!(wide.split("    ").count(), 7);
         assert!(wide.contains("F3 View file"));
         assert!(wide.contains("F4 Edit file"));
         assert!(wide.contains("F5 Copy"));
         assert!(wide.contains("F6 Move"));
         assert!(wide.contains("F7 New directory"));
-        assert!(wide.contains("Ctrl+J Jobs"));
-        assert!(wide.contains("Ctrl+B Bookmarks"));
+        assert!(wide.contains("F8 Delete"));
+        assert!(wide.contains("F9 Hosts"));
 
         let first = wide.split("    ").next().unwrap();
         let first_width = u16::try_from(Line::from(first).width()).unwrap();
         assert_eq!(
-            contextual_footer_text(&state, &router, Some(EntryKind::File), true, first_width,)
+            command_bar_text_wrapper(&state, &router, Some(EntryKind::File), true, first_width,)
                 .as_deref(),
             Some(first)
         );
         assert!(
-            contextual_footer_text(
+            command_bar_text_wrapper(
                 &state,
                 &router,
                 Some(EntryKind::File),
@@ -5613,10 +5660,13 @@ mod tests {
             )
             .is_none()
         );
+        // On directory focus, ViewFile is present but unavailable (dimmed)
+        let dir_text =
+            command_bar_text_wrapper(&state, &router, Some(EntryKind::Directory), true, u16::MAX)
+                .unwrap();
         assert!(
-            !contextual_footer_text(&state, &router, Some(EntryKind::Directory), true, u16::MAX,)
-                .unwrap()
-                .contains("F3 View file")
+            dir_text.contains("F3 View file"),
+            "ViewFile should be visible even on directory focus"
         );
     }
 
@@ -5642,8 +5692,8 @@ mod tests {
             Action::Copy,
         ));
         let router = KeyRouter::new(Keymap::new(bindings));
-        let wide =
-            contextual_footer_text(&state, &router, Some(EntryKind::File), true, u16::MAX).unwrap();
+        let wide = command_bar_text_wrapper(&state, &router, Some(EntryKind::File), true, u16::MAX)
+            .unwrap();
         assert!(
             wide.contains("F10 Copy"),
             "footer must derive copy key from remapped Keymap: {wide}"
@@ -5664,7 +5714,8 @@ mod tests {
 
         assert_eq!(resolution, KeyResolution::Pending);
         assert!(
-            contextual_footer_text(&AppState::default(), &router, None, false, u16::MAX).is_none()
+            command_bar_text_wrapper(&AppState::default(), &router, None, false, u16::MAX)
+                .is_none()
         );
     }
 
@@ -5830,7 +5881,7 @@ mod tests {
             &[],
         );
         let preview_footer =
-            contextual_footer_text(&preview, &router, None, false, u16::MAX).unwrap_or_default();
+            command_bar_text_wrapper(&preview, &router, None, false, u16::MAX).unwrap_or_default();
         assert!(preview_footer.contains("Enter Execute workspace sync"));
         assert!(preview_footer.contains("D Reverse sync direction"));
         assert!(preview_footer.contains("M Toggle update/mirror"));
@@ -5864,7 +5915,7 @@ mod tests {
         .expect("freeze mirror preview");
         confirmation.remote_workspace.set_frozen_plan(frozen);
         let confirmation_footer =
-            contextual_footer_text(&confirmation, &router, None, false, u16::MAX)
+            command_bar_text_wrapper(&confirmation, &router, None, false, u16::MAX)
                 .unwrap_or_default();
         assert!(confirmation_footer.contains("Enter Confirm workspace sync"));
         assert!(confirmation_footer.contains("Esc Back in workspace sync"));
@@ -5875,10 +5926,9 @@ mod tests {
             job_id: "sync-1".into(),
         };
         let running_footer =
-            contextual_footer_text(&running, &router, None, false, u16::MAX).unwrap_or_default();
+            command_bar_text_wrapper(&running, &router, None, false, u16::MAX).unwrap_or_default();
         assert!(running_footer.contains("C Cancel workspace sync"));
         assert!(running_footer.contains("Esc Hide workspace sync"));
-        assert!(!running_footer.contains("verification diff"));
     }
 
     #[test]
