@@ -139,6 +139,11 @@ impl Default for Keymap {
             KeyBinding::new(Browser, vec![plain(' ')], Action::ToggleSelect),
             KeyBinding::new(
                 Browser,
+                vec![KeyStroke::new(KeyCode::F(1), KeyModifiers::NONE)],
+                Action::OpenHelp,
+            ),
+            KeyBinding::new(
+                Browser,
                 vec![KeyStroke::new(KeyCode::F(3), KeyModifiers::NONE)],
                 Action::ViewFile,
             ),
@@ -180,6 +185,11 @@ impl Default for Keymap {
                 Browser,
                 vec![KeyStroke::new(F(9), KeyModifiers::NONE)],
                 Action::OpenHosts,
+            ),
+            KeyBinding::new(
+                Browser,
+                vec![KeyStroke::new(F(10), KeyModifiers::NONE)],
+                Action::Quit,
             ),
             // Tmux sessions: Command Center only (Ctrl+P → "List tmux sessions")
             KeyBinding::new(Browser, vec![plain('?')], Action::OpenHelp),

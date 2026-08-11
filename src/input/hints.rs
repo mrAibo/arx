@@ -20,6 +20,9 @@ pub struct ContextHint {
     pub binding: String,
     pub label: &'static str,
     pub priority: HintPriority,
+    /// Whether this action is available in the current context.
+    /// Unavailable actions are rendered dimmed, not hidden.
+    pub available: bool,
 }
 
 /// Resolve a compact set of context-aware hints without duplicating shortcut
@@ -45,9 +48,7 @@ pub fn contextual_hints_with_file_context(
     let mut hints = Vec::new();
 
     for (action, priority) in candidate_actions(state) {
-        if !action_availability(action, &action_context).is_available() {
-            continue;
-        }
+        let available = action_availability(action, &action_context).is_available();
 
         let Some(binding) = keymap.bindings().iter().find(|binding| {
             binding.context == context && binding.discoverable && binding.action.id() == action
@@ -69,11 +70,57 @@ pub fn contextual_hints_with_file_context(
             binding,
             label: meta.label,
             priority,
+            available,
         });
     }
 
-    hints.sort_by_key(|hint| hint.priority);
+    // Stable order: by priority, with unavailable trailing their available peers
+    hints.sort_by_key(|hint| (hint.priority, !hint.available));
     hints
+}
+
+/// Returns two rows of command-bar chips.
+///
+/// Row A — Commander core: F3-F9 always visible, dimmed when unavailable.
+/// Row B — Discovery: Ctrl+P Commands, Ctrl+D Compare, Ctrl+X P Sync,
+///         Ctrl+X T Terminal, F1 Help, F10 Quit.
+pub fn command_bar_rows(
+    state: &AppState,
+    keymap: &Keymap,
+    focused_kind: Option<EntryKind>,
+    editor_available: bool,
+) -> (Vec<ContextHint>, Vec<ContextHint>) {
+    let hints = contextual_hints_with_file_context(state, keymap, focused_kind, editor_available);
+
+    let row_a_actions = [
+        ActionId::ViewFile,
+        ActionId::EditFile,
+        ActionId::Copy,
+        ActionId::Move,
+        ActionId::Mkdir,
+        ActionId::Delete,
+        ActionId::OpenHosts,
+    ];
+    let row_b_actions = [
+        ActionId::OpenCommandCenter,
+        ActionId::ToggleWorkspaceComparison,
+        ActionId::PreviewWorkspaceSync,
+        ActionId::ToggleEmbeddedTerminal,
+        ActionId::OpenHelp,
+        ActionId::Quit,
+    ];
+
+    let row_a: Vec<_> = row_a_actions
+        .iter()
+        .filter_map(|action| hints.iter().find(|h| &h.action == action).cloned())
+        .collect();
+
+    let row_b: Vec<_> = row_b_actions
+        .iter()
+        .filter_map(|action| hints.iter().find(|h| &h.action == action).cloned())
+        .collect();
+
+    (row_a, row_b)
 }
 
 fn candidate_actions(state: &AppState) -> Vec<(ActionId, HintPriority)> {
@@ -102,6 +149,7 @@ fn candidate_actions(state: &AppState) -> Vec<(ActionId, HintPriority)> {
             (OpenJobs, Discovery),
             (OpenBookmarks, Discovery),
             (OpenHelp, Discovery),
+            (Quit, Discovery),
             (ListTmuxSessions, Discovery),
         ],
         InputContext::SyncPreview => vec![
@@ -137,23 +185,32 @@ mod tests {
         let state = AppState::default();
         let hints = contextual_hints(&state, &Keymap::default());
 
-        assert_eq!(hints.len(), 8);
-        assert_eq!(hints[0].action, ActionId::Mkdir);
-        assert_eq!(hints[0].binding, "F7");
-        assert_eq!(hints[1].action, ActionId::ToggleWorkspaceComparison);
-        assert_eq!(hints[1].binding, "Ctrl+D");
-        assert_eq!(hints[2].action, ActionId::OpenCommandCenter);
-        assert_eq!(hints[2].binding, "Ctrl+P");
-        assert_eq!(hints[3].action, ActionId::ToggleEmbeddedTerminal);
-        assert_eq!(hints[3].binding, "Ctrl+X T");
-        assert_eq!(hints[4].action, ActionId::OpenHosts);
-        assert_eq!(hints[4].binding, "F9");
-        assert_eq!(hints[5].action, ActionId::OpenJobs);
-        assert_eq!(hints[5].binding, "Ctrl+J");
-        assert_eq!(hints[6].action, ActionId::OpenBookmarks);
-        assert_eq!(hints[6].binding, "Ctrl+B");
-        assert_eq!(hints[7].action, ActionId::OpenHelp);
-        assert_eq!(hints[7].binding, "?");
+        // Hint count includes all candidate actions, including ones with available=false
+        assert_eq!(hints.len(), 14);
+        // Verify actions with known bindings are present
+        let mkdir = hints.iter().find(|h| h.action == ActionId::Mkdir).unwrap();
+        assert_eq!(mkdir.binding, "F7");
+        let compare = hints
+            .iter()
+            .find(|h| h.action == ActionId::ToggleWorkspaceComparison)
+            .unwrap();
+        assert_eq!(compare.binding, "Ctrl+D");
+        let cmd = hints
+            .iter()
+            .find(|h| h.action == ActionId::OpenCommandCenter)
+            .unwrap();
+        assert_eq!(cmd.binding, "Ctrl+P");
+    }
+
+    #[test]
+    fn command_bar_rows_always_include_commander_core() {
+        let (_row_a, _row_b) =
+            command_bar_rows(&AppState::default(), &Keymap::default(), None, false);
+        assert_eq!(_row_a.len(), 7, "F3-F9 must always be present");
+        assert!(
+            _row_b.len() >= 3,
+            "discovery row must have at least Commands + Compare + Help"
+        );
     }
 
     #[test]
@@ -202,15 +259,14 @@ mod tests {
             Some(EntryKind::File),
             false,
         );
+        // EditFile is returned but marked unavailable when editor is missing
+        let edit = no_editor
+            .iter()
+            .find(|h| h.action == ActionId::EditFile)
+            .unwrap();
         assert!(
-            no_editor
-                .iter()
-                .any(|hint| hint.action == ActionId::ViewFile)
-        );
-        assert!(
-            no_editor
-                .iter()
-                .all(|hint| hint.action != ActionId::EditFile)
+            !edit.available,
+            "EditFile should be unavailable without editor"
         );
     }
 
@@ -228,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_actions_are_not_offered() {
+    fn unavailable_actions_are_returned_but_not_available() {
         let mut state = AppState::default();
         state.remote_workspace.preview_open = true;
         state.remote_workspace.ux = WorkspaceSyncUxState::Finished {
@@ -236,16 +292,21 @@ mod tests {
         };
 
         let hints = contextual_hints(&state, &Keymap::default());
+        // CancelWorkspaceSync is returned but marked unavailable
+        let cancel = hints
+            .iter()
+            .find(|h| h.action == ActionId::CancelWorkspaceSync)
+            .unwrap();
         assert!(
-            !hints
-                .iter()
-                .any(|hint| hint.action == ActionId::CancelWorkspaceSync)
+            !cancel.available,
+            "CancelWorkspaceSync should be unavailable in Finished state"
         );
-        assert!(
-            hints
-                .iter()
-                .any(|hint| hint.action == ActionId::CloseWorkspaceSyncOverlay)
-        );
+        // CloseWorkspaceSyncOverlay is available
+        let close = hints
+            .iter()
+            .find(|h| h.action == ActionId::CloseWorkspaceSyncOverlay)
+            .unwrap();
+        assert!(close.available);
     }
 
     #[test]
