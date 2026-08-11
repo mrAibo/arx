@@ -1,4 +1,5 @@
 use crate::tui_terminal::TuiTerminalSession;
+use arx::app::InputContext;
 use arx::app::{
     Action, ActionAvailability, ActionContext, ActionId, AppState, CommandItem, CommandKind,
     CommandTarget, OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SessionCallout,
@@ -17,11 +18,16 @@ use arx::services::{
 };
 use arx::vfs::{Entry, EntryKind, Location, ProviderId, RemoteEditSession, RemoteEditState};
 use arx::workspace_sync::{
-    DiffState, SyncDirection, SyncMode, WorkspaceSide, WorkspaceSyncOperation,
+    DiffState, SyncDirection, SyncMode, WorkspaceDiff, WorkspaceSide, WorkspaceSyncOperation,
+    WorkspaceSyncPlan,
 };
 use arx::workspace_sync_execution::SyncPlanId;
 use arx::workspace_sync_verification::{
     SyncVerificationEvent, SyncVerificationStatus, SyncVerificationVerdict,
+    SyncVerificationVerdict::{
+        DifferencesRemain as VerifyDifferencesRemain, Inconclusive as VerifyInconclusive,
+        Synchronized as VerifySynchronized,
+    },
 };
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{
@@ -321,27 +327,52 @@ async fn event_loop(
                     if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
                         let hitboxes: Vec<_> = state.command_hitboxes.clone();
                         for hb in &hitboxes {
-                            if mouse.row == hb.row
-                                && mouse.column >= hb.col
-                                && mouse.column < hb.col + hb.width
+                            if mouse.column >= hb.rect.x
+                                && mouse.column < hb.rect.x + hb.rect.width
+                                && mouse.row >= hb.rect.y
+                                && mouse.row < hb.rect.y + hb.rect.height
                             {
+                                // Clear any pending keyboard chord on explicit mouse command
+                                key_router.clear_pending();
+
+                                // Derive the SAME active context as keyboard dispatch
+                                let entries = if state.active == Pane::Left {
+                                    &left_filtered
+                                } else {
+                                    &right_filtered
+                                };
+                                let cursor = {
+                                    let pane = state.active_pane();
+                                    if pane.split && pane.split_active {
+                                        pane.split_cursor
+                                    } else {
+                                        pane.cursor
+                                    }
+                                };
+                                let focused = entries.get(cursor).copied();
+                                let visible_count = entries.len();
+
                                 if hb.available {
                                     dispatch_ui_action(
                                         &mut state,
                                         hb.action,
-                                        None,
-                                        &[],
-                                        0,
+                                        focused,
+                                        entries,
+                                        visible_count,
                                         &workspace_scanner,
                                         &sync_runtime,
                                         &effect_dispatcher,
                                         &pane_loader,
                                         terminal_session,
                                         editor.as_deref(),
+                                        &mut key_router,
                                     )
                                     .await?;
                                 } else {
-                                    let ctx = ActionContext::from_state(&state);
+                                    let ctx = ActionContext::from_state(&state).with_file_context(
+                                        focused.map(|e| e.kind),
+                                        editor.is_some(),
+                                    );
                                     let action_id = action_to_id(hb.action);
                                     let avail = action_availability(action_id, &ctx);
                                     state.message =
@@ -355,12 +386,20 @@ async fn event_loop(
                     let (area, is_left) = if let Some(a) = state.left_area {
                         if mouse.column >= a.x
                             && mouse.column < a.x + a.width
-                            && mouse.row > a.y
+                            && mouse.row >= a.y
                             && mouse.row < a.y + a.height
                         {
                             (a, true)
                         } else if let Some(a) = state.right_area {
-                            (a, false)
+                            if mouse.column >= a.x
+                                && mouse.column < a.x + a.width
+                                && mouse.row >= a.y
+                                && mouse.row < a.y + a.height
+                            {
+                                (a, false)
+                            } else {
+                                continue;
+                            }
                         } else {
                             continue;
                         }
@@ -435,6 +474,7 @@ async fn event_loop(
                                     &pane_loader,
                                     terminal_session,
                                     editor.as_deref(),
+                                    &mut key_router,
                                 )
                                 .await?;
                                 continue;
@@ -452,6 +492,7 @@ async fn event_loop(
                                     &pane_loader,
                                     terminal_session,
                                     editor.as_deref(),
+                                    &mut key_router,
                                 )
                                 .await?;
                                 continue;
@@ -517,6 +558,7 @@ async fn event_loop(
                                         &effect_dispatcher,
                                         terminal_session,
                                         editor.as_deref(),
+                                        &mut key_router,
                                     )
                                     .await?
                                     {
@@ -947,6 +989,46 @@ async fn event_loop(
                         }
                     };
 
+                    // Help overlay owns navigation keys when open — intercept BEFORE router
+                    if matches!(state.input_context(), InputContext::Help) {
+                        match key.code {
+                            KeyCode::Esc
+                            | KeyCode::F(1)
+                            | KeyCode::Char('?')
+                            | KeyCode::Char('q') => {
+                                key_router.clear_pending();
+                                state.show_help = false;
+                                state.help_scroll = 0;
+                                continue;
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                state.help_scroll = state.help_scroll.saturating_add(1);
+                                continue;
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                state.help_scroll = state.help_scroll.saturating_sub(1);
+                                continue;
+                            }
+                            KeyCode::PageDown => {
+                                state.help_scroll = state.help_scroll.saturating_add(20);
+                                continue;
+                            }
+                            KeyCode::PageUp => {
+                                state.help_scroll = state.help_scroll.saturating_sub(20);
+                                continue;
+                            }
+                            KeyCode::Home => {
+                                state.help_scroll = 0;
+                                continue;
+                            }
+                            KeyCode::End => {
+                                state.help_scroll = usize::MAX;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     // First migration slice: resolve stable app actions before
                     // falling back to the legacy key matcher below.
                     match key_router.resolve(state.input_context(), key) {
@@ -974,6 +1056,7 @@ async fn event_loop(
                                         &pane_loader,
                                         terminal_session,
                                         editor.as_deref(),
+                                        &mut key_router,
                                     )
                                     .await?
                                 }
@@ -1063,6 +1146,10 @@ async fn event_loop(
                         }
                         KeyCode::Char('?') => {
                             state.show_help = !state.show_help;
+                        }
+                        KeyCode::F(1) => {
+                            state.show_help = !state.show_help;
+                            state.help_scroll = 0;
                         }
                         KeyCode::Enter
                             if key.modifiers.contains(KeyModifiers::ALT)
@@ -1931,6 +2018,12 @@ fn action_id_to_action(id: ActionId) -> Option<Action> {
         ActionId::Mkdir => Action::Mkdir,
         ActionId::Delete => Action::Delete,
         ActionId::OpenHosts => Action::OpenHosts,
+        ActionId::OpenCommandCenter => Action::OpenCommandCenter,
+        ActionId::ToggleWorkspaceComparison => Action::ToggleWorkspaceComparison,
+        ActionId::PreviewWorkspaceSync => Action::PreviewWorkspaceSync,
+        ActionId::ToggleEmbeddedTerminal => Action::ToggleEmbeddedTerminal,
+        ActionId::OpenHelp => Action::OpenHelp,
+        ActionId::Quit => Action::Quit,
         _ => return None,
     })
 }
@@ -1944,6 +2037,12 @@ fn action_to_id(a: Action) -> ActionId {
         Action::Mkdir => ActionId::Mkdir,
         Action::Delete => ActionId::Delete,
         Action::OpenHosts => ActionId::OpenHosts,
+        Action::OpenCommandCenter => ActionId::OpenCommandCenter,
+        Action::ToggleWorkspaceComparison => ActionId::ToggleWorkspaceComparison,
+        Action::PreviewWorkspaceSync => ActionId::PreviewWorkspaceSync,
+        Action::ToggleEmbeddedTerminal => ActionId::ToggleEmbeddedTerminal,
+        Action::OpenHelp => ActionId::OpenHelp,
+        Action::Quit => ActionId::Quit,
         _ => unreachable!("only commander core actions reach hitboxes"),
     }
 }
@@ -1957,11 +2056,18 @@ fn compact_action_label(action: ActionId) -> &'static str {
         ActionId::Mkdir => "MkDir",
         ActionId::Delete => "Del",
         ActionId::OpenHosts => "Hosts",
+        ActionId::OpenCommandCenter => "Cmd",
+        ActionId::ToggleWorkspaceComparison => "Diff",
+        ActionId::PreviewWorkspaceSync => "Sync",
+        ActionId::ToggleEmbeddedTerminal => "Term",
+        ActionId::OpenHelp => "Help",
+        ActionId::Quit => "Quit",
         _ => "",
     }
 }
 
 /// Format one command-bar row from hints, respecting width.
+#[allow(dead_code)] // used in test helpers
 fn format_command_row(hints: &[ContextHint], width: u16) -> String {
     let mut text = String::new();
     for hint in hints {
@@ -2005,12 +2111,10 @@ fn render_command_bar(
                 hint.label
             };
             let chip_text = format!("{} {}", hint.binding, label);
-            let chip_width = chip_text.len() as u16;
+            let chip_width = Line::from(chip_text.as_str()).width() as u16;
             if let Some(action) = action_id_to_action(hint.action) {
                 hitboxes.push(arx::app::CommandHitbox {
-                    row: 0,
-                    col,
-                    width: chip_width,
+                    rect: Rect::new(col, row_a_area.y, chip_width, 1),
                     action,
                     available: hint.available,
                 });
@@ -2030,14 +2134,81 @@ fn render_command_bar(
     }
 
     // Row B — Discovery (responsive, priority-based).
+    // Single layout model for both rendering and hitboxes.
     if !row_b.is_empty() && row_b_area.width > 0 {
-        let text = format_command_row(row_b, row_b_area.width);
-        if !text.is_empty() {
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct PositionedChip {
+            text: String,
+            rect: Rect,
+            available: bool,
+        }
+
+        let mut chips = Vec::new();
+        let mut cursor = row_b_area.x;
+        let spacing = 3u16; // matches format_command_row spacing
+
+        for hint in row_b {
+            let chip_text = format!("{} {}", hint.binding, hint.label);
+            let chip_width = Line::from(chip_text.as_str()).width() as u16;
+
+            let chip_x = if chips.is_empty() {
+                cursor
+            } else {
+                cursor + spacing
+            };
+
+            if chip_x + chip_width > row_b_area.x + row_b_area.width {
+                break; // stop at first overflow — same as format_command_row
+            }
+
+            if let Some(action) = action_id_to_action(hint.action) {
+                let rect = Rect::new(chip_x, row_b_area.y, chip_width, 1);
+                chips.push(PositionedChip {
+                    text: chip_text,
+                    rect,
+                    available: hint.available,
+                });
+                hitboxes.push(arx::app::CommandHitbox {
+                    rect,
+                    action,
+                    available: hint.available,
+                });
+            }
+
+            cursor = chip_x + chip_width;
+        }
+
+        // Render from the same computed layout — geometry is source of truth
+        if !chips.is_empty() {
+            let mut spans: Vec<Span> = Vec::new();
+            let mut render_cursor = row_b_area.x;
+
+            for chip in chips.iter() {
+                // render padding to align with chip.rect.x (includes inter-chip spacing)
+                if chip.rect.x > render_cursor {
+                    let pad = chip.rect.x - render_cursor;
+                    spans.push(Span::styled(
+                        " ".repeat(pad as usize),
+                        Style::default().fg(Color::Black).bg(Color::DarkGray),
+                    ));
+                    render_cursor = chip.rect.x + chip.rect.width;
+                } else {
+                    render_cursor = chip.rect.x + chip.rect.width;
+                }
+                let style = if !chip.available {
+                    Style::default()
+                        .fg(Color::Gray)
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM)
+                } else {
+                    Style::default().fg(Color::Black).bg(Color::DarkGray)
+                };
+                spans.push(Span::styled(chip.text.clone(), style));
+            }
             frame.render_widget(
-                Paragraph::new(Span::styled(
-                    text,
-                    Style::default().fg(Color::Black).bg(Color::DarkGray),
-                )),
+                Paragraph::new(Line::from(spans))
+                    .style(Style::default().fg(Color::Black).bg(Color::DarkGray)),
                 row_b_area,
             );
         }
@@ -2146,6 +2317,181 @@ fn is_archive(name: &str) -> bool {
         || name.ends_with(".tar.bz2")
         || name.ends_with(".tar.xz")
         || name.ends_with(".zip")
+}
+
+// ponytail: presentation-only model for workspace ribbon.
+// Reads runtime truth from `state` but never mutates backend semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RibbonPhase {
+    Commander,
+    Ready,
+    Scanning,
+    Differences,
+    Preview,
+    Running,
+    Verifying,
+    Synchronized,
+    DifferencesRemain,
+    Inconclusive,
+    VerificationFailed,
+    VerificationCancelled,
+    VerificationSuperseded,
+    Blocked,
+}
+
+fn ribbon_phase(state: &AppState) -> RibbonPhase {
+    use RibbonPhase::*;
+    if !state.remote_workspace.enabled {
+        return Commander;
+    }
+    match state.remote_workspace.ux {
+        WorkspaceSyncUxState::Scanning => Scanning,
+        WorkspaceSyncUxState::Preview { .. }
+        | WorkspaceSyncUxState::ConfirmationRequired { .. } => Preview,
+        WorkspaceSyncUxState::Launching { .. }
+        | WorkspaceSyncUxState::Queued { .. }
+        | WorkspaceSyncUxState::Cancelling { .. }
+        | WorkspaceSyncUxState::Running { .. } => Running,
+        WorkspaceSyncUxState::Verifying { .. } => Verifying,
+        WorkspaceSyncUxState::Finished { .. } | WorkspaceSyncUxState::VerificationDiff { .. } => {
+            if let Some(snap) = &state.remote_workspace.verification {
+                match &snap.status {
+                    SyncVerificationStatus::Finished(result) => match result.verdict {
+                        VerifySynchronized => Synchronized,
+                        VerifyDifferencesRemain { .. } => DifferencesRemain,
+                        VerifyInconclusive { .. } => Inconclusive,
+                    },
+                    SyncVerificationStatus::Failed { .. } => VerificationFailed,
+                    SyncVerificationStatus::Cancelled => VerificationCancelled,
+                    SyncVerificationStatus::Superseded => VerificationSuperseded,
+                    _ => Inconclusive,
+                }
+            } else {
+                Inconclusive
+            }
+        }
+        WorkspaceSyncUxState::Blocked { .. } => Blocked,
+        _ => {
+            if state.remote_workspace.diff.is_some() {
+                Differences
+            } else {
+                Ready
+            }
+        }
+    }
+}
+
+fn workspace_ribbon_text(state: &AppState) -> String {
+    let enabled = state.remote_workspace.enabled;
+    let direction = state.remote_workspace.policy.direction;
+    let (src_id, dst_id) = match direction {
+        arx::workspace_sync::SyncDirection::LeftToRight => (
+            provider_identity(&state.left.location),
+            provider_identity(&state.right.location),
+        ),
+        arx::workspace_sync::SyncDirection::RightToLeft => (
+            provider_identity(&state.right.location),
+            provider_identity(&state.left.location),
+        ),
+    };
+    let phase = ribbon_phase(state);
+
+    let action_hint = if !enabled {
+        "Ctrl+D Compare".into()
+    } else {
+        match phase {
+            RibbonPhase::Commander => "Ctrl+D Compare".into(),
+            RibbonPhase::Ready => "Ctrl+D Compare".into(),
+            RibbonPhase::Scanning => "Comparing…".into(),
+            RibbonPhase::Differences => {
+                let count = state
+                    .remote_workspace
+                    .diff
+                    .as_ref()
+                    .map(diff_metric_summary)
+                    .unwrap_or_default();
+                format!("{} · Ctrl+X P Preview", count)
+            }
+            RibbonPhase::Preview => {
+                if let Some(plan) = &state.remote_workspace.plan {
+                    let ops = plan_metric_summary(plan);
+                    format!("{} · Enter Execute", ops)
+                } else {
+                    "Preview · Enter Execute".into()
+                }
+            }
+            RibbonPhase::Running => {
+                #[allow(clippy::collapsible_if)]
+                if let Some(current_job_id) = state.remote_workspace.ux.job_id() {
+                    if let Some(job) = state.jobs.iter().find(|j| j.id == current_job_id) {
+                        if let arx::jobs::JobProgress::WorkspaceSync(sync_prog) = &job.progress {
+                            if let Some(pct) = sync_prog.percent() {
+                                return format!("{} → {} · Syncing… {}%", src_id, dst_id, pct);
+                            }
+                        }
+                    }
+                }
+                "Syncing…".into()
+            }
+            RibbonPhase::Verifying => "Verifying…".into(),
+            RibbonPhase::Synchronized => "✓ SYNCHRONIZED".into(),
+            RibbonPhase::DifferencesRemain => "⚠ DIFFERENCES REMAIN".into(),
+            RibbonPhase::Inconclusive => "? INCONCLUSIVE".into(),
+            RibbonPhase::VerificationFailed => "! VERIFICATION FAILED".into(),
+            RibbonPhase::VerificationCancelled => "✗ VERIFICATION CANCELLED".into(),
+            RibbonPhase::VerificationSuperseded => "… VERIFICATION SUPERSEDED".into(),
+            RibbonPhase::Blocked => "BLOCKED".into(),
+        }
+    };
+
+    if enabled {
+        format!("WORKSPACE {} → {} · {}", src_id, dst_id, action_hint)
+    } else {
+        format!("COMMANDER {} ⇄ {} · {}", src_id, dst_id, action_hint)
+    }
+}
+
+fn provider_identity(location: &Location) -> &'static str {
+    match location.provider_id() {
+        ProviderId::Local => "[LOCAL]",
+        ProviderId::Sftp => "[SSH]",
+        ProviderId::Archive => "[ARCHIVE]",
+        _ => "[?]",
+    }
+}
+
+fn diff_metric_summary(diff: &WorkspaceDiff) -> String {
+    let changes = diff.entries.len();
+    let bytes: u64 = diff
+        .entries
+        .iter()
+        .filter_map(|e| {
+            e.left
+                .as_ref()
+                .and_then(|f| f.size)
+                .or_else(|| e.right.as_ref().and_then(|f| f.size))
+        })
+        .sum();
+    format!("{} changes · {} B", changes, bytes)
+}
+
+fn plan_metric_summary(plan: &WorkspaceSyncPlan) -> String {
+    let copies = plan
+        .operations
+        .iter()
+        .filter(|o| matches!(o, arx::workspace_sync::WorkspaceSyncOperation::Copy { .. }))
+        .count();
+    let deletes = plan
+        .operations
+        .iter()
+        .filter(|o| {
+            matches!(
+                o,
+                arx::workspace_sync::WorkspaceSyncOperation::Delete { .. }
+            )
+        })
+        .count();
+    format!("{} copies · {} deletes", copies, deletes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2359,7 +2705,7 @@ fn render(
 
     // Help overlay
     if state.show_help {
-        render_help(frame, area);
+        render_help(frame, area, state);
     }
 
     // Viewer overlay
@@ -2758,23 +3104,8 @@ fn render(
     let git_info = state.git_status.as_str();
     let msg_hint = message.map(|m| format!(" | {m}")).unwrap_or_default();
 
-    // Workspace Ribbon — Local ⇄ Remote identity at a glance
-    let ribbon_text = if state.remote_workspace.enabled {
-        let left_label = state.left.location.label();
-        let right_label = state.right.location.label();
-        let summary = state.remote_workspace.summary();
-        format!(
-            "WORKSPACE [LOCAL] {} ⇄ {} · {}",
-            left_label, right_label, summary
-        )
-    } else {
-        let left_label = state.left.location.label();
-        let right_label = state.right.location.label();
-        format!(
-            "WORKSPACE [LOCAL] {} ⇄ {} · Not compared · Ctrl+D Compare",
-            left_label, right_label
-        )
-    };
+    // Workspace Ribbon — provider-truthful identity + workflow phase
+    let ribbon_text = workspace_ribbon_text(state);
     let ribbon = Paragraph::new(Line::from(Span::styled(
         ribbon_text,
         Style::default().fg(Color::Cyan),
@@ -2793,10 +3124,10 @@ fn render(
     // Session milestones are passive presentation. They never own backend
     // state and disappear on the next user interaction.
     let (footer_row_a, footer_row_b) = if let Some(callout) = session_callout.as_deref() {
-        render_session_callout(frame, chunks[2], callout);
-        (chunks[3], chunks[4])
+        render_session_callout(frame, chunks[3], callout);
+        (chunks[4], chunks[5])
     } else {
-        (chunks[2], chunks[3])
+        (chunks[3], chunks[4])
     };
 
     // Two-row command bar: Row A = Commander core, Row B = Discovery.
@@ -3351,28 +3682,96 @@ fn render_verification_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>
         }
     }
 }
-fn render_help(frame: &mut ratatui::Frame, area: Rect) {
+fn render_help(frame: &mut ratatui::Frame, area: Rect, state: &mut AppState) {
     let popup_area = centered_rect(68, 90, area);
     frame.render_widget(Clear, popup_area);
 
-    let text = vec![
-        Line::from(Span::styled("ARX Help", Style::default().fg(Color::Yellow))),
+    // Full help content (Getting Started first, then full reference)
+    let full_lines = help_full_lines();
+
+    // Compute visible slice
+    let content_height = popup_area.height.saturating_sub(2) as usize; // minus borders
+    let total = full_lines.len();
+    let scroll = state.help_scroll.min(total.saturating_sub(content_height));
+    state.help_scroll = scroll;
+    let visible: Vec<Line> = full_lines
+        .iter()
+        .skip(scroll)
+        .take(content_height)
+        .cloned()
+        .collect();
+
+    // Scroll hint
+    let scroll_hint = if total > content_height {
+        format!(
+            " {}/{} | j/k/↑↓:scroll PgUp/PgDn:page Home/End:jump q/Esc/F1:close ",
+            scroll + visible.len().min(total - scroll),
+            total
+        )
+    } else {
+        " q/Esc/F1/?:close ".into()
+    };
+
+    let help = Paragraph::new(visible)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Help ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .style(Style::default().fg(Color::White))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(help, popup_area);
+
+    // Scroll hint at bottom
+    let hint_area = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(popup_area);
+    let hint = Paragraph::new(Line::from(scroll_hint))
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(hint, hint_area[1]);
+}
+
+fn help_full_lines() -> Vec<Line<'static>> {
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+
+    vec![
+        // Getting Started (short, first)
         Line::from(Span::styled(
-            "F1/? or Esc to close",
+            "ARX Help — Getting Started",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "F1/? or Esc to close  |  j/k/↑↓/PgUp/PgDn/Home/End to scroll",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
+        Line::from(Span::styled(
+            "Core Workflow",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from("  Tab           Switch pane (left ↔ right)"),
+        Line::from("  F9            Hosts / SFTP (connect remote)"),
+        Line::from("  Ctrl+D        Compare workspace (diff)"),
+        Line::from("  Ctrl+X P      Sync Preview (after compare)"),
+        Line::from("  Enter         Execute preview"),
+        Line::from("  Ctrl+P        Command Center"),
+        Line::from("  F1/?          This help"),
+        Line::from("  F10 / q       Quit"),
+        Line::from(""),
         Line::from(Span::styled("Navigation", Style::default().fg(Color::Cyan))),
-        Line::from("  j/↓ k/↑       Move cursor"),
-        Line::from("  Enter          Enter directory / content diff"),
-        Line::from("  Backspace      Parent directory"),
-        Line::from("  Tab            Switch pane (left ↔ right)"),
-        Line::from("  Ctrl+G         Go to path"),
-        Line::from("  Ctrl+U         Swap panes"),
-        Line::from("  Alt+O          Sync other pane to active"),
-        Line::from("  Alt+Down       Go back in directory history"),
-        Line::from("  Alt+/          Recursive file search (find)"),
-        Line::from("  Ctrl+\\        Open in file manager"),
+        Line::from("  j / ↓ / k / ↑      Move cursor"),
+        Line::from("  Enter              Enter directory / content diff"),
+        Line::from("  Backspace          Parent directory"),
+        Line::from("  Ctrl+G             Go to path"),
+        Line::from("  Ctrl+U             Swap panes"),
+        Line::from("  Alt+O              Sync other pane to active"),
+        Line::from("  Alt+Down           Go back in directory history"),
+        Line::from("  Alt+/              Recursive file search (find)"),
+        Line::from("  Ctrl+\\\\             Open in file manager"),
         Line::from(""),
         Line::from(Span::styled("Tabs", Style::default().fg(Color::Cyan))),
         Line::from("  Ctrl+T         New tab"),
@@ -3424,9 +3823,7 @@ fn render_help(frame: &mut ratatui::Frame, area: Rect) {
             "Panels & Tools",
             Style::default().fg(Color::Cyan),
         )),
-        Line::from("  Ctrl+D         Toggle directory diff"),
         Line::from("  F2             User menu (arx.menu)"),
-        Line::from("  F9             Hosts / SFTP"),
         Line::from("  Ctrl+B         Bookmarks"),
         Line::from("  Ctrl+J         Background jobs"),
         Line::from("  Ctrl+O         Shell (drop to subshell)"),
@@ -3436,13 +3833,7 @@ fn render_help(frame: &mut ratatui::Frame, area: Rect) {
         Line::from("  Ctrl+R         Refresh"),
         Line::from("  q              Quit"),
         Line::from("  F1 / ?         This help"),
-    ];
-
-    let help = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title(" Help "))
-        .style(Style::default().fg(Color::White))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(help, popup_area);
+    ]
 }
 
 fn render_viewer(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
@@ -4189,6 +4580,7 @@ async fn dispatch_ui_action(
     pane_loader: &PaneLoader,
     terminal_session: &mut TuiTerminalSession,
     configured_editor: Option<&str>,
+    key_router: &mut KeyRouter,
 ) -> io::Result<()> {
     let focused = focused.filter(|entry| entry.name != VIRTUAL_PARENT_NAME);
     if matches!(
@@ -4220,7 +4612,11 @@ async fn dispatch_ui_action(
         Action::OpenBookmarks => state.toggle_overlay(OverlayKind::Bookmarks),
         Action::OpenJobs => state.toggle_overlay(OverlayKind::Jobs),
         Action::OpenHosts => toggle_hosts_overlay(state),
-        Action::OpenHelp => state.toggle_overlay(OverlayKind::Help),
+        Action::OpenHelp => {
+            key_router.clear_pending();
+            state.help_scroll = 0;
+            state.toggle_overlay(OverlayKind::Help);
+        }
         Action::ToggleSelect => {
             toggle_selection_and_advance(state, focused, visible_count);
         }
@@ -5114,6 +5510,7 @@ async fn execute_command_target(
     effect_dispatcher: &EffectDispatcher,
     terminal_session: &mut TuiTerminalSession,
     configured_editor: Option<&str>,
+    key_router: &mut KeyRouter,
 ) -> io::Result<Option<Effect>> {
     let effect = match target {
         CommandTarget::Action(action) => {
@@ -5129,6 +5526,7 @@ async fn execute_command_target(
                 pane_loader,
                 terminal_session,
                 configured_editor,
+                key_router,
             )
             .await?;
             None
