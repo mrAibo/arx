@@ -2741,10 +2741,6 @@ fn render(
 
     // Status bar
     let pane = state.active_pane();
-    let loc_str = match &pane.location {
-        Location::Local(p) => p.display().to_string(),
-        other => other.to_string(),
-    };
     let selection_count = state.selection_count(state.active, &pane.location);
     let hint = if state.cmd_input {
         format!(" :{}_", state.cmd)
