@@ -27,8 +27,8 @@ A localhost disposable OpenSSH/SFTP environment is preferable for reproducibilit
 Two workspace roots with a small, deterministic non-destructive difference set.
 
 ```
-local:  ~/arx-demo/app
-remote: demo-prod:/srv/arx-demo/app
+local:  ~/arx-demo/project
+remote: arx-demo:/tmp/arx-demo/project
 ```
 
 Use regular files. Directory and symlink equality is intentionally conservative where the current fingerprint model lacks comparable evidence.
