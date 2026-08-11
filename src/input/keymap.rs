@@ -217,8 +217,6 @@ impl Default for Keymap {
             KeyBinding::new(Browser, vec![ctrl('x'), plain('o')], Action::BeginChown),
             KeyBinding::alias(Browser, vec![ctrl('x'), ctrl('o')], Action::BeginChown),
             KeyBinding::new(Help, vec![plain('?')], Action::OpenHelp),
-            // Current ARX behavior lets q quit while the help overlay is open.
-            KeyBinding::new(Help, vec![plain('q')], Action::Quit),
             KeyBinding::new(
                 SyncPreview,
                 vec![plain('d')],
