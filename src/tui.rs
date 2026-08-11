@@ -15,7 +15,7 @@ use arx::services::{
     PaneLoadResponse, PaneLoader, SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions,
     WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
 };
-use arx::vfs::{Entry, EntryKind, Location, RemoteEditSession, RemoteEditState};
+use arx::vfs::{Entry, EntryKind, Location, ProviderId, RemoteEditSession, RemoteEditState};
 use arx::workspace_sync::{
     DiffState, SyncDirection, SyncMode, WorkspaceSide, WorkspaceSyncOperation,
 };
@@ -3705,7 +3705,14 @@ fn render_pane(
         Style::default().fg(Color::DarkGray)
     };
 
-    let title = format!(" {} ", pane.location.label());
+    // Provider badge: [LOCAL] | [SSH] | [ARCHIVE]
+    let provider_badge = match pane.location.provider_id() {
+        ProviderId::Local => "[LOCAL]",
+        ProviderId::Sftp => "[SSH]",
+        ProviderId::Archive => "[ARCHIVE]",
+        _ => "[REMOTE]",
+    };
+    let title = format!(" {} {} ", provider_badge, pane.location.label());
 
     let banner = match surface {
         PaneSurfaceState::Loading {
