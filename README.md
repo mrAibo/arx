@@ -68,8 +68,8 @@ Download the archive and SHA256SUMS from the [latest GitHub Release](https://git
 sha256sum -c SHA256SUMS
 
 # Extract
-tar xzf arx-v0.15.0-x86_64-unknown-linux-gnu.tar.gz
-cd arx-v0.15.0-x86_64-unknown-linux-gnu
+tar xzf arx-v0.15.1-x86_64-unknown-linux-gnu.tar.gz
+cd arx-v0.15.1-x86_64-unknown-linux-gnu
 
 # Place on PATH
 sudo install -m 755 arx /usr/local/bin/arx
