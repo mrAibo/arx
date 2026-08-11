@@ -259,7 +259,7 @@ pub const ACTION_CATALOG: &[ActionMeta] = &[
     ActionMeta {
         id: ActionId::EditFile,
         label: "Edit file",
-        description: "Open the focused local file in the configured editor",
+        description: "Edit the focused supported text file",
         category: ActionCategory::Files,
         destructive: false,
     },
@@ -287,7 +287,7 @@ pub const ACTION_CATALOG: &[ActionMeta] = &[
     ActionMeta {
         id: ActionId::Delete,
         label: "Delete",
-        description: "Delete file selection to trash",
+        description: "Delete the selected items using the provider's safe delete flow",
         category: ActionCategory::Files,
         destructive: true,
     },
