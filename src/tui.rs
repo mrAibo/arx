@@ -1,8 +1,9 @@
 use crate::tui_terminal::TuiTerminalSession;
 use arx::app::{
-    Action, ActionAvailability, ActionContext, AppState, CommandItem, CommandKind, CommandTarget,
-    OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SessionCallout, SortMode,
-    WorkspaceSyncUxState, action_availability, action_meta, build_command_items_with_file_context,
+    Action, ActionAvailability, ActionContext, ActionId, AppState, CommandItem, CommandKind,
+    CommandTarget, OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SessionCallout,
+    SortMode, WorkspaceSyncUxState, action_availability, action_meta,
+    build_command_items_with_file_context,
 };
 use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectResponse, EffectScope};
 use arx::effects::{Effect, EffectEvent};
@@ -26,7 +27,7 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEve
 use ratatui::{
     DefaultTerminal,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
@@ -316,6 +317,40 @@ async fn event_loop(
                     }
                 }
                 Event::Mouse(mouse) => {
+                    // Check command bar hitboxes first (before pane area)
+                    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                        let hitboxes: Vec<_> = state.command_hitboxes.clone();
+                        for hb in &hitboxes {
+                            if mouse.row == hb.row
+                                && mouse.column >= hb.col
+                                && mouse.column < hb.col + hb.width
+                            {
+                                if hb.available {
+                                    dispatch_ui_action(
+                                        &mut state,
+                                        hb.action,
+                                        None,
+                                        &[],
+                                        0,
+                                        &workspace_scanner,
+                                        &sync_runtime,
+                                        &effect_dispatcher,
+                                        &pane_loader,
+                                        terminal_session,
+                                        editor.as_deref(),
+                                    )
+                                    .await?;
+                                } else {
+                                    let ctx = ActionContext::from_state(&state);
+                                    let action_id = action_to_id(hb.action);
+                                    let avail = action_availability(action_id, &ctx);
+                                    state.message =
+                                        Some(avail.reason().unwrap_or("unavailable").to_string());
+                                }
+                                continue; // handled by command bar
+                            }
+                        }
+                    }
                     // Compute pane + row once for all mouse events
                     let (area, is_left) = if let Some(a) = state.left_area {
                         if mouse.column >= a.x
@@ -1885,6 +1920,47 @@ fn pane_surface_state<'a>(
     }
 }
 
+// --- Commander core action helpers (ponytail: 7-variant match, covers hitbox set) ---
+
+fn action_id_to_action(id: ActionId) -> Option<Action> {
+    Some(match id {
+        ActionId::ViewFile => Action::ViewFile,
+        ActionId::EditFile => Action::EditFile,
+        ActionId::Copy => Action::Copy,
+        ActionId::Move => Action::Move,
+        ActionId::Mkdir => Action::Mkdir,
+        ActionId::Delete => Action::Delete,
+        ActionId::OpenHosts => Action::OpenHosts,
+        _ => return None,
+    })
+}
+
+fn action_to_id(a: Action) -> ActionId {
+    match a {
+        Action::ViewFile => ActionId::ViewFile,
+        Action::EditFile => ActionId::EditFile,
+        Action::Copy => ActionId::Copy,
+        Action::Move => ActionId::Move,
+        Action::Mkdir => ActionId::Mkdir,
+        Action::Delete => ActionId::Delete,
+        Action::OpenHosts => ActionId::OpenHosts,
+        _ => unreachable!("only commander core actions reach hitboxes"),
+    }
+}
+
+fn compact_action_label(action: ActionId) -> &'static str {
+    match action {
+        ActionId::ViewFile => "View",
+        ActionId::EditFile => "Edit",
+        ActionId::Copy => "Copy",
+        ActionId::Move => "Move",
+        ActionId::Mkdir => "MkDir",
+        ActionId::Delete => "Del",
+        ActionId::OpenHosts => "Hosts",
+        _ => "",
+    }
+}
+
 /// Format one command-bar row from hints, respecting width.
 fn format_command_row(hints: &[ContextHint], width: u16) -> String {
     let mut text = String::new();
@@ -1907,41 +1983,55 @@ fn render_command_bar(
     frame: &mut ratatui::Frame,
     row_a_area: Rect,
     row_b_area: Rect,
-    state: &AppState,
-    key_router: &KeyRouter,
-    focused_kind: Option<EntryKind>,
-    editor_available: bool,
+    hitboxes: &mut Vec<arx::app::CommandHitbox>,
+    row_a: &[ContextHint],
+    row_b: &[ContextHint],
 ) {
-    if !key_router.pending().is_empty() {
-        return;
-    }
-
-    let (row_a, row_b) =
-        command_bar_rows(state, key_router.keymap(), focused_kind, editor_available);
+    hitboxes.clear();
 
     // Row A — Commander core (always visible, dimmed if unavailable).
     if !row_a.is_empty() && row_a_area.width > 0 {
         let mut spans: Vec<Span> = Vec::new();
+        let compact = row_a_area.width < 90;
+        let mut col = row_a_area.x;
         for (i, hint) in row_a.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::raw("  "));
+                col += 2;
             }
-            let style = if hint.available {
-                Style::default().fg(Color::Black).bg(Color::DarkGray)
+            let label = if compact {
+                compact_action_label(hint.action)
             } else {
-                Style::default().fg(Color::DarkGray).bg(Color::DarkGray)
+                hint.label
             };
-            spans.push(Span::styled(
-                format!("{} {}", hint.binding, hint.label),
-                style,
-            ));
+            let chip_text = format!("{} {}", hint.binding, label);
+            let chip_width = chip_text.len() as u16;
+            if let Some(action) = action_id_to_action(hint.action) {
+                hitboxes.push(arx::app::CommandHitbox {
+                    row: 0,
+                    col,
+                    width: chip_width,
+                    action,
+                    available: hint.available,
+                });
+            }
+            col += chip_width;
+            let style = if !hint.available {
+                Style::default()
+                    .fg(Color::Gray)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM)
+            } else {
+                Style::default().fg(Color::Black).bg(Color::DarkGray)
+            };
+            spans.push(Span::styled(chip_text, style));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), row_a_area);
     }
 
     // Row B — Discovery (responsive, priority-based).
     if !row_b.is_empty() && row_b_area.width > 0 {
-        let text = format_command_row(&row_b, row_b_area.width);
+        let text = format_command_row(row_b, row_b_area.width);
         if !text.is_empty() {
             frame.render_widget(
                 Paragraph::new(Span::styled(
@@ -2700,14 +2790,15 @@ fn render(
 
     // Two-row command bar: Row A = Commander core, Row B = Discovery.
     // Derived from the same runtime Keymap that owns keyboard routing.
+    let focused_kind = focused_entry(state, left_entries, right_entries).map(|entry| entry.kind);
+    let (row_a, row_b) = command_bar_rows(state, key_router.keymap(), focused_kind, editor_available);
     render_command_bar(
         frame,
         footer_row_a,
         footer_row_b,
-        state,
-        key_router,
-        focused_entry(state, left_entries, right_entries).map(|entry| entry.kind),
-        editor_available,
+        &mut state.command_hitboxes,
+        &row_a,
+        &row_b,
     );
 
     if state.active_overlay() == Some(OverlayKind::SyncPreview) {
