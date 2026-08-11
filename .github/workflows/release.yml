@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
   contents: write
@@ -12,26 +12,94 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - name: Derive tag version
+        id: tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          TAG_VER="${TAG#v}"
+          echo "tag=${TAG}"           >> $GITHUB_OUTPUT
+          echo "version=${TAG_VER}"   >> $GITHUB_OUTPUT
+
+      - name: Derive Cargo version
+        id: cargo
+        run: |
+          CARGO_VER=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+            | python3 -c 'import json,sys; [print(p["version"]) for p in json.load(sys.stdin)["packages"] if p["name"]=="arx"]')
+          echo "version=${CARGO_VER}" >> $GITHUB_OUTPUT
+
+      - name: Gate tag ↔ Cargo version
+        run: |
+          TAG_VER="${{ steps.tag.outputs.version }}"
+          CARGO_VER="${{ steps.cargo.outputs.version }}"
+          if [ "${TAG_VER}" != "${CARGO_VER}" ]; then
+            echo "FAIL: tag version '${TAG_VER}' != Cargo version '${CARGO_VER}'"
+            exit 1
+          fi
+          echo "version=${TAG_VER}" >> $GITHUB_ENV
+
+      - name: Require hero asset
+        run: |
+          if [ ! -f docs/assets/remote-workspace-update.gif ]; then
+            echo "FAIL: Product hero GIF is missing. Merge PR #55 before tagging a release."
+            exit 1
+          fi
 
       - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --all-features
+
+      - name: MSRV check
+        run: |
+          rustup toolchain install 1.88 --no-self-update --profile minimal
+          cargo +1.88 check --locked --all-features
+
       - name: Build
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Package
         run: |
-          cd target/release
-          tar czf /tmp/arx-x86_64-unknown-linux-gnu.tar.gz arx
+          scripts/package-release.sh \
+            "${{ env.version }}" \
+            x86_64-unknown-linux-gnu \
+            target/release/arx \
+            dist
 
-      - name: Release
-        uses: softprops/action-gh-release@v2
+      - name: Smoke packaged binary
+        run: |
+          mkdir -p /tmp/arx-release-smoke
+          tar xzf "dist/arx-v${{ env.version }}-x86_64-unknown-linux-gnu.tar.gz" -C /tmp/arx-release-smoke
+          SMOKE_DIR="/tmp/arx-release-smoke/arx-v${{ env.version }}-x86_64-unknown-linux-gnu"
+          "$SMOKE_DIR/arx" --version | grep -q "${{ env.version }}" || {
+            echo "FAIL: packaged binary version mismatch"
+            exit 1
+          }
+          "$SMOKE_DIR/arx" --help > /dev/null
+          echo "Packaged binary smoke: OK"
+
+      - name: Verify checksum
+        run: ( cd dist && sha256sum -c SHA256SUMS )
+
+      - name: Publish
+        uses: softprops/action-gh-release@v3
         with:
-          files: /tmp/arx-x86_64-unknown-linux-gnu.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            dist/arx-*.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          make_latest: true
