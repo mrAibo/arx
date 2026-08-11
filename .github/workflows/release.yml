@@ -4,6 +4,18 @@ on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/package-release.sh'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to dry-run (e.g. 0.15.0)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -17,32 +29,42 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Derive tag version
-        id: tag
+      - name: Derive version
+        id: ver
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          TAG_VER="${TAG#v}"
-          echo "tag=${TAG}"           >> $GITHUB_OUTPUT
-          echo "version=${TAG_VER}"   >> $GITHUB_OUTPUT
+          IS_TAG=false
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            IS_TAG=true
+            TAG="${GITHUB_REF#refs/tags/}"
+            TAG_VER="${TAG#v}"
+            echo "version=${TAG_VER}" >> $GITHUB_OUTPUT
+          elif [[ -n "${{ github.event.inputs.version }}" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            CARGO_VER=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
+              | python3 -c 'import json,sys; [print(p["version"]) for p in json.load(sys.stdin)["packages"] if p["name"]=="arx"]')
+            echo "version=${CARGO_VER}" >> $GITHUB_OUTPUT
+          fi
+          echo "is_tag=${IS_TAG}" >> $GITHUB_OUTPUT
 
-      - name: Derive Cargo version
-        id: cargo
+      - name: Gate tag ↔ Cargo version (tag only)
+        if: steps.ver.outputs.is_tag == 'true'
         run: |
           CARGO_VER=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
             | python3 -c 'import json,sys; [print(p["version"]) for p in json.load(sys.stdin)["packages"] if p["name"]=="arx"]')
-          echo "version=${CARGO_VER}" >> $GITHUB_OUTPUT
-
-      - name: Gate tag ↔ Cargo version
-        run: |
-          TAG_VER="${{ steps.tag.outputs.version }}"
-          CARGO_VER="${{ steps.cargo.outputs.version }}"
+          TAG_VER="${{ steps.ver.outputs.version }}"
           if [ "${TAG_VER}" != "${CARGO_VER}" ]; then
             echo "FAIL: tag version '${TAG_VER}' != Cargo version '${CARGO_VER}'"
             exit 1
           fi
           echo "version=${TAG_VER}" >> $GITHUB_ENV
 
-      - name: Require hero asset
+      - name: Set version env
+        if: steps.ver.outputs.is_tag != 'true'
+        run: echo "version=${{ steps.ver.outputs.version }}" >> $GITHUB_ENV
+
+      - name: Require hero asset (tag only)
+        if: steps.ver.outputs.is_tag == 'true'
         run: |
           if [ ! -f docs/assets/remote-workspace-update.gif ]; then
             echo "FAIL: Product hero GIF is missing. Merge PR #55 before tagging a release."
@@ -95,7 +117,8 @@ jobs:
       - name: Verify checksum
         run: ( cd dist && sha256sum -c SHA256SUMS )
 
-      - name: Publish
+      - name: Publish (tag only)
+        if: steps.ver.outputs.is_tag == 'true'
         uses: softprops/action-gh-release@v3
         with:
           files: |
