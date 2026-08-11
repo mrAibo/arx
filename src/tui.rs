@@ -2179,12 +2179,22 @@ fn render_command_bar(
             cursor = chip_x + chip_width;
         }
 
-        // Render from the same computed layout
+        // Render from the same computed layout — geometry is source of truth
         if !chips.is_empty() {
             let mut spans: Vec<Span> = Vec::new();
-            for (i, chip) in chips.iter().enumerate() {
-                if i > 0 {
-                    // spacing already encoded in chip.rect.x; just render in order
+            let mut render_cursor = row_b_area.x;
+
+            for chip in chips.iter() {
+                // render padding to align with chip.rect.x (includes inter-chip spacing)
+                if chip.rect.x > render_cursor {
+                    let pad = chip.rect.x - render_cursor;
+                    spans.push(Span::styled(
+                        " ".repeat(pad as usize),
+                        Style::default().fg(Color::Black).bg(Color::DarkGray),
+                    ));
+                    render_cursor = chip.rect.x + chip.rect.width;
+                } else {
+                    render_cursor = chip.rect.x + chip.rect.width;
                 }
                 let style = if !chip.available {
                     Style::default()
