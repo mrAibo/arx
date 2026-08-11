@@ -21,12 +21,7 @@ pub struct OpenSshSftpConnection {
 
 impl OpenSshSftpConnection {
     pub async fn connect(alias: &str) -> io::Result<Self> {
-        if alias.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SSH alias must not be empty",
-            ));
-        }
+        super::validate_ssh_alias(alias)?;
 
         let mut child = Command::new("ssh")
             .args([
@@ -65,6 +60,55 @@ impl OpenSshSftpConnection {
         Ok(Self { session, child })
     }
 
+    /// Create a transaction directory with mode 0700 in the creating syscall.
+    /// SFTP v3's MKDIR wrapper does not expose attributes, so use the same
+    /// validated OpenSSH transport for this one operation.
+    pub async fn create_private_dir(alias: &str, path: &str) -> io::Result<()> {
+        super::validate_ssh_alias(alias)?;
+        if path.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "remote directory path contains NUL",
+            ));
+        }
+
+        let script = format!("set -eu; umask 077; mkdir -m 700 -- {}", shell_quote(path));
+        let remote_command = format!("sh -c {}", shell_quote(&script));
+        let status = timeout(
+            Duration::from_secs(10),
+            Command::new("ssh")
+                .args([
+                    "-T",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "StrictHostKeyChecking=yes",
+                    "-o",
+                    "ConnectTimeout=5",
+                    alias,
+                    &remote_command,
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SSH mkdir outcome uncertain"))??;
+
+        match status.code() {
+            Some(0) => Ok(()),
+            Some(255) | None => Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "SSH mkdir transport outcome uncertain",
+            )),
+            Some(code) => Err(io::Error::other(format!(
+                "remote private mkdir failed with status {code}"
+            ))),
+        }
+    }
+
     pub async fn close(mut self) -> io::Result<()> {
         let _ = self.session.close().await;
         match timeout(Duration::from_secs(2), self.child.wait()).await {
@@ -83,6 +127,10 @@ impl OpenSshSftpConnection {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 struct SshSubsystemStream {
@@ -118,5 +166,24 @@ impl AsyncWrite for SshSubsystemStream {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.stdin).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn transport_rejects_ssh_option_alias_before_spawn() {
+        let error = match OpenSshSftpConnection::connect("-oProxyCommand=bad").await {
+            Ok(_) => panic!("unsafe SSH alias reached process spawn"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn shell_quote_preserves_single_quotes() {
+        assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
     }
 }

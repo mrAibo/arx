@@ -12,7 +12,7 @@ use arx::services::{
     PaneLoadResponse, PaneLoader, SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions,
     WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
 };
-use arx::vfs::{Entry, EntryKind, FileMetadata, Location, RemoteEditSession, RemoteEditState};
+use arx::vfs::{Entry, EntryKind, Location, RemoteEditSession, RemoteEditState};
 use arx::workspace_sync::{
     DiffState, SyncDirection, SyncMode, WorkspaceSide, WorkspaceSyncOperation,
 };
@@ -30,7 +30,6 @@ use ratatui::{
 };
 use std::io;
 use std::path::PathBuf;
-use tempfile;
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
@@ -180,6 +179,8 @@ async fn event_loop(
                 continue;
             }
             Some(response) = effect_rx.recv() => {
+                let mut response = response;
+                finalize_received_effect(&effect_dispatcher, &mut response);
                 handle_effect_response(
                     response,
                     &mut state,
@@ -188,63 +189,10 @@ async fn event_loop(
                     &pane_loader,
                 );
 
-                // Phase 2-3: if download completed, launch editor and dispatch write-back
-                if let Some(session) = state.pending_remote_edit_session.take() {
-                    if session.state == RemoteEditState::Downloading {
-                        // Downloaded hasn't arrived yet or failed — skip
-                        state.pending_remote_edit_session = Some(session);
-                    } else {
-                        // Re-check scope: user may have navigated away
-                        let same_location =
-                            state.active_pane().location == session.location;
-                        if same_location {
-                            let editor_cmd = if let Some(cfg_editor) = &editor {
-                                cfg_editor.clone()
-                            } else {
-                                session.editor.clone()
-                            };
-                            let working_path = session.temp_dir.path().join("working");
-                            // Phase 2: suspend TUI, launch editor on working copy
-                            let editor_result = terminal_session
-                                .suspend_while(|| {
-                                    DesktopService::open_editor(&editor_cmd, &working_path)
-                                })
-                                .await?;
-                            if let Err(error) = editor_result {
-                                state.message = Some(format!("Editor failed: {error}"));
-                            } else {
-                                // Check for no-change before dispatching write-back
-                                let working_bytes =
-                                    match tokio::fs::read(&working_path).await {
-                                        Ok(b) => b,
-                                        Err(e) => {
-                                            state.message = Some(format!(
-                                                "Failed reading edited file: {e}"
-                                            ));
-                                            continue;
-                                        }
-                                    };
-                                if working_bytes == session.frozen_original {
-                                    state.message = Some(format!(
-                                        "No changes to {} — skipping write-back",
-                                        session.name
-                                    ));
-                                    continue;
-                                }
-                                // Phase 3: dispatch write-back
-                                let id = effect_dispatcher.dispatch(
-                                    EffectLane::RemoteEdit,
-                                    EffectScope::Location(session.location.clone()),
-                                    Effect::WriteBackRemoteFile { session },
-                                );
-                                state.register_effect(EffectLane::RemoteEdit, id);
-                            }
-                        } else {
-                            state.message = Some(
-                                "Edit cancelled — you navigated away".into(),
-                            );
-                        }
-                    }
+                // Defer editor launch until after terminal input is polled,
+                // so queued Quit/navigation input is processed first.
+                if state.pending_remote_edit_session.is_some() {
+                    state.pending_editor = true;
                 }
 
                 continue;
@@ -321,7 +269,11 @@ async fn event_loop(
                     Some(event::read()?)
                 } else {
                     if let Some(ref mut term) = state.term { term.drain(); }
-                    continue;
+                    if state.pending_editor {
+                        None
+                    } else {
+                        continue;
+                    }
                 }
             }
         };
@@ -667,7 +619,7 @@ async fn event_loop(
                                             continue;
                                         }
                                         // Validate child name — reject empty, ".", "..", "/", NUL.
-                                        if let Err(e) = arx::vfs::validate_mkdir_child(&name) {
+                                        if let Err(e) = arx::vfs::validate_child_name(&name) {
                                             state.message = Some(e.to_string());
                                             continue;
                                         }
@@ -1007,7 +959,7 @@ async fn event_loop(
                     let pane = state.active_pane_mut();
 
                     match key.code {
-                        KeyCode::Char('q') => state.apply(Action::Quit),
+                        KeyCode::Char('q') => request_quit(&mut state, &effect_dispatcher),
                         KeyCode::Tab => {
                             let pane = state.active_pane_mut();
                             if pane.split {
@@ -1584,6 +1536,55 @@ async fn event_loop(
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // ── Deferred editor launch: only after terminal input is drained ──
+        if state.pending_editor && !state.should_quit {
+            state.pending_editor = false;
+            if let Some(mut session) = state.pending_remote_edit_session.take() {
+                let origin_matches =
+                    state
+                        .pending_remote_edit_origin
+                        .as_ref()
+                        .is_some_and(|(pane, location)| {
+                            location == &session.location
+                                && pane_still_at_location(&state, *pane, location)
+                        });
+                if session.state != RemoteEditState::ReadyToEdit {
+                    state.pending_remote_edit_origin = None;
+                    state.message = Some("Remote edit session invalid".into());
+                    continue;
+                }
+                if !origin_matches {
+                    state.pending_remote_edit_origin = None;
+                    state.message =
+                        Some("Remote edit cancelled: originating pane navigated away".into());
+                    continue;
+                }
+
+                let editor_cmd = if let Some(cfg_editor) = &editor {
+                    cfg_editor.clone()
+                } else {
+                    session.editor.clone()
+                };
+                let working_path = session.temp_dir.path().join("working");
+                session.state = RemoteEditState::Editing;
+                let editor_result = terminal_session
+                    .suspend_while(|| DesktopService::open_editor(&editor_cmd, &working_path))
+                    .await?;
+                if let Some(effect) = finish_remote_editor(session, editor_result, &mut state) {
+                    let location = match &effect {
+                        Effect::WriteBackRemoteFile { session } => session.location.clone(),
+                        _ => unreachable!("remote editor can only schedule write-back"),
+                    };
+                    let id = effect_dispatcher.dispatch(
+                        EffectLane::RemoteEdit,
+                        EffectScope::Location(location),
+                        effect,
+                    );
+                    state.register_effect(EffectLane::RemoteEdit, id);
+                }
             }
         }
     }
@@ -4006,6 +4007,17 @@ fn toggle_hosts_overlay(state: &mut AppState) {
     state.toggle_overlay(OverlayKind::Hosts);
 }
 
+fn request_quit(state: &mut AppState, effect_dispatcher: &EffectDispatcher) {
+    let cancellation_requested = state
+        .pending_effect(EffectLane::RemoteEdit)
+        .is_some_and(|id| effect_dispatcher.cancel(id));
+    state.apply(Action::Quit);
+    if cancellation_requested {
+        state.message =
+            Some("Remote edit cancellation requested — waiting for safe cleanup".into());
+    }
+}
+
 // ponytail: keep the one action seam instead of wrapping runtime services in a one-use context.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_ui_action(
@@ -4034,7 +4046,7 @@ async fn dispatch_ui_action(
     }
 
     match action {
-        Action::Quit => state.apply(action),
+        Action::Quit => request_quit(state, effect_dispatcher),
         Action::OpenCommandCenter => {
             state.open_overlay(OverlayKind::CommandCenter);
             state.filter.clear();
@@ -4116,19 +4128,17 @@ async fn dispatch_ui_action(
                 }
                 Location::Sftp { .. } => {
                     // Remote: download → edit → write-back
+                    if state.pending_effects.contains_key(&EffectLane::RemoteEdit)
+                        || state.pending_remote_edit_origin.is_some()
+                    {
+                        state.message = Some("Another remote edit is still in progress".into());
+                        return Ok(());
+                    }
                     let location = state.active_pane().location.clone();
                     let name = entry.name.clone();
 
-                    // Phase 1: download to temp, store pending state
-                    state.pending_remote_edit_session = Some(RemoteEditSession {
-                        name: name.clone(),
-                        location: location.clone(),
-                        editor: editor.to_string(),
-                        frozen_original: Vec::new(),
-                        original_metadata: FileMetadata::default(),
-                        temp_dir: std::sync::Arc::new(tempfile::TempDir::new().expect("temp dir")),
-                        state: RemoteEditState::Downloading,
-                    });
+                    state.pending_remote_edit_session = None;
+                    state.pending_remote_edit_origin = Some((state.active, location.clone()));
                     let id = effect_dispatcher.dispatch(
                         EffectLane::RemoteEdit,
                         EffectScope::Location(location.clone()),
@@ -5078,6 +5088,34 @@ fn handle_workspace_scan_response(response: WorkspaceScanResponse, state: &mut A
     }
 }
 
+fn finalize_received_effect(dispatcher: &EffectDispatcher, response: &mut EffectResponse) {
+    let was_cancelled = dispatcher
+        .finish(response.id)
+        .is_some_and(|cancellation| cancellation.is_cancelled());
+    if was_cancelled && matches!(&response.event, EffectEvent::Downloaded { .. }) {
+        response.event = EffectEvent::Failed {
+            label: "remote edit download".into(),
+            error: "cancelled before editor launch".into(),
+        };
+    }
+}
+
+fn finish_remote_editor(
+    mut session: RemoteEditSession,
+    editor_result: io::Result<()>,
+    state: &mut AppState,
+) -> Option<Effect> {
+    if let Err(error) = editor_result {
+        session.state = RemoteEditState::Failed;
+        state.pending_remote_edit_origin = None;
+        state.message = Some(format!("Editor failed: {error}"));
+        return None;
+    }
+
+    session.state = RemoteEditState::WritingBack;
+    Some(Effect::WriteBackRemoteFile { session })
+}
+
 fn apply_effect_event(state: &mut AppState, event: EffectEvent) {
     match event {
         EffectEvent::ShellCaptured {
@@ -5157,10 +5195,22 @@ fn apply_effect_event(state: &mut AppState, event: EffectEvent) {
             state.message = Some(format!("Uploaded: {name}"));
             state.pending_remote_edit_session = None;
         }
-        EffectEvent::RemoteConflict { name } => {
+        EffectEvent::NoChange { name } => {
+            state.message = Some(format!("No changes: {name}"));
+            state.pending_remote_edit_session = None;
+        }
+        EffectEvent::RemoteConflict { name, reason } => {
             state.message = Some(format!(
-                "{name} changed on remote during edit — write-back refused"
+                "{name} changed on remote — write-back refused: {reason}"
             ));
+            state.pending_remote_edit_session = None;
+        }
+        EffectEvent::RecoveryRequired { name, details } => {
+            state.message = Some(format!("{name}: RECOVERY REQUIRED — {details}"));
+            state.pending_remote_edit_session = None;
+        }
+        EffectEvent::WrittenBackWarning { name, warning } => {
+            state.message = Some(format!("Uploaded {name} with warning: {warning}"));
             state.pending_remote_edit_session = None;
         }
         EffectEvent::Failed { label, error } => {
@@ -5179,11 +5229,29 @@ fn handle_effect_response(
     if !state.accepts_effect(response.id, response.lane, &response.scope) {
         return;
     }
+    let refresh_origin = if matches!(
+        &response.event,
+        EffectEvent::WrittenBack { .. } | EffectEvent::WrittenBackWarning { .. }
+    ) {
+        state.pending_remote_edit_origin.clone()
+    } else {
+        None
+    };
+    let remote_terminal = response.lane == EffectLane::RemoteEdit
+        && !matches!(&response.event, EffectEvent::Downloaded { .. });
+
     state.finish_effect(response.lane, response.id);
     apply_effect_event(state, response.event);
+    if remote_terminal {
+        state.pending_remote_edit_origin = None;
+    }
 
-    // Pure process responses normally do not require directory refresh. Pane
-    // and workspace effect lanes added later can opt into targeted refresh.
+    if let Some((pane, location)) = refresh_origin
+        && pane_still_at_location(state, pane, &location)
+    {
+        schedule_pane_load(pane_loader, state, pane);
+    }
+
     match response.lane {
         EffectLane::LeftPane => {
             schedule_pane_load(pane_loader, state, Pane::Left);
@@ -5192,6 +5260,13 @@ fn handle_effect_response(
             schedule_pane_load(pane_loader, state, Pane::Right);
         }
         _ => {}
+    }
+}
+
+fn pane_still_at_location(state: &AppState, pane: Pane, location: &Location) -> bool {
+    match pane {
+        Pane::Left => &state.left.location == location,
+        Pane::Right => &state.right.location == location,
     }
 }
 
@@ -5227,7 +5302,9 @@ mod tests {
     use arx::app::{Action, InputContext};
     use arx::input::{KeyBinding, KeyStroke, Keymap};
     use arx::jobs::{Job, JobKind, JobResult, JobStatus};
+    use arx::process::ProcessService;
     use arx::services::{PaneLoadId, WorkspaceScanId};
+    use arx::vfs::{Capability, CapabilitySet, ProviderRegistry};
     use arx::workspace_sync::{
         WorkspaceDiff, WorkspaceEntry, WorkspaceFingerprint, WorkspaceSyncPlan,
     };
@@ -5238,6 +5315,215 @@ mod tests {
     use arx::workspace_sync_verification::{
         SyncVerificationId, SyncVerificationResult, SyncVerificationSnapshot,
     };
+
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+
+    async fn remote_script(host: &str, script: &str) -> std::process::ExitStatus {
+        ProcessService::status(
+            "ssh",
+            &[host.to_string(), format!("sh -c {}", shell_quote(script))],
+            None,
+        )
+        .await
+        .expect("run physical SFTP fixture command")
+    }
+
+    struct PhysicalRemoteEditFixture {
+        host: String,
+        base: String,
+    }
+
+    impl PhysicalRemoteEditFixture {
+        async fn new(host: &str, case: &str) -> Self {
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            arx::remote::validate_ssh_alias(host).unwrap();
+            let token = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let base = format!("/tmp/arx-demo/arx-remote-edit-{case}-{token}");
+            let quoted_base = shell_quote(&base);
+            let path = shell_quote(&format!("{base}/note.txt"));
+            let script = format!(
+                "set -eu; rm -rf -- {quoted_base}; mkdir -m 700 -- {quoted_base}; printf '%s' 'original text\n' > {path}; chmod 600 -- {path}"
+            );
+            assert!(remote_script(host, &script).await.success());
+            Self {
+                host: host.to_string(),
+                base,
+            }
+        }
+
+        fn location(&self) -> Location {
+            Location::Sftp {
+                host: self.host.clone(),
+                path: self.base.clone(),
+            }
+        }
+
+        async fn cleanup(&self) {
+            let script = format!("rm -rf -- {}", shell_quote(&self.base));
+            assert!(remote_script(&self.host, &script).await.success());
+        }
+    }
+
+    fn physical_sftp_registry(host: &str) -> ProviderRegistry {
+        let registry = ProviderRegistry::new();
+        registry.insert_sftp(
+            host,
+            Box::new(arx::vfs::sftp::SftpProvider::new(
+                arx::remote::Host::from_alias(host),
+            )),
+            CapabilitySet::NONE
+                .with(Capability::List)
+                .with(Capability::Read)
+                .with(Capability::Write),
+        );
+        registry
+    }
+
+    async fn assert_remote_original(registry: &ProviderRegistry, location: &Location) {
+        let bytes = registry
+            .read_all_capped_at(location, "note.txt", 64)
+            .await
+            .unwrap()
+            .bytes;
+        assert_eq!(bytes, b"original text\n");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn physical_editor_nonzero_never_schedules_writeback() {
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        let fixture = PhysicalRemoteEditFixture::new(&host, "editor-failure").await;
+        let location = fixture.location();
+        let registry = physical_sftp_registry(&host);
+        let (dispatcher, mut responses) = EffectDispatcher::channel(registry.clone());
+        let (pane_loader, _pane_responses) = PaneLoader::channel(registry.clone());
+        let mut state = AppState {
+            registry: registry.clone(),
+            ..AppState::default()
+        };
+        state.left.location = location.clone();
+        state.pending_remote_edit_origin = Some((Pane::Left, location.clone()));
+        let id = dispatcher.dispatch(
+            EffectLane::RemoteEdit,
+            EffectScope::Location(location.clone()),
+            Effect::DownloadRemoteFile {
+                location: location.clone(),
+                name: "note.txt".into(),
+                editor: "false".into(),
+            },
+        );
+        state.register_effect(EffectLane::RemoteEdit, id);
+        let mut response =
+            tokio::time::timeout(std::time::Duration::from_secs(20), responses.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(matches!(&response.event, EffectEvent::Downloaded { .. }));
+        finalize_received_effect(&dispatcher, &mut response);
+        handle_effect_response(
+            response,
+            &mut state,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &pane_loader,
+        );
+
+        let session = state.pending_remote_edit_session.take().unwrap();
+        let temp_path = session.temp_dir.path().to_path_buf();
+        let working_path = temp_path.join("working");
+        let editor_result = DesktopService::open_editor("false", &working_path).await;
+        assert!(editor_result.is_err());
+        assert!(finish_remote_editor(session, editor_result, &mut state).is_none());
+        assert!(state.pending_remote_edit_origin.is_none());
+        assert!(
+            !temp_path.exists(),
+            "secure temporary directory must be dropped"
+        );
+        assert_remote_original(&registry, &location).await;
+        fixture.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn physical_queued_download_cancel_never_reaches_editor() {
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        let fixture = PhysicalRemoteEditFixture::new(&host, "queued-cancel").await;
+        let location = fixture.location();
+        let registry = physical_sftp_registry(&host);
+        let (dispatcher, mut responses) = EffectDispatcher::channel(registry.clone());
+        let (pane_loader, _pane_responses) = PaneLoader::channel(registry.clone());
+        let mut state = AppState {
+            registry: registry.clone(),
+            ..AppState::default()
+        };
+        state.left.location = location.clone();
+        state.pending_remote_edit_origin = Some((Pane::Left, location.clone()));
+        let id = dispatcher.dispatch(
+            EffectLane::RemoteEdit,
+            EffectScope::Location(location.clone()),
+            Effect::DownloadRemoteFile {
+                location: location.clone(),
+                name: "note.txt".into(),
+                editor: "false".into(),
+            },
+        );
+        state.register_effect(EffectLane::RemoteEdit, id);
+        let mut response =
+            tokio::time::timeout(std::time::Duration::from_secs(20), responses.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let temp_path = match &response.event {
+            EffectEvent::Downloaded { session } => session.temp_dir.path().to_path_buf(),
+            event => panic!("expected queued download, got {event:?}"),
+        };
+        assert!(
+            dispatcher.cancel(id),
+            "queued response must remain cancellable"
+        );
+        finalize_received_effect(&dispatcher, &mut response);
+        assert!(matches!(&response.event, EffectEvent::Failed { .. }));
+        handle_effect_response(
+            response,
+            &mut state,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &pane_loader,
+        );
+
+        assert!(state.pending_remote_edit_session.is_none());
+        assert!(state.pending_remote_edit_origin.is_none());
+        assert!(
+            !temp_path.exists(),
+            "queued session must be dropped before editor launch"
+        );
+        assert_remote_original(&registry, &location).await;
+        fixture.cleanup().await;
+    }
+
+    #[test]
+    fn remote_edit_origin_is_bound_to_one_exact_pane_and_location() {
+        let mut state = AppState::default();
+        let origin = Location::Sftp {
+            host: "test".into(),
+            path: "/srv".into(),
+        };
+        state.left.location = origin.clone();
+        state.right.location = origin.clone();
+
+        assert!(pane_still_at_location(&state, Pane::Left, &origin));
+        assert!(pane_still_at_location(&state, Pane::Right, &origin));
+
+        state.left.location = Location::Local("/elsewhere".into());
+        assert!(!pane_still_at_location(&state, Pane::Left, &origin));
+        assert!(pane_still_at_location(&state, Pane::Right, &origin));
+    }
 
     #[test]
     fn footer_uses_remapped_file_action_bindings() {

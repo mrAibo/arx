@@ -96,9 +96,20 @@ pub enum EffectEvent {
     WrittenBack {
         name: String,
     },
-    /// Remote file changed during edit — write-back refused.
+    NoChange {
+        name: String,
+    },
     RemoteConflict {
         name: String,
+        reason: String,
+    },
+    RecoveryRequired {
+        name: String,
+        details: String,
+    },
+    WrittenBackWarning {
+        name: String,
+        warning: String,
     },
     Failed {
         label: String,

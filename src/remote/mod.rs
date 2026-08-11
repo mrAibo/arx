@@ -1,10 +1,21 @@
 use std::collections::BTreeSet;
+use std::io;
 
 pub mod hosts_config;
 pub mod openssh_sftp;
 pub mod ssh_config;
 #[cfg(target_os = "linux")]
 pub mod watch;
+
+pub fn validate_ssh_alias(alias: &str) -> io::Result<()> {
+    if alias.is_empty() || alias.starts_with('-') || alias.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH alias must be non-empty and must not begin with '-' or contain NUL",
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Host {
@@ -90,5 +101,11 @@ mod tests {
         assert!(host.belongs_to("database"));
         assert!(host.belongs_to("project-a"));
         assert!(host.belongs_to("production"));
+    }
+
+    #[test]
+    fn ssh_alias_rejects_option_injection() {
+        assert!(validate_ssh_alias("arx-demo").is_ok());
+        assert!(validate_ssh_alias("-oProxyCommand=bad").is_err());
     }
 }

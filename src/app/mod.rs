@@ -246,6 +246,10 @@ pub struct AppState {
     pub cmd_prefix: bool,
     /// Phase-2 remote edit: Download landed, editor needs launching.
     pub pending_remote_edit_session: Option<RemoteEditSession>,
+    /// Pane and exact location that initiated the current remote edit.
+    pub pending_remote_edit_origin: Option<(Pane, Location)>,
+    /// Defer editor launch until after queued terminal input is drained.
+    pub pending_editor: bool,
     // C3: user menu
     pub menu: Vec<MenuEntry>,
     pub show_menu: bool,
@@ -352,6 +356,8 @@ impl Default for AppState {
             pending_delete: None,
             cmd_prefix: false,
             pending_remote_edit_session: None,
+            pending_remote_edit_origin: None,
+            pending_editor: false,
             menu: Vec::new(),
             show_menu: false,
             menu_cursor: 0,
@@ -487,6 +493,12 @@ impl AppState {
             return false;
         }
 
+        // A mutation result must never be discarded merely because the user
+        // navigated away; it may carry conflict or recovery instructions.
+        if lane == EffectLane::RemoteEdit {
+            return true;
+        }
+
         match scope {
             EffectScope::Global => true,
             EffectScope::Location(location) => {
@@ -504,8 +516,15 @@ impl AppState {
         }
     }
 
+    pub fn pending_effect(&self, lane: EffectLane) -> Option<EffectId> {
+        self.pending_effects.get(&lane).copied()
+    }
+
     pub fn apply(&mut self, action: Action) {
         match action {
+            Action::Quit if self.pending_effects.contains_key(&EffectLane::RemoteEdit) => {
+                self.message = Some("Remote edit in progress — wait for a safe outcome".into());
+            }
             Action::Quit => self.should_quit = true,
             Action::SwitchPane => {
                 self.active = match self.active {
@@ -858,5 +877,30 @@ mod tests {
         assert!(!state.accepts_effect(preview_a, EffectLane::Preview, &scope));
         // GlobalProcess lane unchanged
         assert!(state.accepts_effect(process_a, EffectLane::GlobalProcess, &scope));
+    }
+
+    #[test]
+    fn remote_edit_result_survives_navigation_but_stale_id_does_not() {
+        let mut state = preview_state();
+        let original = EffectScope::Location(state.left.location.clone());
+        let current = EffectId(7);
+        state.register_effect(EffectLane::RemoteEdit, current);
+        state.left.location = Location::Local(std::path::PathBuf::from("/elsewhere"));
+
+        assert!(state.accepts_effect(current, EffectLane::RemoteEdit, &original));
+        assert!(!state.accepts_effect(EffectId(6), EffectLane::RemoteEdit, &original));
+    }
+
+    #[test]
+    fn quit_waits_for_remote_edit_outcome() {
+        let mut state = preview_state();
+        state.register_effect(EffectLane::RemoteEdit, EffectId(9));
+        state.apply(Action::Quit);
+        assert!(!state.should_quit);
+        assert!(state.message.as_deref().unwrap().contains("Remote edit"));
+
+        state.finish_effect(EffectLane::RemoteEdit, EffectId(9));
+        state.apply(Action::Quit);
+        assert!(state.should_quit);
     }
 }

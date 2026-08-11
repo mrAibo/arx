@@ -1,227 +1,134 @@
-# ARX Remote F4 Edit — Design Audit
+# ARX remote F4 editing over SFTP
 
-Feature branch: `feature/remote-edit`  
-Date: 2026-08-11  
-Status: AUDIT ONLY — no implementation
+Feature branch: `feature/remote-edit`
+Status: implemented; merge requires the gates in this document
 
----
+## User flow
 
-## 1. Current State: Local F4
+F4 keeps the local in-place editor path unchanged. For SFTP files it uses a split flow:
 
-### 1.1 Keybinding → Action
+1. The TUI dispatches `DownloadRemoteFile` on the remote-edit effect lane.
+2. `ProcessService` reads one complete, stable remote revision into a private `TempDir`.
+3. The TUI suspends terminal mode and opens the `working` copy in the configured editor.
+4. If the copy changed, `ProcessService` revalidates the remote revision and performs guarded write-back.
+5. The originating location is refreshed only after a completed write.
 
-`Action::EditFile` triggered by edit key (configurable, defaults to F4).  
-**File:** `src/tui.rs:4033-4055`
+The remote-edit session owns the exact location, name, editor, private temp directory, immutable original revision, and working copy. Stale effect IDs or responses from another location cannot complete the session.
 
-### 1.2 Guards (in order)
+## Read contract
 
-| Guard | File:Line | |
+`MAX_REMOTE_EDIT_BYTES` is 16 MiB (`16_777_216` bytes). A file exactly at the limit is accepted. A file one byte larger is rejected before editor launch.
+
+The SFTP reader:
+
+- accepts only a regular file;
+- validates a safe parent directory;
+- creates a unique no-follow hardlink pin and opens that pinned inode;
+- reads the metadata-sized content twice (or clones the first bounded prefix when oversized);
+- compares content, size, mtime, mode, UID, and GID;
+- keeps cancellation inside the provider and removes the pin before returning any terminal result.
+
+There is no path from preview's bounded prefix reader into remote editing. Static symlinks and path-swap races are rejected without opening the symlink target. Hosts without the OpenSSH hardlink extension cannot use remote F4 editing.
+
+The complete revision must be UTF-8 text without NUL bytes. Empty files and Unicode text are valid.
+
+## Local temp contract
+
+Each session uses a unique `tempfile::TempDir` with mode `0700`. It contains:
+
+- `original`: the immutable bytes captured from SFTP;
+- `working`: the copy given to the editor.
+
+`TempDir` ownership ties cleanup to the session. Success, no-change, conflict, cancellation, editor failure, and ordinary error paths drop the session and remove the directory. A process crash may leave an operating-system temp artifact.
+
+The edited file is read once with a 16 MiB + 1 bound. The reader checks regular-file type, inode/device identity, length, mtime, UTF-8 validity, and absence of NUL bytes before accepting it. A replaced, growing, truncated, symlinked, oversized, or binary working file is rejected.
+
+## Write-back contract
+
+No-change sessions do not call the provider.
+
+Changed sessions carry `RemoteEditRevision`; there is no revision-blind public write API. The provider verifies content, mode, UID, and GID before mutation and again from the commit-time backup.
+
+The SFTP transaction is:
+
+1. Validate the target and its parent.
+2. Create and verify an empty `0600` regular-file stage exclusively to prove the SFTP account UID.
+3. Atomically create a unique `.arx-txn-*` namespace with mode `0700`, verify its UID, type, mode, emptiness, and unchanged parent, then move the empty stage inside it. SFTP v3 does not expose MKDIR attributes through the current client, so the atomic mode-bearing mkdir uses the same validated OpenSSH alias and an explicitly quoted `sh -c` command.
+4. Probe `hardlink@openssh.com` inside the private namespace, then write, flush, close, and verify the staged bytes.
+5. Apply the original mode, UID, and GID to the stage; verify all metadata.
+6. Revalidate target content and metadata.
+7. Immediately revalidate the parent and private namespace, move the target to the verified-absent backup name inside that namespace, and verify the backup against the immutable revision.
+8. Link the verified stage into the target name without overwriting another entry.
+9. Verify the visible target's exact content and metadata while both recovery links still exist, then remove stage, backup, and transaction namespace.
+
+A conflict restores the original and leaves the competing content untouched. A failed commit with successful rollback returns failure. Failed or uncertain rollback returns `RecoveryRequired` with artifact paths. A successful commit followed by backup-cleanup failure returns `CommittedWithWarning`. Ambiguous transport failures invalidate the pooled SFTP connection and are never retried destructively.
+
+## Metadata boundary
+
+ARX preserves the SFTP metadata available through the current protocol implementation: Unix mode, UID, and GID. If it cannot apply or verify them, write-back stops before replacing the original. Physical acceptance includes a non-primary supplementary-group GID.
+
+POSIX ACLs, extended attributes, security labels, file capabilities, birth time, and sub-second timestamps are not captured by the current SFTP API. Remote F4 must not be used for files whose security or behavior depends on that unsupported metadata. This limitation is fail-visible documentation, not a claim that those attributes survive inode replacement.
+
+The target parent must have known Unix ownership. Group- or world-writable parents are accepted only when the sticky bit protects entries, as in `/tmp`; writable non-sticky parents are rejected because the transaction protocol cannot prove exclusive namespace control there.
+
+## Cancellation and terminal behavior
+
+Download and pre-commit work are cooperatively cancellable. A cancellable SFTP read owns its hardlink pin through cleanup rather than letting the caller drop the read future. Cancellation state remains registered until the TUI consumes the terminal response, so a queued download cannot open the editor after Quit. Once the target has been preserved as backup, rollback and recovery run to a terminal state instead of abandoning the transaction halfway through.
+
+Quit never starts a new editor. A running editor exits through the existing terminal suspension lifecycle. Temp ownership and transaction cleanup do not depend on the active pane.
+
+## Acceptance matrix
+
+| Case | Required result | Evidence |
 |---|---|---|
-| File type | `tui.rs:4034` | `entry.kind == EntryKind::File` |
-| Provider | `tui.rs:4038` | `matches!(location, Location::Local)` **← HARD BLOCK** |
-| Editor configured | `tui.rs:4043` | `configured_editor` from `DesktopService::resolve_editor()` |
+| E1 small UTF-8 edit | exact new remote content | physical `ProcessService` download/write-back |
+| E2 file over 1 MiB | full tail preserved; over 16 MiB refused before editor | physical exact-limit, limit+1, and large-file cases |
+| E3 same-size concurrent edit | conflict; external bytes survive | physical provider and `ProcessService` cases |
+| E4 commit-window mutation | conflict/rollback; no silent overwrite | physical fault/race injection |
+| E5 no local change | no provider write | production-flow test and mock call count |
+| E6 binary input | editor event is never produced | physical NUL and invalid UTF-8 downloads |
+| E7 mode `0600` | remains `0600` with original UID/GID | physical metadata assertions |
+| E8 executable file | executable bits survive | physical `0755` case |
+| E9 editor failure | remote untouched; temp removed | physical dispatcher/`ProcessService` download plus real nonzero editor exit |
+| E10 write/commit failure | rollback or typed recovery outcome | physical fault injection |
+| E11 navigation during download | stale response cannot write or steal focus | effect ID/scope tests |
+| E12 Quit/terminal regression | no delayed editor, orphan, or terminal corruption | physical post-pin cleanup and queued-response cancellation through dispatcher/TUI handoff |
 
-### 1.3 Availability
+The physical fixture is ignored by default and runs against a disposable host:
 
-**File:** `src/app/availability.rs:176-188`
-
-```rust
-ActionId::EditFile if ctx.active_provider != ProviderId::Local => Disabled {
-    reason: "Remote editing is not supported yet"
-}
+```sh
+ARX_SFTP_SMOKE_HOST=arx-demo \
+  cargo test --test remote_edit_sftp_smoke -- --ignored --nocapture
 ```
 
-Blanket provider-type check. No capability check. Compare: F3 (ViewFile) already uses `Capability::Read` for SFTP (lines 155-170).
+The fault/race fixture uses the same environment variable. Remote artifacts must be absent after both fixtures.
 
-### 1.4 Editor Launch
+The physical TUI lifecycle cases run with:
 
-```rust
-terminal_session.suspend_while(|| DesktopService::open_editor(editor, &path)).await?
+```sh
+ARX_SFTP_SMOKE_HOST=arx-demo \
+  cargo test --all-features physical_editor_nonzero_never_schedules_writeback \
+  -- --ignored --nocapture
+ARX_SFTP_SMOKE_HOST=arx-demo \
+  cargo test --all-features physical_queued_download_cancel_never_reaches_editor \
+  -- --ignored --nocapture
 ```
 
-- Suspends terminal raw mode, spawns editor as child process, waits for exit
-- Editor receives **original file path** — no temp copy, no change detection
-- `DesktopService::open_editor()` → `editor_argv()` → `ProcessService::status()` — no shell interpolation
-- After exit: `schedule_active_pane_load()` refreshes pane listing
+## Merge gate
 
-### 1.5 What Local F4 Does NOT Do
+Run:
 
-- No temp copy — edits in-place on original file
-- No change detection — always reloads listing
-- No write-back verification
-- No conflict handling
-
----
-
-## 2. Existing Infrastructure Reusable for Remote Edit
-
-### 2.1 SFTP Transactional Upload Pattern
-
-**File:** `src/transfer/sftp_copy.rs:87-186` (`upload_file`)
-
-Phase | Operation | Safety
----|---|---
-Stage | `session.create(temp)` → `copy_stream` → `flush` → `shutdown` | Temp `.arx-part-{token}`, removed on failure
-Verify | `session.metadata(temp)` → compare `.len()` with local source | Size mismatch → abort + cleanup
-Backup | `session.rename(target → backup)` if target exists | `.arx-bak-{token}` suffix
-Commit | `session.rename(temp → target)` | On failure: restore backup from `.arx-bak-{token}`
-Cancel | `check_cancelled()` after stage, after verify, after backup | Each stage cleans up its artifacts
-
-**Assessment:** Proven, battle-tested atomic SFTP write. Directly reusable for remote edit write-back. Currently tied to `TransferPlan`/`TransferIntent::Copy` — needs extraction into `SftpProvider::write_file_bytes()`.
-
-### 2.2 SFTP Read (Bounded)
-
-**File:** `src/vfs/sftp.rs:285-327` (`read_prefix_bytes`)
-
-- Pooled connection with 1 retry
-- Bounded read via `tokio::io::AsyncReadExt::take(cap)`
-- Returns `BoundedRead { bytes, truncated }` (from PR #45)
-- For full download: loop on `read_prefix_bytes` or add `read_all_bytes()` variant
-
-### 2.3 DesktopService::open_editor
-
-**File:** `src/services/desktop.rs:34-42`
-
-- Accepts any `&Path` — no assumption about local vs temp
-- Safe command construction via `editor_argv()`
-- **Zero changes needed for remote edit**
-
-### 2.4 Capability System
-
-**File:** `src/vfs/capabilities.rs`
-
-- `Capability::Write` already defined (line 13, value 2)
-- `SFTP_CAPABILITIES` currently: `List | Read | Mkdir | Delete` (line 59-63)
-- Missing: `Write` — SFTP CAN write (proven by `upload_file`), just doesn't advertise it
-- **Fix:** Add `Capability::Write` to `SFTP_CAPABILITIES`, use `Read + Write` for F4 availability gate
-
-### 2.5 Effect Pipeline
-
-**File:** `src/effect_dispatcher.rs`, `src/process/mod.rs`
-
-- `EffectDispatcher` spawns tokio tasks for async I/O (proven by PR #45 PreviewLocation)
-- `EffectLane` enum: `Preview`, `GlobalProcess`, `LeftPane`, `RightPane`
-- Add `EffectLane::RemoteEdit` — one line
-- `ProcessService::execute_with_registry()` already accepts `ProviderRegistry`
-
-### 2.6 tempfile Crate
-
-Already a dependency (used in 40+ test locations). Production use for remote edit temp directory: zero new dependencies.
-
----
-
-## 3. VfsProvider Trait Gaps
-
-### 3.1 Missing: `write_file_bytes`
-
-**Current:** No write method on `VfsProvider` trait. All writes go through transfer layer.
-
-**Needed:** 
-```rust
-async fn write_file_bytes(&self, path: &str, data: &[u8]) -> io::Result<()>
-```
-Default: `Unsupported`. SftpProvider implements via extracted atomic staging pattern.
-
-### 3.2 Missing: `metadata`
-
-**Current:** No `metadata()` on trait. `SftpProvider` has internal `connection.session.metadata()` access.
-
-**Needed:**
-```rust
-async fn metadata(&self, path: &str) -> io::Result<FileMetadata>
-```
-For remote revalidation: compare snapshot size/mtime before write-back.
-
----
-
-## 4. Architecture Decision: Split-Phase vs Single Effect
-
-The terminal suspension constraint (editor must run on main thread, raw mode off) means remote edit **cannot** be a single effect.
-
-### Recommended: Split TUI + Effects (matches F3 pattern)
-
-```
-Phase 1: TUI dispatches download effect → EffectLane::RemoteEdit
-         ├─ registry.read_all_bytes_at(location, name) 
-         ├─ writes to TempDir
-         └─ returns EffectEvent::Downloaded { temp_path, snapshot }
-
-Phase 2: TUI → suspend_while(open_editor(temp_path))
-         ├─ editor runs on main thread
-         └─ TUI resumes
-
-Phase 3: TUI checks local change (mtime/size diff)
-         ├─ if unchanged: cleanup temp, message "no changes"
-         ├─ if changed: read temp content, dispatch write-back effect
-         │   ├─ registry.metadata_at(location, name) → revalidate
-         │   ├─ if remote changed: EffectEvent::Conflict { ... }
-         │   └─ if remote unchanged: registry.write_file_bytes_at(...) → atomic upload
-         └─ cleanup TempDir
+```sh
+cargo fmt --all
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo build --all-features
+git diff --check
 ```
 
-This reuses the existing `dispatch_ui_action` → `handle_effect_response` pattern proven by PR #45.
+Remote F4 is merge-ready only after the local gate, physical SFTP acceptance, physical fault/race injection, clean remote artifact check, and an independent final review with zero BLOCKER and zero MAJOR findings.
 
----
+## Non-goals
 
-## 5. Gap Summary: What Needs New Code
-
-File | What | Est. Lines
----|---|---
-`src/vfs/capabilities.rs` | Add `Write` to `SFTP_CAPABILITIES` | 2
-`src/vfs/mod.rs` | Add `write_file_bytes()` + `metadata()` to trait | 15
-`src/vfs/sftp.rs` | Implement `write_file_bytes` (extract from upload_file) + `metadata` | 40
-`src/vfs/local.rs` | Stub `write_file_bytes` + `metadata` (or default Unsupported) | 5
-`src/app/availability.rs` | Replace `!= Local` with `Read + Write` capability check | 5
-`src/effects.rs` | Add `DownloadRemoteFile`, `WriteBackRemoteFile` effects | 10
-`src/process/mod.rs` | Add handlers for new effects | 60
-`src/effect_dispatcher.rs` | Add `EffectLane::RemoteEdit` | 1
-`src/tui.rs` | Split-phase EditFile handler for SFTP locations | 50
-Tests | Download, write-back, conflict, cancellation, bounds | 200+
-
----
-
-## 6. Safety Contract
-
-| Contract | Mechanism |
-|---|---|
-| No silent overwrite | Atomic staging (`.arx-part-{token}` → rename) |
-| Remote changed during edit | `metadata()` revalidation before write-back |
-| Write-back failure | Backup restoration from `.arx-bak-{token}` |
-| Partial temp file | Removed on error at every stage |
-| Editor crash | Temp file stays in `TempDir` → auto-cleaned by Drop |
-| Large file DoS | Bounded download (1 MiB cap, same as F3) |
-| Binary file edit | Reuse F3 binary detection; refuse edit of binary |
-| Temp directory security | `tempfile::TempDir` with `0o700` permissions |
-| No shell interpolation | `editor_argv()` + `ProcessService::status()` — proven safe |
-
----
-
-## 7. Out of Scope (explicit non-goals)
-
-- Real-time remote sync (rsync/watch)
-- Collaborative editing
-- Directory editing
-- Partial/sector writes
-- Binary hex editing
-- Image/PDF editing
-- WebDAV/S3 remote edit
-- Symlink remote edit
-- Editor plugin/integration
-- Edit history/undo beyond local editor
-
----
-
-## 8. Implementation Order
-
-Card | Description | Dependencies
----|---|---
-1 | Add `Write` capability to SFTP | None
-2 | Add `write_file_bytes` + `metadata` to VfsProvider trait | 1
-3 | Extract atomic staging into `SftpProvider::write_file_bytes` | 2
-4 | Add `EffectLane::RemoteEdit` + new effects | 2
-5 | Implement download + write-back handlers in ProcessService | 4
-6 | Change availability gate to `Read + Write` | 1
-7 | Split-phase EditFile handler in tui.rs for SFTP | 4, 5, 6
-8 | Tests: download, write-back, conflict, cancellation, bounds | 7
-
-**Ready for approval → Card 1 implementation.**
+Remote editing does not provide collaborative editing, continuous sync, partial writes, binary/hex editing, directory editing, WebDAV/S3 support, or edit history beyond the configured local editor.
