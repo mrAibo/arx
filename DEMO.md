@@ -43,12 +43,13 @@ Use regular files. Directory and symlink equality is intentionally conservative 
 
 | Second | What |
 |--------|------|
-| 0–3 | Local ↔ Remote both panes visible |
-| 3–7 | Ctrl+D — Compare runs |
-| 7–12 | Ctrl+X P — Sync Preview, UPDATE, 0 deletes shown |
-| 12–17 | Enter — real execution with progress |
-| 17–22 | Execution Completed, then Verifying phase |
-| 22–27 | Real Synchronized / VERIFIED verdict |
+| 0–3 | Local ↔ Remote both panes visible with provider badges `[LOCAL]` / `[SSH]` |
+| 3–7 | Workspace Ribbon shows `Not compared · Ctrl+D Compare` |
+| 7–12 | Ctrl+D — Compare runs, Ribbon shows `Scanning...` |
+| 12–17 | Preview: 3 matches, 1 diff, 0 conflicts |
+| 17–22 | Execute UPDATE — real rsync with progress |
+| 22–27 | Verifying phase, then `Synchronized` verdict |
+| 27–30 | Ribbon summary: workspace healthy, badges visible |
 
 ### Gate script
 
