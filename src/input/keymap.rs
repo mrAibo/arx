@@ -217,43 +217,6 @@ impl Default for Keymap {
             KeyBinding::new(Browser, vec![ctrl('x'), plain('o')], Action::BeginChown),
             KeyBinding::alias(Browser, vec![ctrl('x'), ctrl('o')], Action::BeginChown),
             KeyBinding::new(Help, vec![plain('?')], Action::OpenHelp),
-            // Current ARX behavior lets q quit while the help overlay is open.
-            KeyBinding::new(Help, vec![plain('q')], Action::Quit),
-            KeyBinding::new(
-                Help,
-                vec![KeyStroke::new(KeyCode::F(1), KeyModifiers::NONE)],
-                Action::OpenHelp,
-            ),
-            KeyBinding::new(
-                Help,
-                vec![KeyStroke::new(KeyCode::Esc, KeyModifiers::NONE)],
-                Action::Quit,
-            ),
-            KeyBinding::new(Help, vec![plain('j'), plain('k')], Action::Up),
-            KeyBinding::new(
-                Help,
-                vec![
-                    KeyStroke::new(KeyCode::Up, KeyModifiers::NONE),
-                    KeyStroke::new(KeyCode::Down, KeyModifiers::NONE),
-                ],
-                Action::Up,
-            ),
-            KeyBinding::new(
-                Help,
-                vec![
-                    KeyStroke::new(KeyCode::PageUp, KeyModifiers::NONE),
-                    KeyStroke::new(KeyCode::PageDown, KeyModifiers::NONE),
-                ],
-                Action::Up,
-            ),
-            KeyBinding::new(
-                Help,
-                vec![
-                    KeyStroke::new(KeyCode::Home, KeyModifiers::NONE),
-                    KeyStroke::new(KeyCode::End, KeyModifiers::NONE),
-                ],
-                Action::Up,
-            ),
             KeyBinding::new(
                 SyncPreview,
                 vec![plain('d')],

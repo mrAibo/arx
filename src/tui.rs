@@ -962,6 +962,45 @@ async fn event_loop(
                         }
                     };
 
+                    // Help overlay owns navigation keys when open — intercept BEFORE router
+                    if matches!(state.input_context(), InputContext::Help) {
+                        match key.code {
+                            KeyCode::Esc
+                            | KeyCode::F(1)
+                            | KeyCode::Char('?')
+                            | KeyCode::Char('q') => {
+                                state.show_help = false;
+                                state.help_scroll = 0;
+                                continue;
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                state.help_scroll = state.help_scroll.saturating_add(1);
+                                continue;
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                state.help_scroll = state.help_scroll.saturating_sub(1);
+                                continue;
+                            }
+                            KeyCode::PageDown => {
+                                state.help_scroll = state.help_scroll.saturating_add(20);
+                                continue;
+                            }
+                            KeyCode::PageUp => {
+                                state.help_scroll = state.help_scroll.saturating_sub(20);
+                                continue;
+                            }
+                            KeyCode::Home => {
+                                state.help_scroll = 0;
+                                continue;
+                            }
+                            KeyCode::End => {
+                                state.help_scroll = usize::MAX;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     // First migration slice: resolve stable app actions before
                     // falling back to the legacy key matcher below.
                     match key_router.resolve(state.input_context(), key) {
@@ -1000,37 +1039,6 @@ async fn event_loop(
                             continue;
                         }
                         KeyResolution::Unhandled => {}
-                    }
-
-                    // Help overlay owns navigation keys when open
-                    if matches!(state.input_context(), InputContext::Help) {
-                        match key.code {
-                            KeyCode::Char('j') | KeyCode::Down => {
-                                state.help_scroll = state.help_scroll.saturating_add(1);
-                                continue;
-                            }
-                            KeyCode::Char('k') | KeyCode::Up => {
-                                state.help_scroll = state.help_scroll.saturating_sub(1);
-                                continue;
-                            }
-                            KeyCode::PageDown => {
-                                state.help_scroll = state.help_scroll.saturating_add(20);
-                                continue;
-                            }
-                            KeyCode::PageUp => {
-                                state.help_scroll = state.help_scroll.saturating_sub(20);
-                                continue;
-                            }
-                            KeyCode::Home => {
-                                state.help_scroll = 0;
-                                continue;
-                            }
-                            KeyCode::End => {
-                                state.help_scroll = usize::MAX;
-                                continue;
-                            }
-                            _ => {}
-                        }
                     }
 
                     // Handle tree-filter Backspace before borrowing the active pane.
@@ -2030,6 +2038,7 @@ fn compact_action_label(action: ActionId) -> &'static str {
 }
 
 /// Format one command-bar row from hints, respecting width.
+#[allow(dead_code)] // used in test helpers
 fn format_command_row(hints: &[ContextHint], width: u16) -> String {
     let mut text = String::new();
     for hint in hints {
@@ -2096,30 +2105,69 @@ fn render_command_bar(
     }
 
     // Row B — Discovery (responsive, priority-based).
+    // Single layout model for both rendering and hitboxes.
     if !row_b.is_empty() && row_b_area.width > 0 {
-        let text = format_command_row(row_b, row_b_area.width);
-        if !text.is_empty() {
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    text,
-                    Style::default().fg(Color::Black).bg(Color::DarkGray),
-                )),
-                row_b_area,
-            );
+        #[derive(Debug)]
+        struct PositionedChip {
+            text: String,
+            available: bool,
         }
-        // Row B hitboxes — match exact rendered chip text from format_command_row.
+
+        let mut chips = Vec::new();
         let mut col = row_b_area.x;
+        let spacing = 3u16; // matches format_command_row spacing
+
         for hint in row_b {
             let chip_text = format!("{} {}", hint.binding, hint.label);
             let chip_width = Line::from(chip_text.as_str()).width() as u16;
+            let required = if chips.is_empty() {
+                chip_width
+            } else {
+                chip_width + spacing
+            };
+
+            if col + required > row_b_area.x + row_b_area.width {
+                break; // stop at first overflow — same as format_command_row
+            }
+
             if let Some(action) = action_id_to_action(hint.action) {
+                let rect = Rect::new(col, row_b_area.y, chip_width, 1);
+                chips.push(PositionedChip {
+                    text: chip_text,
+                    available: hint.available,
+                });
                 hitboxes.push(arx::app::CommandHitbox {
-                    rect: Rect::new(col, row_b_area.y, chip_width, 1),
+                    rect,
                     action,
                     available: hint.available,
                 });
             }
-            col += chip_width + 3; // spacing matches format_command_row
+
+            col += required;
+        }
+
+        // Render from the same computed layout
+        if !chips.is_empty() {
+            let mut spans: Vec<Span> = Vec::new();
+            for (i, chip) in chips.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::raw("   "));
+                }
+                let style = if !chip.available {
+                    Style::default()
+                        .fg(Color::Gray)
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM)
+                } else {
+                    Style::default().fg(Color::Black).bg(Color::DarkGray)
+                };
+                spans.push(Span::styled(chip.text.clone(), style));
+            }
+            frame.render_widget(
+                Paragraph::new(Line::from(spans))
+                    .style(Style::default().fg(Color::Black).bg(Color::DarkGray)),
+                row_b_area,
+            );
         }
     }
 }
