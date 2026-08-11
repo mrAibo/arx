@@ -2169,19 +2169,19 @@ fn render(
     let constraints = if session_callout.is_some() {
         vec![
             Constraint::Min(1),
-            Constraint::Length(1),  // workspace ribbon
-            Constraint::Length(1),  // status line
-            Constraint::Length(1),  // session callout
-            Constraint::Length(1),  // Row A
-            Constraint::Length(1),  // Row B
+            Constraint::Length(1), // workspace ribbon
+            Constraint::Length(1), // status line
+            Constraint::Length(1), // session callout
+            Constraint::Length(1), // Row A
+            Constraint::Length(1), // Row B
         ]
     } else {
         vec![
             Constraint::Min(1),
-            Constraint::Length(1),  // workspace ribbon
-            Constraint::Length(1),  // status line
-            Constraint::Length(1),  // Row A
-            Constraint::Length(1),  // Row B
+            Constraint::Length(1), // workspace ribbon
+            Constraint::Length(1), // status line
+            Constraint::Length(1), // Row A
+            Constraint::Length(1), // Row B
         ]
     };
 
@@ -2767,11 +2767,17 @@ fn render(
         let left_label = state.left.location.label();
         let right_label = state.right.location.label();
         let summary = state.remote_workspace.summary();
-        format!("WORKSPACE [LOCAL] {} ⇄ {} · {}", left_label, right_label, summary)
+        format!(
+            "WORKSPACE [LOCAL] {} ⇄ {} · {}",
+            left_label, right_label, summary
+        )
     } else {
         let left_label = state.left.location.label();
         let right_label = state.right.location.label();
-        format!("WORKSPACE [LOCAL] {} ⇄ {} · Not compared · Ctrl+D Compare", left_label, right_label)
+        format!(
+            "WORKSPACE [LOCAL] {} ⇄ {} · Not compared · Ctrl+D Compare",
+            left_label, right_label
+        )
     };
     let ribbon = Paragraph::new(Line::from(Span::styled(
         ribbon_text,
@@ -2800,7 +2806,8 @@ fn render(
     // Two-row command bar: Row A = Commander core, Row B = Discovery.
     // Derived from the same runtime Keymap that owns keyboard routing.
     let focused_kind = focused_entry(state, left_entries, right_entries).map(|entry| entry.kind);
-    let (row_a, row_b) = command_bar_rows(state, key_router.keymap(), focused_kind, editor_available);
+    let (row_a, row_b) =
+        command_bar_rows(state, key_router.keymap(), focused_kind, editor_available);
     render_command_bar(
         frame,
         footer_row_a,
