@@ -1,3 +1,13 @@
+/// Hitbox for command bar mouse click routing.
+#[derive(Debug, Clone)]
+pub struct CommandHitbox {
+    pub row: u16,
+    pub col: u16,
+    pub width: u16,
+    pub action: Action,
+    pub available: bool,
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -267,6 +277,8 @@ pub struct AppState {
     pub search_index: usize,
     // Panel ratio (default 50/50)
     pub panel_ratio: u16,
+    // Command bar hitboxes computed during render, consumed by mouse handler
+    pub command_hitboxes: Vec<CommandHitbox>,
     pub show_hotlist: bool,
     pub hotlist_cursor: usize,
     pub show_tab_switcher: bool,
@@ -387,6 +399,7 @@ impl Default for AppState {
             command_matches: Vec::new(),
             overlay_list_state: ratatui::widgets::ListState::default(),
             registry: crate::vfs::default_registry(),
+            command_hitboxes: Vec::new(),
         }
     }
 }
