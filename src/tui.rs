@@ -2791,7 +2791,8 @@ fn render(
     // Two-row command bar: Row A = Commander core, Row B = Discovery.
     // Derived from the same runtime Keymap that owns keyboard routing.
     let focused_kind = focused_entry(state, left_entries, right_entries).map(|entry| entry.kind);
-    let (row_a, row_b) = command_bar_rows(state, key_router.keymap(), focused_kind, editor_available);
+    let (row_a, row_b) =
+        command_bar_rows(state, key_router.keymap(), focused_kind, editor_available);
     render_command_bar(
         frame,
         footer_row_a,
