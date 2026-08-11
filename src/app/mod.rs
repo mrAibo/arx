@@ -1,9 +1,7 @@
 /// Hitbox for command bar mouse click routing.
 #[derive(Debug, Clone)]
 pub struct CommandHitbox {
-    pub row: u16,
-    pub col: u16,
-    pub width: u16,
+    pub rect: Rect,
     pub action: Action,
     pub available: bool,
 }

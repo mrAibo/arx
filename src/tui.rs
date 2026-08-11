@@ -321,9 +321,10 @@ async fn event_loop(
                     if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
                         let hitboxes: Vec<_> = state.command_hitboxes.clone();
                         for hb in &hitboxes {
-                            if mouse.row == hb.row
-                                && mouse.column >= hb.col
-                                && mouse.column < hb.col + hb.width
+                            if mouse.column >= hb.rect.x
+                                && mouse.column < hb.rect.x + hb.rect.width
+                                && mouse.row >= hb.rect.y
+                                && mouse.row < hb.rect.y + hb.rect.height
                             {
                                 if hb.available {
                                     dispatch_ui_action(
@@ -355,12 +356,20 @@ async fn event_loop(
                     let (area, is_left) = if let Some(a) = state.left_area {
                         if mouse.column >= a.x
                             && mouse.column < a.x + a.width
-                            && mouse.row > a.y
+                            && mouse.row >= a.y
                             && mouse.row < a.y + a.height
                         {
                             (a, true)
                         } else if let Some(a) = state.right_area {
-                            (a, false)
+                            if mouse.column >= a.x
+                                && mouse.column < a.x + a.width
+                                && mouse.row >= a.y
+                                && mouse.row < a.y + a.height
+                            {
+                                (a, false)
+                            } else {
+                                continue;
+                            }
                         } else {
                             continue;
                         }
@@ -2005,12 +2014,10 @@ fn render_command_bar(
                 hint.label
             };
             let chip_text = format!("{} {}", hint.binding, label);
-            let chip_width = chip_text.len() as u16;
+            let chip_width = Line::from(chip_text.as_str()).width() as u16;
             if let Some(action) = action_id_to_action(hint.action) {
                 hitboxes.push(arx::app::CommandHitbox {
-                    row: 0,
-                    col,
-                    width: chip_width,
+                    rect: Rect::new(col, row_a_area.y, chip_width, 1),
                     action,
                     available: hint.available,
                 });
@@ -2040,6 +2047,21 @@ fn render_command_bar(
                 )),
                 row_b_area,
             );
+        }
+        // Row B hitboxes — reuse same formatted widths.
+        let mut col = row_b_area.x;
+        for hint in row_b {
+            let label = compact_action_label(hint.action);
+            let chip_text = format!("{} {}", hint.binding, label);
+            let chip_width = Line::from(chip_text.as_str()).width() as u16;
+            if let Some(action) = action_id_to_action(hint.action) {
+                hitboxes.push(arx::app::CommandHitbox {
+                    rect: Rect::new(col, row_b_area.y, chip_width, 1),
+                    action,
+                    available: hint.available,
+                });
+            }
+            col += chip_width + 3; // spacing matches format_command_row
         }
     }
 }
@@ -2793,10 +2815,10 @@ fn render(
     // Session milestones are passive presentation. They never own backend
     // state and disappear on the next user interaction.
     let (footer_row_a, footer_row_b) = if let Some(callout) = session_callout.as_deref() {
-        render_session_callout(frame, chunks[2], callout);
-        (chunks[3], chunks[4])
+        render_session_callout(frame, chunks[3], callout);
+        (chunks[4], chunks[5])
     } else {
-        (chunks[2], chunks[3])
+        (chunks[3], chunks[4])
     };
 
     // Two-row command bar: Row A = Commander core, Row B = Discovery.
