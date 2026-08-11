@@ -28,7 +28,7 @@ Two workspace roots with a small, deterministic non-destructive difference set.
 
 ```
 local:  ~/arx-demo/app
-remote: demo-prod:/srv/arx-demo/app
+remote: arx-demo:/tmp/arx-demo/app
 ```
 
 Use regular files. Directory and symlink equality is intentionally conservative where the current fingerprint model lacks comparable evidence.
