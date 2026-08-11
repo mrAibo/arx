@@ -88,6 +88,7 @@ fn flush_entry(
 pub fn resolve_effective(
     alias: &str,
 ) -> io::Result<(String, u16, String, Option<PathBuf>, Option<String>)> {
+    super::validate_ssh_alias(alias)?;
     let output = std::process::Command::new("ssh")
         .args(["-G", alias])
         .output()

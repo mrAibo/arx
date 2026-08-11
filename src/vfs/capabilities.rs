@@ -49,6 +49,7 @@ impl CapabilitySet {
 pub const LOCAL_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::List)
     .with(Capability::Read)
+    .with(Capability::Write)
     .with(Capability::Mkdir)
     .with(Capability::Delete)
     .with(Capability::Copy)
@@ -59,6 +60,7 @@ pub const LOCAL_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
 pub const SFTP_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::List)
     .with(Capability::Read)
+    .with(Capability::Write)
     .with(Capability::Mkdir)
     .with(Capability::Delete);
 
@@ -119,6 +121,11 @@ mod tests {
     #[test]
     fn sftp_has_read_capability() {
         assert!(SFTP_CAPABILITIES.supports(Capability::Read));
+    }
+
+    #[test]
+    fn sftp_has_write_capability() {
+        assert!(SFTP_CAPABILITIES.supports(Capability::Write));
     }
 
     #[test]

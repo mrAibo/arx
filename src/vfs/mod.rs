@@ -16,6 +16,7 @@ pub use capabilities::{Capability, CapabilitySet};
 // Once all call sites use registry, delete old Location enum.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 // ── Error taxonomy ──
@@ -178,7 +179,134 @@ impl Target {
 pub struct BoundedRead {
     pub bytes: Vec<u8>,
     pub truncated: bool,
+    /// Unix mode and ownership captured in the same stable-read window as `bytes`.
+    pub unix_mode: Option<u32>,
+    pub unix_uid: Option<u32>,
+    pub unix_gid: Option<u32>,
 }
+
+impl BoundedRead {
+    pub fn into_revision(self) -> std::io::Result<RemoteEditRevision> {
+        if self.truncated {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "remote snapshot is truncated",
+            ));
+        }
+        let missing = |field| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("remote snapshot has no Unix {field}"),
+            )
+        };
+        Ok(RemoteEditRevision {
+            bytes: self.bytes,
+            unix_mode: self.unix_mode.ok_or_else(|| missing("mode"))?,
+            unix_uid: self.unix_uid.ok_or_else(|| missing("uid"))?,
+            unix_gid: self.unix_gid.ok_or_else(|| missing("gid"))?,
+        })
+    }
+}
+
+/// Exact content, mode, and ownership captured by one stable remote read.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RemoteEditRevision {
+    bytes: Vec<u8>,
+    unix_mode: u32,
+    unix_uid: u32,
+    unix_gid: u32,
+}
+
+impl RemoteEditRevision {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn unix_mode(&self) -> u32 {
+        self.unix_mode
+    }
+
+    pub fn unix_uid(&self) -> u32 {
+        self.unix_uid
+    }
+
+    pub fn unix_gid(&self) -> u32 {
+        self.unix_gid
+    }
+}
+
+impl std::fmt::Debug for RemoteEditRevision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteEditRevision")
+            .field("bytes_len", &self.bytes.len())
+            .field("unix_mode", &format_args!("{:#o}", self.unix_mode))
+            .field("unix_uid", &self.unix_uid)
+            .field("unix_gid", &self.unix_gid)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteWriteFailureKind {
+    RecoveryRequired,
+    CommittedWithWarning,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct RemoteWriteFailure {
+    kind: RemoteWriteFailureKind,
+    message: String,
+}
+
+pub fn remote_write_error(
+    kind: RemoteWriteFailureKind,
+    message: impl Into<String>,
+) -> std::io::Error {
+    std::io::Error::other(RemoteWriteFailure {
+        kind,
+        message: message.into(),
+    })
+}
+
+pub fn remote_write_failure_kind(error: &std::io::Error) -> Option<RemoteWriteFailureKind> {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<RemoteWriteFailure>())
+        .map(|failure| failure.kind)
+}
+
+/// Cooperative cancellation checked only at data-safe I/O boundaries.
+#[derive(Clone, Default)]
+pub struct CancellationFlag {
+    cancelled: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl CancellationFlag {
+    pub fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        let _ = notified.as_mut().enable();
+        if !self.is_cancelled() {
+            notified.await;
+        }
+    }
+}
+
+/// Maximum bytes ARX will download for remote editing.
+/// Files larger than this are refused before editor launch.
+pub const MAX_REMOTE_EDIT_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
 /// Backend trait — each provider implements this. async deferred to F2.
 /// ponytail: sync list() kept for backward compat; list_async() is the new path.
@@ -226,6 +354,72 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
             "read_prefix_bytes not supported by this provider",
         ))
     }
+
+    /// Write bytes atomically only if the current target still matches the
+    /// exact frozen content, Unix mode, and ownership captured before editing.
+    /// Default: unsupported.
+    async fn write_file_bytes_if_unchanged(
+        &self,
+        _path: &str,
+        _data: &[u8],
+        _revision: &RemoteEditRevision,
+        _cancellation: &CancellationFlag,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "write_file_bytes not supported by this provider",
+        ))
+    }
+
+    /// Return filesystem metadata for a file. Default: unsupported.
+    async fn metadata(&self, _path: &str) -> std::io::Result<FileMetadata> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "metadata not supported by this provider",
+        ))
+    }
+
+    /// Read entire file up to a safety cap. Returns the bytes and whether
+    /// the file is complete (false = file was larger than max_bytes and
+    /// the returned Vec is truncated).
+    async fn read_all_capped(
+        &self,
+        _path: &str,
+        _max_bytes: usize,
+    ) -> std::io::Result<BoundedRead> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "read_all_capped not supported by this provider",
+        ))
+    }
+
+    /// Cancellable bounded read. Providers with cleanup-bearing reads should
+    /// override this so cancellation runs their cleanup before returning.
+    async fn read_all_capped_cancellable(
+        &self,
+        path: &str,
+        max_bytes: usize,
+        cancellation: &CancellationFlag,
+    ) -> std::io::Result<BoundedRead> {
+        tokio::select! {
+            _ = cancellation.cancelled() => Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("read cancelled: {path}"),
+            )),
+            result = self.read_all_capped(path, max_bytes) => result,
+        }
+    }
+}
+
+/// File metadata returned by a remote provider.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileMetadata {
+    pub len: u64,
+    pub is_regular: bool,
+    /// Unix permission and ownership fields. None if unavailable.
+    pub unix_mode: Option<u32>,
+    pub unix_uid: Option<u32>,
+    pub unix_gid: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -486,7 +680,7 @@ impl ProviderRegistry {
     /// Create directory at frozen location. Routes to correct host instance.
     pub async fn mkdir_at(&self, location: &Location, child_name: &str) -> std::io::Result<()> {
         let (provider, parent_path) = self.provider_for_location(location)?;
-        let path = format!("{parent_path}/{child_name}");
+        let path = validated_child_path(&parent_path, child_name)?;
         provider.mkdir(&path).await
     }
 
@@ -510,14 +704,71 @@ impl ProviderRegistry {
         max_bytes: usize,
     ) -> std::io::Result<BoundedRead> {
         let (provider, parent_path) = self.provider_for_location(location)?;
-        let path = format!("{}/{}", parent_path.trim_end_matches('/'), name);
+        let path = validated_child_path(&parent_path, name)?;
         provider.read_prefix_bytes(&path, max_bytes).await
+    }
+
+    pub async fn write_file_bytes_if_unchanged_at(
+        &self,
+        location: &Location,
+        name: &str,
+        data: &[u8],
+        revision: &RemoteEditRevision,
+        cancellation: &CancellationFlag,
+    ) -> std::io::Result<()> {
+        self.require(&location.provider_id(), Capability::Write)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Unsupported, error))?;
+        let (provider, parent_path) = self.provider_for_location(location)?;
+        let path = validated_child_path(&parent_path, name)?;
+        provider
+            .write_file_bytes_if_unchanged(&path, data, revision, cancellation)
+            .await
+    }
+
+    pub async fn metadata_at(
+        &self,
+        location: &Location,
+        name: &str,
+    ) -> std::io::Result<FileMetadata> {
+        let (provider, parent_path) = self.provider_for_location(location)?;
+        let path = validated_child_path(&parent_path, name)?;
+        provider.metadata(&path).await
+    }
+
+    pub async fn read_all_capped_at(
+        &self,
+        location: &Location,
+        name: &str,
+        max_bytes: usize,
+    ) -> std::io::Result<BoundedRead> {
+        let (provider, parent_path) = self.provider_for_location(location)?;
+        let path = validated_child_path(&parent_path, name)?;
+        provider.read_all_capped(&path, max_bytes).await
+    }
+
+    pub async fn read_all_capped_cancellable_at(
+        &self,
+        location: &Location,
+        name: &str,
+        max_bytes: usize,
+        cancellation: &CancellationFlag,
+    ) -> std::io::Result<BoundedRead> {
+        let (provider, parent_path) = self.provider_for_location(location)?;
+        let path = validated_child_path(&parent_path, name)?;
+        provider
+            .read_all_capped_cancellable(&path, max_bytes, cancellation)
+            .await
     }
 }
 
-/// Validate a single child directory name for remote mkdir.
+fn validated_child_path(parent: &str, name: &str) -> std::io::Result<String> {
+    validate_child_name(name)?;
+    Ok(format!("{}/{}", parent.trim_end_matches('/'), name))
+}
+
+/// Validate one child name before joining it to a provider path.
 /// Rejects: empty, ".", "..", names containing '/' or NUL.
-pub fn validate_mkdir_child(name: &str) -> std::io::Result<()> {
+pub fn validate_child_name(name: &str) -> std::io::Result<()> {
     if name.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -713,6 +964,58 @@ pub struct RemoteDeleteTarget {
     pub name: String,
     pub kind: EntryKind,
     pub path: String,
+}
+
+/// Immutable snapshot of a remote file before editing.
+/// Used to detect remote changes before write-back.
+#[derive(Clone)]
+pub struct RemoteEditSession {
+    pub name: String,
+    pub location: Location,
+    pub editor: String,
+    /// Exact content+mode revision captured by one stable provider read.
+    pub revision: RemoteEditRevision,
+    /// Secure unique temp directory (auto-cleaned on drop).
+    /// Contains `working` (editable copy) and `original` (immutable snapshot).
+    pub temp_dir: std::sync::Arc<tempfile::TempDir>,
+    pub state: RemoteEditState,
+}
+
+impl std::fmt::Debug for RemoteEditSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteEditSession")
+            .field("name", &self.name)
+            .field("location", &self.location)
+            .field("editor", &self.editor)
+            .field("revision", &self.revision)
+            .field("temp_dir", &self.temp_dir.path())
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+impl PartialEq for RemoteEditSession {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.location == other.location
+            && self.editor == other.editor
+            && self.revision == other.revision
+            && self.state == other.state
+    }
+}
+
+impl Eq for RemoteEditSession {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteEditState {
+    Downloading,
+    ReadyToEdit,
+    Editing,
+    NoChange,
+    WritingBack,
+    Conflict,
+    Done,
+    Failed,
 }
 
 pub(crate) fn canonical_unix_mtime_ms(seconds: u64) -> u64 {
@@ -913,36 +1216,36 @@ mod tests {
         assert_eq!(path, "/tmp");
     }
 
-    // ── REMOTE-09: validate_mkdir_child ──
+    // ── REMOTE-09: validate_child_name ──
 
     #[test]
-    fn validate_mkdir_child_rejects_empty() {
-        assert!(validate_mkdir_child("").is_err());
+    fn validate_child_name_rejects_empty() {
+        assert!(validate_child_name("").is_err());
     }
 
     #[test]
-    fn validate_mkdir_child_rejects_dot() {
-        assert!(validate_mkdir_child(".").is_err());
+    fn validate_child_name_rejects_dot() {
+        assert!(validate_child_name(".").is_err());
     }
 
     #[test]
-    fn validate_mkdir_child_rejects_dotdot() {
-        assert!(validate_mkdir_child("..").is_err());
+    fn validate_child_name_rejects_dotdot() {
+        assert!(validate_child_name("..").is_err());
     }
 
     #[test]
-    fn validate_mkdir_child_rejects_slash() {
-        assert!(validate_mkdir_child("foo/bar").is_err());
+    fn validate_child_name_rejects_slash() {
+        assert!(validate_child_name("foo/bar").is_err());
     }
 
     #[test]
-    fn validate_mkdir_child_rejects_nul() {
-        assert!(validate_mkdir_child("bad\0name").is_err());
+    fn validate_child_name_rejects_nul() {
+        assert!(validate_child_name("bad\0name").is_err());
     }
 
     #[test]
-    fn validate_mkdir_child_accepts_normal() {
-        assert!(validate_mkdir_child("created-by-arx").is_ok());
+    fn validate_child_name_accepts_normal() {
+        assert!(validate_child_name("created-by-arx").is_ok());
     }
 
     // ── REMOTE-09: delete plan target kinds ──
@@ -1192,6 +1495,16 @@ mod tests {
                 .take()
                 .expect("mock: read_result already consumed")
         }
+
+        async fn write_file_bytes_if_unchanged(
+            &self,
+            _path: &str,
+            _data: &[u8],
+            _revision: &RemoteEditRevision,
+            _cancellation: &CancellationFlag,
+        ) -> std::io::Result<()> {
+            panic!("mock: write must be rejected at registry boundary")
+        }
     }
 
     #[test]
@@ -1204,6 +1517,9 @@ mod tests {
                 read_result: Mutex::new(Some(Ok(BoundedRead {
                     bytes: b"content from host-a".to_vec(),
                     truncated: false,
+                    unix_mode: None,
+                    unix_uid: None,
+                    unix_gid: None,
                 }))),
             }),
             capabilities::SFTP_CAPABILITIES,
@@ -1215,6 +1531,9 @@ mod tests {
                 read_result: Mutex::new(Some(Ok(BoundedRead {
                     bytes: b"content from host-b".to_vec(),
                     truncated: false,
+                    unix_mode: None,
+                    unix_uid: None,
+                    unix_gid: None,
                 }))),
             }),
             capabilities::SFTP_CAPABILITIES,
@@ -1242,6 +1561,101 @@ mod tests {
         assert_eq!(bounded_b.bytes, b"content from host-b");
         assert!(!bounded_b.truncated);
         assert_ne!(bounded_a.bytes, bounded_b.bytes);
+    }
+
+    #[tokio::test]
+    async fn cancellation_wakes_all_waiters_and_late_waiters() {
+        let cancellation = CancellationFlag::default();
+        let first = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move { cancellation.cancelled().await }
+        });
+        let second = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move { cancellation.cancelled().await }
+        });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            first.await.unwrap();
+            second.await.unwrap();
+            cancellation.cancelled().await;
+        })
+        .await
+        .expect("all cancellation waiters must wake");
+    }
+
+    #[tokio::test]
+    async fn write_boundary_requires_capability_before_provider_call() {
+        let registry = ProviderRegistry::new();
+        registry.insert_sftp(
+            "read-only",
+            Box::new(RoutingMockProvider {
+                host_label: "read-only".into(),
+                read_result: Mutex::new(None),
+            }),
+            CapabilitySet::NONE.with(Capability::Read),
+        );
+        let location = Location::Sftp {
+            host: "read-only".into(),
+            path: "/srv".into(),
+        };
+        let revision = RemoteEditRevision {
+            bytes: b"old".to_vec(),
+            unix_mode: 0o600,
+            unix_uid: 1000,
+            unix_gid: 1000,
+        };
+
+        let error = registry
+            .write_file_bytes_if_unchanged_at(
+                &location,
+                "file.txt",
+                b"new",
+                &revision,
+                &CancellationFlag::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn write_boundary_rejects_invalid_child_before_provider_call() {
+        let registry = ProviderRegistry::new();
+        registry.insert_sftp(
+            "host-a",
+            Box::new(RoutingMockProvider {
+                host_label: "host-a".into(),
+                read_result: Mutex::new(None),
+            }),
+            capabilities::SFTP_CAPABILITIES,
+        );
+        let location = Location::Sftp {
+            host: "host-a".into(),
+            path: "/srv".into(),
+        };
+        let revision = RemoteEditRevision {
+            bytes: b"old".to_vec(),
+            unix_mode: 0o600,
+            unix_uid: 1000,
+            unix_gid: 1000,
+        };
+
+        let error = registry
+            .write_file_bytes_if_unchanged_at(
+                &location,
+                "../escape",
+                b"new",
+                &revision,
+                &CancellationFlag::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

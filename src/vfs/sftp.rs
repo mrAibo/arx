@@ -1,9 +1,49 @@
-use super::{Entry, EntryKind, canonical_unix_mtime_ms};
+use super::{
+    BoundedRead, CancellationFlag, Entry, EntryKind, FileMetadata, RemoteEditRevision,
+    RemoteWriteFailureKind, VfsProvider, canonical_unix_mtime_ms, remote_write_error,
+};
 use crate::remote::Host;
 use anyhow::Context;
 use std::collections::BTreeSet;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
+
+static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn unique_token() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    let entropy = {
+        use std::io::Read;
+        let mut bytes = [0_u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut bytes))
+            .ok()
+            .map(|()| {
+                use std::fmt::Write;
+                let mut hex = String::with_capacity(bytes.len() * 2);
+                for byte in bytes {
+                    let _ = write!(&mut hex, "{byte:02x}");
+                }
+                hex
+            })
+    };
+    #[cfg(not(unix))]
+    let entropy: Option<String> = None;
+
+    format!(
+        "{}-{}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed),
+        entropy.unwrap_or_else(|| "no-entropy".to_string()),
+    )
+}
 
 /// SFTP filesystem backend.
 pub struct SftpFs;
@@ -91,10 +131,510 @@ fn entries_from_read_dir(read_dir: Vec<russh_sftp::client::fs::DirEntry>) -> Vec
     result
 }
 
-use crate::vfs::{BoundedRead, VfsProvider};
+fn bounded_read_plan(file_len: u64, max_bytes: usize) -> std::io::Result<(usize, bool)> {
+    let truncated = file_len > max_bytes as u64;
+    let read_len = usize::try_from(file_len.min(max_bytes as u64))
+        .map_err(|_| std::io::Error::other("remote file length does not fit usize"))?;
+    Ok((read_len, truncated))
+}
+
+fn is_regular_file(metadata: &russh_sftp::protocol::FileAttributes) -> bool {
+    // ponytail: exact type equality; russh-sftp's bitflag check also accepts symlink mode.
+    metadata.file_type().is_file()
+}
+
+async fn read_exact_len<R>(reader: R, expected_len: usize) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut bytes = Vec::with_capacity(expected_len);
+    reader
+        .take(expected_len as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() != expected_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("read {} of {expected_len} bytes", bytes.len()),
+        ));
+    }
+    Ok(bytes)
+}
+
+async fn read_stable_snapshot(
+    session: &russh_sftp::client::SftpSession,
+    path: &str,
+    max_bytes: usize,
+) -> std::io::Result<BoundedRead> {
+    let before = session
+        .symlink_metadata(path.to_string())
+        .await
+        .map_err(|error| std::io::Error::other(format!("SFTP metadata {path}: {error}")))?;
+    if !is_regular_file(&before) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("SFTP read {path}: target is not a regular file"),
+        ));
+    }
+    let file_len = before
+        .size
+        .ok_or_else(|| std::io::Error::other(format!("SFTP metadata size unavailable: {path}")))?;
+    let (read_len, truncated) = bounded_read_plan(file_len, max_bytes)?;
+
+    let first_file = session
+        .open(path.to_string())
+        .await
+        .map_err(|error| std::io::Error::other(format!("SFTP open {path}: {error}")))?;
+    let first = read_exact_len(first_file, read_len)
+        .await
+        .map_err(|error| std::io::Error::other(format!("SFTP read {path}: {error}")))?;
+
+    let second = if truncated {
+        first.clone()
+    } else {
+        let second_file = session
+            .open(path.to_string())
+            .await
+            .map_err(|error| std::io::Error::other(format!("SFTP reopen {path}: {error}")))?;
+        read_exact_len(second_file, read_len)
+            .await
+            .map_err(|error| std::io::Error::other(format!("SFTP reread {path}: {error}")))?
+    };
+    let after = session
+        .symlink_metadata(path.to_string())
+        .await
+        .map_err(|error| std::io::Error::other(format!("SFTP metadata {path}: {error}")))?;
+
+    if !is_regular_file(&after)
+        || after.size != Some(file_len)
+        || before.mtime != after.mtime
+        || before.permissions != after.permissions
+        || before.uid != after.uid
+        || before.gid != after.gid
+        || first != second
+    {
+        return Err(std::io::Error::other(format!(
+            "SFTP file changed while reading: {path}"
+        )));
+    }
+
+    Ok(BoundedRead {
+        bytes: first,
+        truncated,
+        unix_mode: before.permissions,
+        unix_uid: before.uid,
+        unix_gid: before.gid,
+    })
+}
+
+/// Pin the directory entry with a no-follow hardlink before opening it. SFTP v3
+/// has no O_NOFOLLOW flag, so reading the pinned path closes the lstat/open race.
+async fn read_pinned_snapshot(
+    session: &russh_sftp::client::SftpSession,
+    path: &str,
+    max_bytes: usize,
+    cancellation: &CancellationFlag,
+    pause_after_pin: Option<&tokio::sync::Notify>,
+) -> std::io::Result<BoundedRead> {
+    if cancellation.is_cancelled() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("SFTP read cancelled: {path}"),
+        ));
+    }
+    let _parent = validate_transaction_parent(session, path).await?;
+    let pin_path = format!("{path}.arx-read-{}", unique_token());
+    match session.hardlink(path.to_string(), pin_path.clone()).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "SFTP server lacks hardlink@openssh.com required for no-follow reads",
+            ));
+        }
+        Err(error) => {
+            if let russh_sftp::client::error::Error::Status(status) = &error {
+                // Definitive: the server rejected the hardlink creation.
+                // ARX did not create pin_path; do not attempt cleanup.
+                return Err(std::io::Error::other(format!(
+                    "SFTP pin snapshot {path}: server refused hardlink: {status:?}"
+                )));
+            }
+            // Transport-ambiguous: pin creation outcome is uncertain; attempt cleanup.
+            match session.remove_file(pin_path.clone()).await {
+                Ok(()) => {}
+                Err(russh_sftp::client::error::Error::Status(status))
+                    if status.status_code == russh_sftp::protocol::StatusCode::NoSuchFile => {}
+                Err(cleanup_error) => {
+                    return Err(std::io::Error::other(format!(
+                        "SFTP pin snapshot {path} failed ({error}); pin cleanup is uncertain ({cleanup_error}); pin={pin_path}"
+                    )));
+                }
+            }
+            return Err(std::io::Error::other(format!(
+                "SFTP pin snapshot {path}: {error}; pin={pin_path}"
+            )));
+        }
+    }
+
+    if let Some(pin_created) = pause_after_pin {
+        pin_created.notify_one();
+        cancellation.cancelled().await;
+    }
+
+    let result = tokio::select! {
+        _ = cancellation.cancelled() => Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("SFTP read cancelled: {path}"),
+        )),
+        result = read_stable_snapshot(session, &pin_path, max_bytes) => result,
+    };
+    let cleanup = session.remove_file(pin_path.clone()).await;
+    match (result, cleanup) {
+        (Ok(snapshot), Ok(())) => Ok(snapshot),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(std::io::Error::other(format!(
+            "SFTP snapshot read succeeded but pin cleanup failed ({error}); pin={pin_path}"
+        ))),
+        (Err(read_error), Err(cleanup_error)) => Err(std::io::Error::other(format!(
+            "{read_error}; pin cleanup failed ({cleanup_error}); pin={pin_path}"
+        ))),
+    }
+}
+
+async fn remote_entry_metadata(
+    session: &russh_sftp::client::SftpSession,
+    path: &str,
+) -> std::io::Result<Option<russh_sftp::protocol::FileAttributes>> {
+    match session.symlink_metadata(path.to_string()).await {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(russh_sftp::client::error::Error::Status(status))
+            if status.status_code == russh_sftp::protocol::StatusCode::NoSuchFile =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(std::io::Error::other(format!(
+            "SFTP inspect {path}: {error}"
+        ))),
+    }
+}
+
+async fn staged_failure(
+    session: &russh_sftp::client::SftpSession,
+    target_path: &str,
+    stage_path: &str,
+    cause: impl Into<String>,
+) -> std::io::Error {
+    let cause = cause.into();
+    match session.remove_file(stage_path.to_string()).await {
+        Ok(()) => std::io::Error::other(cause),
+        Err(cleanup_error) => remote_write_error(
+            RemoteWriteFailureKind::RecoveryRequired,
+            format!(
+                "SFTP RECOVERY REQUIRED {target_path}: {cause}; stage cleanup failed ({cleanup_error}); stage={stage_path}"
+            ),
+        ),
+    }
+}
+
+async fn transaction_failure(
+    session: &russh_sftp::client::SftpSession,
+    path: &str,
+    stage_path: &str,
+    transaction_path: &str,
+    cause: impl Into<String>,
+) -> std::io::Error {
+    let cause = cause.into();
+    let stage_cleanup = session.remove_file(stage_path.to_string()).await.err();
+    let transaction_cleanup = session.remove_dir(transaction_path.to_string()).await.err();
+    if stage_cleanup.is_some() || transaction_cleanup.is_some() {
+        remote_write_error(
+            RemoteWriteFailureKind::RecoveryRequired,
+            format!(
+                "SFTP RECOVERY REQUIRED {path}: {cause}; stage={stage_path}; stage cleanup={stage_cleanup:?}; transaction={transaction_path}; transaction cleanup={transaction_cleanup:?}"
+            ),
+        )
+    } else {
+        std::io::Error::other(cause)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TransactionParent {
+    path: String,
+    mode: u32,
+    uid: u32,
+    gid: Option<u32>,
+}
+
+fn remote_parent_path(path: &str) -> String {
+    match path.rsplit_once('/') {
+        Some(("", _)) => "/".into(),
+        Some((parent, _)) => parent.into(),
+        None => ".".into(),
+    }
+}
+
+fn private_stage_owner(metadata: &russh_sftp::protocol::FileAttributes) -> Option<u32> {
+    (is_regular_file(metadata) && metadata.permissions.map(|mode| mode & 0o7777) == Some(0o600))
+        .then_some(metadata.uid)
+        .flatten()
+}
+
+async fn validate_transaction_parent(
+    session: &russh_sftp::client::SftpSession,
+    target_path: &str,
+) -> std::io::Result<TransactionParent> {
+    let path = remote_parent_path(target_path);
+    let metadata = session
+        .symlink_metadata(path.clone())
+        .await
+        .map_err(|error| std::io::Error::other(format!("SFTP inspect parent {path}: {error}")))?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("SFTP transaction parent is not a directory: {path}"),
+        ));
+    }
+    let mode = metadata
+        .permissions
+        .ok_or_else(|| std::io::Error::other(format!("SFTP parent mode unavailable: {path}")))?;
+    let uid = metadata
+        .uid
+        .ok_or_else(|| std::io::Error::other(format!("SFTP parent owner unavailable: {path}")))?;
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("SFTP unsafe writable transaction parent without sticky bit: {path}"),
+        ));
+    }
+    Ok(TransactionParent {
+        path,
+        mode,
+        uid,
+        gid: metadata.gid,
+    })
+}
+
+async fn verify_transaction_parent_unchanged(
+    session: &russh_sftp::client::SftpSession,
+    target_path: &str,
+    expected: &TransactionParent,
+) -> std::io::Result<()> {
+    if validate_transaction_parent(session, target_path).await? != *expected {
+        return Err(std::io::Error::other(format!(
+            "SFTP transaction parent changed: {}",
+            expected.path
+        )));
+    }
+    Ok(())
+}
+
+async fn verify_transaction_dir(
+    session: &russh_sftp::client::SftpSession,
+    transaction_path: &str,
+    expected_uid: u32,
+) -> std::io::Result<()> {
+    let metadata = session
+        .symlink_metadata(transaction_path.to_string())
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "SFTP inspect transaction namespace {transaction_path}: {error}"
+            ))
+        })?;
+    if !metadata.file_type().is_dir()
+        || metadata.permissions.map(|mode| mode & 0o7777) != Some(0o700)
+        || metadata.uid != Some(expected_uid)
+    {
+        return Err(std::io::Error::other(format!(
+            "SFTP transaction namespace is not private or changed owner: {transaction_path}"
+        )));
+    }
+    Ok(())
+}
+
+async fn prepare_transaction_dir(
+    session: &russh_sftp::client::SftpSession,
+    path: &str,
+    stage_path: &str,
+    transaction_path: &str,
+    parent: &TransactionParent,
+    expected_owner: u32,
+) -> std::io::Result<u32> {
+    let metadata = match session.symlink_metadata(transaction_path.to_string()).await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(transaction_failure(
+                session,
+                path,
+                stage_path,
+                transaction_path,
+                format!("SFTP inspect transaction namespace: {error}"),
+            )
+            .await);
+        }
+    };
+    if metadata.uid != Some(expected_owner) {
+        return Err(transaction_failure(
+            session,
+            path,
+            stage_path,
+            transaction_path,
+            format!("SFTP transaction namespace owner mismatch: {transaction_path}"),
+        )
+        .await);
+    }
+    if let Err(error) = verify_transaction_dir(session, transaction_path, expected_owner).await {
+        return Err(transaction_failure(
+            session,
+            path,
+            stage_path,
+            transaction_path,
+            error.to_string(),
+        )
+        .await);
+    }
+    let entries = match session.read_dir(transaction_path.to_string()).await {
+        Ok(entries) => entries.collect::<Vec<_>>(),
+        Err(error) => {
+            return Err(transaction_failure(
+                session,
+                path,
+                stage_path,
+                transaction_path,
+                format!("SFTP inspect empty transaction namespace: {error}"),
+            )
+            .await);
+        }
+    };
+    if !entries.is_empty() {
+        return Err(transaction_failure(
+            session,
+            path,
+            stage_path,
+            transaction_path,
+            format!("SFTP transaction namespace was modified before use: {transaction_path}"),
+        )
+        .await);
+    }
+    if let Err(error) = verify_transaction_parent_unchanged(session, path, parent).await {
+        return Err(transaction_failure(
+            session,
+            path,
+            stage_path,
+            transaction_path,
+            format!("SFTP revalidate transaction parent: {error}"),
+        )
+        .await);
+    }
+    Ok(expected_owner)
+}
+
+async fn staged_conflict(
+    session: &russh_sftp::client::SftpSession,
+    path: &str,
+    stage_path: &str,
+    transaction_path: &str,
+    reason: &str,
+) -> std::io::Error {
+    let stage_cleanup = session.remove_file(stage_path.to_string()).await.err();
+    let transaction_cleanup = session.remove_dir(transaction_path.to_string()).await.err();
+    if stage_cleanup.is_none() && transaction_cleanup.is_none() {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("SFTP conflict {path}: {reason}"),
+        )
+    } else {
+        remote_write_error(
+            RemoteWriteFailureKind::RecoveryRequired,
+            format!(
+                "SFTP RECOVERY REQUIRED {path}: {reason}; stage={stage_path}; stage cleanup={stage_cleanup:?}; transaction={transaction_path}; transaction cleanup={transaction_cleanup:?}"
+            ),
+        )
+    }
+}
+
+async fn cancel_before_commit(
+    session: &russh_sftp::client::SftpSession,
+    path: &str,
+    stage_path: &str,
+    transaction_path: Option<&str>,
+) -> std::io::Error {
+    let stage_cleanup = session.remove_file(stage_path.to_string()).await.err();
+    let transaction_cleanup = if let Some(transaction_path) = transaction_path {
+        session.remove_dir(transaction_path.to_string()).await.err()
+    } else {
+        None
+    };
+    if stage_cleanup.is_some() || transaction_cleanup.is_some() {
+        remote_write_error(
+            RemoteWriteFailureKind::RecoveryRequired,
+            format!(
+                "SFTP RECOVERY REQUIRED {path}: cancellation cleanup failed; stage={stage_path}; stage cleanup={stage_cleanup:?}; transaction cleanup={transaction_cleanup:?}"
+            ),
+        )
+    } else {
+        std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("SFTP remote edit cancelled before commit: {path}"),
+        )
+    }
+}
+
+async fn restore_backup_no_clobber(
+    session: &russh_sftp::client::SftpSession,
+    backup_path: &str,
+    target_path: &str,
+) -> Result<(), String> {
+    match session
+        .hardlink(backup_path.to_string(), target_path.to_string())
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return Err("server lacks hardlink@openssh.com".into()),
+        Err(error) => return Err(format!("restore link failed: {error}")),
+    }
+    session
+        .remove_file(backup_path.to_string())
+        .await
+        .map_err(|error| format!("restored target but backup cleanup failed: {error}"))
+}
+
+#[derive(Clone, Copy)]
+enum AtomicWriteFault {
+    PreserveMode,
+    VerifyBackup,
+    VerifyVisible,
+    Commit,
+    Restore,
+    BackupCleanup,
+    ConcurrentTarget,
+    CancelBeforeCommit,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct AtomicWriteFaults {
+    preserve_mode: bool,
+    verify_backup: bool,
+    verify_visible: bool,
+    commit: bool,
+    restore: bool,
+    backup_cleanup: bool,
+    concurrent_target: bool,
+    cancel_before_commit: bool,
+}
+
 pub struct SftpProvider {
     pub host: crate::remote::Host,
     connection: Mutex<Option<crate::remote::openssh_sftp::OpenSshSftpConnection>>,
+    #[cfg(test)]
+    faults: AtomicWriteFaults,
+    #[cfg(test)]
+    pause_after_pin: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl std::fmt::Debug for SftpProvider {
@@ -111,6 +651,42 @@ impl SftpProvider {
         Self {
             host,
             connection: Mutex::new(None),
+            #[cfg(test)]
+            faults: AtomicWriteFaults::default(),
+            #[cfg(test)]
+            pause_after_pin: None,
+        }
+    }
+
+    fn pause_after_pin(&self) -> Option<&tokio::sync::Notify> {
+        #[cfg(test)]
+        {
+            self.pause_after_pin.as_deref()
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    fn fault_enabled(&self, fault: AtomicWriteFault) -> bool {
+        #[cfg(test)]
+        {
+            match fault {
+                AtomicWriteFault::PreserveMode => self.faults.preserve_mode,
+                AtomicWriteFault::VerifyBackup => self.faults.verify_backup,
+                AtomicWriteFault::VerifyVisible => self.faults.verify_visible,
+                AtomicWriteFault::Commit => self.faults.commit,
+                AtomicWriteFault::Restore => self.faults.restore,
+                AtomicWriteFault::BackupCleanup => self.faults.backup_cleanup,
+                AtomicWriteFault::ConcurrentTarget => self.faults.concurrent_target,
+                AtomicWriteFault::CancelBeforeCommit => self.faults.cancel_before_commit,
+            }
+        }
+        #[cfg(not(test))]
+        {
+            let _ = fault;
+            false
         }
     }
 
@@ -293,6 +869,41 @@ impl VfsProvider for SftpProvider {
     ) -> std::io::Result<BoundedRead> {
         self.read_prefix(path, max_bytes).await
     }
+
+    async fn write_file_bytes_if_unchanged(
+        &self,
+        path: &str,
+        data: &[u8],
+        revision: &RemoteEditRevision,
+        cancellation: &CancellationFlag,
+    ) -> std::io::Result<()> {
+        let result = self.write_atomic(path, data, revision, cancellation).await;
+        if result.is_err() {
+            let mut guard = self.connection.lock().await;
+            if let Some(mut connection) = guard.take() {
+                connection.abort().await;
+            }
+        }
+        result
+    }
+
+    async fn metadata(&self, path: &str) -> std::io::Result<FileMetadata> {
+        self.remote_metadata(path).await
+    }
+
+    async fn read_all_capped(&self, path: &str, max_bytes: usize) -> std::io::Result<BoundedRead> {
+        self.read_all(path, max_bytes, &CancellationFlag::default())
+            .await
+    }
+
+    async fn read_all_capped_cancellable(
+        &self,
+        path: &str,
+        max_bytes: usize,
+        cancellation: &CancellationFlag,
+    ) -> std::io::Result<BoundedRead> {
+        self.read_all(path, max_bytes, cancellation).await
+    }
 }
 
 impl SftpProvider {
@@ -336,6 +947,9 @@ impl SftpProvider {
                     return Ok(BoundedRead {
                         bytes: buf,
                         truncated,
+                        unix_mode: None,
+                        unix_uid: None,
+                        unix_gid: None,
                     });
                 }
                 Err(error) => {
@@ -350,6 +964,737 @@ impl SftpProvider {
         }
 
         unreachable!()
+    }
+
+    /// Read a stable snapshot up to max_bytes. Files within the limit are read
+    /// twice; size, mtime, mode, ownership, and content must remain unchanged.
+    async fn read_all(
+        &self,
+        path: &str,
+        max_bytes: usize,
+        cancellation: &CancellationFlag,
+    ) -> std::io::Result<BoundedRead> {
+        let mut guard = self.connect_for_mutation().await?;
+        let session = &guard
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?
+            .session;
+        let result = read_pinned_snapshot(
+            session,
+            path,
+            max_bytes,
+            cancellation,
+            self.pause_after_pin(),
+        )
+        .await;
+        if result.is_err()
+            && let Some(mut broken) = guard.take()
+        {
+            broken.abort().await;
+        }
+        result
+    }
+
+    /// Atomic write via SFTP: stage → verify → commit → rollback on failure.
+    /// Reuses the transactional pattern proven in sftp_copy::upload_file.
+    async fn write_atomic(
+        &self,
+        path: &str,
+        data: &[u8],
+        revision: &RemoteEditRevision,
+        cancellation: &CancellationFlag,
+    ) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let expected_original = revision.bytes();
+        let original_unix_mode = revision.unix_mode();
+        let original_unix_uid = revision.unix_uid();
+        let original_unix_gid = revision.unix_gid();
+
+        if cancellation.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("SFTP remote edit cancelled before staging: {path}"),
+            ));
+        }
+
+        let token = unique_token();
+        let mut stage_path = format!("{path}.arx-part-{token}");
+        let transaction_path = format!("{path}.arx-txn-{token}");
+        let transaction_stage_path = format!("{transaction_path}/stage");
+        let backup_path = format!("{transaction_path}/backup");
+
+        let mut guard = self.connect_for_mutation().await?;
+        let session = &guard
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?
+            .session;
+        let transaction_parent = validate_transaction_parent(session, path).await?;
+
+        // Create an empty 0600 stage first. Its owner proves which account the
+        // separate atomic mkdir command must create the private namespace for.
+        let mut create_attrs = russh_sftp::protocol::FileAttributes::empty();
+        create_attrs.permissions = Some(0o600);
+        let mut remote = match session
+            .open_with_flags_and_attributes(
+                stage_path.clone(),
+                russh_sftp::protocol::OpenFlags::CREATE
+                    | russh_sftp::protocol::OpenFlags::EXCLUDE
+                    | russh_sftp::protocol::OpenFlags::WRITE,
+                create_attrs,
+            )
+            .await
+        {
+            Ok(remote) => remote,
+            Err(russh_sftp::client::error::Error::Status(status)) => {
+                return Err(std::io::Error::other(format!(
+                    "SFTP create stage for {path} refused: {status:?}"
+                )));
+            }
+            Err(error) => {
+                let message = format!(
+                    "SFTP RECOVERY REQUIRED {path}: stage creation outcome is uncertain ({error}); stage={stage_path}"
+                );
+                if let Some(mut broken) = guard.take() {
+                    broken.abort().await;
+                }
+                return Err(remote_write_error(
+                    RemoteWriteFailureKind::RecoveryRequired,
+                    message,
+                ));
+            }
+        };
+        let stage_owner = match session.symlink_metadata(stage_path.clone()).await {
+            Ok(metadata) => match private_stage_owner(&metadata) {
+                Some(owner) => owner,
+                None => {
+                    drop(remote);
+                    return Err(staged_failure(
+                        session,
+                        path,
+                        &stage_path,
+                        format!("SFTP stage is not a private 0600 regular file: {stage_path}"),
+                    )
+                    .await);
+                }
+            },
+            Err(error) => {
+                drop(remote);
+                return Err(staged_failure(
+                    session,
+                    path,
+                    &stage_path,
+                    format!("SFTP inspect stage {stage_path}: {error}"),
+                )
+                .await);
+            }
+        };
+
+        match crate::remote::openssh_sftp::OpenSshSftpConnection::create_private_dir(
+            &self.host.ssh_alias,
+            &transaction_path,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                drop(remote);
+                let stage_cleanup = session.remove_file(stage_path.clone()).await.err();
+                return Err(remote_write_error(
+                    RemoteWriteFailureKind::RecoveryRequired,
+                    format!(
+                        "SFTP RECOVERY REQUIRED {path}: private transaction creation outcome is uncertain ({error}); transaction={transaction_path}; stage={stage_path}; stage cleanup={stage_cleanup:?}"
+                    ),
+                ));
+            }
+            Err(error) => {
+                drop(remote);
+                return Err(staged_failure(
+                    session,
+                    path,
+                    &stage_path,
+                    format!(
+                        "SFTP create private transaction namespace {transaction_path}: {error}"
+                    ),
+                )
+                .await);
+            }
+        }
+        let transaction_owner = prepare_transaction_dir(
+            session,
+            path,
+            &stage_path,
+            &transaction_path,
+            &transaction_parent,
+            stage_owner,
+        )
+        .await?;
+
+        match session
+            .rename(stage_path.clone(), transaction_stage_path.clone())
+            .await
+        {
+            Ok(()) => stage_path = transaction_stage_path,
+            Err(russh_sftp::client::error::Error::Status(status)) => {
+                drop(remote);
+                return Err(transaction_failure(
+                    session,
+                    path,
+                    &stage_path,
+                    &transaction_path,
+                    format!("SFTP move stage into private transaction refused: {status:?}"),
+                )
+                .await);
+            }
+            Err(error) => {
+                drop(remote);
+                let message = format!(
+                    "SFTP RECOVERY REQUIRED {path}: moving stage into transaction is uncertain ({error}); old-stage={stage_path}; transaction-stage={transaction_stage_path}; transaction={transaction_path}"
+                );
+                if let Some(mut broken) = guard.take() {
+                    broken.abort().await;
+                }
+                return Err(remote_write_error(
+                    RemoteWriteFailureKind::RecoveryRequired,
+                    message,
+                ));
+            }
+        }
+
+        // Probe no-clobber support inside the private namespace before upload.
+        let link_probe_path = format!("{transaction_path}/link-probe");
+        match session
+            .hardlink(stage_path.clone(), link_probe_path.clone())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                drop(remote);
+                return Err(transaction_failure(
+                    session,
+                    path,
+                    &stage_path,
+                    &transaction_path,
+                    "SFTP server lacks hardlink@openssh.com required for safe commit",
+                )
+                .await);
+            }
+            Err(russh_sftp::client::error::Error::Status(status)) => {
+                drop(remote);
+                return Err(transaction_failure(
+                    session,
+                    path,
+                    &stage_path,
+                    &transaction_path,
+                    format!("SFTP no-clobber capability probe refused: {status:?}"),
+                )
+                .await);
+            }
+            Err(error) => {
+                drop(remote);
+                let message = format!(
+                    "SFTP RECOVERY REQUIRED {path}: no-clobber probe outcome is uncertain ({error}); probe={link_probe_path}; stage={stage_path}; transaction={transaction_path}"
+                );
+                if let Some(mut broken) = guard.take() {
+                    broken.abort().await;
+                }
+                return Err(remote_write_error(
+                    RemoteWriteFailureKind::RecoveryRequired,
+                    message,
+                ));
+            }
+        }
+        if let Err(error) = session.remove_file(link_probe_path.clone()).await {
+            drop(remote);
+            return Err(remote_write_error(
+                RemoteWriteFailureKind::RecoveryRequired,
+                format!(
+                    "SFTP RECOVERY REQUIRED {path}: no-clobber probe cleanup failed ({error}); probe={link_probe_path}; stage={stage_path}; transaction={transaction_path}"
+                ),
+            ));
+        }
+        if cancellation.is_cancelled() {
+            drop(remote);
+            return Err(
+                cancel_before_commit(session, path, &stage_path, Some(&transaction_path)).await,
+            );
+        }
+
+        if let Err(e) = remote.write_all(data).await {
+            drop(remote);
+            return Err(transaction_failure(
+                session,
+                path,
+                &stage_path,
+                &transaction_path,
+                format!("SFTP write {path}: {e}"),
+            )
+            .await);
+        }
+        if let Err(e) = remote.flush().await {
+            drop(remote);
+            return Err(transaction_failure(
+                session,
+                path,
+                &stage_path,
+                &transaction_path,
+                format!("SFTP flush {path}: {e}"),
+            )
+            .await);
+        }
+        if let Err(e) = remote.shutdown().await {
+            drop(remote);
+            return Err(transaction_failure(
+                session,
+                path,
+                &stage_path,
+                &transaction_path,
+                format!("SFTP close {path}: {e}"),
+            )
+            .await);
+        }
+        drop(remote);
+        if cancellation.is_cancelled() {
+            return Err(
+                cancel_before_commit(session, path, &stage_path, Some(&transaction_path)).await,
+            );
+        }
+
+        // Keep the staged payload private while it is written. Restore the
+        // target metadata only after the complete payload is closed.
+        if self.fault_enabled(AtomicWriteFault::PreserveMode) {
+            return Err(transaction_failure(
+                session,
+                path,
+                &stage_path,
+                &transaction_path,
+                format!("SFTP preserve metadata for {path}: injected failure"),
+            )
+            .await);
+        }
+        let mut attrs = russh_sftp::protocol::FileAttributes::empty();
+        attrs.permissions = Some(original_unix_mode);
+        attrs.uid = Some(original_unix_uid);
+        attrs.gid = Some(original_unix_gid);
+        if let Err(error) = session.set_metadata(stage_path.clone(), attrs).await {
+            return Err(transaction_failure(
+                session,
+                path,
+                &stage_path,
+                &transaction_path,
+                format!("SFTP preserve metadata for {path}: {error}"),
+            )
+            .await);
+        }
+        if cancellation.is_cancelled() {
+            return Err(
+                cancel_before_commit(session, path, &stage_path, Some(&transaction_path)).await,
+            );
+        }
+
+        // ── Verify staged content and metadata ──
+        match self
+            .verify_remote_matches(
+                session,
+                &stage_path,
+                data,
+                original_unix_mode,
+                original_unix_uid,
+                original_unix_gid,
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(transaction_failure(
+                    session,
+                    path,
+                    &stage_path,
+                    &transaction_path,
+                    format!("SFTP stage verification failed for {path}"),
+                )
+                .await);
+            }
+            Err(error) => {
+                return Err(transaction_failure(
+                    session,
+                    path,
+                    &stage_path,
+                    &transaction_path,
+                    format!("SFTP stage verification error for {path}: {error}"),
+                )
+                .await);
+            }
+        }
+
+        // ── Backup existing target ──
+        let target_metadata = match remote_entry_metadata(session, path).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return Err(transaction_failure(
+                    session,
+                    path,
+                    &stage_path,
+                    &transaction_path,
+                    format!("SFTP inspect target {path}: {error}"),
+                )
+                .await);
+            }
+        };
+        let Some(target_metadata) = target_metadata else {
+            return Err(staged_conflict(
+                session,
+                path,
+                &stage_path,
+                &transaction_path,
+                "remote target disappeared during edit",
+            )
+            .await);
+        };
+        if !is_regular_file(&target_metadata) {
+            return Err(staged_conflict(
+                session,
+                path,
+                &stage_path,
+                &transaction_path,
+                "remote target is no longer a regular file",
+            )
+            .await);
+        }
+        match remote_entry_metadata(session, &backup_path).await {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Err(transaction_failure(
+                    session,
+                    path,
+                    &stage_path,
+                    &transaction_path,
+                    format!("SFTP backup path already exists: {backup_path}"),
+                )
+                .await);
+            }
+            Err(error) => {
+                return Err(transaction_failure(
+                    session,
+                    path,
+                    &stage_path,
+                    &transaction_path,
+                    format!("SFTP inspect backup path {backup_path}: {error}"),
+                )
+                .await);
+            }
+        }
+        if self.fault_enabled(AtomicWriteFault::CancelBeforeCommit) {
+            cancellation.cancel();
+        }
+        if cancellation.is_cancelled() {
+            return Err(
+                cancel_before_commit(session, path, &stage_path, Some(&transaction_path)).await,
+            );
+        }
+        if let Err(error) =
+            verify_transaction_parent_unchanged(session, path, &transaction_parent).await
+        {
+            return Err(transaction_failure(
+                session,
+                path,
+                &stage_path,
+                &transaction_path,
+                format!("SFTP transaction parent changed before commit: {error}"),
+            )
+            .await);
+        }
+        if let Err(error) =
+            verify_transaction_dir(session, &transaction_path, transaction_owner).await
+        {
+            return Err(transaction_failure(
+                session,
+                path,
+                &stage_path,
+                &transaction_path,
+                format!("SFTP transaction namespace changed before commit: {error}"),
+            )
+            .await);
+        }
+        match session.rename(path.to_string(), backup_path.clone()).await {
+            Ok(()) => {}
+            Err(russh_sftp::client::error::Error::Status(status)) => {
+                return Err(transaction_failure(
+                    session,
+                    path,
+                    &stage_path,
+                    &transaction_path,
+                    format!("SFTP backup rename refused for {path}: {status:?}"),
+                )
+                .await);
+            }
+            Err(error) => {
+                let message = format!(
+                    "SFTP RECOVERY REQUIRED {path}: backup rename transport outcome is uncertain ({error}); backup={backup_path}; stage={stage_path}"
+                );
+                if let Some(mut broken) = guard.take() {
+                    broken.abort().await;
+                }
+                return Err(remote_write_error(
+                    RemoteWriteFailureKind::RecoveryRequired,
+                    message,
+                ));
+            }
+        }
+
+        // ── Commit-time race check against exact content and metadata ──
+        let backup_verification = if self.fault_enabled(AtomicWriteFault::VerifyBackup) {
+            Ok(false)
+        } else {
+            self.verify_remote_matches(
+                session,
+                &backup_path,
+                expected_original,
+                original_unix_mode,
+                original_unix_uid,
+                original_unix_gid,
+            )
+            .await
+        };
+        let (backup_matches, verification_error) = match backup_verification {
+            Ok(matches) => (matches, None),
+            Err(error) => (false, Some(error)),
+        };
+        if !backup_matches {
+            let restore_error = if self.fault_enabled(AtomicWriteFault::Restore) {
+                Some("injected failure".to_string())
+            } else {
+                restore_backup_no_clobber(session, &backup_path, path)
+                    .await
+                    .err()
+            };
+            if let Some(error) = restore_error {
+                return Err(remote_write_error(
+                    RemoteWriteFailureKind::RecoveryRequired,
+                    format!(
+                        "SFTP RECOVERY REQUIRED {path}: verification failed but restore failed ({error}); backup={backup_path}; stage={stage_path}"
+                    ),
+                ));
+            }
+            let stage_cleanup = session.remove_file(stage_path.clone()).await.err();
+            let transaction_cleanup = session.remove_dir(transaction_path.clone()).await.err();
+            if stage_cleanup.is_some() || transaction_cleanup.is_some() {
+                return Err(remote_write_error(
+                    RemoteWriteFailureKind::RecoveryRequired,
+                    format!(
+                        "SFTP RECOVERY REQUIRED {path}: original restored after verification failure but cleanup failed; stage={stage_path}; stage cleanup={stage_cleanup:?}; transaction={transaction_path}; transaction cleanup={transaction_cleanup:?}"
+                    ),
+                ));
+            }
+            if let Some(error) = verification_error {
+                return Err(error);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("SFTP conflict {path}: remote modified during edit"),
+            ));
+        }
+
+        // ── Commit ──
+        let mut injected_error = None;
+        if self.fault_enabled(AtomicWriteFault::ConcurrentTarget) {
+            match session.create(path.to_string()).await {
+                Ok(mut competing) => {
+                    if let Err(error) = competing.write_all(b"concurrent").await {
+                        injected_error = Some(format!("inject concurrent target: {error}"));
+                    } else if let Err(error) = competing.shutdown().await {
+                        injected_error = Some(format!("close concurrent target: {error}"));
+                    }
+                    drop(competing);
+                }
+                Err(error) => {
+                    injected_error = Some(format!("create concurrent target: {error}"));
+                }
+            }
+        }
+        let commit_error = if let Some(error) = injected_error {
+            Some(error)
+        } else if self.fault_enabled(AtomicWriteFault::Commit) {
+            Some("injected failure".to_string())
+        } else {
+            match session.hardlink(stage_path.clone(), path.to_string()).await {
+                Ok(true) => None,
+                Ok(false) => Some("server lacks hardlink@openssh.com".to_string()),
+                Err(russh_sftp::client::error::Error::Status(status)) => {
+                    Some(format!("commit link refused: {status:?}"))
+                }
+                Err(error) => {
+                    let message = format!(
+                        "SFTP RECOVERY REQUIRED {path}: commit link transport outcome is uncertain ({error}); backup={backup_path}; stage={stage_path}"
+                    );
+                    if let Some(mut broken) = guard.take() {
+                        broken.abort().await;
+                    }
+                    return Err(remote_write_error(
+                        RemoteWriteFailureKind::RecoveryRequired,
+                        message,
+                    ));
+                }
+            }
+        };
+        if let Some(error) = commit_error {
+            let restore_error = if self.fault_enabled(AtomicWriteFault::Restore) {
+                Some("injected failure".to_string())
+            } else {
+                restore_backup_no_clobber(session, &backup_path, path)
+                    .await
+                    .err()
+            };
+            if let Some(restore_error) = restore_error {
+                return Err(remote_write_error(
+                    RemoteWriteFailureKind::RecoveryRequired,
+                    format!(
+                        "SFTP RECOVERY REQUIRED {path}: commit failed ({error}) and restore failed ({restore_error}); backup={backup_path}; stage={stage_path}"
+                    ),
+                ));
+            }
+            let stage_cleanup = session.remove_file(stage_path.clone()).await.err();
+            let transaction_cleanup = session.remove_dir(transaction_path.clone()).await.err();
+            if stage_cleanup.is_some() || transaction_cleanup.is_some() {
+                return Err(remote_write_error(
+                    RemoteWriteFailureKind::RecoveryRequired,
+                    format!(
+                        "SFTP RECOVERY REQUIRED {path}: commit failed ({error}), original restored, but cleanup failed; stage={stage_path}; stage cleanup={stage_cleanup:?}; transaction={transaction_path}; transaction cleanup={transaction_cleanup:?}"
+                    ),
+                ));
+            }
+            return Err(std::io::Error::other(format!(
+                "SFTP commit {path}: {error}"
+            )));
+        }
+
+        // The hardlink response alone is not proof that the visible name is
+        // the staged revision. Keep both recovery links until exact content
+        // and metadata verification succeeds on the visible target.
+        let visible_verification = if self.fault_enabled(AtomicWriteFault::VerifyVisible) {
+            Ok(false)
+        } else {
+            self.verify_remote_matches(
+                session,
+                path,
+                data,
+                original_unix_mode,
+                original_unix_uid,
+                original_unix_gid,
+            )
+            .await
+        };
+        match visible_verification {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(remote_write_error(
+                    RemoteWriteFailureKind::RecoveryRequired,
+                    format!(
+                        "SFTP RECOVERY REQUIRED {path}: visible target verification failed after commit; backup={backup_path}; stage={stage_path}; transaction={transaction_path}"
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(remote_write_error(
+                    RemoteWriteFailureKind::RecoveryRequired,
+                    format!(
+                        "SFTP RECOVERY REQUIRED {path}: visible target verification errored after commit ({error}); backup={backup_path}; stage={stage_path}; transaction={transaction_path}"
+                    ),
+                ));
+            }
+        }
+
+        // ── Success: remove the stage link and proven-original backup ──
+        let mut cleanup_warnings = Vec::new();
+        if let Err(error) = session.remove_file(stage_path.clone()).await {
+            match &error {
+                russh_sftp::client::error::Error::Status(_) => {
+                    cleanup_warnings.push(format!(
+                        "stage cleanup refused ({error}); stage={stage_path}"
+                    ));
+                }
+                _ => {
+                    // Transport-ambiguous stage removal: retain backup evidence.
+                    return Err(remote_write_error(
+                        RemoteWriteFailureKind::CommittedWithWarning,
+                        format!(
+                            "SFTP COMMITTED WITH WARNING {path}: stage cleanup outcome uncertain ({error}); stage={stage_path}; backup retained={backup_path}",
+                        ),
+                    ));
+                }
+            }
+        }
+        let backup_cleanup_error = if self.fault_enabled(AtomicWriteFault::BackupCleanup) {
+            Some("injected failure".to_string())
+        } else {
+            session
+                .remove_file(backup_path.clone())
+                .await
+                .err()
+                .map(|error| error.to_string())
+        };
+        if let Some(error) = backup_cleanup_error {
+            cleanup_warnings.push(format!(
+                "backup cleanup failed ({error}); backup={backup_path}"
+            ));
+        } else if let Err(error) = session.remove_dir(transaction_path.clone()).await {
+            cleanup_warnings.push(format!(
+                "transaction cleanup failed ({error}); transaction={transaction_path}"
+            ));
+        }
+        if !cleanup_warnings.is_empty() {
+            return Err(remote_write_error(
+                RemoteWriteFailureKind::CommittedWithWarning,
+                format!(
+                    "SFTP COMMITTED WITH WARNING {path}: {}",
+                    cleanup_warnings.join("; ")
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
+    async fn verify_remote_matches(
+        &self,
+        session: &russh_sftp::client::SftpSession,
+        backup_path: &str,
+        frozen: &[u8],
+        expected_mode: u32,
+        expected_uid: u32,
+        expected_gid: u32,
+    ) -> std::io::Result<bool> {
+        let snapshot =
+            read_stable_snapshot(session, backup_path, frozen.len().saturating_add(1)).await?;
+        Ok(!snapshot.truncated
+            && snapshot.bytes == frozen
+            && snapshot.unix_mode.map(|value| value & 0o7777) == Some(expected_mode & 0o7777)
+            && snapshot.unix_uid == Some(expected_uid)
+            && snapshot.unix_gid == Some(expected_gid))
+    }
+
+    async fn remote_metadata(&self, path: &str) -> std::io::Result<FileMetadata> {
+        let guard = self.connect_for_mutation().await?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
+        let meta = conn
+            .session
+            .symlink_metadata(path.to_string())
+            .await
+            .map_err(|error| std::io::Error::other(format!("SFTP metadata {path}: {error}")))?;
+        Ok(FileMetadata {
+            len: meta.len(),
+            is_regular: is_regular_file(&meta),
+            unix_mode: meta.permissions,
+            unix_uid: meta.uid,
+            unix_gid: meta.gid,
+        })
     }
 }
 
@@ -369,6 +1714,21 @@ mod metadata_tests {
         assert_eq!(modified_unix_ms, Some(1_234_000));
     }
 
+    #[test]
+    fn private_stage_requires_regular_0600_file_with_owner() {
+        let mut metadata = russh_sftp::protocol::FileAttributes::empty();
+        metadata.permissions = Some(0o600);
+        metadata.uid = Some(7);
+        metadata.set_regular(true);
+        assert_eq!(private_stage_owner(&metadata), Some(7));
+
+        metadata.permissions = Some(0o100644);
+        assert_eq!(private_stage_owner(&metadata), None);
+        metadata.permissions = Some(0o100600);
+        metadata.uid = None;
+        assert_eq!(private_stage_owner(&metadata), None);
+    }
+
     // ── REMOTE-09: transport invalidation mechanism ──
 
     #[test]
@@ -386,6 +1746,387 @@ mod metadata_tests {
         assert!(!prod_code.contains("remove_dir_all"));
         assert!(!prod_code.contains(".recursive"));
         assert!(!prod_code.contains("walkdir"));
+    }
+
+    #[tokio::test]
+    async fn exact_len_read_accepts_exact_remote_edit_limit() {
+        let max = crate::vfs::MAX_REMOTE_EDIT_BYTES;
+        let bytes = vec![b'a'; max];
+        let (read_len, truncated) = bounded_read_plan(max as u64, max).unwrap();
+        assert!(!truncated);
+        assert_eq!(
+            read_exact_len(std::io::Cursor::new(bytes.clone()), read_len)
+                .await
+                .unwrap(),
+            bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_read_plan_marks_limit_plus_one_truncated() {
+        let max = crate::vfs::MAX_REMOTE_EDIT_BYTES;
+        let (read_len, truncated) = bounded_read_plan((max + 1) as u64, max).unwrap();
+        assert!(truncated);
+        assert_eq!(read_len, max);
+    }
+
+    #[tokio::test]
+    async fn exact_len_read_handles_short_chunks_zero_and_early_eof() {
+        use tokio::io::AsyncWriteExt;
+
+        let empty = read_exact_len(std::io::Cursor::new(Vec::<u8>::new()), 0)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+
+        let (mut writer, reader) = tokio::io::duplex(3);
+        let write = tokio::spawn(async move {
+            for chunk in b"short chunks survive".chunks(2) {
+                writer.write_all(chunk).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        let result = read_exact_len(reader, b"short chunks survive".len())
+            .await
+            .unwrap();
+        write.await.unwrap();
+        assert_eq!(result, b"short chunks survive");
+
+        let error = read_exact_len(std::io::Cursor::new(b"short"), 6)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    struct RemoteFaultFixture {
+        host: String,
+        base: String,
+    }
+
+    impl Drop for RemoteFaultFixture {
+        fn drop(&mut self) {
+            let script = format!("rm -rf -- {}", shell_quote(&self.base));
+            let _ = std::process::Command::new("ssh")
+                .arg(&self.host)
+                .arg(format!("sh -c {}", shell_quote(&script)))
+                .status();
+        }
+    }
+
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+
+    fn seed_remote(host: &str, path: &str, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
+        let quoted = shell_quote(path);
+        let script = format!("set -eu; umask 077; cat > {quoted}; chmod {mode:o} {quoted}");
+        let mut child = std::process::Command::new("ssh")
+            .arg(host)
+            .arg(format!("sh -c {}", shell_quote(&script)))
+            .stdin(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("ssh stdin unavailable"))?
+            .write_all(bytes)?;
+        let status = child.wait()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "ssh seed {path} exited with {status}"
+            )))
+        }
+    }
+
+    async fn transaction_artifacts(provider: &SftpProvider, base: &str, name: &str) -> Vec<String> {
+        provider
+            .list_async(base)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .filter(|entry| {
+                entry.contains(name)
+                    && (entry.contains(".arx-part-") || entry.contains(".arx-txn-"))
+            })
+            .collect()
+    }
+
+    async fn remote_revision(provider: &SftpProvider, path: &str) -> RemoteEditRevision {
+        provider
+            .read_all_capped(path, crate::vfs::MAX_REMOTE_EDIT_BYTES)
+            .await
+            .unwrap()
+            .into_revision()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn sftp_cancellation_after_pin_removes_remote_artifact() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        crate::remote::validate_ssh_alias(&host).unwrap();
+        let token = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = format!("/tmp/arx-demo/arx-remote-edit-pin-cancel-{token}");
+        let script = format!("mkdir -m 700 -- {}", shell_quote(&base));
+        assert!(
+            std::process::Command::new("ssh")
+                .arg(&host)
+                .arg(format!("sh -c {}", shell_quote(&script)))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _fixture = RemoteFaultFixture {
+            host: host.clone(),
+            base: base.clone(),
+        };
+        let path = format!("{base}/cancel.txt");
+        seed_remote(&host, &path, b"cancel me", 0o600).unwrap();
+
+        let pin_created = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
+        provider.pause_after_pin = Some(pin_created.clone());
+        let cancellation = CancellationFlag::default();
+        let read = provider.read_all_capped_cancellable(&path, 64, &cancellation);
+        tokio::pin!(read);
+        tokio::select! {
+            _ = pin_created.notified() => {}
+            result = &mut read => panic!("read completed before pin fault point: {result:?}"),
+        }
+        cancellation.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(5), &mut read)
+            .await
+            .expect("cancelled SFTP read must finish")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+
+        let entries = provider.list_async(&base).await.unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.name.contains(".arx-read-")),
+            "pin cleanup left remote artifacts: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn sftp_atomic_fault_injection_preserves_recovery_evidence() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        crate::remote::validate_ssh_alias(&host).unwrap();
+        let token = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = format!("/tmp/arx-demo/arx-remote-edit-fault-{token}");
+        let quoted = shell_quote(&base);
+        let script = format!("set -eu; mkdir -p {quoted}; chmod 700 {quoted}");
+        let status = std::process::Command::new("ssh")
+            .arg(&host)
+            .arg(format!("sh -c {}", shell_quote(&script)))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let _fixture = RemoteFaultFixture {
+            host: host.clone(),
+            base: base.clone(),
+        };
+        let mut provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
+        let cancellation = CancellationFlag::default();
+
+        let mode_path = format!("{base}/mode.txt");
+        seed_remote(&host, &mode_path, b"old", 0o600).unwrap();
+        let mode_revision = remote_revision(&provider, &mode_path).await;
+        provider.faults.preserve_mode = true;
+        let mode_error = provider
+            .write_file_bytes_if_unchanged(&mode_path, b"new", &mode_revision, &cancellation)
+            .await
+            .unwrap_err();
+        assert!(mode_error.to_string().contains("preserve metadata"));
+        assert_eq!(
+            provider
+                .read_all_capped(&mode_path, 16)
+                .await
+                .unwrap()
+                .bytes,
+            b"old"
+        );
+        assert!(
+            transaction_artifacts(&provider, &base, "mode.txt")
+                .await
+                .is_empty()
+        );
+
+        let commit_path = format!("{base}/commit.txt");
+        seed_remote(&host, &commit_path, b"old", 0o600).unwrap();
+        let commit_revision = remote_revision(&provider, &commit_path).await;
+        provider.faults = AtomicWriteFaults {
+            commit: true,
+            ..AtomicWriteFaults::default()
+        };
+        let commit_error = provider
+            .write_file_bytes_if_unchanged(&commit_path, b"new", &commit_revision, &cancellation)
+            .await
+            .unwrap_err();
+        assert!(!commit_error.to_string().contains("RECOVERY REQUIRED"));
+        assert_eq!(
+            provider
+                .read_all_capped(&commit_path, 16)
+                .await
+                .unwrap()
+                .bytes,
+            b"old"
+        );
+        assert!(
+            transaction_artifacts(&provider, &base, "commit.txt")
+                .await
+                .is_empty()
+        );
+
+        let recovery_path = format!("{base}/recovery.txt");
+        seed_remote(&host, &recovery_path, b"old", 0o600).unwrap();
+        let recovery_revision = remote_revision(&provider, &recovery_path).await;
+        provider.faults = AtomicWriteFaults {
+            verify_backup: true,
+            restore: true,
+            ..AtomicWriteFaults::default()
+        };
+        let recovery_error = provider
+            .write_file_bytes_if_unchanged(
+                &recovery_path,
+                b"new",
+                &recovery_revision,
+                &cancellation,
+            )
+            .await
+            .unwrap_err();
+        let recovery_message = recovery_error.to_string();
+        assert!(recovery_message.contains("RECOVERY REQUIRED"));
+        assert!(recovery_message.contains("backup="));
+        assert!(recovery_message.contains("stage="));
+        let recovery_artifacts = transaction_artifacts(&provider, &base, "recovery.txt").await;
+        assert_eq!(recovery_artifacts.len(), 1, "{recovery_artifacts:?}");
+        let recovery_entries = provider
+            .list_async(&format!("{base}/{}", recovery_artifacts[0]))
+            .await
+            .unwrap();
+        assert!(recovery_entries.iter().any(|entry| entry.name == "stage"));
+        assert!(recovery_entries.iter().any(|entry| entry.name == "backup"));
+
+        let visible_path = format!("{base}/visible.txt");
+        seed_remote(&host, &visible_path, b"old", 0o600).unwrap();
+        let visible_revision = remote_revision(&provider, &visible_path).await;
+        provider.faults = AtomicWriteFaults {
+            verify_visible: true,
+            ..AtomicWriteFaults::default()
+        };
+        let visible_error = provider
+            .write_file_bytes_if_unchanged(&visible_path, b"new", &visible_revision, &cancellation)
+            .await
+            .unwrap_err();
+        assert!(visible_error.to_string().contains("RECOVERY REQUIRED"));
+        assert_eq!(
+            provider
+                .read_all_capped(&visible_path, 16)
+                .await
+                .unwrap()
+                .bytes,
+            b"new"
+        );
+        let visible_artifacts = transaction_artifacts(&provider, &base, "visible.txt").await;
+        assert_eq!(visible_artifacts.len(), 1, "{visible_artifacts:?}");
+        let visible_entries = provider
+            .list_async(&format!("{base}/{}", visible_artifacts[0]))
+            .await
+            .unwrap();
+        assert!(visible_entries.iter().any(|entry| entry.name == "stage"));
+        assert!(visible_entries.iter().any(|entry| entry.name == "backup"));
+
+        let race_path = format!("{base}/race.txt");
+        seed_remote(&host, &race_path, b"old", 0o600).unwrap();
+        let race_revision = remote_revision(&provider, &race_path).await;
+        provider.faults = AtomicWriteFaults {
+            concurrent_target: true,
+            ..AtomicWriteFaults::default()
+        };
+        let race_error = provider
+            .write_file_bytes_if_unchanged(&race_path, b"new", &race_revision, &cancellation)
+            .await
+            .unwrap_err();
+        assert!(race_error.to_string().contains("RECOVERY REQUIRED"));
+        assert_eq!(
+            provider
+                .read_all_capped(&race_path, 16)
+                .await
+                .unwrap()
+                .bytes,
+            b"concurrent"
+        );
+        let race_artifacts = transaction_artifacts(&provider, &base, "race.txt").await;
+        assert_eq!(race_artifacts.len(), 1, "{race_artifacts:?}");
+
+        let warning_path = format!("{base}/warning.txt");
+        seed_remote(&host, &warning_path, b"old", 0o600).unwrap();
+        let warning_revision = remote_revision(&provider, &warning_path).await;
+        provider.faults = AtomicWriteFaults {
+            backup_cleanup: true,
+            ..AtomicWriteFaults::default()
+        };
+        let warning_error = provider
+            .write_file_bytes_if_unchanged(&warning_path, b"new", &warning_revision, &cancellation)
+            .await
+            .unwrap_err();
+        assert!(warning_error.to_string().contains("COMMITTED WITH WARNING"));
+        assert_eq!(
+            provider
+                .read_all_capped(&warning_path, 16)
+                .await
+                .unwrap()
+                .bytes,
+            b"new"
+        );
+        let warning_artifacts = transaction_artifacts(&provider, &base, "warning.txt").await;
+        assert_eq!(warning_artifacts.len(), 1, "{warning_artifacts:?}");
+
+        let cancel_path = format!("{base}/cancel.txt");
+        seed_remote(&host, &cancel_path, b"old", 0o600).unwrap();
+        let cancel_revision = remote_revision(&provider, &cancel_path).await;
+        provider.faults = AtomicWriteFaults {
+            cancel_before_commit: true,
+            ..AtomicWriteFaults::default()
+        };
+        let cancel = CancellationFlag::default();
+        let cancel_error = provider
+            .write_file_bytes_if_unchanged(&cancel_path, b"new", &cancel_revision, &cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(cancel_error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(
+            provider
+                .read_all_capped(&cancel_path, 16)
+                .await
+                .unwrap()
+                .bytes,
+            b"old"
+        );
+        assert!(
+            transaction_artifacts(&provider, &base, "cancel.txt")
+                .await
+                .is_empty()
+        );
     }
 
     #[test]
