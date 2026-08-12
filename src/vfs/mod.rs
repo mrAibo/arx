@@ -409,6 +409,42 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
             result = self.read_all_capped(path, max_bytes) => result,
         }
     }
+
+    /// Provider-side paginated listing contract.
+    ///
+    /// `location` is the typed `Location` (NOT a flattened `&str` path) so future
+    /// S3 listing can distinguish target-root, bucket, and prefix without encoding
+    /// them into a pseudo-filesystem path. Default impl wraps the existing
+    /// `list_async` path: for `continuation == None` it lists and converts each
+    /// `Entry` into `ListedEntry { entry, identity: EntryIdentity::Other }` with
+    /// `continuation: None`. For `continuation == Some(..)` on an unpaged provider
+    /// it fails closed with `Unsupported` rather than silently re-running page 1.
+    // ponytail: transitional adapter; S3 overrides this later without path flattening
+    async fn list_page(
+        &self,
+        location: &Location,
+        continuation: Option<&ProviderContinuation>,
+    ) -> std::io::Result<ProviderListingPage> {
+        if continuation.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "provider does not support listing continuation",
+            ));
+        }
+        let path = Location::legacy_listing_path(location)?;
+        let entries = self.list_async(path.as_ref()).await?;
+        let listed: Vec<ListedEntry> = entries
+            .into_iter()
+            .map(|entry| ListedEntry {
+                entry,
+                identity: EntryIdentity::Other,
+            })
+            .collect();
+        Ok(ProviderListingPage {
+            entries: listed,
+            continuation: None,
+        })
+    }
 }
 
 /// File metadata returned by a remote provider.
@@ -620,19 +656,7 @@ impl ProviderRegistry {
     ) -> std::io::Result<(Arc<dyn VfsProvider>, String)> {
         let key = Self::instance_key_for_location(loc);
 
-        let path = match loc {
-            Location::Local(path) => path.to_string_lossy().into_owned(),
-            Location::Sftp { path, .. } => path.clone(),
-            Location::Archive { inner_path, .. } => inner_path.clone(),
-            // ponytail: S3 provider routing not wired yet (later client/registry card);
-            // fail-closed Unsupported, no client/provider construction, no bucket+prefix flatten
-            Location::S3 { .. } => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "S3 provider routing not implemented yet",
-                ));
-            }
-        };
+        let path = Location::legacy_listing_path(loc)?;
 
         if let Some(provider) = self
             .providers
@@ -698,6 +722,22 @@ impl ProviderRegistry {
     pub async fn list_location_async(&self, loc: &Location) -> std::io::Result<Vec<Entry>> {
         let (provider, path) = self.provider_for_location(loc)?;
         provider.list_async(&path).await
+    }
+
+    /// Provider-side paginated listing entry point.
+    ///
+    /// Selects the concrete provider via existing provider-instance routing and
+    /// invokes the provider `list_page` contract. S3 remains fail-closed at
+    /// routing (no client/provider construction). `list_location` /
+    /// `list_location_async` are unchanged for existing PaneLoader consumers.
+    // ponytail: parallel page contract; S3 overrides later without path flattening
+    pub async fn list_page(
+        &self,
+        loc: &Location,
+        continuation: Option<&ProviderContinuation>,
+    ) -> std::io::Result<ProviderListingPage> {
+        let (provider, _path) = self.provider_for_location(loc)?;
+        provider.list_page(loc, continuation).await
     }
 
     /// Create directory at frozen location. Routes to correct host instance.
@@ -971,6 +1011,27 @@ impl Location {
         }
     }
 
+    /// Single legacy unpaged-provider listing-path conversion.
+    ///
+    /// Used by both `provider_for_location` and the default `list_page` adapter so
+    /// the two listing paths cannot drift. For `Location::Local` an unrepresentable
+    /// (non-UTF8) path is lossily converted — it is NOT silently retargeted to
+    /// filesystem root "/". S3 stays typed/fail-closed and is never flattened.
+    // ponytail: one conversion rule; S3 overrides list_page later without using this
+    pub(crate) fn legacy_listing_path(location: &Location) -> std::io::Result<String> {
+        match location {
+            Location::Local(path) => Ok(path.to_string_lossy().into_owned()),
+            Location::Sftp { path, .. } => Ok(path.clone()),
+            Location::Archive { inner_path, .. } => Ok(inner_path.clone()),
+            // ponytail: S3 provider routing not wired yet; fail-closed Unsupported,
+            // no client/provider construction, no bucket+prefix flatten
+            Location::S3 { .. } => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "S3 provider routing not implemented yet",
+            )),
+        }
+    }
+
     /// Resolve one parent while preserving provider identity where possible.
     pub fn parent(&self) -> Option<Self> {
         match self {
@@ -1064,6 +1125,30 @@ pub enum EntryIdentity {
     S3Prefix(s3::S3PrefixRef),
     S3Bucket(s3::S3BucketRef),
     Other,
+}
+
+/// Opaque, provider-native pagination continuation token.
+///
+/// The token is treated as opaque bytes: not trimmed, not normalized, not
+/// parsed, and no provider kind / pane id / generation / location / S3
+/// target / bucket / prefix / page number is encoded into it. An exact value
+/// such as `"  opaque+/=token 日本語  "` must survive storage verbatim.
+// ponytail: provider-side only; pane correlation lives in S3-14/S3-15
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderContinuation {
+    pub token: String,
+}
+
+/// One provider-side page of listed entries with authoritative identity.
+///
+/// `entries` carries `ListedEntry` (presentation + exact identity). `continuation`
+/// is `None` when the page is the last page (or the provider is unpaged). This is
+/// the provider contract only — no pane-layer correlation data is attached here.
+// ponytail: provider page boundary; S3-14/S3-15 own pane correlation/staleness
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderListingPage {
+    pub entries: Vec<ListedEntry>,
+    pub continuation: Option<ProviderContinuation>,
 }
 
 /// Plan for a remote delete operation, stored in AppState pending confirmation.
@@ -2240,5 +2325,193 @@ mod s3_identity_tests {
         assert_eq!(le.entry.size, Some(1024));
         assert_eq!(le.entry.modified_unix_ms, Some(1_700_000_000_000));
         assert!(matches!(le.identity, EntryIdentity::Other));
+    }
+}
+
+#[cfg(test)]
+mod s3_list_page_tests {
+    use super::*;
+    use std::fs;
+
+    #[tokio::test]
+    async fn opaque_token_roundtrip_exact() {
+        let token = "  opaque+/=token 日本語  ";
+        let cont = ProviderContinuation {
+            token: token.to_string(),
+        };
+        assert_eq!(cont.token, token);
+        let page = ProviderListingPage {
+            entries: vec![],
+            continuation: Some(cont.clone()),
+        };
+        match page.continuation {
+            Some(c) => assert_eq!(c.token, token),
+            None => panic!("continuation must be preserved exactly"),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_first_page_equivalence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("a.txt"), b"a").unwrap();
+        fs::write(dir.join("b.log"), b"b").unwrap();
+        fs::create_dir(dir.join("sub")).unwrap();
+
+        let registry = ProviderRegistry::new();
+        let loc = Location::Local(dir.to_path_buf());
+        let legacy = registry.list_location_async(&loc).await.unwrap();
+
+        let page = registry.list_page(&loc, None).await.unwrap();
+        assert!(page.continuation.is_none());
+        assert_eq!(page.entries.len(), legacy.len());
+        for le in &page.entries {
+            assert!(matches!(le.identity, EntryIdentity::Other));
+            assert!(legacy.iter().any(|e| e == &le.entry));
+        }
+    }
+
+    #[tokio::test]
+    async fn unpaged_provider_continuation_fails_closed() {
+        // LocalProvider is unpaged; passing a continuation must fail closed
+        // rather than silently re-running page 1.
+        let provider = local::LocalProvider;
+        let loc = Location::Local(std::path::PathBuf::from("/"));
+        let cont = ProviderContinuation { token: "x".into() };
+        let err = provider.list_page(&loc, Some(&cont)).await;
+        assert!(err.is_err());
+        assert_eq!(err.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn registry_s3_routing_still_fail_closed() {
+        let registry = ProviderRegistry::new();
+        let loc = Location::S3 {
+            target: "t".into(),
+            bucket: None,
+            prefix: String::new(),
+        };
+        let err = registry.list_page(&loc, None).await;
+        assert!(err.is_err());
+        assert_eq!(err.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    // ── MAJOR-01: real SFTP registry route, both APIs observe "/srv/data" exactly ──
+
+    use std::sync::Mutex;
+
+    struct ListingMockProvider {
+        seen_paths: std::sync::Arc<Mutex<Vec<String>>>,
+        entries: Vec<Entry>,
+    }
+
+    impl std::fmt::Debug for ListingMockProvider {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ListingMockProvider").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VfsProvider for ListingMockProvider {
+        fn list(&self, path: &str) -> std::io::Result<Vec<Entry>> {
+            self.seen_paths
+                .lock()
+                .expect("mock poisoned")
+                .push(path.to_string());
+            Ok(self.entries.clone())
+        }
+        fn read_head(&self, _path: &str, _lines: usize) -> std::io::Result<Vec<String>> {
+            panic!("mock: read_head not called")
+        }
+        fn copy_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("mock: copy_files not called")
+        }
+        fn move_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("mock: move_files not called")
+        }
+        fn delete_files(&self, _dir: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("mock: delete_files not called")
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_registry_route_observes_exact_path_on_both_calls() {
+        let registry = ProviderRegistry::new();
+        let entries = vec![
+            Entry {
+                name: "a.txt".into(),
+                kind: EntryKind::File,
+                size: Some(1),
+                modified_unix_ms: Some(1_700_000_000_000),
+            },
+            Entry {
+                name: "b.txt".into(),
+                kind: EntryKind::File,
+                size: Some(2),
+                modified_unix_ms: Some(1_700_000_000_000),
+            },
+        ];
+        let seen_paths = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mock = ListingMockProvider {
+            seen_paths: seen_paths.clone(),
+            entries: entries.clone(),
+        };
+        registry.insert_sftp("test-host", Box::new(mock), capabilities::SFTP_CAPABILITIES);
+
+        let loc = Location::Sftp {
+            host: "test-host".into(),
+            path: "/srv/data".into(),
+        };
+
+        let legacy = registry.list_location_async(&loc).await.unwrap();
+        let page = registry.list_page(&loc, None).await.unwrap();
+
+        // identical entries after projecting ListedEntry.entry
+        assert_eq!(legacy, entries);
+        assert_eq!(page.entries.len(), entries.len());
+        for le in &page.entries {
+            assert!(matches!(le.identity, EntryIdentity::Other));
+            assert!(legacy.iter().any(|e| e == &le.entry));
+        }
+        assert!(page.continuation.is_none());
+
+        // mock observed "/srv/data" exactly on BOTH calls — proves real SFTP
+        // routing, no Local substitution, no extra path transformation
+        assert_eq!(
+            *seen_paths.lock().expect("mock poisoned"),
+            vec!["/srv/data".to_string(), "/srv/data".to_string()]
+        );
+    }
+
+    // ── MAJOR-02: non-UTF8 Local path must not fall back to "/" (Unix only) ──
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_non_utf8_page_does_not_retarget_to_root() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp_root = tempfile::tempdir().unwrap();
+        // Fresh empty dir → neither the non-UTF8 path nor its lossy form exists.
+        let bad_component = OsString::from_vec(vec![b'b', b'a', b'd', b'-', 0xff]);
+        let non_utf8_path = temp_root.path().join(bad_component);
+        assert!(non_utf8_path.to_str().is_none());
+
+        let loc = Location::Local(non_utf8_path.clone());
+
+        // legacy semantics: registry routes Location::Local via to_string_lossy()
+        let legacy_path = non_utf8_path.to_string_lossy().into_owned();
+        let legacy = local::LocalProvider.list_async(&legacy_path).await;
+        // page semantics: default adapter now uses the SAME legacy_listing_path()
+        let page = local::LocalProvider.list_page(&loc, None).await;
+
+        // Regression: old path_for_listing().unwrap_or("/") would have listed "/"
+        // and likely returned Ok. Fixed code propagates the lossy/non-existent
+        // path, so both APIs error for this non-existent location.
+        assert!(
+            legacy.is_err(),
+            "legacy listing must fail for non-UTF8 path"
+        );
+        assert!(page.is_err(), "page listing must NOT fall back to '/'");
     }
 }
