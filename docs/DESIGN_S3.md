@@ -561,4 +561,19 @@ For every future card: specify dependencies, files likely touched (`src/vfs/s3.r
 
 ---
 
+## S3 Inspector and Storage Analytics (POST-MVP)
+
+These capabilities extend the S3 backend after the MVP is released. They do
+**not** expand the current S3 MVP scope (S3-00 through S3-10).
+
+- AWS S3 Console is **behavioral inspiration only**, not an API compatibility requirement.
+- Basic MVP browsing must **not** require property/analytics calls.
+- Rich object/bucket information is loaded **on demand** (Inspector), never during ordinary listing.
+- Missing IAM evidence is reported as `Unknown` / `PermissionDenied`, **never fabricated** or silently downgraded to empty/Disabled.
+- AWS-only analytics (Storage Lens, Inventory, CloudWatch) must **not** become mandatory for MinIO or other S3-compatible providers; they are optional enhancements layered over the live object-storage usage model.
+- **ETag is never treated as a universal content hash.** When a real checksum (e.g. SHA-256) is available it is shown distinctly; ETag is shown as ETag.
+- Usage analytics must **identify the evidence source** (LiveScan / StorageLens / Inventory / OtherProvider / Unavailable) and, for non-live data, an **as-of timestamp**. A live recursive scan is an explicit, cancellable background Job — never a silent full-tree scan triggered from pane rendering.
+
+---
+
 *Audit baseline — ARX `origin/main` = `bbf6313` (v0.15.1). WinSCP reference: upstream master at audit time (behavioral reference only; GPLv3 source not read). No implementation performed.*
