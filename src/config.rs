@@ -68,8 +68,8 @@ fn config_path() -> std::path::PathBuf {
 
 // ponytail: S3 target data model. Integrated into ArxConfig.s3 (S3-06) with
 // validation (no normalization). No secrets, no AWS client. endpoint_url is
-// stored opaque; user-visible diagnostics must not echo it raw (see sanitize_diag).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+// stored opaque and redacted in Debug (see impl Debug below).
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct S3TargetConfig {
     /// Unique target id used by ARX location addressing. Not a secret.
     pub id: String,
@@ -91,6 +91,26 @@ pub struct S3TargetConfig {
     /// Path-style addressing for non-AWS S3-compatible stores.
     #[serde(default)]
     pub force_path_style: bool,
+}
+
+// Manual Debug: redact endpoint_url so signed-query/userinfo credentials never
+// leak through `{:?}` (target, S3Config, or ArxConfig). Stored value is
+// untouched — this is output-only redaction, not normalization.
+impl std::fmt::Debug for S3TargetConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3TargetConfig")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("profile", &self.profile)
+            .field(
+                "endpoint_url",
+                &self.endpoint_url.as_ref().map(|_| "<configured>"),
+            )
+            .field("force_path_style", &self.force_path_style)
+            .finish()
+    }
 }
 
 /// Wrapper matching the `[[s3.targets]]` TOML shape.
@@ -503,9 +523,45 @@ name = "AWS2"
     }
 
     #[test]
-    fn t_r6_endpoint_url_not_in_diagnostic() {
-        // endpoint with fake signed query must not leak into validation error
-        let r = parse_config(
+    fn t_r6_debug_redacts_signed_query() {
+        // T1: target Debug must not reveal signed-query credentials
+        let t: S3TargetConfig = toml::from_str(
+            r#"
+id = "x"
+name = "X"
+endpoint_url = "https://example.invalid/?X-Amz-Signature=SUPERSECRET"
+"#,
+        )
+        .expect("valid");
+        let text = format!("{t:?}");
+        assert!(!text.contains("SUPERSECRET"), "leak: {text}");
+        assert!(!text.contains("X-Amz-Signature"), "leak: {text}");
+        assert!(
+            text.contains("<configured>"),
+            "redaction marker missing: {text}"
+        );
+    }
+
+    #[test]
+    fn t_r7_debug_redacts_userinfo() {
+        // T2: target Debug must not reveal userinfo credentials
+        let t: S3TargetConfig = toml::from_str(
+            r#"
+id = "y"
+name = "Y"
+endpoint_url = "https://user:password@example.invalid/"
+"#,
+        )
+        .expect("valid");
+        let text = format!("{t:?}");
+        assert!(!text.contains("user:password"), "leak: {text}");
+        assert!(!text.contains("password@example"), "leak: {text}");
+    }
+
+    #[test]
+    fn t_r9_s3config_debug_transitive() {
+        // T3: S3Config Debug must not reveal endpoint secret
+        let cfg = parse_config(
             r#"
 [s3]
 [[s3.targets]]
@@ -513,41 +569,65 @@ id = "x"
 name = "X"
 endpoint_url = "https://example.invalid/?X-Amz-Signature=SUPERSECRET"
 "#,
-        );
-        // valid config (no validation error) — but if an error path existed,
-        // SUPERSECRET must never appear; assert the returned error (if any)
-        // does not contain it. Config parses fine here, so check the value
-        // is stored verbatim and not echoed in any error.
-        let cfg = r.expect("valid config");
+        )
+        .expect("valid");
+        let text = format!("{:?}", cfg.s3);
+        assert!(!text.contains("SUPERSECRET"), "leak: {text}");
+        assert!(!text.contains("X-Amz-Signature"), "leak: {text}");
+    }
+
+    #[test]
+    fn t_r10_arxconfig_debug_transitive() {
+        // T4: ArxConfig Debug must not reveal endpoint secret
+        let cfg = parse_config(
+            r#"
+[s3]
+[[s3.targets]]
+id = "x"
+name = "X"
+endpoint_url = "https://example.invalid/?X-Amz-Signature=SUPERSECRET"
+"#,
+        )
+        .expect("valid");
+        let text = format!("{cfg:?}");
+        assert!(!text.contains("SUPERSECRET"), "leak: {text}");
+        assert!(!text.contains("X-Amz-Signature"), "leak: {text}");
+    }
+
+    #[test]
+    fn t_r11_storage_unchanged() {
+        // T5: redaction must NOT mutate stored endpoint_url
+        let cfg = parse_config(
+            r#"
+[s3]
+[[s3.targets]]
+id = "x"
+name = "X"
+endpoint_url = "https://example.invalid/?X-Amz-Signature=SUPERSECRET"
+"#,
+        )
+        .expect("valid");
         assert_eq!(
             cfg.s3.targets[0].endpoint_url.as_deref(),
             Some("https://example.invalid/?X-Amz-Signature=SUPERSECRET")
         );
-        // no diagnostic path created by this card echoes the secret
-        assert!(!format!("{:?}", cfg.s3.targets[0].id).contains("SUPERSECRET"));
     }
 
     #[test]
-    fn t_r7_endpoint_userinfo_not_echoed_raw() {
-        // userinfo-like endpoint content must not be echoed raw in the
-        // duplicate-id diagnostic created by this card.
-        let r = parse_config(
+    fn t_r12_endpoint_none_debug() {
+        // T6: None endpoint renders clearly without leaking anything
+        let t: S3TargetConfig = toml::from_str(
             r#"
-[s3]
-[[s3.targets]]
-id = "y"
-name = "Y"
-endpoint_url = "https://user:password@example/"
-
-[[s3.targets]]
-id = "y"
-name = "Y2"
-endpoint_url = "https://user:password@example/"
+id = "x"
+name = "X"
 "#,
+        )
+        .expect("valid");
+        let text = format!("{t:?}");
+        assert!(
+            text.contains("endpoint_url: None"),
+            "expected None marker: {text}"
         );
-        let msg = r.unwrap_err();
-        assert!(msg.contains("duplicate"));
-        assert!(!msg.contains("password@example"));
     }
 
     #[test]
