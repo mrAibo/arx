@@ -16,9 +16,9 @@
 
 ## Column summary
 
-- **READY** (1): S3-14
+- **READY** (0): —
 - **DOING** (0): —
-- **REVIEW** (0): —
+- **REVIEW** (1): S3-14
 - **BLOCKED** (0): —
 - **DONE** (14): S3-00, S3-01, S3-02, S3-03, S3-04, S3-05, S3-06, S3-07, S3-08, S3-09, S3-10, S3-11, S3-12, S3-13
 - **BACKLOG** (66): S3-15, S3-16, S3-17, S3-18, S3-19, S3-20, S3-21, S3-22, S3-23, S3-24, S3-25, S3-26, S3-27, S3-28, S3-29, S3-30, S3-31, S3-32, S3-33, S3-34, S3-35, S3-36, S3-37, S3-38, S3-39, S3-40, S3-41, S3-42, S3-43, S3-44, S3-45, S3-46, S3-47, S3-48, S3-49, S3-50, S3-51, S3-52, S3-53, S3-54, S3-55, S3-56, S3-57, S3-58, S3-59, S3-60, S3-61, S3-62, S3-63, S3-64, S3-65, S3-66, S3-67, S3-68, S3-69, S3-70, S3-71, S3-72, S3-73, S3-74, S3-75, S3-76, S3-77, S3-78, S3-79, S3-80
@@ -161,7 +161,7 @@
 
 ### S3-14 — PaneListingContinuation
 - **Phase:** P6
-- **Status:** READY
+- **Status:** REVIEW
 - **Depends on:** S3-13
 - **Allowed files:** src/services/pane_loader.rs, src/services/mod.rs, src/app/mod.rs
 - **Acceptance:** Add PaneListingContinuation{provider_continuation, provider_instance: ProviderInstanceKey, location: Location, generation: PaneLoadId}. PaneLoadId stays in pane_loader. Re-export from src/services/mod.rs. No S3 code, no pagination behavior.
