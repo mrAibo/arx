@@ -427,6 +427,10 @@ pub enum ProviderInstanceKey {
     Singleton(ProviderId),
     SftpHost(String),
     ArchiveFile(PathBuf),
+    /// One concrete configured S3 target instance, keyed by its config `id`.
+    /// Distinct from `Singleton(ProviderId::S3)` (provider class vs instance).
+    // ponytail: id stored verbatim; no normalization — S3-06 already validated
+    S3Target(String),
 }
 
 #[derive(Debug, Clone)]
@@ -1093,6 +1097,56 @@ impl VfsOps for Location {
 mod tests {
     use super::*;
 
+    // S3-08: S3Target is concrete-instance identity, distinct from class/other kinds.
+    #[test]
+    fn s3_target_distinct_ids() {
+        let a = ProviderInstanceKey::S3Target("prod".into());
+        let b = ProviderInstanceKey::S3Target("backups".into());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn s3_target_distinct_from_class() {
+        let class_key = ProviderInstanceKey::Singleton(ProviderId::S3);
+        let instance_key = ProviderInstanceKey::S3Target("prod".into());
+        assert_ne!(class_key, instance_key);
+    }
+
+    #[test]
+    fn s3_target_distinct_from_sftp_same_string() {
+        let s3 = ProviderInstanceKey::S3Target("prod".into());
+        let sftp = ProviderInstanceKey::SftpHost("prod".into());
+        assert_ne!(s3, sftp);
+    }
+
+    #[test]
+    fn s3_target_map_identity() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(ProviderInstanceKey::S3Target("prod".into()));
+        set.insert(ProviderInstanceKey::S3Target("backups".into()));
+        set.insert(ProviderInstanceKey::SftpHost("prod".into()));
+        set.insert(ProviderInstanceKey::Singleton(ProviderId::S3));
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn s3_target_stable_identity() {
+        let a = ProviderInstanceKey::S3Target("prod".into());
+        let b = ProviderInstanceKey::S3Target("prod".into());
+        assert_eq!(a, b);
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        map.insert(a, 1u32);
+        assert_eq!(map.get(&b), Some(&1));
+    }
+
+    #[test]
+    fn s3_target_no_normalization() {
+        let exact = ProviderInstanceKey::S3Target("prod".into());
+        let spaced = ProviderInstanceKey::S3Target(" prod ".into());
+        assert_ne!(exact, spaced);
+    }
     #[test]
     fn formats_sftp_location() {
         let location = Location::Sftp {
