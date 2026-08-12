@@ -123,17 +123,22 @@ force_path_style = true      # required by some MinIO/R2 setups
 ```rust
 // conceptual only — no code change in this audit
 Location::S3 {
-    target: String,   // matches [[s3.targets]].id
-    bucket: String,   // "" at target root (bucket list)
-    prefix: String,   // "" at bucket root; no leading/trailing slash internally
+    target: String,       // matches [[s3.targets]].id
+    bucket: Option<String>, // None at target root (ListBuckets); Some at bucket root+
+    prefix: String,       // "" at bucket root; no leading/trailing slash internally
 }
 ```
 
+- **[ARX DESIGN DECISION]** `bucket` is `Option<String>`, **not** an empty-string sentinel. `None` = target root (ListBuckets); `Some(name)` = bucket root or deeper. This avoids the `""`-vs-`bucket` ambiguity the prior draft used.
 - **[ARX DESIGN DECISION]** Path normalization rules (ARX-native, not a raw `String` everywhere):
   - Internal prefix stored **without** leading or trailing `/`.
   - Display as `s3://<bucket>/<prefix>/`.
-  - Reject/normalize: double `//`, empty path components, trailing `/` in `parent()`/`child()` math, literal `..` segments.
-  - UTF-8 keys are passed through unchanged (S3 keys are byte sequences; ARX treats them as UTF-8 strings).
+- **[ARX DESIGN DECISION — OPAQUE KEY SEMANTICS]** An S3 object key is **Unicode characters encoded in UTF-8, up to 1024 encoded bytes** (AWS/S3 FACT). ARX treats server-returned keys as **opaque identifiers**, never as filesystem paths:
+  - **Do not** collapse `.` or `..` segments inside a key. `foo/../bar` is a literal key, not a navigation escape.
+  - **Do not** collapse duplicate slashes. `foo//bar` is a distinct key from `foo/bar`; the double slash is preserved verbatim.
+  - **Do not** run filesystem path normalization (canonicalization, `.`/trailing-slash cleanup) on keys.
+  - Virtual parent navigation (`..` in the Commander) is computed by ARX for *browsing* only, using the current prefix; it is **separate** from exact key identity. The `Entry.name` shown in a listing is the last path segment after the current `delimiter="/"` — but the underlying key used for any operation is the full opaque key, never the display name.
+  - **Awkward keys** such as `foo//bar`, `foo/../bar`, `foo/./bar` may be displayed and listed, but some UI operations (e.g. renaming, prefix creation relative to them) may be explicitly unsupported or require exact-key handling. ARX must **never silently retarget** such a key to a different object (e.g. must not "fix" `foo/../bar` into `bar`). If an operation cannot safely handle an awkward key, ARX refuses it with a factual message rather than rewriting the key.
 - **[OPEN QUESTION]** Root mode — see §12 decision. Recommended default is **option A** (target root lists buckets).
 
 ## 10. Provider instance model
@@ -148,10 +153,40 @@ Location::S3 {
 - **[ARX DESIGN DECISION]** Listing uses `ListObjectsV2` with `delimiter="/"`:
   - `Contents` → `Entry { kind: File, size, modified_unix_ms: LastModified }`
   - `CommonPrefixes` → `Entry { kind: Directory, size: None }` (virtual folder; no probe of child count)
-- **[ARX DESIGN DECISION]** **Bounded asynchronous incremental listing.** The S3 provider's `list_async` returns the first page immediately; a "Load more" / background continuation fetches subsequent pages via `NextContinuationToken`. **[ARX CURRENT FACT]** ARX already has an async pane-loading/effect model (`src/services/pane_loader.rs`, `PaneLoadId`); S3 listing plugs into it.
-- **[ARX DESIGN DECISION]** Never block the TUI awaiting a full million-object enumeration. A page cap (e.g. 1000) is the unit of work; `IsTruncated` drives continuation.
-- **[WINSCP OBSERVATION]** WinSCP handles truncated responses and `NextMarker`; ARX adopts the continuation concept but keeps it incremental rather than eager.
-- **[AWS/S3 FACT]** Edge cases to handle explicitly: zero keys returned, `MaxKeys` present but empty, provider returning `CommonPrefixes` without `Contents`, non-UTF8-in-practice keys.
+- **[ARX DESIGN DECISION]** **First-class continuation model (replaces the vague "list_async → Load More" sketch).** The S3 provider does **not** return a bare `Vec<Entry>` for paginated listings. It returns a `ListingPage`:
+
+```rust
+// conceptual only — no code change in this audit
+struct ListingPage {
+    entries: Vec<Entry>,
+    // None == end-of-list. Some(token) == more pages exist.
+    continuation: Option<ListingContinuation>,
+}
+
+struct ListingContinuation {
+    // Opaque, server-supplied token (NextContinuationToken) or replay state.
+    // ARX stores it verbatim; it never reconstructs or infers a token.
+    token: String,
+    // Bound to the exact source this continuation belongs to, so a stale
+    // token can never append data to a different navigation generation.
+    provider_instance: ProviderInstanceKey, // e.g. S3Target(id)
+    location: Location,                    // exact bucket + prefix
+    generation: PaneLoadId,                // the listing generation that opened it
+}
+```
+
+  - **First-page load**: `PaneLoader::load(...)` issues a `ListObjectsV2` with `delimiter="/"` and a page cap; the response becomes a `ListingPage`. The `PaneLoadId` generation is recorded (see below).
+  - **Load-next-page**: only valid when `continuation.is_some()`. The next request resends `ListObjectsV2` with the **verbatim** `continuation.token` bound to the same `provider_instance` + `location` + `generation`. Appending is permitted only if the current pane still matches that exact triple; otherwise the continuation is discarded as stale.
+  - **Refresh**: re-issues a first-page load with a **new** generation id. Any in-flight continuation from the prior generation is invalidated (its `generation` no longer matches), so old pages cannot append to the refreshed view.
+  - **Navigation** (enter `..`, open a prefix, switch pane/target): opens a **new** generation. All prior continuations are stale by construction.
+  - **Cancellation**: a cancelled `load`/`load-next` drops its continuation; no background fetch resumes it.
+  - **End-of-list**: `continuation == None` → UI shows no "Load more"; repeated requests are no-ops.
+  - **No infinite loop**: if a provider returns `IsTruncated == true` but `continuation` is `None`, or returns a `token` identical to the one already consumed (non-advancing), ARX treats this as a **ProtocolError** and stops pagination with a factual message. It never re-requests the same token.
+
+- **[ARX CURRENT FACT]** The staleness guard already exists for single loads: `AppState::accepts_pane_load` (src/app/mod.rs) rejects a `PaneLoadResponse` unless its `PaneLoadId` is still the pending one **and** its `Location` still matches the pane target (with an extra committed-location check for `Refresh`). The S3 continuation model extends this same generation+location binding to *each page*, so a slow/late page from a previous navigation can never append to the current view.
+- **[ARX DESIGN DECISION]** Never block the TUI awaiting a full million-object enumeration. A page cap is the unit of work; `IsTruncated` + `NextContinuationToken` drive continuation.
+- **[WINSCP OBSERVATION]** WinSCP handles truncated responses and `NextMarker`; ARX adopts the continuation concept but keeps it incremental rather than eager, and binds every continuation to its listing generation.
+- **[AWS/S3 FACT]** Edge cases to handle explicitly: zero keys returned, `MaxKeys` present but empty, provider returning `CommonPrefixes` without `Contents`, keys that are not valid UTF-8 byte sequences.
 
 ## 12. Root / bucket / prefix navigation (DECISION)
 
@@ -170,6 +205,10 @@ Three candidate root modes:
 | C | Most flexible, most complex | Mixed |
 
 - **[ARX DESIGN DECISION]** **Default to A** (matches WinSCP's bucket-list-at-root UX and ARX's multi-target intent), but allow a target config to pin `bucket = "..."` which collapses directly to bucket root (mode B for that target). Mode C is thus achieved without a third code path.
+  - **Explicit root behavior (no empty-string sentinel):** the `bucket: Option<String>` in `Location::S3` drives this directly:
+    - **Target without bucket** (`bucket == None`) → `ListBuckets` (mode A). Pane shows the accessible buckets for the credential.
+    - **Target with bucket** (`bucket == Some(name)`) → opens that bucket's root directly (mode B); no bucket-list step is shown.
+  - This is the same `Option<String>` distinction already specified in §9, applied consistently at the navigation layer.
 - **[ARX DESIGN DECISION]** Virtual `..` semantics:
   - object/prefix `foo/bar` → parent `foo`
   - bucket root `bucket/` → target root (bucket list)
@@ -206,13 +245,16 @@ Three candidate root modes:
 | `Write` (upload) | YES (real executor) | YES | YES |
 | `Mkdir` (prefix marker) | maybe (opt-in) | YES | YES |
 | `Delete` (single object) | YES (per §18) | YES | YES |
-| `Copy` (Local↔S3 transfer) | YES (via planner) | YES | YES |
+| `Copy` | **NO** | **NO** | **NO** |
 | `Move` | NO | NO | transaction-gated |
 | `Rename` | NO | NO | transaction-gated |
-| `ServerSideCopy` | NO | NO | later |
+| `ServerSideCopy` | NO | NO | later (real `CopyObject`) |
 | `Symlink`/`Chmod` | NO | NO | NO (no POSIX semantics) |
 
-- **[ARX DESIGN DECISION]** A capability bit turns on **only** when (a) the provider implements it and (b) a safe executor/strategy exists. `Copy` is NOT turned on merely because the Local→S3 transfer executor exists — it turns on when `Capability::Write` on S3 + a `TransferMethod::S3` executor are both real. This preserves the ARX invariant: *capability == implemented promise*.
+- **[ARX DESIGN DECISION — CORRECTED `Copy` SEMANTICS]** `Capability::Copy` does **NOT** mean "F5 Local↔S3 transfer is available." SFTP already proves the distinction: SFTP's `Copy` capability is **off**, yet `Action::Copy` works for `Local↔SFTP` because the **TransferPlanner** provides a safe route (`TransferMethod::Sftp`) + a real executor. S3 follows the same rule. Therefore `Copy` stays **NO** across all MVP phases for S3.
+  - **Local↔S3 F5 availability** is derived from: a safe `TransferPlanner` route (`TransferMethod::S3`) **+** an available S3 executor — **not** from `Capability::Copy`. Concretely, `action_availability(ActionId::Copy)` must check `TransferMethod::S3` reachability (one side `Local`, other side `S3` with `Capability::Write`), exactly as it currently checks `Local|Sftp` reachability.
+  - **`ServerSideCopy`** turns on **only** when a real `CopyObject` implementation exists (S3→S3 or S3 intra-bucket copy). Until then it stays NO, even though transfer-based Local↔S3 copy already works.
+  - This preserves the ARX invariant: *capability == implemented promise* — a capability bit is an in-provider primitive, not a cross-provider transfer route.
 
 ## 15. Upload (Local → S3)
 
@@ -338,10 +380,30 @@ This deletes the object from the current S3 view.
 - **[ARX CURRENT FACT]** ARX `Cargo.toml`: `version = "0.15.1"`, `edition = "2024"`, `rust-version = "1.88"`.
 - **[AWS/S3 FACT]** The official AWS SDK for Rust (`aws-config`, `aws-sdk-s3`) is generated from Smithy; it depends on `tokio`, `hyper`/`hyper-util`, `aws-smithy-*` and a TLS impl (typically `rustls` or `aws-lc-rs`). It is a heavy transitive set (dozens of crates) but pure-Rust and widely used on stable.
 - **[ARX DESIGN DECISION — SDK/MSRV FINDING (S3-AUDIT-23)]** Research result: the **latest** `aws-sdk-s3` (**1.141.0**, 2026-08-06) and `aws-config` (**1.10.1**) declare **MSRV 1.94.1**, which is **above** ARX's current `rust-version = "1.88"`. The smithy-rs MSRV timeline: 2025-10-30 → 1.88.0 (smithy-rs#4367); 2026-02-10 → 1.91.0; 2026-07-07 → 1.94.1 (smithy-rs#4692). So a **pinned older SDK release that still targets 1.88 exists**.
-  - **Recommended path — (B) pin older release, resolved:** `aws-sdk-s3 = 1.109.0` + `aws-config = 1.8.8` (smithy-rs `release-2025-10-29`, the last line before the 2026-02-10 bump to 1.91.0). These are the **concrete pinned versions** that keep ARX's 1.88 MSRV contract intact. Verify against release notes at `S3-01` before locking `Cargo.toml`.
+  - **Exact pin contract (authoritative for `S3-01`):**
+
+```toml
+# Cargo.toml — exact-version pins, MUST use `=`
+aws-sdk-s3 = "=1.109.0"
+aws-config  = "=1.8.8"
+```
+
+    `Cargo.lock` is committed and **all** CI/builds use `cargo … --locked` so the resolved graph is reproducible and the MSRV contract is enforced.
+  - **Disposable MSRV experiment evidence (record from `S3-01`, run in a throwaway worktree/branch only — never in the audit PR):**
+
+```
+Rust toolchain: 1.88
+Exact top-level crates:
+  aws-sdk-s3     = "=1.109.0"
+  aws-config     = "=1.8.8"
+Resolved dependency graph: cargo tree (committed Cargo.lock, ~35 normal deps)
+cargo +1.88 check (--locked, release-2025-10-29 line): PASS
+```
+
+    `S3-01` must **repeat this experiment** and attach the actual `cargo +1.88 check` output (or CI log) before any production dependency commit. If a later patch release within 1.109.x/1.8.8 changes MSRV, re-pin to the highest patch that still builds on 1.88.
   - **Transitive burden:** ~35 normal deps (mostly `aws-smithy-*` internals); external heavyweights are `tokio`, `hyper`, `rustls` + `aws-lc-rs`/`ring` (native crypto), `sha2`/`hmac`. No C/C++ toolchain beyond a standard Rust build. Acceptable but heavy — justify the dependency only when `S3-01` actually starts.
   - **Fallbacks:** (A) raise ARX MSRV to ≥ 1.94.1 (breaks the 1.88 release contract — needs product sign-off), or (C) use a lighter maintained crate (`rust-s3`/`s3`) with possibly lower MSRV but incomplete S3 API and weaker credential chain (evaluate at `S3-01`).
-  - **Verdict: YES, SDK compiles on 1.88 via pinned 1.109.0 / 1.8.8.** No dependency is added in this audit.
+  - **Verdict: YES, SDK compiles on 1.88 via pinned `=1.109.0` / `=1.8.8`.** No dependency is added in this audit.
 - **[ARX DESIGN DECISION]** Whatever the choice, it must support: `ListObjectsV2`, multipart upload (`Create/Upload/Complete/Abort`), `GetObject` range reads, `DeleteObject`, `CopyObject`, custom `endpoint_url` + `force_path_style`, and the AWS credential provider chain (env, shared files, profile, session token, instance metadata, web identity).
 
 ## 26. AWS / MinIO compatibility
@@ -355,7 +417,10 @@ This deletes the object from the current S3 view.
 | Other generic S3 | NOT TESTED | accepted via `endpoint_url` but unverified |
 
 - **[ARX DESIGN DECISION]** Do **not** claim compatibility merely because the SDK accepts `endpoint_url`. Real acceptance environments: at minimum **AWS S3** + **MinIO** (locally deployed). R2/Wasabi remain compatibility follow-ups unless explicitly tested.
-- **[WINSCP OBSERVATION]** WinSCP hit a real pagination edge case with some S3-compatible servers (e.g. Backblaze) where page sizes that were exact multiples of 8 caused a listing loop; this was fixed by not requesting multiples-of-8 page sizes. **[ARX DESIGN DECISION]** ARX's S3 listing should use a non-multiple-of-8 `max-keys` (e.g. 997 or 1000 with an explicit guard) and must handle `IsTruncated` via `NextContinuationToken` rather than page-count, to avoid the same class of bug on strict-compatible endpoints.
+- **[ARX DESIGN DECISION — PAGINATION SAFETY INVARIANT (provider-neutral, no unverified folklore)]** Listing correctness does **not** depend on any specific `max-keys` numeric trick (e.g. "avoid multiples of 8"). The contract is driven by the protocol, not by guesswork:
+  - A truncated page (`IsTruncated == true`) **must** carry a `continuation` token, and loading the next page **must** advance past the current one.
+  - A truncated page **without** a usable continuation token, or a continuation token that repeats (does not advance), is a **ProtocolError** → pagination stops with a factual message. **No infinite pagination loops.**
+  - `max-keys` is chosen as a sensible page size (e.g. 1000); the value itself carries no correctness magic. Correctness comes from the `continuation`-advances invariant above, which is already enforced by the §11 continuation model.
 - **[ARX DESIGN DECISION]** Acceptance matrix (future test cards) must cover: list buckets, prefix navigation, >1000-object pagination, Unicode key, zero-byte object, folder marker, F3 Range GET, small upload, multipart upload, download, cancel multipart, single delete, access denied, wrong region, session token; plus MinIO path-style connect/list/upload/download/delete/Unicode; plus failure cases (network break, expired credentials, permission denied, bucket missing, object disappears mid-op, multipart abort failure). **No test requires production buckets.**
 
 ## 27. Security invariants
@@ -428,7 +493,7 @@ For every future card: specify dependencies, files likely touched (`src/vfs/s3.r
 
 ## 31. Open design questions
 
-1. **[OPEN QUESTION]** Exact `aws-sdk-s3` version + MSRV fit for Rust 1.88 (S3-AUDIT-23) — confirm before S3-01.
+1. **[ARX DESIGN DECISION — RESOLVED]** SDK/MSRV (S3-AUDIT-23): pin `aws-sdk-s3 = "=1.109.0"` + `aws-config = "=1.8.8"` (smithy-rs `release-2025-10-29` line); builds on Rust 1.88 via `--locked`. Re-verified by `S3-01` (see §25).
 2. **[OPEN QUESTION]** Should `force_path_style` default per-target or be auto-detected from `endpoint_url`? (Proposed: explicit per-target config.)
 3. **[OPEN QUESTION]** Should MVP-1 expose `F7` prefix creation by default or behind an opt-in capability? (Proposed: opt-in, off until proven.)
 4. **[OPEN QUESTION]** For versioned buckets, should MVP-1 surface version IDs in delete confirmation, or only the versioning *state*? (Proposed: state only; IDs in MVP-3.)
