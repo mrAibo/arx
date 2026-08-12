@@ -16,13 +16,14 @@
 
 ## Column summary
 
-- **READY** (0): —
+- **READY** (1): S3-17
 - **DOING** (0): —
-- **REVIEW** (1): S3-16
 - **BLOCKED** (0): —
-- **DONE** (16): S3-00, S3-01, S3-02, S3-03, S3-04, S3-05, S3-06, S3-07, S3-08, S3-09, S3-10, S3-11, S3-12, S3-13, S3-14, S3-15
-- **BACKLOG** (64): S3-17, S3-18, S3-19, S3-20, S3-21, S3-22, S3-23, S3-24, S3-25, S3-26, S3-27, S3-28, S3-29, S3-30, S3-31, S3-32, S3-33, S3-34, S3-35, S3-36, S3-37, S3-38, S3-39, S3-40, S3-41, S3-42, S3-43, S3-44, S3-45, S3-46, S3-47, S3-48, S3-49, S3-50, S3-51, S3-52, S3-53, S3-54, S3-55, S3-56, S3-57, S3-58, S3-59, S3-60, S3-61, S3-62, S3-63, S3-64, S3-65, S3-66, S3-67, S3-68, S3-69, S3-70, S3-71, S3-72, S3-73, S3-74, S3-75, S3-76, S3-77, S3-78, S3-79, S3-80
+- **DONE** (17): S3-00..S3-16
+- **BACKLOG** (63): S3-18..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
+
+
 
 ---
 
@@ -178,21 +179,22 @@
 
 ### S3-16 — AWS S3 Client Factory
 - **Phase:** P7
-- **Status:** REVIEW
+- **Status:** DONE
 - **Depends on:** STOP GATE B (S3-13..15 PASS, Local/SFTP no regress, no S3 caps)
 - **Allowed files:** src/vfs/s3.rs
 - **Acceptance:** Create AWS SDK client for one S3TargetConfig: region/profile/endpoint_url/force_path_style, standard credential chain, approved retry policy from S3-03. No list ops. Never log creds. Unit-test config translation. Endpoint security: reject embedded credentials (userinfo, X-Amz-* query) fail-closed.
 - **Stop conditions:** List operations. Logging credentials.
 - **Hermes prompt:** S3 client factory from S3TargetConfig (region/profile/endpoint_url/force_path_style, std credential chain, S3-03 retry policy). No list ops. Never log creds. Test config translation. Endpoint validation.
+- **Orchestrator review:** efc397a — BLOCKER 0 / MAJOR 0 / NIT 1 (non-blocking, Debug-based endpoint tests). APPROVED. Merged.
 
 ### S3-17 — Client registry lifecycle
 - **Phase:** P7
-- **Status:** BACKLOG
+- **Status:** READY
 - **Depends on:** S3-16
-- **Allowed files:** src/vfs/mod.rs, src/vfs/s3.rs
-- **Acceptance:** ProviderInstanceKey::S3Target => correct target config => correct client. A!=B, separate endpoint/profile, no singleton S3 client. No listing yet.
-- **Stop conditions:** Singleton S3 client. Listing.
-- **Hermes prompt:** Wire S3Target(target_id) => target config => dedicated client. A!=B, no singleton. No listing yet.
+- **Allowed files:** src/vfs/mod.rs, src/vfs/s3.rs, src/tui.rs, docs/S3_KANBAN.md
+- **Acceptance:** ProviderInstanceKey::S3Target => correct target config => correct lazy client. A!=B, separate endpoint/profile, no singleton S3 client. Startup registers target inventory only (no AWS load/network/client). Typed page route target-aware but S3 list_page stays Unsupported. No listing yet.
+- **Stop conditions:** Singleton S3 client. Listing. AWS client at startup.
+- **Hermes prompt:** Wire S3Target(target_id) => target config => dedicated lazy client. A!=B, no singleton. No listing yet. Scope correction: add src/tui.rs (register_s3_targets startup wiring, no AWS calls).
 
 ### S3-18 — ListBuckets first page
 - **Phase:** P8
