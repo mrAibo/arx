@@ -162,7 +162,7 @@ fn validate_s3(targets: &[S3TargetConfig]) -> Result<(), String> {
 /// terminal lines or control sequences. Stored config values are NEVER
 /// modified by this — it only affects the rendered message.
 // ponytail: no dependency needed; std char iteration covers the threat.
-fn sanitize_diag(s: &str) -> String {
+pub(crate) fn sanitize_diag(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { '�' } else { c })
         .collect()

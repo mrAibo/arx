@@ -83,7 +83,7 @@ mod provider_registry_tests {
         assert_eq!(clone.instance_count(), 1);
         clone.insert(
             ProviderId::S3,
-            Box::new(s3::S3Provider),
+            Box::new(local::LocalProvider),
             capabilities::S3_CAPABILITIES,
         );
         assert_eq!(registry.instance_count(), 2);
@@ -483,6 +483,9 @@ struct RegisteredProvider {
 pub struct ProviderRegistry {
     providers: Arc<RwLock<HashMap<ProviderInstanceKey, RegisteredProvider>>>,
     capabilities: Arc<RwLock<HashMap<ProviderId, CapabilitySet>>>,
+    // ponytail: configured S3 target inventory (id -> validated config).
+    // Populated at startup via register_s3_targets; never builds clients.
+    s3_targets: Arc<RwLock<HashMap<String, crate::config::S3TargetConfig>>>,
 }
 
 impl ProviderRegistry {
@@ -490,6 +493,24 @@ impl ProviderRegistry {
         Self {
             providers: Arc::new(RwLock::new(HashMap::new())),
             capabilities: Arc::new(RwLock::new(HashMap::new())),
+            s3_targets: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Install the configured S3 target inventory.
+    ///
+    /// Synchronous, offline: copies validated target definitions only. Does
+    /// NOT construct `S3Provider` instances or AWS clients (DESIGN_S3 §10
+    /// lazy per-target model — first client appears inside a provider on use).
+    // ponytail: id stored verbatim (no trim/lowercase); config parsing owns
+    // validation (S3-06 / validate_s3 already ran).
+    pub fn register_s3_targets(&self, targets: &[crate::config::S3TargetConfig]) {
+        let mut inventory = self
+            .s3_targets
+            .write()
+            .expect("s3 target inventory poisoned");
+        for target in targets {
+            inventory.insert(target.id.clone(), target.clone());
         }
     }
 
@@ -714,6 +735,65 @@ impl ProviderRegistry {
         Ok((provider, path))
     }
 
+    /// Typed provider resolver for the page contract.
+    ///
+    /// Local/SFTP/Archive keep existing behavior. `Location::S3` resolves to a
+    /// concrete `S3Target(id)` provider instance via the configured inventory —
+    /// never to `Singleton(ProviderId::S3)`, never flattening bucket/prefix.
+    // ponytail: parallel to provider_for_location (legacy path); legacy path
+    // stays fail-closed for S3 via Location::legacy_listing_path.
+    pub fn provider_for_page_location(
+        &self,
+        loc: &Location,
+    ) -> std::io::Result<Arc<dyn VfsProvider>> {
+        match loc {
+            Location::S3 { target, .. } => self.resolve_s3_provider(target),
+            other => Ok(self.provider_for_location(other)?.0),
+        }
+    }
+
+    /// Resolve a concrete `S3Target(id)` provider instance.
+    ///
+    /// Returns the already-registered instance on repeat resolution (stable
+    /// `Arc`). Unknown target id fails factually/closed — no Singleton fallback,
+    /// no default/first-target substitution. Constructs no AWS client here.
+    fn resolve_s3_provider(&self, target_id: &str) -> std::io::Result<Arc<dyn VfsProvider>> {
+        let key = ProviderInstanceKey::S3Target(target_id.to_string());
+
+        if let Some(registered) = self
+            .providers
+            .read()
+            .expect("provider registry poisoned")
+            .get(&key)
+        {
+            return Ok(Arc::clone(&registered.provider));
+        }
+
+        let target = self
+            .s3_targets
+            .read()
+            .expect("s3 target inventory poisoned")
+            .get(target_id)
+            .cloned()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "unknown S3 target: {}",
+                        crate::config::sanitize_diag(target_id)
+                    ),
+                )
+            })?;
+
+        let provider: Arc<dyn VfsProvider> = Arc::new(s3::S3Provider::new(target));
+
+        let mut providers = self.providers.write().expect("provider registry poisoned");
+        let registered = providers.entry(key).or_insert_with(|| RegisteredProvider {
+            provider: Arc::clone(&provider),
+        });
+        Ok(Arc::clone(&registered.provider))
+    }
+
     pub fn list_location(&self, loc: &Location) -> std::io::Result<Vec<Entry>> {
         let (provider, path) = self.provider_for_location(loc)?;
         provider.list(&path)
@@ -736,7 +816,7 @@ impl ProviderRegistry {
         loc: &Location,
         continuation: Option<&ProviderContinuation>,
     ) -> std::io::Result<ProviderListingPage> {
-        let (provider, _path) = self.provider_for_location(loc)?;
+        let provider = self.provider_for_page_location(loc)?;
         provider.list_page(loc, continuation).await
     }
 
@@ -2386,6 +2466,8 @@ mod s3_list_page_tests {
     #[tokio::test]
     async fn registry_s3_routing_still_fail_closed() {
         let registry = ProviderRegistry::new();
+        // Target registered, but S3 listing is still not implemented (S3-18).
+        registry.register_s3_targets(&[mk_s3_target("t", None, None, None, false)]);
         let loc = Location::S3 {
             target: "t".into(),
             bucket: None,
@@ -2513,5 +2595,172 @@ mod s3_list_page_tests {
             "legacy listing must fail for non-UTF8 path"
         );
         assert!(page.is_err(), "page listing must NOT fall back to '/'");
+    }
+
+    // ── S3-17: registry inventory + typed provider lifecycle ──
+
+    fn mk_s3_target(
+        id: &str,
+        profile: Option<&str>,
+        region: Option<&str>,
+        endpoint_url: Option<&str>,
+        force_path_style: bool,
+    ) -> crate::config::S3TargetConfig {
+        crate::config::S3TargetConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            bucket: None,
+            region: region.map(|s| s.to_string()),
+            profile: profile.map(|s| s.to_string()),
+            endpoint_url: endpoint_url.map(|s| s.to_string()),
+            force_path_style,
+        }
+    }
+
+    #[test]
+    fn two_target_inventory_exact() {
+        let a = mk_s3_target("aws-prod", Some("prod"), Some("eu-central-1"), None, false);
+        let b = mk_s3_target(
+            "minio-lab",
+            Some("lab"),
+            None,
+            Some("http://127.0.0.1:9000"),
+            true,
+        );
+        let registry = ProviderRegistry::new();
+        registry.register_s3_targets(&[a.clone(), b.clone()]);
+
+        let inv = registry.s3_targets.read().expect("poisoned");
+        assert_eq!(inv.len(), 2);
+        assert_eq!(
+            inv.get("aws-prod").unwrap().region.as_deref(),
+            Some("eu-central-1")
+        );
+        assert_eq!(
+            inv.get("aws-prod").unwrap().profile.as_deref(),
+            Some("prod")
+        );
+        assert_eq!(
+            inv.get("minio-lab").unwrap().endpoint_url.as_deref(),
+            Some("http://127.0.0.1:9000")
+        );
+        assert!(inv.get("minio-lab").unwrap().force_path_style);
+    }
+
+    #[test]
+    fn exact_target_id_preserved() {
+        // Harmless surrounding characters must be preserved verbatim.
+        let t = mk_s3_target(" My Target_01 ", Some("p"), None, None, false);
+        let registry = ProviderRegistry::new();
+        registry.register_s3_targets(&[t]);
+        let inv = registry.s3_targets.read().expect("poisoned");
+        assert!(inv.contains_key(" My Target_01 "));
+        assert!(!inv.contains_key("my target_01"));
+    }
+
+    #[test]
+    fn unknown_s3_target_fails_closed() {
+        let registry = ProviderRegistry::new();
+        registry.register_s3_targets(&[mk_s3_target(
+            "aws-prod",
+            Some("prod"),
+            Some("eu-central-1"),
+            None,
+            false,
+        )]);
+        let loc = Location::S3 {
+            target: "missing".to_string(),
+            bucket: None,
+            prefix: "".to_string(),
+        };
+        let err = registry.provider_for_page_location(&loc);
+        assert!(err.is_err());
+        assert!(
+            !matches!(err.unwrap_err().kind(), std::io::ErrorKind::Unsupported),
+            "must not be the legacy Unsupported routing error; unknown target is NotFound/factual"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_target_reuses_provider_instance() {
+        let registry = ProviderRegistry::new();
+        registry.register_s3_targets(&[mk_s3_target(
+            "aws-prod",
+            Some("prod"),
+            Some("eu-central-1"),
+            None,
+            false,
+        )]);
+        let loc = Location::S3 {
+            target: "aws-prod".to_string(),
+            bucket: None,
+            prefix: "".to_string(),
+        };
+        let first = registry.provider_for_page_location(&loc).unwrap();
+        let second = registry.provider_for_page_location(&loc).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same target must reuse provider Arc"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_targets_are_not_singleton() {
+        let registry = ProviderRegistry::new();
+        registry.register_s3_targets(&[
+            mk_s3_target("aws-prod", Some("prod"), Some("eu-central-1"), None, false),
+            mk_s3_target(
+                "minio-lab",
+                Some("lab"),
+                None,
+                Some("http://127.0.0.1:9000"),
+                true,
+            ),
+        ]);
+        let a = registry
+            .provider_for_page_location(&Location::S3 {
+                target: "aws-prod".to_string(),
+                bucket: None,
+                prefix: "".to_string(),
+            })
+            .unwrap();
+        let b = registry
+            .provider_for_page_location(&Location::S3 {
+                target: "minio-lab".to_string(),
+                bucket: None,
+                prefix: "".to_string(),
+            })
+            .unwrap();
+        assert!(!Arc::ptr_eq(&a, &b), "different targets must differ");
+        // No Singleton(ProviderId::S3) instance exists.
+        assert!(!registry.contains_instance(&ProviderInstanceKey::Singleton(ProviderId::S3)));
+        assert!(registry.contains_instance(&ProviderInstanceKey::S3Target("aws-prod".to_string())));
+        assert!(
+            registry.contains_instance(&ProviderInstanceKey::S3Target("minio-lab".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_page_route_is_target_aware_but_still_unsupported() {
+        let registry = ProviderRegistry::new();
+        registry.register_s3_targets(&[mk_s3_target(
+            "aws-prod",
+            Some("prod"),
+            Some("eu-central-1"),
+            None,
+            false,
+        )]);
+        let loc = Location::S3 {
+            target: "aws-prod".to_string(),
+            bucket: None,
+            prefix: "".to_string(),
+        };
+        // Reaches the target-aware provider lifecycle, but S3Provider::list_page
+        // remains Unsupported (S3-18 will implement ListBuckets). No AWS call.
+        let result = registry.list_page(&loc, None).await;
+        assert!(matches!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        ));
     }
 }
