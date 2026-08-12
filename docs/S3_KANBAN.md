@@ -189,8 +189,8 @@
 
 ### S3-17 — Client registry lifecycle
 - **Phase:** P7
-- **Status:** READY
-- **Depends on:** S3-16
+- **Status:** REVIEW
+- **Depends on:** S3-16 (client_for_target factory), S3-06 (validate_s3), S3-13..15 (provider registry + guarded TUI)
 - **Allowed files:** src/vfs/mod.rs, src/vfs/s3.rs, src/tui.rs, docs/S3_KANBAN.md
 - **Acceptance:** ProviderInstanceKey::S3Target => correct target config => correct lazy client. A!=B, separate endpoint/profile, no singleton S3 client. Startup registers target inventory only (no AWS load/network/client). Typed page route target-aware but S3 list_page stays Unsupported. No listing yet.
 - **Stop conditions:** Singleton S3 client. Listing. AWS client at startup.
