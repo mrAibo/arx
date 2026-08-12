@@ -16,7 +16,9 @@ pub use file_info::FileInfoService;
 pub use git::GitService;
 pub use infrastructure::InfrastructureService;
 pub use mutation::{MutationError, MutationProgress, MutationService, TrashOutcome};
-pub use pane_loader::{PaneLoadId, PaneLoadPurpose, PaneLoadResponse, PaneLoader};
+pub use pane_loader::{
+    PaneListingContinuation, PaneLoadId, PaneLoadPurpose, PaneLoadResponse, PaneLoader,
+};
 pub use preview::{PreviewService, format_bounded_preview};
 pub use tree::TreeService;
 pub use workspace_scanner::scan_workspace;
