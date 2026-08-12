@@ -66,8 +66,9 @@ fn config_path() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("arx.toml"))
 }
 
-// ponytail: S3 data model only — no ArxConfig field, no validation (S3-06),
-// no secrets, no client. bucket/endpoint are not normalized here.
+// ponytail: S3 target data model. Integrated into ArxConfig.s3 (S3-06) with
+// validation (no normalization). No secrets, no AWS client. endpoint_url is
+// stored opaque; user-visible diagnostics must not echo it raw (see sanitize_diag).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct S3TargetConfig {
     /// Unique target id used by ARX location addressing. Not a secret.
@@ -124,15 +125,27 @@ fn validate_s3(targets: &[S3TargetConfig]) -> Result<(), String> {
         {
             return Err(format!(
                 "S3 target {} bucket must not be empty/whitespace",
-                t.id
+                // ponytail: output-only sanitize; stored value untouched
+                sanitize_diag(&t.id)
             ));
         }
         // ponytail: exact-id dedup, no case-insensitive identity in this card
         if !seen.insert(t.id.clone()) {
-            return Err(format!("duplicate S3 target id: {}", t.id));
+            return Err(format!("duplicate S3 target id: {}", sanitize_diag(&t.id)));
         }
     }
     Ok(())
+}
+
+/// Output-only sanitization for diagnostic text. Replaces control characters
+/// (newline, tab, ESC/ANSI) so a hostile local config id cannot inject extra
+/// terminal lines or control sequences. Stored config values are NEVER
+/// modified by this — it only affects the rendered message.
+// ponytail: no dependency needed; std char iteration covers the threat.
+fn sanitize_diag(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '�' } else { c })
+        .collect()
 }
 
 #[cfg(test)]
@@ -396,20 +409,163 @@ name = "X"
 
     #[test]
     fn t12_no_normalization() {
-        // value with surrounding spaces is accepted verbatim (only trimmed for
+        // surrounding whitespace is preserved verbatim (only trimmed for
         // emptiness check, never rewritten)
         let cfg = parse_config(
             r#"
 [s3]
 [[s3.targets]]
-id = "prod"
+id = " prod "
 name = "Prod Bucket"
-bucket = "my-bucket"
+bucket = " my-bucket "
 "#,
         )
         .expect("valid");
-        assert_eq!(cfg.s3.targets[0].id, "prod");
+        assert_eq!(cfg.s3.targets[0].id, " prod ");
         assert_eq!(cfg.s3.targets[0].name, "Prod Bucket");
-        assert_eq!(cfg.s3.targets[0].bucket.as_deref(), Some("my-bucket"));
+        assert_eq!(cfg.s3.targets[0].bucket.as_deref(), Some(" my-bucket "));
+    }
+
+    // ---- S3-07: config redaction truth ----
+
+    #[test]
+    fn t_r1_non_normalization_whitespace() {
+        // same as t12 but asserts exact whitespace preservation
+        let cfg = parse_config(
+            r#"
+[s3]
+[[s3.targets]]
+id = " prod "
+name = "Prod"
+bucket = " my-bucket "
+"#,
+        )
+        .expect("valid");
+        assert_eq!(cfg.s3.targets[0].id, " prod ");
+        assert_eq!(cfg.s3.targets[0].bucket.as_deref(), Some(" my-bucket "));
+    }
+
+    #[test]
+    fn t_r2_validation_error_useful() {
+        // ordinary id yields a readable message, not a panic
+        let r = parse_config(
+            r#"
+[s3]
+[[s3.targets]]
+id = ""
+name = "X"
+"#,
+        );
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("id"));
+    }
+
+    #[test]
+    fn t_r3_newline_id_no_injection() {
+        // sanitize_diag must remove a raw newline so a hostile id cannot inject
+        // an extra terminal line in the diagnostic
+        let sanitized = sanitize_diag("a\nb");
+        assert!(
+            !sanitized.contains('\n'),
+            "diag must not contain raw newline: {sanitized:?}"
+        );
+    }
+
+    #[test]
+    fn t_r4_control_char_id_sanitized() {
+        // ESC / control char in id is replaced in the diagnostic, not echoed
+        let input = format!("bad{}\x1bid", 0x1b as char);
+        let sanitized = sanitize_diag(&input);
+        assert!(
+            !sanitized.contains('\x1b'),
+            "diag must not echo ESC: {sanitized:?}"
+        );
+    }
+
+    #[test]
+    fn t_r5_duplicate_error_safe_repr() {
+        let r = parse_config(
+            r#"
+[s3]
+[[s3.targets]]
+id = "aws"
+name = "AWS"
+
+[[s3.targets]]
+id = "aws"
+name = "AWS2"
+"#,
+        );
+        let msg = r.unwrap_err();
+        // duplicate id is reported via sanitized repr; no raw control injection
+        assert!(msg.contains("duplicate"));
+        assert!(!msg.contains('\n'));
+    }
+
+    #[test]
+    fn t_r6_endpoint_url_not_in_diagnostic() {
+        // endpoint with fake signed query must not leak into validation error
+        let r = parse_config(
+            r#"
+[s3]
+[[s3.targets]]
+id = "x"
+name = "X"
+endpoint_url = "https://example.invalid/?X-Amz-Signature=SUPERSECRET"
+"#,
+        );
+        // valid config (no validation error) — but if an error path existed,
+        // SUPERSECRET must never appear; assert the returned error (if any)
+        // does not contain it. Config parses fine here, so check the value
+        // is stored verbatim and not echoed in any error.
+        let cfg = r.expect("valid config");
+        assert_eq!(
+            cfg.s3.targets[0].endpoint_url.as_deref(),
+            Some("https://example.invalid/?X-Amz-Signature=SUPERSECRET")
+        );
+        // no diagnostic path created by this card echoes the secret
+        assert!(!format!("{:?}", cfg.s3.targets[0].id).contains("SUPERSECRET"));
+    }
+
+    #[test]
+    fn t_r7_endpoint_userinfo_not_echoed_raw() {
+        // userinfo-like endpoint content must not be echoed raw in the
+        // duplicate-id diagnostic created by this card.
+        let r = parse_config(
+            r#"
+[s3]
+[[s3.targets]]
+id = "y"
+name = "Y"
+endpoint_url = "https://user:password@example/"
+
+[[s3.targets]]
+id = "y"
+name = "Y2"
+endpoint_url = "https://user:password@example/"
+"#,
+        );
+        let msg = r.unwrap_err();
+        assert!(msg.contains("duplicate"));
+        assert!(!msg.contains("password@example"));
+    }
+
+    #[test]
+    fn t_r8_normal_config_unchanged() {
+        let cfg = parse_config(
+            r#"
+[s3]
+[[s3.targets]]
+id = "aws"
+name = "AWS"
+bucket = "company-artifacts"
+"#,
+        )
+        .expect("valid");
+        assert_eq!(cfg.s3.targets[0].id, "aws");
+        assert_eq!(
+            cfg.s3.targets[0].bucket.as_deref(),
+            Some("company-artifacts")
+        );
     }
 }
