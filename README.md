@@ -1,30 +1,13 @@
 # ARX
 
-**Terminal commander for local ↔ remote workspaces.**
+Terminal commander for local ↔ remote workspaces.
 
-Compare before touching anything. Preview the exact sync consequences.
-Run the frozen plan as a background job. Verify the workspace afterwards.
+![ARX Remote Workspace — Compare, Preview, Sync, Verify](docs/assets/remote-workspace-update.gif)
 
-```
-Local project                         Remote workspace
-~/code/app                 ↔         prod:/srv/app
-      │                                  │
-      └──────────── Compare ──────────────┘
-                         ↓
-                    Sync Preview
-                         ↓
-                  Confirm when needed
-                         ↓
-                   Background sync
-                         ↓
-                      Verify
-```
-
-ARX is also a keyboard-driven dual-pane file manager with SFTP browsing,
-archive support, background transfers, tabs, previews, embedded terminal,
-and tmux. Its defining workflow is **Remote Workspace**: treat two
-locations as one operational pair and make synchronization observable
-from comparison through post-execution verification.
+Compare before touching anything.
+Preview the exact consequences.
+Execute.
+Verify the real result.
 
 ## Why ARX?
 
