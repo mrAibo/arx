@@ -1,7 +1,3 @@
-// ponytail: Location grew with S3 variant (S3-09); error variants carrying
-// Location by-value now trip result_large_err. Intentional, not a regression.
-#![allow(clippy::result_large_err)]
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::transfer::{
@@ -56,13 +52,13 @@ impl SyncExecutorMatrix {
             }
             (Location::Sftp { .. }, Location::Sftp { .. }) => {
                 Err(SyncCompileError::RemoteToRemoteUnsupported {
-                    source_location: source.clone(),
-                    destination_location: destination.clone(),
+                    source_location: Box::new(source.clone()),
+                    destination_location: Box::new(destination.clone()),
                 })
             }
             _ => Err(SyncCompileError::UnsupportedTransferPair {
-                source_location: source.clone(),
-                destination_location: destination.clone(),
+                source_location: Box::new(source.clone()),
+                destination_location: Box::new(destination.clone()),
             }),
         }
     }
@@ -90,13 +86,13 @@ pub enum SyncCompileError {
         "remote-to-remote sync is not implemented: {source_location} -> {destination_location}"
     )]
     RemoteToRemoteUnsupported {
-        source_location: Location,
-        destination_location: Location,
+        source_location: Box<Location>,
+        destination_location: Box<Location>,
     },
     #[error("unsupported transfer pair: {source_location} -> {destination_location}")]
     UnsupportedTransferPair {
-        source_location: Location,
-        destination_location: Location,
+        source_location: Box<Location>,
+        destination_location: Box<Location>,
     },
     #[error("missing transfer executor availability for SSH host {host}")]
     MissingExecutorAvailability { host: String },

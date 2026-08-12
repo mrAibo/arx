@@ -1,7 +1,3 @@
-// ponytail: Location grew with S3 variant (S3-09); error variants carrying
-// Location by-value now trip result_large_err. Intentional, not a regression.
-#![allow(clippy::result_large_err)]
-
 use std::collections::BTreeSet;
 use std::io;
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
@@ -614,14 +610,14 @@ mod tests {
     fn launch_error_message_never_claims_a_mutation() {
         let error =
             WorkspaceSyncLaunchError::Compile(SyncCompileError::RemoteToRemoteUnsupported {
-                source_location: Location::Sftp {
+                source_location: Box::new(Location::Sftp {
                     host: "a".into(),
                     path: "/src".into(),
-                },
-                destination_location: Location::Sftp {
+                }),
+                destination_location: Box::new(Location::Sftp {
                     host: "b".into(),
                     path: "/dst".into(),
-                },
+                }),
             });
         let message = error.user_message();
         assert!(message.contains("Remote → Remote sync is not supported yet"));

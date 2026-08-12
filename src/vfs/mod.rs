@@ -618,22 +618,20 @@ impl ProviderRegistry {
         &self,
         loc: &Location,
     ) -> std::io::Result<(Arc<dyn VfsProvider>, String)> {
-        // ponytail: S3 provider routing not wired yet (later client/registry card);
-        // fail-closed Unsupported, no client/provider construction, no bucket+prefix flatten
-        if let Location::S3 { .. } = loc {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "S3 provider routing not implemented yet",
-            ));
-        }
         let key = Self::instance_key_for_location(loc);
 
         let path = match loc {
             Location::Local(path) => path.to_string_lossy().into_owned(),
             Location::Sftp { path, .. } => path.clone(),
             Location::Archive { inner_path, .. } => inner_path.clone(),
-            // unreachable: S3 returns Unsupported before this point
-            Location::S3 { .. } => unreachable!("S3 handled earlier"),
+            // ponytail: S3 provider routing not wired yet (later client/registry card);
+            // fail-closed Unsupported, no client/provider construction, no bucket+prefix flatten
+            Location::S3 { .. } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "S3 provider routing not implemented yet",
+                ));
+            }
         };
 
         if let Some(provider) = self
@@ -667,8 +665,14 @@ impl ProviderRegistry {
                     }),
                     capabilities::ARCHIVE_CAPABILITIES,
                 ),
-                // unreachable: S3 returns Unsupported before this point
-                Location::S3 { .. } => unreachable!("S3 handled earlier"),
+                // ponytail: S3 provider routing not wired yet (later client/registry card);
+                // fail-closed Unsupported, no client/provider construction, no bucket+prefix flatten
+                Location::S3 { .. } => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "S3 provider routing not implemented yet",
+                    ));
+                }
             };
 
         let mut providers = self.providers.write().expect("provider registry poisoned");
@@ -841,7 +845,8 @@ impl fmt::Display for Location {
                 inner_path,
             } => write!(f, "archive://{}!/{inner_path}", archive.display()),
             // ponytail: S3-10 owns final S3 Display; safe compile-only rep here
-            Self::S3 { target, .. } => write!(f, "[S3 {target}]"),
+            // ponytail: S3-10 owns final display identity; temporary control-safe rep
+            Self::S3 { .. } => write!(f, "[S3]"),
         }
     }
 }
@@ -873,7 +878,8 @@ impl Location {
                 last.to_string()
             }
             // ponytail: label is the exact target id; no config/display-name lookup
-            Self::S3 { target, .. } => target.clone(),
+            // ponytail: S3-10 owns final label identity; temporary control-safe rep
+            Self::S3 { .. } => "S3".to_string(),
         }
     }
 
@@ -1287,7 +1293,37 @@ mod tests {
             bucket: None,
             prefix: "".into(),
         };
-        assert_eq!(loc.label(), " aws ");
+        // temporary control-safe label; exact target preserved in instance key
+        assert_eq!(loc.label(), "S3");
+        assert_eq!(
+            ProviderRegistry::instance_key_for_location(&loc),
+            ProviderInstanceKey::S3Target(" aws ".into())
+        );
+    }
+
+    #[test]
+    fn s3_display_label_control_safe() {
+        let loc = Location::S3 {
+            target: "prod\x1b[31m\nEVIL".into(),
+            bucket: None,
+            prefix: String::new(),
+        };
+        let displayed = format!("{loc}");
+        assert_eq!(displayed, "[S3]");
+        assert!(!displayed.contains('\n'));
+        assert!(!displayed.contains('\x1b'));
+        assert!(!displayed.contains("EVIL"));
+        let label = loc.label();
+        assert_eq!(label, "S3");
+        assert!(!label.contains('\n'));
+        assert!(!label.contains('\x1b'));
+        assert!(!label.contains("EVIL"));
+        // stored target still verbatim
+        if let Location::S3 { target, .. } = &loc {
+            assert_eq!(target, "prod\x1b[31m\nEVIL");
+        } else {
+            panic!("not S3");
+        }
     }
 
     #[test]
