@@ -30,10 +30,60 @@ Issues #47–#53 track deferred engineering work:
 
 ## FUTURE
 
-- S3/MinIO and WebDAV production backends
+- S3/MinIO backend — implementation in progress; not released as supported until physical acceptance gates pass.
 - Cross-backend Move
 - SFTP → SFTP workspace sync
 - Recursive remote delete
 - Binary remote editing
 - Plugin system (Lua/WASM)
 - Broader platform support (aarch64, macOS, Windows)
+
+### Storage Inspector / Disk Usage
+
+#### A. Filesystem Overview ("df++")
+
+Future fields:
+
+- device / filesystem
+- mount
+- filesystem type
+- total
+- used
+- available
+- usage %
+- inode total / used / free where supported
+- read-only state
+- provider / evidence
+
+#### B. Usage Analyzer ("du++")
+
+Future capabilities:
+
+- recursive subtree size
+- logical / apparent bytes
+- allocated bytes where supported
+- file count
+- directory count
+- top-N largest
+- depth control
+- same-filesystem policy
+- symlink policy
+- hard-link handling
+- permission errors
+- progress
+- cancellation
+- partial / inconclusive result
+
+Execution rule: potentially expensive recursive scans are background Jobs. No blocking full-tree scan from pane render.
+
+Provider rule:
+
+- **Local:** native filesystem information.
+- **SFTP / remote:** expose filesystem stats only when the transport/provider can prove them; otherwise `Unsupported`.
+- **S3:** object-storage usage model, not POSIX `df`. Use object bytes/count and explicit evidence source.
+
+#### S3 Inspector and Analytics (POST-MVP)
+
+- Read-only Object Inspector (Ctrl+I) and Bucket Inspector for S3.
+- Usage Analytics with explicit evidence source (LiveScan / StorageLens / Inventory / OtherProvider / Unavailable) and as-of freshness.
+- Behavioral inspiration only: AWS S3 Console, duf, dust, dua, gdu. No source copied; no dependencies added.
