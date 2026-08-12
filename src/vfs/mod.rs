@@ -409,6 +409,42 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
             result = self.read_all_capped(path, max_bytes) => result,
         }
     }
+
+    /// Provider-side paginated listing contract.
+    ///
+    /// `location` is the typed `Location` (NOT a flattened `&str` path) so future
+    /// S3 listing can distinguish target-root, bucket, and prefix without encoding
+    /// them into a pseudo-filesystem path. Default impl wraps the existing
+    /// `list_async` path: for `continuation == None` it lists and converts each
+    /// `Entry` into `ListedEntry { entry, identity: EntryIdentity::Other }` with
+    /// `continuation: None`. For `continuation == Some(..)` on an unpaged provider
+    /// it fails closed with `Unsupported` rather than silently re-running page 1.
+    // ponytail: transitional adapter; S3 overrides this later without path flattening
+    async fn list_page(
+        &self,
+        location: &Location,
+        continuation: Option<&ProviderContinuation>,
+    ) -> std::io::Result<ProviderListingPage> {
+        if continuation.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "provider does not support listing continuation",
+            ));
+        }
+        let path = location.path_for_listing();
+        let entries = self.list_async(path.as_ref()).await?;
+        let listed: Vec<ListedEntry> = entries
+            .into_iter()
+            .map(|entry| ListedEntry {
+                entry,
+                identity: EntryIdentity::Other,
+            })
+            .collect();
+        Ok(ProviderListingPage {
+            entries: listed,
+            continuation: None,
+        })
+    }
 }
 
 /// File metadata returned by a remote provider.
@@ -698,6 +734,22 @@ impl ProviderRegistry {
     pub async fn list_location_async(&self, loc: &Location) -> std::io::Result<Vec<Entry>> {
         let (provider, path) = self.provider_for_location(loc)?;
         provider.list_async(&path).await
+    }
+
+    /// Provider-side paginated listing entry point.
+    ///
+    /// Selects the concrete provider via existing provider-instance routing and
+    /// invokes the provider `list_page` contract. S3 remains fail-closed at
+    /// routing (no client/provider construction). `list_location` /
+    /// `list_location_async` are unchanged for existing PaneLoader consumers.
+    // ponytail: parallel page contract; S3 overrides later without path flattening
+    pub async fn list_page(
+        &self,
+        loc: &Location,
+        continuation: Option<&ProviderContinuation>,
+    ) -> std::io::Result<ProviderListingPage> {
+        let (provider, _path) = self.provider_for_location(loc)?;
+        provider.list_page(loc, continuation).await
     }
 
     /// Create directory at frozen location. Routes to correct host instance.
@@ -1064,6 +1116,30 @@ pub enum EntryIdentity {
     S3Prefix(s3::S3PrefixRef),
     S3Bucket(s3::S3BucketRef),
     Other,
+}
+
+/// Opaque, provider-native pagination continuation token.
+///
+/// The token is treated as opaque bytes: not trimmed, not normalized, not
+/// parsed, and no provider kind / pane id / generation / location / S3
+/// target / bucket / prefix / page number is encoded into it. An exact value
+/// such as `"  opaque+/=token 日本語  "` must survive storage verbatim.
+// ponytail: provider-side only; pane correlation lives in S3-14/S3-15
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderContinuation {
+    pub token: String,
+}
+
+/// One provider-side page of listed entries with authoritative identity.
+///
+/// `entries` carries `ListedEntry` (presentation + exact identity). `continuation`
+/// is `None` when the page is the last page (or the provider is unpaged). This is
+/// the provider contract only — no pane-layer correlation data is attached here.
+// ponytail: provider page boundary; S3-14/S3-15 own pane correlation/staleness
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderListingPage {
+    pub entries: Vec<ListedEntry>,
+    pub continuation: Option<ProviderContinuation>,
 }
 
 /// Plan for a remote delete operation, stored in AppState pending confirmation.
@@ -2240,5 +2316,74 @@ mod s3_identity_tests {
         assert_eq!(le.entry.size, Some(1024));
         assert_eq!(le.entry.modified_unix_ms, Some(1_700_000_000_000));
         assert!(matches!(le.identity, EntryIdentity::Other));
+    }
+}
+
+#[cfg(test)]
+mod s3_list_page_tests {
+    use super::*;
+    use std::fs;
+
+    #[tokio::test]
+    async fn opaque_token_roundtrip_exact() {
+        let token = "  opaque+/=token 日本語  ";
+        let cont = ProviderContinuation {
+            token: token.to_string(),
+        };
+        assert_eq!(cont.token, token);
+        let page = ProviderListingPage {
+            entries: vec![],
+            continuation: Some(cont.clone()),
+        };
+        match page.continuation {
+            Some(c) => assert_eq!(c.token, token),
+            None => panic!("continuation must be preserved exactly"),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_first_page_equivalence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("a.txt"), b"a").unwrap();
+        fs::write(dir.join("b.log"), b"b").unwrap();
+        fs::create_dir(dir.join("sub")).unwrap();
+
+        let registry = ProviderRegistry::new();
+        let loc = Location::Local(dir.to_path_buf());
+        let legacy = registry.list_location_async(&loc).await.unwrap();
+
+        let page = registry.list_page(&loc, None).await.unwrap();
+        assert!(page.continuation.is_none());
+        assert_eq!(page.entries.len(), legacy.len());
+        for le in &page.entries {
+            assert!(matches!(le.identity, EntryIdentity::Other));
+            assert!(legacy.iter().any(|e| e == &le.entry));
+        }
+    }
+
+    #[tokio::test]
+    async fn unpaged_provider_continuation_fails_closed() {
+        // LocalProvider is unpaged; passing a continuation must fail closed
+        // rather than silently re-running page 1.
+        let provider = local::LocalProvider;
+        let loc = Location::Local(std::path::PathBuf::from("/"));
+        let cont = ProviderContinuation { token: "x".into() };
+        let err = provider.list_page(&loc, Some(&cont)).await;
+        assert!(err.is_err());
+        assert_eq!(err.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn registry_s3_routing_still_fail_closed() {
+        let registry = ProviderRegistry::new();
+        let loc = Location::S3 {
+            target: "t".into(),
+            bucket: None,
+            prefix: String::new(),
+        };
+        let err = registry.list_page(&loc, None).await;
+        assert!(err.is_err());
+        assert_eq!(err.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
     }
 }
