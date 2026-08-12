@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2029
 set -euo pipefail
 
-# HERO-REAL-02 — Record real terminal capture for ARX v0.15.1
-# Requires: asciinema, agg
+# HERO safety recorder for ARX v0.15.1
+# Requires: ssh, asciinema, agg
 # Output: docs/assets/remote-workspace-update.gif
+#
+# Order is fail-closed: validate host + remote path BEFORE any mutation,
+# record BEFORE convert, and never destroy the existing GIF unless the new
+# conversion succeeds.
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
@@ -14,38 +19,44 @@ ARX_HERO_BINARY="${ARX_HERO_BINARY:-$REPO_ROOT/dist/arx-v0.15.1-x86_64-unknown-l
 ARX_HERO_CAST="${ARX_HERO_CAST:-$REPO_ROOT/.hero/remote-workspace-v0.15.1.cast}"
 ARX_HERO_OUTPUT="${ARX_HERO_OUTPUT:-$REPO_ROOT/docs/assets/remote-workspace-update.gif}"
 
-# Dependency preflight
+# 1. Dependency preflight
 command -v ssh >/dev/null || { echo "FAIL: ssh not found"; exit 1; }
 command -v asciinema >/dev/null || { echo "FAIL: asciinema not found"; exit 1; }
 command -v agg >/dev/null || { echo "FAIL: agg not found"; exit 1; }
 
-# Binary gate
+# 2. Binary gate
 [ -x "$ARX_HERO_BINARY" ] || { echo "FAIL: binary not executable: $ARX_HERO_BINARY"; exit 1; }
 "$ARX_HERO_BINARY" --version | grep -q "0.15.1" || { echo "FAIL: wrong binary version"; exit 1; }
 
-# SSH preflight
+# 3. Host validation (fail-closed: only arx-demo may receive destructive fixture)
+[ "$ARX_HERO_HOST" = "arx-demo" ] || {
+    echo "FAIL: destructive fixture creation only allowed for arx-demo host"; exit 1; }
+
+# 4. Remote path validation (under /tmp/arx-demo/, non-empty, no traversal)
+case "$ARX_HERO_REMOTE" in
+    /tmp/arx-demo/*) ;;
+    *) echo "FAIL: remote path must be under /tmp/arx-demo/"; exit 1 ;;
+esac
+[ "$ARX_HERO_REMOTE" = "/tmp/arx-demo" ] && {
+    echo "FAIL: remote path must not equal /tmp/arx-demo"; exit 1; }
+case "$ARX_HERO_REMOTE" in
+    *".."*) echo "FAIL: remote path must not contain traversal components"; exit 1 ;;
+esac
+
+# 5. SSH connectivity preflight
 echo "=== SSH PREFLIGHT ==="
-ssh -o BatchMode=yes "$ARX_HERO_HOST" 'printf "ARX_DEMO_SSH_OK\n"' || { echo "FAIL: SSH fixture not ready"; exit 1; }
+ssh -o BatchMode=yes "$ARX_HERO_HOST" 'printf "ARX_DEMO_SSH_OK\n"' || {
+    echo "FAIL: SSH fixture not ready"; exit 1; }
 echo "SSH OK"
 
-# Remote fixture creation (through SSH, not local mkdir)
+# 6. Fixture mutation (local + remote) — only after all validation passed
 echo "=== REMOTE FIXTURE ==="
 ssh "$ARX_HERO_HOST" "mkdir -p '$ARX_HERO_REMOTE/src'"
-ssh "$ARX_HERO_HOST" "echo '{\\\"name\\\":\\\"ARX Demo\\\",\\\"mode\\\":\\\"safe-update\\\"}' > '$ARX_HERO_REMOTE/manifest.json'"
+ssh "$ARX_HERO_HOST" "echo '{\"name\":\"ARX Demo\",\"mode\":\"safe-update\"}' > '$ARX_HERO_REMOTE/manifest.json'"
 ssh "$ARX_HERO_HOST" "echo 'fn main() {}' > '$ARX_HERO_REMOTE/src/main.rs'"
 ssh "$ARX_HERO_HOST" "echo '[tool]' > '$ARX_HERO_REMOTE/config.toml'"
 
-# Safety: reject cleanup unless host == arx-demo and remote path is correct
-if [ "$ARX_HERO_HOST" != "arx-demo" ]; then
-    echo "FAIL: cleanup only allowed for arx-demo host"
-    exit 1
-fi
-if [[ ! "$ARX_HERO_REMOTE" =~ ^/tmp/arx-demo/ ]] || [ "$ARX_HERO_REMOTE" = "/tmp/arx-demo" ] || [[ "$ARX_HERO_REMOTE" == *".."* ]]; then
-    echo "FAIL: remote path must be under /tmp/arx-demo/ and not be /tmp/arx-demo or contain .."
-    exit 1
-fi
-
-# Local fixture
+echo "=== LOCAL FIXTURE ==="
 mkdir -p "$ARX_HERO_LOCAL/src"
 echo '{"name":"ARX Demo","mode":"safe-update"}' > "$ARX_HERO_LOCAL/manifest.json"
 echo 'fn main() {}' > "$ARX_HERO_LOCAL/src/main.rs"
@@ -56,15 +67,14 @@ echo "// local only" > "$ARX_HERO_LOCAL/local_change_1.rs"
 echo "// local only" > "$ARX_HERO_LOCAL/local_change_2.rs"
 echo "// local only" > "$ARX_HERO_LOCAL/local_change_3.rs"
 
-# Clean artifacts
+# Clean stale artifacts
 rm -f "$ARX_HERO_LOCAL"/.arx-bak-*
 ssh "$ARX_HERO_HOST" "rm -f '$ARX_HERO_REMOTE'/.arx-bak-* 2>/dev/null || true"
 
-# Convert cast → gif with agg
-echo ""
-echo "=== CONVERTING ==="
-agg "$ARX_HERO_CAST" "$ARX_HERO_OUTPUT"
-echo "GIF written to $ARX_HERO_OUTPUT"
+# 7. Record
+mkdir -p "$(dirname "$ARX_HERO_CAST")"
+mkdir -p "$(dirname "$ARX_HERO_OUTPUT")"
+rm -f "$ARX_HERO_CAST"
 
 echo "=== READY ==="
 echo "Binary: $ARX_HERO_BINARY"
@@ -75,15 +85,17 @@ echo ""
 echo "Starting asciinema in 3 seconds..."
 sleep 3
 
-mkdir -p "$(dirname "$ARX_HERO_CAST")"
-mkdir -p "$(dirname "$ARX_HERO_OUTPUT")"
-
-# Remove existing cast file
-rm -f "$ARX_HERO_CAST"
-
 asciinema rec "$ARX_HERO_CAST" --command="$ARX_HERO_BINARY" --cols=120 --rows=30
 
+# 8. Convert — only if recording produced a non-empty cast
+test -s "$ARX_HERO_CAST" || { echo "FAIL: cast missing or empty after recording"; exit 1; }
+
 echo ""
-echo "=== RECORDING SAVED ==="
-echo "Preview:   asciinema play $ARX_HERO_CAST"
-echo "Convert:   agg $ARX_HERO_CAST $ARX_HERO_OUTPUT"
+echo "=== CONVERTING ==="
+NEW_GIF="${ARX_HERO_OUTPUT}.new"
+rm -f "$NEW_GIF"
+agg "$ARX_HERO_CAST" "$NEW_GIF"
+test -s "$NEW_GIF" || { echo "FAIL: conversion produced empty GIF"; exit 1; }
+mv -f "$NEW_GIF" "$ARX_HERO_OUTPUT"
+
+echo "GIF written to $ARX_HERO_OUTPUT"
