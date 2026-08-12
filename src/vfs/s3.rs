@@ -2,8 +2,8 @@
 use crate::config::S3TargetConfig;
 use crate::vfs::{Entry, VfsOps, VfsProvider};
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::config::{Builder, retry::RetryConfig};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::config::{Builder, retry::RetryConfig};
 use std::io;
 // ponytail: reqwest already a dependency; use its Url for endpoint validation
 // (no new dep). aws_sdk_s3 re-exports its own Region via aws_types.
