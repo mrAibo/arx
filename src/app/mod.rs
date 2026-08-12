@@ -14,9 +14,9 @@ use ratatui::layout::Rect;
 use crate::effect_dispatcher::{EffectId, EffectLane, EffectScope};
 use crate::jobs::Job;
 use crate::remote::Host;
-use crate::services::{PaneLoadId, PaneLoadPurpose};
+use crate::services::{PaneListingContinuation, PaneLoadId, PaneLoadPurpose};
 use crate::terminal::TermPane;
-use crate::vfs::Location;
+use crate::vfs::{Location, ProviderRegistry};
 use crate::vfs::{RemoteDeletePlan, RemoteEditSession};
 
 mod actions;
@@ -213,6 +213,12 @@ pub struct AppState {
     /// Latest async VFS load generation for each pane.
     pub pending_pane_loads: BTreeMap<Pane, PaneLoadId>,
     pub pending_pane_targets: BTreeMap<Pane, (Location, PaneLoadPurpose)>,
+    /// Persistent current listing generation per pane. Advanced on every
+    /// register_pane_load; preserved across finish_pane_load so a page-1
+    /// continuation stays valid for page 2. Stale guard compares against this.
+    // ponytail: separate from pending_* (request state) — pagination needs the
+    // generation to outlive the request; finish_pane_load only clears pending_*.
+    pub pane_listing_generations: BTreeMap<Pane, PaneLoadId>,
     /// Persistent presentation state for the latest accepted pane-load failure.
     pub pane_load_errors: BTreeMap<Pane, PaneLoadUiError>,
     pub infrastructure_lines: Vec<String>,
@@ -339,6 +345,7 @@ impl Default for AppState {
             pending_effects: BTreeMap::new(),
             pending_pane_loads: BTreeMap::new(),
             pending_pane_targets: BTreeMap::new(),
+            pane_listing_generations: BTreeMap::new(),
             pane_load_errors: BTreeMap::new(),
             infrastructure_lines: Vec::new(),
             tree_lines: Vec::new(),
@@ -469,6 +476,9 @@ impl AppState {
         self.pane_load_errors.remove(&pane);
         self.pending_pane_loads.insert(pane, id);
         self.pending_pane_targets.insert(pane, (location, purpose));
+        // advance persistent listing generation; pagination relies on this
+        // surviving finish_pane_load so page-1 continuation stays valid
+        self.pane_listing_generations.insert(pane, id);
     }
 
     pub fn accepts_pane_load(&self, pane: Pane, id: PaneLoadId, location: &Location) -> bool {
@@ -496,6 +506,36 @@ impl AppState {
             self.pending_pane_loads.remove(&pane);
             self.pending_pane_targets.remove(&pane);
         }
+    }
+
+    /// Stale guard for the pane-layer listing continuation.
+    ///
+    /// Returns true only when all three correlation dimensions still match the
+    /// current pane: the listing generation, the exact committed location, and
+    /// the concrete provider instance. Stale continuations are silently
+    /// discarded (design: no error, no UI noise).
+    // ponytail: does NOT touch/parse the provider token — opaque by design
+    pub fn accepts_pane_listing_continuation(
+        &self,
+        pane: Pane,
+        continuation: &PaneListingContinuation,
+    ) -> bool {
+        if self.pane_listing_generations.get(&pane) != Some(&continuation.generation) {
+            return false;
+        }
+        let current_location = match pane {
+            Pane::Left => &self.left.location,
+            Pane::Right => &self.right.location,
+        };
+        if current_location != &continuation.location {
+            return false;
+        }
+        if ProviderRegistry::instance_key_for_location(current_location)
+            != continuation.provider_instance
+        {
+            return false;
+        }
+        true
     }
 
     pub fn register_effect(&mut self, lane: EffectLane, id: EffectId) {
@@ -916,5 +956,194 @@ mod tests {
         state.finish_effect(EffectLane::RemoteEdit, EffectId(9));
         state.apply(Action::Quit);
         assert!(state.should_quit);
+    }
+
+    // ── S3-15: stale pane-listing continuation guard ──
+
+    fn cont(generation: u64, location: Location) -> PaneListingContinuation {
+        PaneListingContinuation {
+            provider_continuation: crate::vfs::ProviderContinuation {
+                token: "tok".to_string(),
+            },
+            provider_instance: ProviderRegistry::instance_key_for_location(&location),
+            location,
+            generation: PaneLoadId(generation),
+        }
+    }
+
+    #[test]
+    fn current_continuation_accepted() {
+        let mut state = AppState::default();
+        let loc = state.left.location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(42),
+            loc.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+
+        let c = cont(42, loc);
+        assert!(state.accepts_pane_listing_continuation(Pane::Left, &c));
+    }
+
+    #[test]
+    fn finish_page1_keeps_continuation_valid() {
+        let mut state = AppState::default();
+        let loc = state.left.location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(42),
+            loc.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        // page 1 finishes — must NOT invalidate its continuation (page 2 needs it)
+        state.finish_pane_load(Pane::Left, PaneLoadId(42));
+
+        let c = cont(42, loc);
+        assert!(state.accepts_pane_listing_continuation(Pane::Left, &c));
+    }
+
+    #[test]
+    fn refresh_invalidates_old_generation() {
+        let mut state = AppState::default();
+        let loc = state.left.location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(42),
+            loc.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        // same location, new refresh generation
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(43),
+            loc.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+
+        let old = cont(42, loc.clone());
+        let new = cont(43, loc);
+        assert!(!state.accepts_pane_listing_continuation(Pane::Left, &old));
+        assert!(state.accepts_pane_listing_continuation(Pane::Left, &new));
+    }
+
+    #[test]
+    fn navigation_invalidates_old_continuation() {
+        let mut state = AppState::default();
+        let loc_a = state.left.location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(42),
+            loc_a.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+
+        let loc_b = Location::Local(std::path::PathBuf::from("/navigated"));
+        state.left.location = loc_b.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(43),
+            loc_b.clone(),
+            PaneLoadPurpose::Navigate {
+                remember_current: false,
+            },
+        );
+
+        let old = cont(42, loc_a);
+        assert!(!state.accepts_pane_listing_continuation(Pane::Left, &old));
+    }
+
+    #[test]
+    fn exact_location_mismatch_rejected() {
+        let mut state = AppState::default();
+        let loc_a = state.left.location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(42),
+            loc_a.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+
+        let loc_b = Location::Local(std::path::PathBuf::from("/other"));
+        let c = cont(42, loc_b);
+        assert!(!state.accepts_pane_listing_continuation(Pane::Left, &c));
+    }
+
+    #[test]
+    fn provider_instance_mismatch_independent() {
+        // Same generation + same exact location, but wrong ProviderInstanceKey.
+        let mut state = AppState::default();
+        let loc = Location::S3 {
+            target: "t".to_string(),
+            bucket: Some("b".to_string()),
+            prefix: "p".to_string(),
+        };
+        state.left.location = loc.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(42),
+            loc.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+
+        let mut c = cont(42, loc);
+        // deliberately break only the provider-instance dimension
+        c.provider_instance = ProviderRegistry::instance_key_for_location(&Location::S3 {
+            target: "other-target".to_string(),
+            bucket: None,
+            prefix: String::new(),
+        });
+        assert!(!state.accepts_pane_listing_continuation(Pane::Left, &c));
+    }
+
+    #[test]
+    fn s3_exact_prefix_distinct() {
+        // "foo/" and "foo//" are different exact locations, no normalization.
+        let mut state = AppState::default();
+        let loc = Location::S3 {
+            target: "t".to_string(),
+            bucket: Some("b".to_string()),
+            prefix: "foo/".to_string(),
+        };
+        state.left.location = loc.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(42),
+            loc.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+
+        let wrong = cont(
+            42,
+            Location::S3 {
+                target: "t".to_string(),
+                bucket: Some("b".to_string()),
+                prefix: "foo//".to_string(),
+            },
+        );
+        assert!(!state.accepts_pane_listing_continuation(Pane::Left, &wrong));
+    }
+
+    #[test]
+    fn pane_isolation_left_right() {
+        let mut state = AppState::default();
+        let loc_l = state.left.location.clone();
+        let loc_r = state.right.location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(42),
+            loc_l.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        state.register_pane_load(
+            Pane::Right,
+            PaneLoadId(42),
+            loc_r.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+
+        // Left continuation must not validate via Right's generation/location
+        let left_as_right = cont(42, loc_l);
+        assert!(!state.accepts_pane_listing_continuation(Pane::Right, &left_as_right));
     }
 }
