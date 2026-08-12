@@ -16,11 +16,12 @@
 
 ## Column summary
 
-- **READY** (1): S3-17
+- **READY** (1): S3-18
 - **DOING** (0): —
+- **REVIEW** (0): —
 - **BLOCKED** (0): —
-- **DONE** (17): S3-00..S3-16
-- **BACKLOG** (63): S3-18..S3-80
+- **DONE** (18): S3-00..S3-17
+- **BACKLOG** (62): S3-19..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
 
@@ -189,18 +190,19 @@
 
 ### S3-17 — Client registry lifecycle
 - **Phase:** P7
-- **Status:** READY
-- **Depends on:** S3-16
-- **Allowed files:** src/vfs/mod.rs, src/vfs/s3.rs, src/tui.rs, docs/S3_KANBAN.md
+- **Status:** DONE
+- **Depends on:** S3-16 (client_for_target factory), S3-06 (validate_s3), S3-13..15 (provider registry + guarded TUI)
+- **Allowed files:** src/vfs/mod.rs, src/vfs/s3.rs, src/tui.rs, src/config.rs, docs/S3_KANBAN.md
 - **Acceptance:** ProviderInstanceKey::S3Target => correct target config => correct lazy client. A!=B, separate endpoint/profile, no singleton S3 client. Startup registers target inventory only (no AWS load/network/client). Typed page route target-aware but S3 list_page stays Unsupported. No listing yet.
 - **Stop conditions:** Singleton S3 client. Listing. AWS client at startup.
+- **Orchestrator review:** 540ea1f — BLOCKER 0 / MAJOR 0 / NIT 2 / APPROVED. Merged. (NIT-1: client() map_err redundant; NIT-2: src/config.rs not in initial Allowed files — actual scope added it via pub(crate) sanitize_diag reuse; corrected here.)
 - **Hermes prompt:** Wire S3Target(target_id) => target config => dedicated lazy client. A!=B, no singleton. No listing yet. Scope correction: add src/tui.rs (register_s3_targets startup wiring, no AWS calls).
 
 ### S3-18 — ListBuckets first page
 - **Phase:** P8
-- **Status:** BACKLOG
+- **Status:** READY
 - **Depends on:** S3-17
-- **Allowed files:** src/vfs/s3.rs
+- **Allowed files:** src/vfs/s3.rs, docs/S3_KANBAN.md
 - **Acceptance:** Target-root first page via ListBuckets. Map bucket=>ListedEntry{presentation=bucket name, identity=S3BucketRef}. No Entry.name reconstruction. No create/delete bucket. Tests w/ mocked SDK boundary.
 - **Stop conditions:** Bucket create/delete. Entry.name reconstruction.
 - **Hermes prompt:** Implement target-root first page: ListBuckets => ListedEntry with identity=S3BucketRef (presentation=bucket name only). No name reconstruction. No bucket create/delete. Mock SDK boundary in tests.

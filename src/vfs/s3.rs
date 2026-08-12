@@ -10,8 +10,49 @@ use std::io;
 use aws_config::Region;
 
 pub struct S3Fs;
-#[derive(Debug)]
-pub struct S3Provider;
+/// Per-configured-target S3 provider.
+///
+/// Construction is cheap and offline: it stores the exact target config and a
+/// lazy, per-target AWS client cell. The client is built only on first use via
+/// `client()` (which routes through the S3-16 `client_for_target` boundary),
+/// never at startup (DESIGN_S3 §10 lazy per-target model).
+// ponytail: OnceCell per provider, not a global — different targets get
+// independent clients; no eager AWS config load / network at construction.
+pub struct S3Provider {
+    pub(crate) target: S3TargetConfig,
+    client: tokio::sync::OnceCell<aws_sdk_s3::Client>,
+}
+
+impl S3Provider {
+    pub(crate) fn new(target: S3TargetConfig) -> Self {
+        Self {
+            target,
+            client: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Lazily construct (once) and return the AWS client for this target.
+    ///
+    /// Routes through the S3-16 `client_for_target` security/config boundary;
+    /// never duplicates region/profile/endpoint/retry logic here.
+    // ponytail: called by S3-18+ operations; intentionally unused in S3-17.
+    #[allow(dead_code)]
+    pub(crate) async fn client(&self) -> io::Result<&aws_sdk_s3::Client> {
+        self.client
+            .get_or_try_init(|| client_for_target(&self.target))
+            .await
+            .map_err(|e| io::Error::new(e.kind(), e.to_string()))
+    }
+}
+
+impl std::fmt::Debug for S3Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Provider")
+            .field("target_id", &self.target.id)
+            .field("client_initialized", &self.client.get().is_some())
+            .finish()
+    }
+}
 
 /// Provider-native S3 identity types.
 ///
@@ -460,5 +501,56 @@ mod tests {
         let target = mk_target(None, None, Some("http://127.0.0.1:9000"), true);
         let err = validate_endpoint(target.endpoint_url.as_deref().unwrap());
         assert!(err.is_ok());
+    }
+
+    // ── S3-17: provider lifecycle (no AWS client at construction) ──
+
+    #[test]
+    fn new_provider_client_uninitialized() {
+        let target = mk_target(Some("eu-central-1"), Some("prod"), None, false);
+        let provider = S3Provider::new(target);
+        // No aws_config::load() runs in S3Provider::new.
+        assert!(provider.client.get().is_none());
+    }
+
+    #[test]
+    fn providers_have_distinct_client_cells() {
+        let a = S3Provider::new(mk_target(Some("eu-central-1"), Some("prod"), None, false));
+        let b = S3Provider::new(mk_target(
+            None,
+            Some("lab"),
+            Some("http://127.0.0.1:9000"),
+            true,
+        ));
+        // Distinct storage; not initialized merely for this assertion.
+        assert!(a.client.get().is_none());
+        assert!(b.client.get().is_none());
+        assert!(!std::ptr::eq(&a.client, &b.client));
+    }
+
+    #[test]
+    fn provider_preserves_target_config() {
+        let t = mk_target(
+            Some("eu-central-1"),
+            Some("prod"),
+            Some("http://127.0.0.1:9000"),
+            true,
+        );
+        let provider = S3Provider::new(t.clone());
+        assert_eq!(provider.target.id, t.id);
+        assert_eq!(provider.target.region, t.region);
+        assert_eq!(provider.target.profile, t.profile);
+        assert_eq!(provider.target.endpoint_url, t.endpoint_url);
+        assert_eq!(provider.target.force_path_style, t.force_path_style);
+    }
+
+    #[test]
+    fn debug_output_does_not_contain_raw_endpoint() {
+        let t = mk_target(None, None, Some("http://127.0.0.1:9000"), true);
+        let provider = S3Provider::new(t);
+        let dbg = format!("{:?}", provider);
+        assert!(!dbg.contains("127.0.0.1"));
+        assert!(!dbg.contains("9000"));
+        assert!(dbg.contains("client_initialized"));
     }
 }
