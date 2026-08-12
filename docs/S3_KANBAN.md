@@ -16,12 +16,12 @@
 
 ## Column summary
 
-- **READY** (4): S3-00, S3-01, S3-02, S3-03
+- **READY** (3): S3-05, S3-06, S3-07
 - **DOING** (0): —
 - **REVIEW** (0): —
 - **BLOCKED** (0): —
-- **DONE** (0): —
-- **BACKLOG** (75): S3-04, S3-05, S3-06, S3-07, S3-08, S3-09, S3-10, S3-11, S3-12, S3-13, S3-14, S3-15, S3-16, S3-17, S3-18, S3-19, S3-20, S3-21, S3-22, S3-23, S3-24, S3-25, S3-26, S3-27, S3-28, S3-29, S3-30, S3-31, S3-32, S3-33, S3-34, S3-35, S3-36, S3-37, S3-38, S3-39, S3-40, S3-41, S3-42, S3-43, S3-44, S3-45, S3-46, S3-47, S3-48, S3-49, S3-50, S3-51, S3-52, S3-53, S3-54, S3-55, S3-56, S3-57, S3-58, S3-59, S3-60, S3-61, S3-62, S3-63, S3-64, S3-65, S3-66, S3-67, S3-68, S3-69, S3-70, S3-71, S3-72, S3-73, S3-74, S3-75, S3-76, S3-77, S3-78
+- **DONE** (5): S3-00, S3-01, S3-02, S3-03, S3-04
+- **BACKLOG** (72): S3-08, S3-09, S3-10, S3-11, S3-12, S3-13, S3-14, S3-15, S3-16, S3-17, S3-18, S3-19, S3-20, S3-21, S3-22, S3-23, S3-24, S3-25, S3-26, S3-27, S3-28, S3-29, S3-30, S3-31, S3-32, S3-33, S3-34, S3-35, S3-36, S3-37, S3-38, S3-39, S3-40, S3-41, S3-42, S3-43, S3-44, S3-45, S3-46, S3-47, S3-48, S3-49, S3-50, S3-51, S3-52, S3-53, S3-54, S3-55, S3-56, S3-57, S3-58, S3-59, S3-60, S3-61, S3-62, S3-63, S3-64, S3-65, S3-66, S3-67, S3-68, S3-69, S3-70, S3-71, S3-72, S3-73, S3-74, S3-75, S3-76, S3-77, S3-78, S3-79
 - **PARKED** (10): S3-80, S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93
 
 ---
@@ -31,7 +31,7 @@
 
 ### S3-00 — Merge approved architecture
 - **Phase:** P0
-- **Status:** READY
+- **Status:** DONE
 - **Depends on:** PR #64 approved; HEAD 2531d10
 - **Allowed files:** docs/DESIGN_S3.md (only, before merge)
 - **Acceptance:** 1) Apply only approved NIT wording (ProviderContinuation generic for ListBuckets/ListObjectsV2; Location::S3 prefix wording must not imply normalization). 2) No arch changes. 3) quality SUCCESS + msrv SUCCESS + mergeable. 4) Merge PR #64. 5) Fetch main, record merge SHA.
@@ -40,7 +40,7 @@
 
 ### S3-01 — AWS SDK MSRV disposable spike
 - **Phase:** P1
-- **Status:** READY
+- **Status:** DONE
 - **Depends on:** S3-00 merged
 - **Allowed files:** DISPOSABLE branch/worktree only (no production merge)
 - **Acceptance:** cargo generate-lockfile; cargo +1.88 check --locked; --all-features; cargo +1.88 test --locked; cargo +1.88 build --locked; cargo tree. Record resolved aws-*/aws-smithy*/tokio/hyper/rustls/aws-lc/ring. PASS/FAIL + graph + dep count + build-time delta + binary-size delta.
@@ -49,7 +49,7 @@
 
 ### S3-02 — SDK API compile probe
 - **Phase:** P1
-- **Status:** READY
+- **Status:** DONE
 - **Depends on:** S3-01 PASS
 - **Allowed files:** Throwaway code only
 - **Acceptance:** Compile references for every API in spec (list_buckets, max_buckets, continuation_token, list_objects_v2, get/put/head/delete_object, create/upload/complete/abort multipart, endpoint_url, force_path_style, AWS profile loading). PASS = compiler proves surface. No real AWS calls.
@@ -58,7 +58,7 @@
 
 ### S3-03 — AWS retry ownership audit
 - **Phase:** P1
-- **Status:** READY
+- **Status:** DONE
 - **Depends on:** S3-01 PASS
 - **Allowed files:** No production code
 - **Acceptance:** Inspect pinned SDK RetryConfig: default max attempts, retryable transport/service errors, backoff. Choose A (disable/minimize SDK retries, ARX owns) or B (narrow SDK transport retries w/ specified ops/max/cancellation/Job truth). Return recommended retry policy.
@@ -70,7 +70,7 @@
 
 ### S3-04 — Add exact AWS dependencies
 - **Phase:** P2
-- **Status:** BACKLOG
+- **Status:** DONE
 - **Depends on:** STOP GATE A (S3-01 PASS, S3-02 PASS, S3-03 accepted)
 - **Allowed files:** Cargo.toml, Cargo.lock
 - **Acceptance:** Add aws-sdk-s3="=1.109.0" aws-config="=1.8.8". cargo +1.88 check --locked --all-features; cargo test --locked --all-features; cargo clippy --all-targets --all-features -- -D warnings. Cargo.lock contains expected approved graph. No S3 code.
@@ -79,7 +79,7 @@
 
 ### S3-05 — S3 target config types
 - **Phase:** P3
-- **Status:** BACKLOG
+- **Status:** READY
 - **Depends on:** S3-04 merged
 - **Allowed files:** src/config.rs (or src/config/s3.rs)
 - **Acceptance:** Implement S3TargetConfig data model: id, name, bucket: Option<String>, region: Option<String>, profile: Option<String>, endpoint_url: Option<String>, force_path_style: bool. No creds/secrets, no AWS client, no TUI. Unit tests: minimal, bucket-bound, MinIO-style, multiple targets.
@@ -88,7 +88,7 @@
 
 ### S3-06 — S3 config parsing
 - **Phase:** P3
-- **Status:** BACKLOG
+- **Status:** READY
 - **Depends on:** S3-05
 - **Allowed files:** src/config.rs
 - **Acceptance:** Parse S3 targets from ARX config using S3-05 types. Reject duplicate IDs, empty id, empty bucket if Some(""), invalid endpoint if existing layer validates URLs. Tests: valid AWS, bucket-bound, MinIO, duplicate ID, multiple targets. No credential tests, no SDK clients.
@@ -97,7 +97,7 @@
 
 ### S3-07 — Config redaction truth
 - **Phase:** P3
-- **Status:** BACKLOG
+- **Status:** READY
 - **Depends on:** S3-05, S3-06
 - **Allowed files:** src/config.rs
 - **Acceptance:** Audit Debug/Display/config-error for S3 target output. Allow: id, bucket, region, endpoint host. Never: AWS secret, session token, signed-URL query creds. Tests where practical. No credential storage added.
