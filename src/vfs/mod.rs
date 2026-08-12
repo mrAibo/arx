@@ -609,6 +609,8 @@ impl ProviderRegistry {
             Location::Local(_) => ProviderInstanceKey::Singleton(ProviderId::Local),
             Location::Sftp { host, .. } => ProviderInstanceKey::SftpHost(host.clone()),
             Location::Archive { archive, .. } => ProviderInstanceKey::ArchiveFile(archive.clone()),
+            // ponytail: concrete-instance identity; not S3 client registration
+            Location::S3 { target, .. } => ProviderInstanceKey::S3Target(target.clone()),
         }
     }
 
@@ -616,11 +618,22 @@ impl ProviderRegistry {
         &self,
         loc: &Location,
     ) -> std::io::Result<(Arc<dyn VfsProvider>, String)> {
+        // ponytail: S3 provider routing not wired yet (later client/registry card);
+        // fail-closed Unsupported, no client/provider construction, no bucket+prefix flatten
+        if let Location::S3 { .. } = loc {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "S3 provider routing not implemented yet",
+            ));
+        }
         let key = Self::instance_key_for_location(loc);
+
         let path = match loc {
             Location::Local(path) => path.to_string_lossy().into_owned(),
             Location::Sftp { path, .. } => path.clone(),
             Location::Archive { inner_path, .. } => inner_path.clone(),
+            // unreachable: S3 returns Unsupported before this point
+            Location::S3 { .. } => unreachable!("S3 handled earlier"),
         };
 
         if let Some(provider) = self
@@ -654,6 +667,8 @@ impl ProviderRegistry {
                     }),
                     capabilities::ARCHIVE_CAPABILITIES,
                 ),
+                // unreachable: S3 returns Unsupported before this point
+                Location::S3 { .. } => unreachable!("S3 handled earlier"),
             };
 
         let mut providers = self.providers.write().expect("provider registry poisoned");
@@ -805,6 +820,15 @@ pub enum Location {
         archive: PathBuf,
         inner_path: String,
     },
+    /// Typed S3 location: exact target id, optional bucket, navigation prefix.
+    /// bucket=None => target root; Some+"" => bucket root; Some+prefix => listing
+    /// prefix. Fields stored verbatim (no fs normalization).
+    // ponytail: typed identity only — real S3 routing/navigation is later cards
+    S3 {
+        target: String,
+        bucket: Option<String>,
+        prefix: String,
+    },
 }
 
 impl fmt::Display for Location {
@@ -816,6 +840,8 @@ impl fmt::Display for Location {
                 archive,
                 inner_path,
             } => write!(f, "archive://{}!/{inner_path}", archive.display()),
+            // ponytail: S3-10 owns final S3 Display; safe compile-only rep here
+            Self::S3 { target, .. } => write!(f, "[S3 {target}]"),
         }
     }
 }
@@ -827,6 +853,7 @@ impl Location {
             Self::Local(_) => ProviderId::Local,
             Self::Sftp { .. } => ProviderId::Sftp,
             Self::Archive { .. } => ProviderId::Archive,
+            Self::S3 { .. } => ProviderId::S3,
         }
     }
 
@@ -845,6 +872,8 @@ impl Location {
                 let last = inner_path.rsplit('/').next().unwrap_or(inner_path);
                 last.to_string()
             }
+            // ponytail: label is the exact target id; no config/display-name lookup
+            Self::S3 { target, .. } => target.clone(),
         }
     }
 
@@ -879,6 +908,9 @@ impl Location {
                     inner_path: child,
                 }
             }
+            // ponytail: S3 exact navigation uses S3BucketRef/S3PrefixRef later
+            // (S3-23/24); generic child(name) must not retarget from display text
+            Self::S3 { .. } => self.clone(),
         }
     }
 
@@ -888,6 +920,8 @@ impl Location {
             Self::Local(p) => p.to_str().unwrap_or("/"),
             Self::Sftp { path, .. } => path,
             Self::Archive { inner_path, .. } => inner_path,
+            // ponytail: navigation prefix component only; not object key / provider addr
+            Self::S3 { prefix, .. } => prefix.as_str(),
         }
     }
 
@@ -932,6 +966,8 @@ impl Location {
                     inner_path: parent.to_string(),
                 })
             }
+            // ponytail: S3-25 owns virtual-parent semantics; fail-closed until then
+            Self::S3 { .. } => None,
         }
     }
 }
@@ -1146,6 +1182,144 @@ mod tests {
         let exact = ProviderInstanceKey::S3Target("prod".into());
         let spaced = ProviderInstanceKey::S3Target(" prod ".into());
         assert_ne!(exact, spaced);
+    }
+
+    // S3-09: typed S3 Location + fail-closed navigation/routing.
+    #[test]
+    fn s3_location_target_root_fields() {
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: None,
+            prefix: "".into(),
+        };
+        assert_eq!(loc.provider_id(), ProviderId::S3);
+        if let Location::S3 {
+            target,
+            bucket,
+            prefix,
+        } = &loc
+        {
+            assert_eq!(target, "aws");
+            assert_eq!(*bucket, None);
+            assert_eq!(prefix, "");
+        } else {
+            panic!("not S3");
+        }
+    }
+
+    #[test]
+    fn s3_location_bucket_root() {
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: "".into(),
+        };
+        assert_eq!(loc.provider_id(), ProviderId::S3);
+        if let Location::S3 { bucket, prefix, .. } = &loc {
+            assert_eq!(bucket.as_deref(), Some("company-artifacts"));
+            assert_eq!(prefix, "");
+        } else {
+            panic!("not S3");
+        }
+    }
+
+    #[test]
+    fn s3_location_nested_prefix() {
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: "releases/2026".into(),
+        };
+        assert_eq!(loc.path_for_listing(), "releases/2026");
+    }
+
+    #[test]
+    fn s3_location_unicode_prefix_preserved() {
+        let p = "δοκιμή/данные/日本語";
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("b".into()),
+            prefix: p.into(),
+        };
+        assert_eq!(loc.path_for_listing(), p);
+    }
+
+    #[test]
+    fn s3_location_double_slash_preserved() {
+        let p = "foo//bar";
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("b".into()),
+            prefix: p.into(),
+        };
+        assert_eq!(loc.path_for_listing(), p);
+    }
+
+    #[test]
+    fn s3_location_dot_segments_preserved() {
+        for p in ["foo/../bar", "foo/./bar"] {
+            let loc = Location::S3 {
+                target: "aws".into(),
+                bucket: Some("b".into()),
+                prefix: p.into(),
+            };
+            assert_eq!(loc.path_for_listing(), p, "prefix must not be normalized");
+        }
+    }
+
+    #[test]
+    fn s3_instance_key_is_target() {
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: None,
+            prefix: "".into(),
+        };
+        assert_eq!(
+            ProviderRegistry::instance_key_for_location(&loc),
+            ProviderInstanceKey::S3Target("aws".into())
+        );
+    }
+
+    #[test]
+    fn s3_target_id_preserved_verbatim() {
+        let loc = Location::S3 {
+            target: " aws ".into(),
+            bucket: None,
+            prefix: "".into(),
+        };
+        assert_eq!(loc.label(), " aws ");
+    }
+
+    #[test]
+    fn s3_child_is_fail_closed() {
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("b".into()),
+            prefix: "p".into(),
+        };
+        assert_eq!(loc.child("presentation-name"), loc);
+    }
+
+    #[test]
+    fn s3_parent_is_fail_closed() {
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("b".into()),
+            prefix: "p".into(),
+        };
+        assert_eq!(loc.parent(), None);
+    }
+
+    #[test]
+    fn s3_provider_routing_unavailable() {
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("b".into()),
+            prefix: "p".into(),
+        };
+        let reg = ProviderRegistry::new();
+        let res = reg.provider_for_location(&loc);
+        assert!(res.is_err(), "S3 routing must not be wired yet");
     }
     #[test]
     fn formats_sftp_location() {

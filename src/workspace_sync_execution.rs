@@ -665,6 +665,24 @@ impl DigestBuilder {
                 self.bytes(archive.to_string_lossy().as_bytes());
                 self.bytes(inner_path.as_bytes());
             }
+            // ponytail: total collision-safe S3 identity (tag 3); None vs Some("")
+            // get distinct discriminants; no normalization
+            Location::S3 {
+                target,
+                bucket,
+                prefix,
+            } => {
+                self.u8(3);
+                self.bytes(target.as_bytes());
+                match bucket {
+                    Some(bucket) => {
+                        self.u8(1);
+                        self.bytes(bucket.as_bytes());
+                    }
+                    None => self.u8(0),
+                }
+                self.bytes(prefix.as_bytes());
+            }
         }
     }
 
@@ -942,5 +960,47 @@ mod tests {
             SyncPlanValidator::freeze(&plan, &preview, &default_registry()),
             Err(SyncValidationError::EmptyPlan)
         );
+    }
+
+    fn s3(target: &str, bucket: Option<&str>, prefix: &str) -> Location {
+        Location::S3 {
+            target: target.into(),
+            bucket: bucket.map(|b| b.into()),
+            prefix: prefix.into(),
+        }
+    }
+
+    fn s3_digest(target: &str, bucket: Option<&str>, prefix: &str) -> PlanDigest {
+        let mut b = DigestBuilder::new();
+        b.location(&s3(target, bucket, prefix));
+        b.finish()
+    }
+
+    #[test]
+    fn s3_location_digests_are_distinct() {
+        let a = s3_digest("aws", None, "");
+        let b = s3_digest("aws", Some("bucket"), "");
+        let c = s3_digest("aws", Some("bucket"), "foo");
+        let d = s3_digest("aws", Some("bucket"), "foo//bar");
+        let e = s3_digest("prod", Some("bucket"), "foo");
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(c, d);
+        assert_ne!(d, e);
+        assert_ne!(a, e);
+    }
+
+    #[test]
+    fn s3_none_bucket_distinct_from_empty_bucket() {
+        let none = s3_digest("aws", None, "x");
+        let some_empty = s3_digest("aws", Some(""), "x");
+        assert_ne!(none, some_empty);
+    }
+
+    #[test]
+    fn s3_double_slash_prefix_not_normalized() {
+        let dbl = s3_digest("aws", Some("bucket"), "foo//bar");
+        let single = s3_digest("aws", Some("bucket"), "foo/bar");
+        assert_ne!(dbl, single);
     }
 }
