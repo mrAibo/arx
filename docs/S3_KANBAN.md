@@ -107,7 +107,7 @@
 
 ### S3-08 — ProviderInstanceKey::S3Target
 - **Phase:** P4
-- **Status:** BACKLOG
+- **Status:** READY
 - **Depends on:** S3-04
 - **Allowed files:** src/vfs/mod.rs
 - **Acceptance:** Add ProviderInstanceKey::S3Target(String). No registry client impl. Tests: two target IDs !=, S3 target != SFTP host, hash/map identity stable.
