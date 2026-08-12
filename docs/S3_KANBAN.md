@@ -16,12 +16,12 @@
 
 ## Column summary
 
-- **READY** (1): S3-11
+- **READY** (1): S3-12
 - **DOING** (0): —
 - **REVIEW** (0): —
 - **BLOCKED** (0): —
-- **DONE** (11): S3-00, S3-01, S3-02, S3-03, S3-04, S3-05, S3-06, S3-07, S3-08, S3-09, S3-10
-- **BACKLOG** (70): S3-12, S3-13, S3-14, S3-15, S3-16, S3-17, S3-18, S3-19, S3-20, S3-21, S3-22, S3-23, S3-24, S3-25, S3-26, S3-27, S3-28, S3-29, S3-30, S3-31, S3-32, S3-33, S3-34, S3-35, S3-36, S3-37, S3-38, S3-39, S3-40, S3-41, S3-42, S3-43, S3-44, S3-45, S3-46, S3-47, S3-48, S3-49, S3-50, S3-51, S3-52, S3-53, S3-54, S3-55, S3-56, S3-57, S3-58, S3-59, S3-60, S3-61, S3-62, S3-63, S3-64, S3-65, S3-66, S3-67, S3-68, S3-69, S3-70, S3-71, S3-72, S3-73, S3-74, S3-75, S3-76, S3-77, S3-78, S3-79, S3-80
+- **DONE** (12): S3-00, S3-01, S3-02, S3-03, S3-04, S3-05, S3-06, S3-07, S3-08, S3-09, S3-10, S3-11
+- **BACKLOG** (68): S3-13, S3-14, S3-15, S3-16, S3-17, S3-18, S3-19, S3-20, S3-21, S3-22, S3-23, S3-24, S3-25, S3-26, S3-27, S3-28, S3-29, S3-30, S3-31, S3-32, S3-33, S3-34, S3-35, S3-36, S3-37, S3-38, S3-39, S3-40, S3-41, S3-42, S3-43, S3-44, S3-45, S3-46, S3-47, S3-48, S3-49, S3-50, S3-51, S3-52, S3-53, S3-54, S3-55, S3-56, S3-57, S3-58, S3-59, S3-60, S3-61, S3-62, S3-63, S3-64, S3-65, S3-66, S3-67, S3-68, S3-69, S3-70, S3-71, S3-72, S3-73, S3-74, S3-75, S3-76, S3-77, S3-78, S3-79, S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
 ---
@@ -133,23 +133,23 @@
 - **Stop conditions:** Navigation logic changes.
 - **Hermes prompt:** Implement Display for Location::S3 only. target root=>[S3 name]; bucket root=>s3://bucket/; prefix=>s3://bucket/prefix/. No creds, no nav logic. Tests: Display strings.
 
-### S3-11 — ListedEntry / EntryIdentity core
+### S3-11 — S3 exact reference types
+- **Phase:** P5
+- **Status:** DONE
+- **Depends on:** S3-09, S3-10
+- **Allowed files:** src/vfs/s3.rs
+- **Acceptance:** S3BucketRef{target, bucket}, S3ObjectRef{target, bucket, key}, S3PrefixRef{target, bucket, prefix}; all provider-native strings stored verbatim; no filesystem interpretation, no path normalization, no trimming, no canonicalization, no collapsing //, no resolving . or .., no trailing-slash removal, Unicode preserved exactly; tests pin the exact-identity invariant.
+- **Stop conditions:** Any normalization of provider-native identity; AWS network/client code; capability changes; consumer migration; EntryIdentity implementation; listing implementation.
+- **Hermes prompt:** Implement S3BucketRef/S3ObjectRef/S3PrefixRef exactly as DESIGN_S3 §9/§11 in src/vfs/s3.rs. No normalization. Tests preserve foo//bar, foo/../bar, foo/./bar, foo/, Unicode verbatim.
+
+### S3-12 — ListedEntry / EntryIdentity core
 - **Phase:** P5
 - **Status:** READY
-- **Depends on:** S3-09, S3-10
+- **Depends on:** S3-11
 - **Allowed files:** src/vfs/mod.rs
-- **Acceptance:** Add ListedEntry{entry, identity} and EntryIdentity variants S3Bucket/S3Object/S3Prefix (+ safe Other for existing). Do NOT convert all consumers. Do NOT break Local/SFTP. Tests: presentation name != operational identity; awkward key preserved exactly.
+- **Acceptance:** Add ListedEntry{entry, identity} and EntryIdentity variants S3Bucket(S3BucketRef)/S3Object(S3ObjectRef)/S3Prefix(S3PrefixRef) (+ safe Other for existing). Do NOT convert all consumers. Do NOT break Local/SFTP. Tests: presentation name != operational identity; awkward key preserved exactly.
 - **Stop conditions:** Converting all consumers. Breaking Local/SFTP.
 - **Hermes prompt:** Introduce ListedEntry{entry: Entry, identity: EntryIdentity} with S3Bucket/S3Object/S3Prefix (+Other for existing providers). Do NOT migrate all consumers; do NOT break Local/SFTP. Tests: name!=identity; awkward key exact.
-
-### S3-12 — S3 exact reference types
-- **Phase:** P5
-- **Status:** BACKLOG
-- **Depends on:** S3-11
-- **Allowed files:** src/vfs/s3.rs (or mod.rs)
-- **Acceptance:** Implement S3BucketRef{target,bucket}, S3ObjectRef{target,bucket,key}, S3PrefixRef{target,bucket,prefix}. No path normalization. Tests exact preservation: foo//bar, foo/../bar, foo/./bar, Unicode, foo/.
-- **Stop conditions:** Normalization.
-- **Hermes prompt:** Implement S3BucketRef/S3ObjectRef/S3PrefixRef exactly as DESIGN_S3 §9/§11. No normalization. Tests preserve foo//bar, foo/../bar, foo/./bar, Unicode, foo/ verbatim.
 
 ### S3-13 — ProviderListingPage
 - **Phase:** P6
