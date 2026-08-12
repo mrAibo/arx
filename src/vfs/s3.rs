@@ -304,10 +304,13 @@ fn map_list_buckets_first_page(
         });
     }
 
-    let continuation = output
-        .continuation_token()
-        .map(|t| ProviderContinuation { token: t.to_string() });
-    Ok(ProviderListingPage { entries, continuation })
+    let continuation = output.continuation_token().map(|t| ProviderContinuation {
+        token: t.to_string(),
+    });
+    Ok(ProviderListingPage {
+        entries,
+        continuation,
+    })
 }
 
 // Old VfsOps stub kept for compat
@@ -763,7 +766,9 @@ mod tests {
 
     #[test]
     fn map_no_continuation_when_absent() {
-        let out = ListBucketsOutput::builder().buckets(bucket_named("a")).build();
+        let out = ListBucketsOutput::builder()
+            .buckets(bucket_named("a"))
+            .build();
         let page = map_list_buckets_first_page("t", &out).unwrap();
         assert!(page.continuation.is_none());
     }

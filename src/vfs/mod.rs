@@ -2470,7 +2470,7 @@ mod s3_list_page_tests {
         registry.register_s3_targets(&[mk_s3_target("t", None, None, None, false)]);
         let loc = Location::S3 {
             target: "t".into(),
-            bucket: None,
+            bucket: Some("some-bucket".into()),
             prefix: String::new(),
         };
         let err = registry.list_page(&loc, None).await;
@@ -2752,11 +2752,12 @@ mod s3_list_page_tests {
         )]);
         let loc = Location::S3 {
             target: "aws-prod".to_string(),
-            bucket: None,
+            bucket: Some("some-bucket".into()),
             prefix: "".to_string(),
         };
-        // Reaches the target-aware provider lifecycle, but S3Provider::list_page
-        // remains Unsupported (S3-18 will implement ListBuckets). No AWS call.
+        // Bucket-bound location reaches the target-aware provider lifecycle but
+        // S3Provider::list_page stays Unsupported: object listing (ListObjectsV2)
+        // is S3-20. No AWS call for bucket listing yet.
         let result = registry.list_page(&loc, None).await;
         assert!(matches!(
             result.unwrap_err().kind(),
