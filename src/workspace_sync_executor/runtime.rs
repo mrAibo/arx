@@ -589,6 +589,8 @@ fn location_parent_name(location: &Location) -> Option<(Location, String)> {
             ))
         }
         Location::Archive { .. } => None,
+        // ponytail: S3 Workspace Sync parked; legacy parent/name path invalid for S3
+        Location::S3 { .. } => None,
     }
 }
 
@@ -600,4 +602,19 @@ fn local_parent_name(location: &Location) -> Option<(PathBuf, String)> {
         path.parent()?.to_path_buf(),
         path.file_name()?.to_string_lossy().into_owned(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn location_parent_name_rejects_s3() {
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("bucket".into()),
+            prefix: "foo/bar".into(),
+        };
+        assert_eq!(location_parent_name(&loc), None);
+    }
 }

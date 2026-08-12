@@ -1,3 +1,7 @@
+// ponytail: Location grew with S3 variant (S3-09); error variants carrying
+// Location by-value now trip result_large_err. Intentional, not a regression.
+#![allow(clippy::result_large_err)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::transfer::{

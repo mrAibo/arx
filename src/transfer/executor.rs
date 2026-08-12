@@ -208,6 +208,11 @@ fn endpoint_arg(
             method: TransferMethod::Rsync,
             reason: "rsync cannot address archive locations directly".into(),
         }),
+        // ponytail: rsync cannot address S3; explicit typed rejection, no s3:// encode
+        Location::S3 { .. } => Err(TransferExecutionError::InvalidPlan {
+            method: TransferMethod::Rsync,
+            reason: "rsync cannot address S3 locations directly".into(),
+        }),
     }
 }
 
@@ -397,6 +402,23 @@ mod tests {
         assert!(matches!(
             execute_transfer(&plan, &["x".into()], cancel, |_| {}).await,
             Err(TransferExecutionError::InvalidPlan { .. })
+        ));
+    }
+
+    #[test]
+    fn endpoint_arg_rejects_s3_location() {
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("bucket".into()),
+            prefix: "prefix".into(),
+        };
+        let res = endpoint_arg(&loc, None, false);
+        assert!(matches!(
+            res,
+            Err(TransferExecutionError::InvalidPlan {
+                method: TransferMethod::Rsync,
+                ..
+            })
         ));
     }
 }
