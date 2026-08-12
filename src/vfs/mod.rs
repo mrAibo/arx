@@ -1037,6 +1037,35 @@ pub struct Entry {
     pub modified_unix_ms: Option<u64>,
 }
 
+/// Presentation/listing metadata plus authoritative provider-native identity.
+///
+/// `entry` is presentation/listing metadata (name shown in the pane, kind,
+/// size, mtime). For providers with an authoritative operational identity that
+/// is NOT reconstructable from `parent + entry.name` (notably S3, where a key
+/// like `foo//bar` or `foo/../bar` is opaque), `identity` carries that exact
+/// ref. For everything still using the existing identity model, `Other` is the
+/// safe compatibility identity.
+// ponytail: data-model boundary only; no consumer migration, no listing change
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedEntry {
+    pub entry: Entry,
+    pub identity: EntryIdentity,
+}
+
+/// Authoritative operational identity for a listed entry.
+///
+/// For S3, `entry.name` is presentation only; the `*Ref` variants hold the
+/// exact provider-native key/prefix/bucket. No helper may reconstruct a key
+/// from parent Location + `entry.name` — the ref wins.
+// ponytail: S3 identity derived from exact *Ref; Other keeps non-S3 compat
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryIdentity {
+    S3Object(s3::S3ObjectRef),
+    S3Prefix(s3::S3PrefixRef),
+    S3Bucket(s3::S3BucketRef),
+    Other,
+}
+
 /// Plan for a remote delete operation, stored in AppState pending confirmation.
 #[derive(Debug, Clone)]
 pub struct RemoteDeletePlan {
@@ -2075,5 +2104,141 @@ mod tests {
         assert_ne!(key_a, key_b);
         assert!(matches!(key_a, ProviderInstanceKey::SftpHost(h) if h == "host-a"));
         assert!(matches!(key_b, ProviderInstanceKey::SftpHost(h) if h == "host-b"));
+    }
+}
+
+#[cfg(test)]
+mod s3_identity_tests {
+    use super::*;
+    use crate::vfs::s3::{S3BucketRef, S3ObjectRef, S3PrefixRef};
+
+    #[test]
+    fn s3_presentation_differs_from_object_identity() {
+        let le = ListedEntry {
+            entry: Entry {
+                name: "bar".into(),
+                kind: EntryKind::File,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Object(S3ObjectRef {
+                target: "aws".into(),
+                bucket: "b".into(),
+                key: "foo//bar".into(),
+            }),
+        };
+        assert_eq!(le.entry.name, "bar");
+        match &le.identity {
+            EntryIdentity::S3Object(r) => assert_eq!(r.key, "foo//bar"),
+            _ => panic!("expected S3Object"),
+        }
+        assert_ne!(le.entry.name, "foo//bar");
+    }
+
+    #[test]
+    fn s3_awkward_key_survives_exactly() {
+        let le = ListedEntry {
+            entry: Entry {
+                name: "bar".into(),
+                kind: EntryKind::File,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Object(S3ObjectRef {
+                target: "aws".into(),
+                bucket: "b".into(),
+                key: "foo/../bar".into(),
+            }),
+        };
+        match &le.identity {
+            EntryIdentity::S3Object(r) => assert_eq!(r.key, "foo/../bar"),
+            _ => panic!("expected S3Object"),
+        }
+    }
+
+    #[test]
+    fn s3_unicode_operational_identity() {
+        for key in ["каталог/файл.txt", "日本語/資料.txt"] {
+            let le = ListedEntry {
+                entry: Entry {
+                    name: "файл.txt".into(),
+                    kind: EntryKind::File,
+                    size: None,
+                    modified_unix_ms: None,
+                },
+                identity: EntryIdentity::S3Object(S3ObjectRef {
+                    target: "aws".into(),
+                    bucket: "b".into(),
+                    key: key.into(),
+                }),
+            };
+            match &le.identity {
+                EntryIdentity::S3Object(r) => assert_eq!(r.key, key),
+                _ => panic!("expected S3Object"),
+            }
+        }
+    }
+
+    #[test]
+    fn s3_prefix_identity_exact_while_name_shortened() {
+        let le = ListedEntry {
+            entry: Entry {
+                name: "releases".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Prefix(S3PrefixRef {
+                target: "aws".into(),
+                bucket: "b".into(),
+                prefix: "releases/2026".into(),
+            }),
+        };
+        assert_eq!(le.entry.name, "releases");
+        match &le.identity {
+            EntryIdentity::S3Prefix(r) => assert_eq!(r.prefix, "releases/2026"),
+            _ => panic!("expected S3Prefix"),
+        }
+    }
+
+    #[test]
+    fn s3_bucket_identity_not_label() {
+        let le = ListedEntry {
+            entry: Entry {
+                name: "Production artifacts".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Bucket(S3BucketRef {
+                target: "aws".into(),
+                bucket: "company-prod-artifacts".into(),
+            }),
+        };
+        assert_eq!(le.entry.name, "Production artifacts");
+        match &le.identity {
+            EntryIdentity::S3Bucket(r) => assert_eq!(r.bucket, "company-prod-artifacts"),
+            _ => panic!("expected S3Bucket"),
+        }
+        assert_ne!(le.entry.name, "company-prod-artifacts");
+    }
+
+    #[test]
+    fn other_compatibility_preserves_entry() {
+        let original = Entry {
+            name: "local-file.txt".into(),
+            kind: EntryKind::File,
+            size: Some(1024),
+            modified_unix_ms: Some(1_700_000_000_000),
+        };
+        let le = ListedEntry {
+            entry: original.clone(),
+            identity: EntryIdentity::Other,
+        };
+        assert_eq!(le.entry, original);
+        assert_eq!(le.entry.name, "local-file.txt");
+        assert_eq!(le.entry.size, Some(1024));
+        assert_eq!(le.entry.modified_unix_ms, Some(1_700_000_000_000));
+        assert!(matches!(le.identity, EntryIdentity::Other));
     }
 }
