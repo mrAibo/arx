@@ -835,6 +835,26 @@ pub enum Location {
     },
 }
 
+/// Escape terminal-control characters for safe presentation only.
+/// Printable Unicode is preserved unchanged; stored identity is never mutated.
+// ponytail: display-only escaping, no normalization/lookup
+fn s3_display_safe_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x1b' => out.push_str("\\x1b"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 impl fmt::Display for Location {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -844,9 +864,29 @@ impl fmt::Display for Location {
                 archive,
                 inner_path,
             } => write!(f, "archive://{}!/{inner_path}", archive.display()),
-            // ponytail: S3-10 owns final S3 Display; safe compile-only rep here
-            // ponytail: S3-10 owns final display identity; temporary control-safe rep
-            Self::S3 { .. } => write!(f, "[S3]"),
+            // ponytail: S3-10 control-safe display; presentation only, identity untouched
+            Self::S3 {
+                target,
+                bucket,
+                prefix,
+            } => match bucket {
+                None => write!(f, "[S3 {}]", s3_display_safe_component(target)),
+                Some(bucket) => {
+                    let safe_bucket = s3_display_safe_component(bucket);
+                    if prefix.is_empty() {
+                        write!(f, "s3://{safe_bucket}/")
+                    } else {
+                        let trailing = if prefix.ends_with('/') { "" } else { "/" };
+                        write!(
+                            f,
+                            "s3://{}/{}{}",
+                            safe_bucket,
+                            s3_display_safe_component(prefix),
+                            trailing
+                        )
+                    }
+                }
+            },
         }
     }
 }
@@ -1303,27 +1343,125 @@ mod tests {
 
     #[test]
     fn s3_display_label_control_safe() {
+        // T1 — target root
+        let loc = Location::S3 {
+            target: "artifacts".into(),
+            bucket: None,
+            prefix: "".into(),
+        };
+        assert_eq!(format!("{loc}"), "[S3 artifacts]");
+
+        // T2 — target root control safety
         let loc = Location::S3 {
             target: "prod\x1b[31m\nEVIL".into(),
             bucket: None,
-            prefix: String::new(),
+            prefix: "".into(),
         };
         let displayed = format!("{loc}");
-        assert_eq!(displayed, "[S3]");
-        assert!(!displayed.contains('\n'));
-        assert!(!displayed.contains('\x1b'));
-        assert!(!displayed.contains("EVIL"));
-        let label = loc.label();
-        assert_eq!(label, "S3");
-        assert!(!label.contains('\n'));
-        assert!(!label.contains('\x1b'));
-        assert!(!label.contains("EVIL"));
-        // stored target still verbatim
+        assert!(!displayed.contains('\x1b')); // no raw ESC
+        assert!(!displayed.contains('\n')); // no raw newline (only escaped \n)
         if let Location::S3 { target, .. } = &loc {
             assert_eq!(target, "prod\x1b[31m\nEVIL");
         } else {
             panic!("not S3");
         }
+
+        // T3 — bucket root
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: "".into(),
+        };
+        assert_eq!(format!("{loc}"), "s3://company-artifacts/");
+
+        // T4 — normal nested prefix
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: "releases/2026".into(),
+        };
+        assert_eq!(format!("{loc}"), "s3://company-artifacts/releases/2026/");
+
+        // T5 — already trailing slash (exactly one display slash)
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: "releases/2026/".into(),
+        };
+        assert_eq!(format!("{loc}"), "s3://company-artifacts/releases/2026/");
+        assert_eq!(loc.path_for_listing(), "releases/2026/");
+
+        // T6 — double slash preserved
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: "foo//bar".into(),
+        };
+        assert_eq!(format!("{loc}"), "s3://company-artifacts/foo//bar/");
+
+        // T7 — dot-dot segment preserved
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: "foo/../bar".into(),
+        };
+        assert_eq!(format!("{loc}"), "s3://company-artifacts/foo/../bar/");
+
+        // T8 — dot segment preserved
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: "foo/./bar".into(),
+        };
+        assert_eq!(format!("{loc}"), "s3://company-artifacts/foo/./bar/");
+
+        // T9 — Unicode preserved
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: "данные/日本語".into(),
+        };
+        assert_eq!(format!("{loc}"), "s3://company-artifacts/данные/日本語/");
+
+        // T10 — prefix control character escaped
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: "foo\nEVIL".into(),
+        };
+        let displayed = format!("{loc}");
+        assert!(!displayed.contains('\n')); // only escaped \n present
+        assert_eq!(loc.path_for_listing(), "foo\nEVIL");
+
+        // T11 — bucket control character escaped
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("bucket\x1b[31m".into()),
+            prefix: "".into(),
+        };
+        let displayed = format!("{loc}");
+        assert!(!displayed.contains('\x1b'));
+        if let Location::S3 { bucket, .. } = &loc {
+            assert_eq!(bucket.as_deref(), Some("bucket\x1b[31m"));
+        } else {
+            panic!("not S3");
+        }
+
+        // T12 — leading slash preservation (no normalization)
+        let loc = Location::S3 {
+            target: "aws".into(),
+            bucket: Some("b".into()),
+            prefix: "/foo".into(),
+        };
+        assert_eq!(format!("{loc}"), "s3://b//foo/");
+
+        // T13 — Display does not alter label
+        let loc = Location::S3 {
+            target: "artifacts".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: "releases/2026".into(),
+        };
+        assert_eq!(loc.label(), "S3");
     }
 
     #[test]
