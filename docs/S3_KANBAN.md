@@ -202,7 +202,7 @@
 - **Phase:** P8
 - **Status:** REVIEW
 - **Depends on:** S3-17
-- **Allowed files:** src/vfs/s3.rs, docs/S3_KANBAN.md
+- **Allowed files:** src/vfs/s3.rs, src/vfs/mod.rs (tests only), docs/S3_KANBAN.md
 - **Acceptance:** Target-root first page via ListBuckets. Map bucket=>ListedEntry{presentation=bucket name, identity=S3BucketRef}. No Entry.name reconstruction. No create/delete bucket. Tests w/ mocked SDK boundary.
 - **Stop conditions:** Bucket create/delete. Entry.name reconstruction.
 - **Hermes prompt:** Implement target-root first page: ListBuckets => ListedEntry with identity=S3BucketRef (presentation=bucket name only). No name reconstruction. No bucket create/delete. Mock SDK boundary in tests.
