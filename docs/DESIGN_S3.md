@@ -399,6 +399,12 @@ This deletes the object from the current S3 view.
   - **destructive / no automatic retry**: none beyond above; ARX does **not** auto-retry anything that could amplify cost or side effects without user visibility
 - **[ARX DESIGN DECISION]** No provider-specific retry hidden inside a generic operation. Retry policy is explicit per operation class and respects `CancellationFlag`.
 - **[AWS/S3 FACT]** Common failures to map honestly: `NoSuchBucket`, `NoSuchKey`, `AccessDenied`, `InvalidRegion` (wrong region → redirect), expired credentials, network break, object disappearing mid-operation.
+- **[ARX DESIGN DECISION — SDK RETRY OWNERSHIP (S3-DESIGN-AF-03 / S3-03)]** **Option A: disable SDK retries; ARX owns retry semantics.** Applied as `RetryConfig::disabled()` on the S3 client builder (`S3ConfigBuilder::retry_config(RetryConfig::disabled())`). Rationale from pinned-SDK audit (`aws-smithy-runtime` 1.10.0, `aws-sdk-s3` 1.109.0):
+  - Default `RetryConfig::standard()` = `max_attempts=3`, `RetryMode::Standard`, exp backoff 1s→20s. `aws_config::load_defaults()` with `BehaviorVersion::latest()` (== `v2026_01_12`) **enables retries by default** for AWS SDK clients.
+  - The smithy **orchestrator retry loop runs before service-level classification**. `TransientErrorClassifier` retries transport failures (connection reset, timeout, 5xx) **regardless of operation type**.
+  - Therefore the SDK **WILL retry** `PutObject` / `UploadPart` / `CompleteMultipartUpload` / `DeleteObject` on transport failure — and if the first request already reached S3, the retry is a **duplicate physical mutation** (duplicate object / part / delete). The SDK provides **no idempotency guarantee** for these ops under transport retry (`retryable_error_kind() == None` at service level does not stop the orchestrator).
+  - **Required invariant**: ARX must **never report a single physical attempt when the SDK may perform materially different repeated mutations**. SDK transport retry on mutating ops violates this.
+  - **Consequently**: SDK retries disabled. ARX implements its own retry policy per operation class above, with explicit pre-checks / idempotency where safe, and always respects `CancellationFlag`. Safe idempotent reads (`ListObjectsV2`/`HeadObject`/`GetObject`) may be retried by ARX with bounded attempts; mutating ops are retried by ARX **only** with user visibility or explicit idempotency evidence (e.g. re-`HeadObject` before re-`DeleteObject`), never blindly.
 
 ## 22. Job integration
 
