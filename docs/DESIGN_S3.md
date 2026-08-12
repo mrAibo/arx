@@ -142,6 +142,7 @@ struct ListedEntry {
 enum EntryIdentity {
     S3Object(S3ObjectRef),
     S3Prefix(S3PrefixRef),
+    S3Bucket(S3BucketRef),
     Other, // Local/SFTP/Archive keep their existing identity model
 }
 
@@ -156,9 +157,15 @@ struct S3PrefixRef {
     bucket: String,
     prefix: String, // exact listing/navigation prefix, e.g. "foo/bar"
 }
+
+struct S3BucketRef {
+    target: String,
+    bucket: String, // exact bucket name as returned by ListBuckets
+}
 ```
 
-  - **Required invariant**: `Entry.name` is **presentation only** and **MUST NEVER be the authority** for S3 object operations. The `*Ref` is the authority.
+  - **Required invariant**: `Entry.name` is **presentation only** and **MUST NEVER be the authority** for S3 object operations. The `*Ref` is the authority. This holds for **bucket entries too**: a bucket's `Entry.name` is presentation only; entering a bucket from the target root MUST use `S3BucketRef`, never `target + Entry.name` reconstruction.
+  - **Target-root flow (ListBuckets)**: `ListBuckets` → `ListedEntry { entry: Entry (presentation), identity: EntryIdentity::S3Bucket(S3BucketRef) }`. Entering a bucket → `Location::S3 { target, bucket: Some(exact bucket from ref), prefix: "" }`. No F3/F5/F8 semantics apply to bucket entries in MVP; F7 at target root remains disabled; bucket create/delete remain out of MVP.
   - **F3 (preview)**: focused `ListedEntry` → `S3ObjectRef` → `GetObject` `Range` on the **exact key**.
   - **F5 (download)**: `S3ObjectRef` → `TransferPlan` source identity (not a reconstructed path).
   - **F8 (delete)**: confirmation **freezes the exact** `target + bucket + key`; never re-derived from `parent + display name`.
@@ -169,7 +176,6 @@ struct S3PrefixRef {
   - **`S3ObjectKey`**: the exact, opaque object key as returned by S3 (`S3ObjectRef.key`). Never normalized, never FS-interpreted.
   - **`S3NavigationPrefix`**: the prefix ARX uses for `ListObjectsV2` (`prefix=`) and for `..`/enter navigation (`S3PrefixRef.prefix`). A navigation prefix may have a canonical UI representation (e.g. trailing-slash display).
   - Storing a navigation prefix **without** a trailing slash is a UI/navigation representation choice — it does **not** normalize or modify any existing object key. If `ListObjectsV2` requires `foo/bar/` (trailing slash) while ARX stores `foo/bar` internally, that slash is **protocol/navigation construction**, not a change to object identity. The object key stays exactly what S3 returned.
-- **[OPEN QUESTION]** Root mode — see §12 decision. Recommended default is **option A** (target root lists buckets).
 
 ## 10. Provider instance model
 
@@ -183,7 +189,12 @@ struct S3PrefixRef {
 - **[ARX DESIGN DECISION]** Listing uses `ListObjectsV2` with `delimiter="/"`:
   - `Contents` → `Entry { kind: File, size, modified_unix_ms: LastModified }`
   - `CommonPrefixes` → `Entry { kind: Directory, size: None }` (virtual folder; no probe of child count)
+  - At the **target root**, the listing operation is `ListBuckets` (API: `ListBuckets`; IAM action `s3:ListAllMyBuckets`), producing `EntryIdentity::S3Bucket` entries (see §9). Bucket entries are not paginated by `prefix`/`delimiter`; they use the same continuation model below.
 - **[ARX DESIGN DECISION — TWO-LAYER PAGINATION (S3-DESIGN-FINAL-01)]** Provider pagination and pane correlation are **separate layers**. The `VfsProvider`/`S3Provider` must **not** depend on `PaneLoadId`, `Pane`, or `AppState`.
+- **[ARX DESIGN DECISION — PAGINATION COVERS BOTH ROOT AND PREFIX (S3-DESIGN-AF-02)]** The `ProviderListingPage` / `ProviderContinuation` model applies to **both** listing operations; the provider continuation stays **opaque** (ARX never encodes an API-specific token type into `PaneLoader`):
+  - **Target root** (`ListBuckets`): continuation is the `ListBuckets` `ContinuationToken`.
+  - **Bucket/prefix** (`ListObjectsV2`): continuation is `NextContinuationToken`.
+  All existing stale-generation rules (§11 pane layer) apply unchanged to either operation.
 
 **Provider layer (owns only provider-native state):**
 
@@ -223,8 +234,8 @@ struct PaneListingContinuation {
 **NEVER:** `S3Provider` → `PaneLoadId`; `VfsProvider` → `Pane`; `VfsProvider` → `AppState`.
 
 - **[ARX CURRENT FACT]** The staleness guard already exists for single loads: `AppState::accepts_pane_load` (src/app/mod.rs) rejects a `PaneLoadResponse` unless its `PaneLoadId` is still the pending one **and** its `Location` still matches the pane target (with an extra committed-location check for `Refresh`). The S3 pagination model extends this same generation+location binding to *each page* at the **pane layer** (`PaneListingContinuation`), so a slow/late page from a previous navigation can never append to the current view.
-- **[ARX DESIGN DECISION — PROTOCOL + STALE SAFETY]** Two distinct failure classes:
-  - **ProtocolError**: a provider returns `IsTruncated == true` but `ProviderContinuation` is `None`, or returns a `token` identical to the one already consumed (non-advancing). Pagination stops with a factual message; ARX never re-requests the same token.
+- **[ARX DESIGN DECISION — PROTOCOL + STALE SAFETY]** Two distinct failure classes (apply to **both** `ListBuckets` and `ListObjectsV2`):
+  - **ProtocolError**: a provider returns a truncated/has-more response but `ProviderContinuation` is `None`, or returns a `token` identical to the one already consumed (non-advancing). Pagination stops with a factual message; ARX never re-requests the same token. **No infinite-loop.**
   - **Stale discard**: a `PaneListingContinuation` whose `generation`/`location`/`provider_instance` no longer matches the current pane is dropped silently (no append).
 - **[ARX DESIGN DECISION]** Never block the TUI awaiting a full million-object enumeration. A page cap is the unit of work; `IsTruncated` + `NextContinuationToken` drive continuation.
 - **[WINSCP OBSERVATION]** WinSCP handles truncated responses and `NextMarker`; ARX adopts the continuation concept but keeps it incremental rather than eager, and binds every continuation to its listing generation.
@@ -242,7 +253,7 @@ Three candidate root modes:
 
 | Mode | UX | IAM implication |
 |---|---|---|
-| A | One S3 entry point shows all buckets for the credential | Needs `s3:ListBuckets` + per-bucket access; broader IAM scope |
+| A | One S3 entry point shows all buckets for the credential | Needs `s3:ListAllMyBuckets` (IAM action for the `ListBuckets` API) + per-bucket access; broader IAM scope |
 | B | Simpler, least-privilege per target | Tightest IAM; one bucket per config block |
 | C | Most flexible, most complex | Mixed |
 
@@ -250,6 +261,7 @@ Three candidate root modes:
   - **Explicit root behavior (no empty-string sentinel):** the `bucket: Option<String>` in `Location::S3` drives this directly:
     - **Target without bucket** (`bucket == None`) → `ListBuckets` (mode A). Pane shows the accessible buckets for the credential.
     - **Target with bucket** (`bucket == Some(name)`) → opens that bucket's root directly (mode B); no bucket-list step is shown.
+  - **[ARX DESIGN DECISION — IAM SCOPE (S3-DESIGN-AF-03)]** Distinguish the API operation (`ListBuckets`) from its IAM policy action (`s3:ListAllMyBuckets`). A **bucket-bound target** (mode B) opens the configured bucket directly via `ListObjectsV2` and MUST NOT require `s3:ListAllMyBuckets` (nor `ListBuckets`) merely to open that one bucket. Only target-root mode (mode A) needs `s3:ListAllMyBuckets`. This keeps mode-B targets working under tightest-per-bucket IAM.
   - This is the same `Option<String>` distinction already specified in §9, applied consistently at the navigation layer.
 - **[ARX DESIGN DECISION]** Virtual `..` semantics:
   - object/prefix `foo/bar` → parent `foo`
