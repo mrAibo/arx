@@ -45,7 +45,7 @@ pub fn format_bounded_preview(
     let lines_truncated = source_lines.next().is_some();
 
     let bytes_label = match total_size {
-        Some(sz) => format!("{} bytes", sz),
+        Some(sz) => format!("{sz} bytes"),
         None => format!("{} bytes read", bytes.len()),
     };
     lines.insert(0, format!("[Remote Text] {display_name} — {bytes_label}"));
@@ -53,10 +53,10 @@ pub fn format_bounded_preview(
     if truncated || lines_truncated {
         let mut parts = Vec::new();
         if truncated {
-            parts.push(format!("{} bytes", MAX_TEXT_PREVIEW_BYTES));
+            parts.push(format!("{MAX_TEXT_PREVIEW_BYTES} bytes"));
         }
         if lines_truncated {
-            parts.push(format!("{} lines", MAX_TEXT_PREVIEW_LINES));
+            parts.push(format!("{MAX_TEXT_PREVIEW_LINES} lines"));
         }
         lines.push(format!("[Truncated at {}]", parts.join(" / ")));
     }
@@ -200,8 +200,7 @@ async fn read_text_preview(path: &Path) -> std::io::Result<Vec<String>> {
     );
     if bytes_truncated || lines_truncated {
         lines.push(format!(
-            "[Truncated at {} bytes / {} lines]",
-            MAX_TEXT_PREVIEW_BYTES, MAX_TEXT_PREVIEW_LINES
+            "[Truncated at {MAX_TEXT_PREVIEW_BYTES} bytes / {MAX_TEXT_PREVIEW_LINES} lines]"
         ));
     }
     Ok(lines)

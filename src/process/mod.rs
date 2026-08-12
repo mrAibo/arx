@@ -191,7 +191,7 @@ impl ProcessService {
                 )
                 .unwrap_or_else(|e| vec![format!("Error: {e}")]);
                 EffectEvent::ViewerLines {
-                    title: format!("View: {} — {}", name, location),
+                    title: format!("View: {name} — {location}"),
                     lines,
                 }
             }
@@ -676,8 +676,7 @@ mod tests {
         .await;
         assert!(
             matches!(&event, EffectEvent::Failed { error, .. } if error.contains("too large")),
-            "Truncated file should be refused, got {:?}",
-            event
+            "Truncated file should be refused, got {event:?}"
         );
     }
 
@@ -706,8 +705,7 @@ mod tests {
         .await;
         assert!(
             matches!(&event, EffectEvent::Downloaded { session, .. } if session.name == "small.txt"),
-            "Complete file should produce Downloaded, got {:?}",
-            event
+            "Complete file should produce Downloaded, got {event:?}"
         );
     }
 
@@ -738,8 +736,7 @@ mod tests {
         .await;
         assert!(
             matches!(&event, EffectEvent::Downloaded { .. }),
-            "Complete file should be accepted, got {:?}",
-            event
+            "Complete file should be accepted, got {event:?}"
         );
     }
 
@@ -768,8 +765,7 @@ mod tests {
         .await;
         assert!(
             matches!(&event, EffectEvent::Failed { error, .. } if error.contains("too large")),
-            ">cap file should be refused, got {:?}",
-            event
+            ">cap file should be refused, got {event:?}"
         );
     }
 
@@ -800,8 +796,7 @@ mod tests {
         .await;
         assert!(
             matches!(&event, EffectEvent::Failed { error, .. } if error.contains("NUL")),
-            "NUL bytes should be refused, got {:?}",
-            event
+            "NUL bytes should be refused, got {event:?}"
         );
     }
 
@@ -830,8 +825,7 @@ mod tests {
         .await;
         assert!(
             matches!(&event, EffectEvent::Failed { error, .. } if error.contains("UTF-8")),
-            "Invalid UTF-8 should be refused, got {:?}",
-            event
+            "Invalid UTF-8 should be refused, got {event:?}"
         );
     }
 
@@ -860,8 +854,7 @@ mod tests {
         .await;
         assert!(
             matches!(&event, EffectEvent::Downloaded { .. }),
-            "Valid UTF-8 should be accepted, got {:?}",
-            event
+            "Valid UTF-8 should be accepted, got {event:?}"
         );
     }
 
@@ -929,8 +922,7 @@ mod tests {
         .await;
         assert!(
             matches!(&event, EffectEvent::Downloaded { .. }),
-            "Empty file should be accepted, got {:?}",
-            event
+            "Empty file should be accepted, got {event:?}"
         );
     }
 

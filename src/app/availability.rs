@@ -371,8 +371,7 @@ mod tests {
         let availability = action_availability(ActionId::EditFile, &ctx);
         assert!(
             matches!(availability, ActionAvailability::Available),
-            "SFTP with Read+Write+editor should be Available, got {:?}",
-            availability
+            "SFTP with Read+Write+editor should be Available, got {availability:?}"
         );
     }
 
