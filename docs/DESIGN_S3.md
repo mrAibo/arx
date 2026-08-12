@@ -125,7 +125,7 @@ force_path_style = true      # required by some MinIO/R2 setups
 Location::S3 {
     target: String,       // matches [[s3.targets]].id
     bucket: Option<String>, // None at target root (ListBuckets); Some at bucket root+
-    prefix: String,       // "" at bucket root; no leading/trailing slash internally
+    prefix: String,       // "" at bucket root; internal nav prefix, stored without leading/trailing slash as a UI/navigation convention only — this is NOT normalization of any S3 object key (see §9 KEY vs NAVIGATION PREFIX)
 }
 ```
 
