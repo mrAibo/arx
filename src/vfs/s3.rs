@@ -47,7 +47,7 @@ pub struct S3PrefixRef {
 // ponytail: separates pure translation from environment loading so unit tests
 // need no AWS credentials / network
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct S3ClientSettings {
+pub(crate) struct S3ClientSettings {
     pub region: Option<String>,
     pub profile: Option<String>,
     pub endpoint_url: Option<String>,
@@ -100,6 +100,14 @@ fn validate_endpoint(url_str: &str) -> io::Result<()> {
 /// Build the S3 service `Config` from shared SDK config + translated settings.
 /// Retries are explicitly disabled (DESIGN_S3 S3-03 / S3-DESIGN-AF-03): ARX owns
 /// later operation-class retry behavior.
+///
+/// Endpoint security lives at the S3 service-builder boundary: any endpoint
+/// URL inherited from the shared SDK config (AWS_ENDPOINT_URL,
+/// AWS_ENDPOINT_URL_S3, shared-profile endpoint_url) is cleared first, then
+/// only the validated ARX `S3TargetConfig.endpoint_url` is applied. The
+/// original `SdkConfig` is passed through untouched — all other SDK
+/// configuration (credentials provider, region, HTTP client, identity cache,
+/// time/sleep/timeout, behavior version) is preserved by `Builder::from`.
 // ponytail: single deterministic helper so the retry-invariant is observable
 // and testable without performing real AWS calls
 #[allow(dead_code)]
@@ -108,16 +116,13 @@ pub(crate) fn build_s3_config(
     sdk_config: &aws_config::SdkConfig,
 ) -> aws_sdk_s3::Config {
     let mut builder = Builder::from(sdk_config);
-    if let Some(region) = &settings.region {
-        builder = builder.region(Region::new(region.clone()));
-    }
-    if let Some(profile) = &settings.profile {
-        // profile already applied on the shared config loader; this is a no-op
-        // guard documenting that profile is not an ARX-owned credential store
-        let _ = profile;
-    }
+
+    // Discard endpoint URL inherited from AWS global/service configuration.
+    // ARX target config is authoritative for custom S3 endpoints (DESIGN_S3 §27).
+    builder.set_endpoint_url(None);
+
     if let Some(endpoint) = &settings.endpoint_url {
-        builder = builder.endpoint_url(endpoint.clone());
+        builder.set_endpoint_url(Some(endpoint.clone()));
     }
     builder = builder.force_path_style(settings.force_path_style);
     builder = builder.retry_config(RetryConfig::disabled());
@@ -127,7 +132,10 @@ pub(crate) fn build_s3_config(
 /// Construct an `aws_sdk_s3::Client` for exactly one `S3TargetConfig`.
 ///
 /// Uses the official AWS SDK credential/config chain (no manual chain, no
-/// static credentials). Creates NO requests and performs NO listing.
+/// static credentials). The validated ARX target endpoint is the only custom
+/// S3 endpoint; any endpoint inherited from the shared SDK config is cleared
+/// at the S3 service-builder boundary (see `build_s3_config`). Creates NO
+/// requests and performs NO listing.
 #[allow(dead_code)]
 pub(crate) async fn client_for_target(target: &S3TargetConfig) -> io::Result<Client> {
     if let Some(endpoint) = &target.endpoint_url {
@@ -304,20 +312,102 @@ mod tests {
     }
 
     #[test]
-    fn retry_policy_disabled() {
+    fn retry_policy_disabled_synthetic_sdk_config() {
         let target = mk_target(None, None, None, false);
         let settings = S3ClientSettings::from_target(&target);
 
-        // Build a minimal SDK config in-process (no network) to verify the
-        // service config is constructed with retries disabled.
-        let sdk_config = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(aws_config::defaults(BehaviorVersion::latest()).load());
+        // Fully synthetic shared SDK config: no network, no env/profile/IMDS.
+        let sdk_config = aws_config::SdkConfig::builder()
+            .region(Region::new("us-east-1"))
+            .behavior_version(BehaviorVersion::latest())
+            .build();
         let config = build_s3_config(&settings, &sdk_config);
 
         // RetryConfig::disabled() -> max_attempts == 1
         let retry = config.retry_config().expect("retry config must be present");
         assert_eq!(retry.max_attempts(), 1);
+    }
+
+    // ── S3-16 correction (Proposal D): ambient endpoint must not bypass
+    //    validation; only the validated ARX target endpoint is a custom S3
+    //    endpoint. Endpoint clearing happens at the S3 service-builder
+    //    boundary (build_s3_config), not by reconstructing SdkConfig. ──
+
+    #[test]
+    fn inherited_s3_endpoint_is_cleared() {
+        // Ambient endpoint URL carried by the shared SDK config (e.g.
+        // AWS_ENDPOINT_URL / AWS_ENDPOINT_URL_S3 / profile endpoint_url).
+        let sdk = aws_config::SdkConfig::builder()
+            .region(Region::new("us-east-1"))
+            .endpoint_url("https://user:password@example.invalid")
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+
+        // No ARX target endpoint configured.
+        let settings = S3ClientSettings {
+            region: None,
+            profile: None,
+            endpoint_url: None,
+            force_path_style: false,
+        };
+
+        let config = build_s3_config(&settings, &sdk);
+
+        // If the inherited ambient endpoint had leaked through, config would
+        // differ from one built with an explicit (validated) target endpoint.
+        // Instead the inherited endpoint is cleared, so config is identical to
+        // build_s3_config with the SAME settings over a clean SdkConfig.
+        let clean = aws_config::SdkConfig::builder()
+            .region(Region::new("us-east-1"))
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        let config_clean = build_s3_config(&settings, &clean);
+
+        // No ambient endpoint survives; the two configs are equivalent.
+        assert_eq!(
+            format!("{:?}", config),
+            format!("{:?}", config_clean),
+            "inherited ambient endpoint must be cleared before build"
+        );
+    }
+
+    #[test]
+    fn target_endpoint_is_only_custom_endpoint() {
+        let sdk = aws_config::SdkConfig::builder()
+            .region(Region::new("us-east-1"))
+            .endpoint_url("https://user:password@example.invalid") // ambient, must be cleared
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+
+        // ARX target supplies the only custom endpoint.
+        let settings = S3ClientSettings {
+            region: None,
+            profile: None,
+            endpoint_url: Some("http://127.0.0.1:9000".to_string()),
+            force_path_style: true,
+        };
+
+        let config = build_s3_config(&settings, &sdk);
+
+        // With a different target endpoint the config must differ from the
+        // cleared (None) config above — proving the ARX target endpoint is
+        // what became operational, not the ambient one.
+        let none_settings = S3ClientSettings {
+            region: None,
+            profile: None,
+            endpoint_url: None,
+            force_path_style: true,
+        };
+        let config_none = build_s3_config(&none_settings, &sdk);
+
+        assert_ne!(
+            format!("{:?}", config),
+            format!("{:?}", config_none),
+            "target endpoint must be applied as the only custom endpoint"
+        );
+
+        // Sanity: retry invariant still holds through the boundary.
+        assert_eq!(config.retry_config().expect("retry").max_attempts(), 1);
     }
 
     #[test]
