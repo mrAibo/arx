@@ -130,15 +130,45 @@ Location::S3 {
 ```
 
 - **[ARX DESIGN DECISION]** `bucket` is `Option<String>`, **not** an empty-string sentinel. `None` = target root (ListBuckets); `Some(name)` = bucket root or deeper. This avoids the `""`-vs-`bucket` ambiguity the prior draft used.
-- **[ARX DESIGN DECISION]** Path normalization rules (ARX-native, not a raw `String` everywhere):
-  - Internal prefix stored **without** leading or trailing `/`.
-  - Display as `s3://<bucket>/<prefix>/`.
-- **[ARX DESIGN DECISION — OPAQUE KEY SEMANTICS]** An S3 object key is **Unicode characters encoded in UTF-8, up to 1024 encoded bytes** (AWS/S3 FACT). ARX treats server-returned keys as **opaque identifiers**, never as filesystem paths:
-  - **Do not** collapse `.` or `..` segments inside a key. `foo/../bar` is a literal key, not a navigation escape.
-  - **Do not** collapse duplicate slashes. `foo//bar` is a distinct key from `foo/bar`; the double slash is preserved verbatim.
-  - **Do not** run filesystem path normalization (canonicalization, `.`/trailing-slash cleanup) on keys.
-  - Virtual parent navigation (`..` in the Commander) is computed by ARX for *browsing* only, using the current prefix; it is **separate** from exact key identity. The `Entry.name` shown in a listing is the last path segment after the current `delimiter="/"` — but the underlying key used for any operation is the full opaque key, never the display name.
-  - **Awkward keys** such as `foo//bar`, `foo/../bar`, `foo/./bar` may be displayed and listed, but some UI operations (e.g. renaming, prefix creation relative to them) may be explicitly unsupported or require exact-key handling. ARX must **never silently retarget** such a key to a different object (e.g. must not "fix" `foo/../bar` into `bar`). If an operation cannot safely handle an awkward key, ARX refuses it with a factual message rather than rewriting the key.
+- **[ARX DESIGN DECISION — EXACT LISTED-OBJECT IDENTITY (S3-DESIGN-FINAL-02)]** The generic `Entry { name, kind, size, modified_unix_ms }` is **presentation + listing metadata only**. ARX must never reconstruct an S3 operation target from `parent location + Entry.name` — unsafe for opaque keys (`foo/../bar`, `foo//bar`). Every listed S3 object/prefix carries an **exact provider-native reference**:
+
+```rust
+// conceptual only — no code change in this audit
+struct ListedEntry {
+    entry: Entry,            // presentation + metadata (name, kind, size, mtime)
+    identity: EntryIdentity, // exact operational reference
+}
+
+enum EntryIdentity {
+    S3Object(S3ObjectRef),
+    S3Prefix(S3PrefixRef),
+    Other, // Local/SFTP/Archive keep their existing identity model
+}
+
+struct S3ObjectRef {
+    target: String, // [[s3.targets]].id
+    bucket: String,
+    key: String,    // stored EXACTLY as returned by S3; never normalized
+}
+
+struct S3PrefixRef {
+    target: String,
+    bucket: String,
+    prefix: String, // exact listing/navigation prefix, e.g. "foo/bar"
+}
+```
+
+  - **Required invariant**: `Entry.name` is **presentation only** and **MUST NEVER be the authority** for S3 object operations. The `*Ref` is the authority.
+  - **F3 (preview)**: focused `ListedEntry` → `S3ObjectRef` → `GetObject` `Range` on the **exact key**.
+  - **F5 (download)**: `S3ObjectRef` → `TransferPlan` source identity (not a reconstructed path).
+  - **F8 (delete)**: confirmation **freezes the exact** `target + bucket + key`; never re-derived from `parent + display name`.
+  - **Navigation**: a `CommonPrefixes` entry becomes an `S3PrefixRef` (exact navigation prefix). The virtual `..` is a **navigation operation only**, never an S3 object key.
+  - **Awkward-key test model** (must be preserved exactly): `foo//bar`, `foo/../bar`, `foo/./bar`, Unicode names, and the folder marker `foo/` — display may be abbreviated, but the stored `key`/`prefix` remains the exact server value. ARX never silently retargets an awkward key to a different object.
+  - **Current helpers**: `validated_child_path()` and generic `Location::child(name)` **must not** be used to reconstruct existing S3 object identities (they remain valid for Local/SFTP). Newly created S3 prefix/object names use an S3-specific exact-key construction rule (see §17 for prefix markers).
+- **[ARX DESIGN DECISION — KEY vs NAVIGATION PREFIX (S3-DESIGN-FINAL-03)]** Distinguish two concepts explicitly:
+  - **`S3ObjectKey`**: the exact, opaque object key as returned by S3 (`S3ObjectRef.key`). Never normalized, never FS-interpreted.
+  - **`S3NavigationPrefix`**: the prefix ARX uses for `ListObjectsV2` (`prefix=`) and for `..`/enter navigation (`S3PrefixRef.prefix`). A navigation prefix may have a canonical UI representation (e.g. trailing-slash display).
+  - Storing a navigation prefix **without** a trailing slash is a UI/navigation representation choice — it does **not** normalize or modify any existing object key. If `ListObjectsV2` requires `foo/bar/` (trailing slash) while ARX stores `foo/bar` internally, that slash is **protocol/navigation construction**, not a change to object identity. The object key stays exactly what S3 returned.
 - **[OPEN QUESTION]** Root mode — see §12 decision. Recommended default is **option A** (target root lists buckets).
 
 ## 10. Provider instance model
@@ -153,40 +183,52 @@ Location::S3 {
 - **[ARX DESIGN DECISION]** Listing uses `ListObjectsV2` with `delimiter="/"`:
   - `Contents` → `Entry { kind: File, size, modified_unix_ms: LastModified }`
   - `CommonPrefixes` → `Entry { kind: Directory, size: None }` (virtual folder; no probe of child count)
-- **[ARX DESIGN DECISION]** **First-class continuation model (replaces the vague "list_async → Load More" sketch).** The S3 provider does **not** return a bare `Vec<Entry>` for paginated listings. It returns a `ListingPage`:
+- **[ARX DESIGN DECISION — TWO-LAYER PAGINATION (S3-DESIGN-FINAL-01)]** Provider pagination and pane correlation are **separate layers**. The `VfsProvider`/`S3Provider` must **not** depend on `PaneLoadId`, `Pane`, or `AppState`.
+
+**Provider layer (owns only provider-native state):**
 
 ```rust
 // conceptual only — no code change in this audit
-struct ListingPage {
-    entries: Vec<Entry>,
-    // None == end-of-list. Some(token) == more pages exist.
-    continuation: Option<ListingContinuation>,
+struct ProviderListingPage {
+    entries: Vec<ListedEntry>,           // see §9 identity model
+    continuation: Option<ProviderContinuation>,
 }
 
-struct ListingContinuation {
-    // Opaque, server-supplied token (NextContinuationToken) or replay state.
-    // ARX stores it verbatim; it never reconstructs or infers a token.
+struct ProviderContinuation {
+    // Opaque, provider-native only. For S3: exactly the server's
+    // NextContinuationToken, verbatim. No pane/UI state lives here.
     token: String,
-    // Bound to the exact source this continuation belongs to, so a stale
-    // token can never append data to a different navigation generation.
-    provider_instance: ProviderInstanceKey, // e.g. S3Target(id)
-    location: Location,                    // exact bucket + prefix
-    generation: PaneLoadId,                // the listing generation that opened it
 }
 ```
 
-  - **First-page load**: `PaneLoader::load(...)` issues a `ListObjectsV2` with `delimiter="/"` and a page cap; the response becomes a `ListingPage`. The `PaneLoadId` generation is recorded (see below).
-  - **Load-next-page**: only valid when `continuation.is_some()`. The next request resends `ListObjectsV2` with the **verbatim** `continuation.token` bound to the same `provider_instance` + `location` + `generation`. Appending is permitted only if the current pane still matches that exact triple; otherwise the continuation is discarded as stale.
-  - **Refresh**: re-issues a first-page load with a **new** generation id. Any in-flight continuation from the prior generation is invalidated (its `generation` no longer matches), so old pages cannot append to the refreshed view.
-  - **Navigation** (enter `..`, open a prefix, switch pane/target): opens a **new** generation. All prior continuations are stale by construction.
-  - **Cancellation**: a cancelled `load`/`load-next` drops its continuation; no background fetch resumes it.
-  - **End-of-list**: `continuation == None` → UI shows no "Load more"; repeated requests are no-ops.
-  - **No infinite loop**: if a provider returns `IsTruncated == true` but `continuation` is `None`, or returns a `token` identical to the one already consumed (non-advancing), ARX treats this as a **ProtocolError** and stops pagination with a factual message. It never re-requests the same token.
+**Registry / pane layer (owns correlation + staleness):**
 
-- **[ARX CURRENT FACT]** The staleness guard already exists for single loads: `AppState::accepts_pane_load` (src/app/mod.rs) rejects a `PaneLoadResponse` unless its `PaneLoadId` is still the pending one **and** its `Location` still matches the pane target (with an extra committed-location check for `Refresh`). The S3 continuation model extends this same generation+location binding to *each page*, so a slow/late page from a previous navigation can never append to the current view.
+```rust
+// conceptual only — no code change in this audit
+struct PaneListingContinuation {
+    provider_continuation: ProviderContinuation, // opaque token from provider
+    provider_instance: ProviderInstanceKey,       // e.g. S3Target(id)
+    location: Location,                           // exact bucket + prefix
+    generation: PaneLoadId,                       // owned by PaneLoader/AppState
+}
+```
+
+**Flow:**
+  - **First page**: `PaneLoader` allocates a `generation` → `registry.list_page(location, None)` → provider returns a `ProviderListingPage` with a `ProviderContinuation` → `PaneLoader`/`AppState` wraps it into a `PaneListingContinuation` adding `provider_instance` + exact `Location` + `generation`.
+  - **Next page**: `PaneLoader` verifies the current `generation`/`location` still match → unwraps the `provider_continuation.token` → `registry`/`provider` fetches the next page → the result is accepted **only if** the same `generation`/`location` hold; otherwise it is discarded as stale.
+  - **Refresh** / **Navigation** (enter `..`, open a prefix, switch pane/target): opens a **new** `generation`; all prior `PaneListingContinuation`s become stale by construction.
+  - **Cancellation**: a cancelled load/load-next drops its continuation; no background fetch resumes it.
+  - **End-of-list**: `continuation == None` → UI shows no "Load more"; repeated requests are no-ops.
+
+**NEVER:** `S3Provider` → `PaneLoadId`; `VfsProvider` → `Pane`; `VfsProvider` → `AppState`.
+
+- **[ARX CURRENT FACT]** The staleness guard already exists for single loads: `AppState::accepts_pane_load` (src/app/mod.rs) rejects a `PaneLoadResponse` unless its `PaneLoadId` is still the pending one **and** its `Location` still matches the pane target (with an extra committed-location check for `Refresh`). The S3 pagination model extends this same generation+location binding to *each page* at the **pane layer** (`PaneListingContinuation`), so a slow/late page from a previous navigation can never append to the current view.
+- **[ARX DESIGN DECISION — PROTOCOL + STALE SAFETY]** Two distinct failure classes:
+  - **ProtocolError**: a provider returns `IsTruncated == true` but `ProviderContinuation` is `None`, or returns a `token` identical to the one already consumed (non-advancing). Pagination stops with a factual message; ARX never re-requests the same token.
+  - **Stale discard**: a `PaneListingContinuation` whose `generation`/`location`/`provider_instance` no longer matches the current pane is dropped silently (no append).
 - **[ARX DESIGN DECISION]** Never block the TUI awaiting a full million-object enumeration. A page cap is the unit of work; `IsTruncated` + `NextContinuationToken` drive continuation.
 - **[WINSCP OBSERVATION]** WinSCP handles truncated responses and `NextMarker`; ARX adopts the continuation concept but keeps it incremental rather than eager, and binds every continuation to its listing generation.
-- **[AWS/S3 FACT]** Edge cases to handle explicitly: zero keys returned, `MaxKeys` present but empty, provider returning `CommonPrefixes` without `Contents`, keys that are not valid UTF-8 byte sequences.
+- **[AWS/S3 FACT]** Edge cases to handle explicitly: zero keys returned, `MaxKeys` present but empty, provider returning `CommonPrefixes` without `Contents`, **Unicode keys** (characters requiring safe API/XML/URL encoding, control-character representation, percent-encoding where the SDK/API requires it). ARX must **never** hand-normalize or decode a key into a different key; the AWS SDK owns wire encoding where possible.
 
 ## 12. Root / bucket / prefix navigation (DECISION)
 
