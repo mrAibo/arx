@@ -16,8 +16,9 @@
 
 ## Column summary
 
-- **READY** (1): S3-17
+- **READY** (0): —
 - **DOING** (0): —
+- **REVIEW** (1): S3-17
 - **BLOCKED** (0): —
 - **DONE** (17): S3-00..S3-16
 - **BACKLOG** (63): S3-18..S3-80
