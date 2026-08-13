@@ -16,11 +16,11 @@
 
 ## Column summary
 
-- **READY** (1): S3-20R
+- **READY** (1): S3-24
 - **DOING** (0): —
 - **REVIEW** (0): —
-- **BLOCKED** (1): S3-24
-- **DONE** (25): S3-00..S3-23, S3-24P (PR #98 merged, merge SHA 19d4c04)
+- **BLOCKED** (0): —
+- **DONE** (26): S3-00..S3-23, S3-24P (PR #98 merged, merge SHA 19d4c04), S3-20R (PR #99 merged, merge SHA pending)
 - **BACKLOG** (56): S3-25..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
@@ -290,7 +290,7 @@
 
 ### S3-20R — Reversible S3 navigation/wire-prefix delimiter seam
 - **Phase:** P9 correction / prerequisite for P10 prefix navigation
-- **Status:** DOING (review pending)
+- **Status:** DONE (PR #99 merged; merge SHA pending; independent review APPROVED 0/0/0/0, quality+msrv SUCCESS)
 - **Depends on:** S3-20, S3-21, S3-22
 - **Allowed files:** src/vfs/s3.rs, docs/DESIGN_S3.md, docs/S3_KANBAN.md
 - **Acceptance:**
@@ -327,8 +327,7 @@
 
 ### S3-24 — Enter S3PrefixRef
 - **Phase:** P10
-- **Status:** BLOCKED
-- **Blocker:** S3-20R (reversible delimiter seam must merge first)
+- **Status:** READY
 - **Depends on:** S3-23, S3-20R
 - **Allowed files:** src/app/actions.rs, src/tui.rs (tests only)
 - **Acceptance:** Navigate into `CommonPrefix` using exact `S3PrefixRef`; never reconstruct from presentation name. Remove exactly one final protocol `/` from the exact ref to form `Location::S3.prefix`, preserving every preceding byte, including `//`, `.`, `..`, spaces, and Unicode. Update the existing TUI integration regression so prefix rows navigate while S3 objects and S3 `Other` remain fail-closed. Prove exact ref `foo//` -> nav `foo/`; S3-20R separately proves nav `foo/` -> wire `foo//` (the composed round trip is exact). Because S3-20R now rejects any `CommonPrefix` lacking a trailing `/` (Delimiter="/"), S3-24 may accept only refs that passed that invariant and strip exactly one delimiter — no fallback for a `S3PrefixRef` without trailing `/`.
