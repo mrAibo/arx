@@ -16,8 +16,8 @@
 
 ## Column summary
 
-- **READY** (1): S3-22
-- **DOING** (0): —
+- **READY** (0): —
+- **DOING** (1): S3-22
 - **REVIEW** (0): —
 - **BLOCKED** (0): —
 - **DONE** (22): S3-00..S3-21
@@ -273,10 +273,18 @@
 
 ### S3-22 — Awkward key listing tests
 - **Phase:** P9
-- **Status:** READY
+- **Status:** DOING
 - **Depends on:** S3-20, S3-21
-- **Allowed files:** src/vfs/s3.rs (tests)
-- **Acceptance:** Fixture keys foo//bar.txt, foo/../bar.txt, foo/./bar.txt, space, Unicode, emoji, zero-byte, folder marker. Verify display may simplify presentation only; identity exact. Mocked OK.
+- **Allowed files:** src/vfs/s3.rs (TESTS ONLY), docs/S3_KANBAN.md
+- **Acceptance:**
+  - Test `ListObjectsV2` fixture mapping for awkward keys.
+  - Exact `S3ObjectRef.key` / `S3PrefixRef.prefix` always remains the exact provider value.
+  - `Entry.name` remains presentation-only.
+  - No test may derive expected operational identity from `Entry.name`.
+  - No `Path` / `PathBuf` / `components` / `canonicalize` / filesystem normalization.
+  - No AWS client/network.
+  - No production behavior modification.
+  - Existing S3-20/S3-21 folder-marker and pagination tests stay green.
 - **Stop conditions:** AWS integration required (must allow mocked).
 - **Hermes prompt:** Tests: awkward keys (foo//bar, foo/../bar, foo/./bar, spaces, Unicode, emoji, zero-byte, folder marker) preserve exact identity; display may simplify presentation only. Mocked.
 
