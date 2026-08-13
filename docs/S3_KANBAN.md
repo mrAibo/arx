@@ -16,12 +16,12 @@
 
 ## Column summary
 
-- **READY** (0): —
+- **READY** (1): S3-22
 - **DOING** (0): —
-- **REVIEW** (1): S3-21
+- **REVIEW** (0): —
 - **BLOCKED** (0): —
-- **DONE** (21): S3-00..S3-20
-- **BACKLOG** (59): S3-22..S3-80
+- **DONE** (22): S3-00..S3-21
+- **BACKLOG** (58): S3-23..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
 
@@ -251,7 +251,7 @@
 
 ### S3-21 — ListObjectsV2 pagination
 - **Phase:** P9
-- **Status:** REVIEW
+- **Status:** DONE
 - **Depends on:** S3-20
 - **Allowed files:** src/vfs/s3.rs, docs/S3_KANBAN.md
 - **Acceptance:**
@@ -273,7 +273,7 @@
 
 ### S3-22 — Awkward key listing tests
 - **Phase:** P9
-- **Status:** BACKLOG
+- **Status:** READY
 - **Depends on:** S3-20, S3-21
 - **Allowed files:** src/vfs/s3.rs (tests)
 - **Acceptance:** Fixture keys foo//bar.txt, foo/../bar.txt, foo/./bar.txt, space, Unicode, emoji, zero-byte, folder marker. Verify display may simplify presentation only; identity exact. Mocked OK.
