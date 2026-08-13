@@ -321,14 +321,6 @@ impl VfsProvider for S3Provider {
         location: &Location,
         continuation: Option<&ProviderContinuation>,
     ) -> io::Result<ProviderListingPage> {
-        // S3-19 owns continuation consumption / next-page fetching.
-        if continuation.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "S3 ListBuckets continuation not supported until S3-19",
-            ));
-        }
-
         // Pure offline classification: enforce target binding + exact root form
         // BEFORE any AWS work. Bucket-bound targets cannot reach ListBuckets;
         // malformed root prefixes fail closed (never normalized).
@@ -336,11 +328,34 @@ impl VfsProvider for S3Provider {
 
         match scope {
             S3ListingScope::TargetRoot => {
+                // Validate the incoming continuation token offline, before the
+                // AWS client is built. An empty token is a local protocol error;
+                // ListBuckets has no independent has-more signal, so we never
+                // invent one.
+                let consumed = match continuation {
+                    Some(c) if c.token.is_empty() => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "S3 ListBuckets pagination protocol error: empty continuation token",
+                        ));
+                    }
+                    Some(c) => Some(c.token.as_str()),
+                    None => None,
+                };
+
                 // S3-17 lazy per-target lifecycle: only this boundary builds the
-                // client. The only ListBuckets .send() permitted in S3-18.
+                // client. Exactly one bounded ListBuckets .send() per page.
                 let client = self.client().await?;
-                let output = list_buckets_first_page(client).await?;
-                map_list_buckets_first_page(&self.target.id, &output)
+                let output = list_buckets_page(client, consumed).await?;
+                let page = map_list_buckets_page(&self.target.id, &output)?;
+                // Output continuation protocol: None => end-of-list; Some => next
+                // page. Repeated/empty token is a ProtocolError (no loop).
+                let continuation =
+                    next_list_buckets_continuation(consumed, output.continuation_token())?;
+                Ok(ProviderListingPage {
+                    entries: page.entries,
+                    continuation,
+                })
             }
             S3ListingScope::Bucket { bucket, prefix } => {
                 // Bucket/prefix object listing is ListObjectsV2 (S3-20).
@@ -357,25 +372,67 @@ impl VfsProvider for S3Provider {
     }
 }
 
-/// Bounded page size for the first (and, in S3-18, only) ListBuckets request.
-// ponytail: stays well under the 10k quota ceiling; S3-19 owns pagination.
+/// Bounded page size for every ListBuckets request (first and next pages).
+// ponytail: stays well under the 10k quota ceiling; one page is the unit of work.
 const LIST_BUCKETS_PAGE_SIZE: i32 = 1000;
 
-/// One bounded, unpaginated ListBuckets request. The only `.send()` permitted
-/// in S3-18 production code. No continuation token (S3-19 consumes those).
-async fn list_buckets_first_page(client: &Client) -> io::Result<ListBucketsOutput> {
-    client
-        .list_buckets()
-        .max_buckets(LIST_BUCKETS_PAGE_SIZE)
+/// One bounded ListBuckets request. Exactly one `.send()` per invocation.
+/// `continuation` (verbatim token) is applied as `ContinuationToken` when
+/// present; absent for the first page. No loop, no paginator helper.
+async fn list_buckets_page(
+    client: &Client,
+    continuation: Option<&str>,
+) -> io::Result<ListBucketsOutput> {
+    let mut request = client.list_buckets().max_buckets(LIST_BUCKETS_PAGE_SIZE);
+    if let Some(token) = continuation {
+        request = request.continuation_token(token);
+    }
+    request
         .send()
         .await
         .map_err(|e| io::Error::other(format!("S3 ListBuckets failed: {}", e)))
 }
 
+/// Pure output-continuation protocol for ListBuckets. No network.
+///
+/// ListBuckets exposes no independent `IsTruncated`/`has-more` signal: the
+/// presence/absence of `ContinuationToken` IS the end-of-list decision.
+/// `None` => end-of-list. `Some` => next page. An empty/unusable returned
+/// token, or one identical to the consumed token (non-advancing), is a
+/// ProtocolError — never re-requested, so no infinite loop.
+// ponytail: token values are never echoed into errors (ProviderContinuation is
+// opaque/provider-owned); only a factual "did not advance" message is safe.
+fn next_list_buckets_continuation(
+    consumed: Option<&str>,
+    returned: Option<&str>,
+) -> io::Result<Option<ProviderContinuation>> {
+    match returned {
+        None => Ok(None),
+        Some(next) => {
+            if next.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "S3 ListBuckets pagination protocol error: empty returned token",
+                ));
+            }
+            if Some(next) == consumed {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "S3 ListBuckets pagination protocol error: continuation token did not advance",
+                ));
+            }
+            Ok(Some(ProviderContinuation {
+                token: next.to_string(),
+            }))
+        }
+    }
+}
+
 /// Pure AWS-response → provider-page mapping. No network, no SDK config dump.
 /// Every usable bucket name becomes exactly one `ListedEntry` with an exact
 /// `S3BucketRef` identity. Skips name-less records; never invents one.
-fn map_list_buckets_first_page(
+/// Continuation is handled separately by `next_list_buckets_continuation`.
+fn map_list_buckets_page(
     target_id: &str,
     output: &ListBucketsOutput,
 ) -> io::Result<ProviderListingPage> {
@@ -398,13 +455,9 @@ fn map_list_buckets_first_page(
             }),
         });
     }
-
-    let continuation = output.continuation_token().map(|t| ProviderContinuation {
-        token: t.to_string(),
-    });
     Ok(ProviderListingPage {
         entries,
-        continuation,
+        continuation: None,
     })
 }
 
@@ -761,7 +814,7 @@ mod tests {
         let out = ListBucketsOutput::builder()
             .buckets(bucket_named("company-artifacts"))
             .build();
-        let page = map_list_buckets_first_page("aws-prod", &out).unwrap();
+        let page = map_list_buckets_page("aws-prod", &out).unwrap();
         assert_eq!(page.entries.len(), 1);
         let le = &page.entries[0];
         assert_eq!(le.entry.name, "company-artifacts");
@@ -784,7 +837,7 @@ mod tests {
             .buckets(bucket_named("b"))
             .buckets(bucket_named("c"))
             .build();
-        let page = map_list_buckets_first_page("t", &out).unwrap();
+        let page = map_list_buckets_page("t", &out).unwrap();
         assert_eq!(page.entries.len(), 3);
         let names: Vec<&str> = page.entries.iter().map(|e| e.entry.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
@@ -802,7 +855,7 @@ mod tests {
         let out = ListBucketsOutput::builder()
             .buckets(bucket_named("Company-Artifacts"))
             .build();
-        let page = map_list_buckets_first_page("t", &out).unwrap();
+        let page = map_list_buckets_page("t", &out).unwrap();
         assert_eq!(page.entries[0].entry.name, "Company-Artifacts");
         match &page.entries[0].identity {
             crate::vfs::EntryIdentity::S3Bucket(b) => {
@@ -817,7 +870,7 @@ mod tests {
         let out = ListBucketsOutput::builder()
             .buckets(bucket_named("my.bucket-01_example"))
             .build();
-        let page = map_list_buckets_first_page("t", &out).unwrap();
+        let page = map_list_buckets_page("t", &out).unwrap();
         assert_eq!(page.entries[0].entry.name, "my.bucket-01_example");
     }
 
@@ -829,20 +882,18 @@ mod tests {
             .buckets(Bucket::builder().build()) // no name set
             .buckets(bucket_named("real-bucket"))
             .build();
-        let page = map_list_buckets_first_page("t", &out).unwrap();
+        let page = map_list_buckets_page("t", &out).unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].entry.name, "real-bucket");
     }
 
     #[test]
     fn map_continuation_token_preserved_verbatim() {
-        let out = ListBucketsOutput::builder()
-            .buckets(bucket_named("a"))
-            .continuation_token("  opaque+/=token 日本語  ")
-            .build();
-        let page = map_list_buckets_first_page("t", &out).unwrap();
+        // Continuation preservation is now owned by next_list_buckets_continuation;
+        // the opaque token must survive verbatim (no trim/normalize).
+        let cont = next_list_buckets_continuation(None, Some("  opaque+/=token 日本語  ")).unwrap();
         assert_eq!(
-            page.continuation.as_ref().map(|c| c.token.as_str()),
+            cont.as_ref().map(|c| c.token.as_str()),
             Some("  opaque+/=token 日本語  ")
         );
     }
@@ -852,7 +903,7 @@ mod tests {
         let out = ListBucketsOutput::builder()
             .buckets(bucket_named("only"))
             .build();
-        let page = map_list_buckets_first_page("exact-target-id", &out).unwrap();
+        let page = map_list_buckets_page("exact-target-id", &out).unwrap();
         match &page.entries[0].identity {
             crate::vfs::EntryIdentity::S3Bucket(b) => assert_eq!(b.target, "exact-target-id"),
             other => panic!("expected S3Bucket, got {:?}", other),
@@ -864,7 +915,7 @@ mod tests {
         let out = ListBucketsOutput::builder()
             .buckets(bucket_named("a"))
             .build();
-        let page = map_list_buckets_first_page("t", &out).unwrap();
+        let page = map_list_buckets_page("t", &out).unwrap();
         assert!(page.continuation.is_none());
     }
 
@@ -976,6 +1027,111 @@ mod tests {
         let l = loc("other-target", None, "");
         let err = p.classify_listing_location(&l).unwrap_err();
         assert!(matches!(err.kind(), io::ErrorKind::NotFound));
+        assert!(p.client.get().is_none());
+    }
+
+    // ── S3-19: ListBuckets pagination protocol (offline) ──
+
+    #[test]
+    fn first_page_no_return_token_is_end() {
+        assert!(
+            next_list_buckets_continuation(None, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn first_page_return_token_preserved() {
+        let c = next_list_buckets_continuation(None, Some("opaque-token"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.token, "opaque-token");
+    }
+
+    #[test]
+    fn next_page_advancing_token() {
+        let c = next_list_buckets_continuation(Some("token-A"), Some("token-B"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.token, "token-B");
+    }
+
+    #[test]
+    fn final_next_page_is_end() {
+        assert!(
+            next_list_buckets_continuation(Some("token-A"), None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn repeated_token_protocol_error() {
+        let err = next_list_buckets_continuation(Some("token-A"), Some("token-A")).unwrap_err();
+        assert!(matches!(err.kind(), io::ErrorKind::InvalidData));
+        // No token value echoed into the message.
+        assert!(!err.to_string().contains("token-A"));
+    }
+
+    #[test]
+    fn empty_returned_token_protocol_error() {
+        let err = next_list_buckets_continuation(Some("token-A"), Some("")).unwrap_err();
+        assert!(matches!(err.kind(), io::ErrorKind::InvalidData));
+    }
+
+    #[test]
+    fn opaque_input_token_preserved() {
+        // Punctuation / non-ASCII / whitespace must survive verbatim.
+        let token = "  opaque+/=token 日本語  ";
+        let c = next_list_buckets_continuation(None, Some(token))
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.token, token);
+    }
+
+    // ── S3-19 regression (NIT from S3-18): bucket-bound via PUBLIC list_page ──
+
+    #[tokio::test]
+    async fn bucket_bound_list_page_stays_offline() {
+        let p = S3Provider::new(bound_target("company-artifacts"));
+        let l = Location::S3 {
+            target: "t".to_string(),
+            bucket: Some("company-artifacts".to_string()),
+            prefix: String::new(),
+        };
+        let err = p.list_page(&l, None).await.unwrap_err();
+        assert!(matches!(err.kind(), io::ErrorKind::Unsupported));
+        // Least-privilege invariant: no client init, no ListBuckets before S3-20.
+        assert!(p.client.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn bucket_bound_no_account_root_via_list_page() {
+        let p = S3Provider::new(bound_target("company-artifacts"));
+        let l = Location::S3 {
+            target: "t".to_string(),
+            bucket: None,
+            prefix: String::new(),
+        };
+        let err = p.list_page(&l, None).await.unwrap_err();
+        assert!(matches!(err.kind(), io::ErrorKind::NotFound));
+        assert!(p.client.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_consumed_token_rejected_offline() {
+        let p = S3Provider::new(root_target());
+        let l = Location::S3 {
+            target: "t".to_string(),
+            bucket: None,
+            prefix: String::new(),
+        };
+        let cont = ProviderContinuation {
+            token: String::new(),
+        };
+        let err = p.list_page(&l, Some(&cont)).await.unwrap_err();
+        assert!(matches!(err.kind(), io::ErrorKind::InvalidData));
         assert!(p.client.get().is_none());
     }
 }

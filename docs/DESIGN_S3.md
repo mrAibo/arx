@@ -206,8 +206,9 @@ struct ProviderListingPage {
 }
 
 struct ProviderContinuation {
-    // Opaque, provider-native only. For S3: exactly the server's
-    // NextContinuationToken, verbatim. No pane/UI state lives here.
+    // Opaque, provider-native only. For S3: exactly the server continuation
+    // token for the active listing operation — ListBuckets ContinuationToken
+    // or ListObjectsV2 NextContinuationToken, verbatim. No pane/UI state lives here.
     token: String,
 }
 ```
@@ -234,10 +235,12 @@ struct PaneListingContinuation {
 **NEVER:** `S3Provider` → `PaneLoadId`; `VfsProvider` → `Pane`; `VfsProvider` → `AppState`.
 
 - **[ARX CURRENT FACT]** The staleness guard already exists for single loads: `AppState::accepts_pane_load` (src/app/mod.rs) rejects a `PaneLoadResponse` unless its `PaneLoadId` is still the pending one **and** its `Location` still matches the pane target (with an extra committed-location check for `Refresh`). The S3 pagination model extends this same generation+location binding to *each page* at the **pane layer** (`PaneListingContinuation`), so a slow/late page from a previous navigation can never append to the current view.
-- **[ARX DESIGN DECISION — PROTOCOL + STALE SAFETY]** Two distinct failure classes (apply to **both** `ListBuckets` and `ListObjectsV2`):
-  - **ProtocolError**: a provider returns a truncated/has-more response but `ProviderContinuation` is `None`, or returns a `token` identical to the one already consumed (non-advancing). Pagination stops with a factual message; ARX never re-requests the same token. **No infinite-loop.**
+- **[ARX DESIGN DECISION — PROTOCOL + STALE SAFETY]** Two distinct failure classes:
+  - **ProtocolError** (operation-specific continuation semantics):
+    - **LISTBUCKETS**: the `ListBuckets` response exposes `ContinuationToken` (no independent `IsTruncated`/`has-more` signal exists). `ContinuationToken == None` ⇒ end-of-list; `ContinuationToken == Some(token)` ⇒ another page is available. A returned token that is empty/unusable, or identical to the token already consumed (non-advancing), is a **ProtocolError** → pagination stops with a factual message; ARX never re-requests the same token. **No infinite-loop.**
+    - **LISTOBJECTSV2**: `IsTruncated == true` **must** carry a usable `NextContinuationToken`; a truncated page without one, or a `NextContinuationToken` that repeats (does not advance), is a **ProtocolError** → pagination stops. **No infinite-loop.** (Full ListObjectsV2 continuation model lands in S3-21.)
   - **Stale discard**: a `PaneListingContinuation` whose `generation`/`location`/`provider_instance` no longer matches the current pane is dropped silently (no append).
-- **[ARX DESIGN DECISION]** Never block the TUI awaiting a full million-object enumeration. A page cap is the unit of work; `IsTruncated` + `NextContinuationToken` drive continuation.
+- **[ARX DESIGN DECISION]** Never block the TUI awaiting a full million-object enumeration. A page cap is the unit of work; each listing operation uses its provider-native continuation semantics defined above.
 - **[WINSCP OBSERVATION]** WinSCP handles truncated responses and `NextMarker`; ARX adopts the continuation concept but keeps it incremental rather than eager, and binds every continuation to its listing generation.
 - **[AWS/S3 FACT]** Edge cases to handle explicitly: zero keys returned, `MaxKeys` present but empty, provider returning `CommonPrefixes` without `Contents`, **Unicode keys** (characters requiring safe API/XML/URL encoding, control-character representation, percent-encoding where the SDK/API requires it). ARX must **never** hand-normalize or decode a key into a different key; the AWS SDK owns wire encoding where possible.
 

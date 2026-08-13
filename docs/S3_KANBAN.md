@@ -18,10 +18,10 @@
 
 - **READY** (0): —
 - **DOING** (0): —
-- **REVIEW** (1): S3-18
+- **REVIEW** (1): S3-19
 - **BLOCKED** (0): —
-- **DONE** (18): S3-00..S3-17
-- **BACKLOG** (62): S3-19..S3-80
+- **DONE** (19): S3-00..S3-18
+- **BACKLOG** (61): S3-20..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
 
@@ -209,12 +209,22 @@
 
 ### S3-19 — ListBuckets pagination
 - **Phase:** P8
-- **Status:** BACKLOG
+- **Status:** REVIEW
 - **Depends on:** S3-18
 - **Allowed files:** src/vfs/s3.rs
-- **Acceptance:** Support ContinuationToken via ProviderContinuation=>ProviderListingPage. Safety: has-more+no token=>ProtocolError; repeated/non-advancing token=>ProtocolError; no infinite loop; no eager full load.
-- **Stop conditions:** Eager load all buckets.
-- **Hermes prompt:** ListBuckets pagination via ProviderContinuation. ProtocolError on missing/non-advancing token. No infinite loop, no eager full load.
+- **Acceptance:** Incremental ListBuckets pagination via ProviderContinuation.
+  - ProviderContinuation.token passed verbatim as ListBuckets ContinuationToken (no trim/decode/normalize).
+  - Every request bounded by LIST_BUCKETS_PAGE_SIZE (1000).
+  - Returned ContinuationToken == None => end-of-list.
+  - Returned ContinuationToken == Some(token) => another page available.
+  - Empty returned token => ProtocolError (InvalidData).
+  - Returned token identical to consumed token => ProtocolError (non-advancing).
+  - Empty consumed token => local InvalidData before client/AWS request.
+  - Exactly one ListBuckets request per list_page invocation.
+  - No loop / no eager account enumeration.
+  - NO independent IsTruncated/has-more signal for ListBuckets — do not invent one.
+- **Stop conditions:** Eager loop, paginator helper, full-account load, ListObjectsV2 (S3-20/21).
+- **Hermes prompt:** Implement incremental ListBuckets pagination via exact ContinuationToken. None=end; advancing Some=next page; reject empty/non-advancing tokens. One bounded request per invocation. No IsTruncated/has-more signal, no eager loop.
 
 ### S3-20 — ListObjectsV2 first page
 - **Phase:** P9
