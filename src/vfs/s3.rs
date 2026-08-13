@@ -1,13 +1,16 @@
 //! S3/MinIO VfsProvider stub + AWS client factory (S3-16).
 use crate::config::S3TargetConfig;
-use crate::vfs::{Entry, VfsOps, VfsProvider};
+use crate::config::sanitize_diag;
+use crate::vfs::{
+    Entry, EntryIdentity, EntryKind, ListedEntry, Location, ProviderContinuation,
+    ProviderListingPage, VfsOps, VfsProvider,
+};
 use aws_config::BehaviorVersion;
+use aws_config::Region;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Builder, retry::RetryConfig};
+use aws_sdk_s3::operation::list_buckets::ListBucketsOutput;
 use std::io;
-// ponytail: reqwest already a dependency; use its Url for endpoint validation
-// (no new dep). aws_sdk_s3 re-exports its own Region via aws_types.
-use aws_config::Region;
 
 pub struct S3Fs;
 /// Per-configured-target S3 provider.
@@ -35,14 +38,112 @@ impl S3Provider {
     ///
     /// Routes through the S3-16 `client_for_target` security/config boundary;
     /// never duplicates region/profile/endpoint/retry logic here.
-    // ponytail: called by S3-18+ operations; intentionally unused in S3-17.
-    #[allow(dead_code)]
     pub(crate) async fn client(&self) -> io::Result<&aws_sdk_s3::Client> {
         self.client
             .get_or_try_init(|| client_for_target(&self.target))
             .await
             .map_err(|e| io::Error::new(e.kind(), e.to_string()))
     }
+
+    /// Pure decision boundary: which listing shape does this location request?
+    ///
+    /// Enforces the configured target binding and the exact target-root form
+    /// BEFORE any AWS work, so a bucket-bound target can never trigger
+    /// `s3:ListAllMyBuckets` and a malformed root prefix can never widen into
+    /// an account-root ListBuckets. Performs no network; initializes no client.
+    // ponytail: single guard point; all callers route through this, so a
+    // sibling list path cannot forget the binding/prefix checks.
+    fn classify_listing_location<'a>(
+        &'a self,
+        location: &'a Location,
+    ) -> io::Result<S3ListingScope<'a>> {
+        let (target, bucket, prefix) = match location {
+            Location::S3 {
+                target,
+                bucket,
+                prefix,
+            } => (target, bucket, prefix),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "S3Provider::list_page requires Location::S3",
+                ));
+            }
+        };
+
+        // Exact target id (no trim/lowercase/normalization).
+        if target != &self.target.id {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("S3 target mismatch: {}", sanitize_diag(target)),
+            ));
+        }
+
+        // Configured bucket binding: a bucket-bound target must never reach
+        // account-root ListBuckets, and must not escape to another bucket.
+        match &self.target.bucket {
+            Some(bound) => {
+                let Some(requested) = bucket else {
+                    // bucket == None on a bucket-bound target: fail closed,
+                    // never silently widen to ListAllMyBuckets.
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "S3 target {} is bucket-bound; account-root listing forbidden",
+                            sanitize_diag(&self.target.id)
+                        ),
+                    ));
+                };
+                if requested != bound {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "S3 bucket escape rejected: target bound to {}, requested {}",
+                            sanitize_diag(bound),
+                            sanitize_diag(requested)
+                        ),
+                    ));
+                }
+                // Bucket-bound location is valid but object listing (ListObjectsV2)
+                // is S3-20.
+                Ok(S3ListingScope::Bucket {
+                    bucket: requested,
+                    prefix,
+                })
+            }
+            None => {
+                // Account-style target: ListBuckets only for the exact root
+                // shape (bucket == None AND prefix == ""). A non-empty prefix
+                // on a root is contradictory (prefix lives inside a bucket) and
+                // must fail closed, never normalized into "".
+                if bucket.is_some() {
+                    return Ok(S3ListingScope::Bucket {
+                        bucket: bucket.as_deref().unwrap(),
+                        prefix,
+                    });
+                }
+                if !prefix.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "S3 target-root listing requires empty prefix, got {}",
+                            sanitize_diag(prefix)
+                        ),
+                    ));
+                }
+                Ok(S3ListingScope::TargetRoot)
+            }
+        }
+    }
+}
+
+/// Listing scope decision produced by `classify_listing_location`.
+// ponytail: no filesystem semantics; `Bucket` here is the S3 listing scope,
+// distinct from filesystem directory traversal.
+#[derive(Debug, Clone, Copy)]
+enum S3ListingScope<'a> {
+    TargetRoot,
+    Bucket { bucket: &'a str, prefix: &'a str },
 }
 
 impl std::fmt::Debug for S3Provider {
@@ -197,6 +298,7 @@ pub(crate) async fn client_for_target(target: &S3TargetConfig) -> io::Result<Cli
     Ok(Client::from_conf(build_s3_config(&settings, &sdk_config)))
 }
 
+#[async_trait::async_trait]
 impl VfsProvider for S3Provider {
     fn list(&self, _path: &str) -> io::Result<Vec<Entry>> {
         Err(io::Error::other("S3: not implemented"))
@@ -213,6 +315,97 @@ impl VfsProvider for S3Provider {
     fn delete_files(&self, _dir: &str, _names: &[String]) -> io::Result<usize> {
         Err(io::Error::other("S3: not implemented"))
     }
+
+    async fn list_page(
+        &self,
+        location: &Location,
+        continuation: Option<&ProviderContinuation>,
+    ) -> io::Result<ProviderListingPage> {
+        // S3-19 owns continuation consumption / next-page fetching.
+        if continuation.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "S3 ListBuckets continuation not supported until S3-19",
+            ));
+        }
+
+        // Pure offline classification: enforce target binding + exact root form
+        // BEFORE any AWS work. Bucket-bound targets cannot reach ListBuckets;
+        // malformed root prefixes fail closed (never normalized).
+        let scope = self.classify_listing_location(location)?;
+
+        match scope {
+            S3ListingScope::TargetRoot => {
+                // S3-17 lazy per-target lifecycle: only this boundary builds the
+                // client. The only ListBuckets .send() permitted in S3-18.
+                let client = self.client().await?;
+                let output = list_buckets_first_page(client).await?;
+                map_list_buckets_first_page(&self.target.id, &output)
+            }
+            S3ListingScope::Bucket { bucket, prefix } => {
+                // Bucket/prefix object listing is ListObjectsV2 (S3-20).
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "S3 bucket object listing requires S3-20 (ListObjectsV2): bucket={}, prefix={}",
+                        sanitize_diag(bucket),
+                        sanitize_diag(prefix)
+                    ),
+                ))
+            }
+        }
+    }
+}
+
+/// Bounded page size for the first (and, in S3-18, only) ListBuckets request.
+// ponytail: stays well under the 10k quota ceiling; S3-19 owns pagination.
+const LIST_BUCKETS_PAGE_SIZE: i32 = 1000;
+
+/// One bounded, unpaginated ListBuckets request. The only `.send()` permitted
+/// in S3-18 production code. No continuation token (S3-19 consumes those).
+async fn list_buckets_first_page(client: &Client) -> io::Result<ListBucketsOutput> {
+    client
+        .list_buckets()
+        .max_buckets(LIST_BUCKETS_PAGE_SIZE)
+        .send()
+        .await
+        .map_err(|e| io::Error::other(format!("S3 ListBuckets failed: {}", e)))
+}
+
+/// Pure AWS-response → provider-page mapping. No network, no SDK config dump.
+/// Every usable bucket name becomes exactly one `ListedEntry` with an exact
+/// `S3BucketRef` identity. Skips name-less records; never invents one.
+fn map_list_buckets_first_page(
+    target_id: &str,
+    output: &ListBucketsOutput,
+) -> io::Result<ProviderListingPage> {
+    let mut entries = Vec::new();
+    for bucket in output.buckets() {
+        // No name => malformed/unusable record; skip, never invent identity.
+        let Some(name) = bucket.name() else {
+            continue;
+        };
+        entries.push(ListedEntry {
+            entry: Entry {
+                name: name.to_string(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Bucket(S3BucketRef {
+                target: target_id.to_string(),
+                bucket: name.to_string(),
+            }),
+        });
+    }
+
+    let continuation = output.continuation_token().map(|t| ProviderContinuation {
+        token: t.to_string(),
+    });
+    Ok(ProviderListingPage {
+        entries,
+        continuation,
+    })
 }
 
 // Old VfsOps stub kept for compat
@@ -552,5 +745,237 @@ mod tests {
         assert!(!dbg.contains("127.0.0.1"));
         assert!(!dbg.contains("9000"));
         assert!(dbg.contains("client_initialized"));
+    }
+
+    // ── S3-18: ListBuckets first-page mapping (offline, pure fixtures) ──
+
+    use aws_sdk_s3::operation::list_buckets::ListBucketsOutput;
+    use aws_sdk_s3::types::Bucket;
+
+    fn bucket_named(name: &str) -> Bucket {
+        Bucket::builder().name(name).build()
+    }
+
+    #[test]
+    fn map_one_bucket_presentation_and_identity() {
+        let out = ListBucketsOutput::builder()
+            .buckets(bucket_named("company-artifacts"))
+            .build();
+        let page = map_list_buckets_first_page("aws-prod", &out).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        let le = &page.entries[0];
+        assert_eq!(le.entry.name, "company-artifacts");
+        assert_eq!(le.entry.kind, crate::vfs::EntryKind::Directory);
+        assert_eq!(le.entry.size, None);
+        assert_eq!(le.entry.modified_unix_ms, None);
+        match &le.identity {
+            crate::vfs::EntryIdentity::S3Bucket(b) => {
+                assert_eq!(b.target, "aws-prod");
+                assert_eq!(b.bucket, "company-artifacts");
+            }
+            other => panic!("expected S3Bucket identity, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn map_multiple_buckets_stable_one_to_one() {
+        let out = ListBucketsOutput::builder()
+            .buckets(bucket_named("a"))
+            .buckets(bucket_named("b"))
+            .buckets(bucket_named("c"))
+            .build();
+        let page = map_list_buckets_first_page("t", &out).unwrap();
+        assert_eq!(page.entries.len(), 3);
+        let names: Vec<&str> = page.entries.iter().map(|e| e.entry.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+        // every entry carries exact identity with the same target id
+        for le in &page.entries {
+            match &le.identity {
+                crate::vfs::EntryIdentity::S3Bucket(b) => assert_eq!(b.target, "t"),
+                other => panic!("expected S3Bucket, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn map_exact_case_preserved() {
+        let out = ListBucketsOutput::builder()
+            .buckets(bucket_named("Company-Artifacts"))
+            .build();
+        let page = map_list_buckets_first_page("t", &out).unwrap();
+        assert_eq!(page.entries[0].entry.name, "Company-Artifacts");
+        match &page.entries[0].identity {
+            crate::vfs::EntryIdentity::S3Bucket(b) => {
+                assert_eq!(b.bucket, "Company-Artifacts")
+            }
+            other => panic!("expected S3Bucket, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn map_exact_punctuation_preserved() {
+        let out = ListBucketsOutput::builder()
+            .buckets(bucket_named("my.bucket-01_example"))
+            .build();
+        let page = map_list_buckets_first_page("t", &out).unwrap();
+        assert_eq!(page.entries[0].entry.name, "my.bucket-01_example");
+    }
+
+    #[test]
+    fn map_missing_name_skipped_no_invented_identity() {
+        // A bucket record without a name must be skipped, not turned into an
+        // empty-string operational identity.
+        let out = ListBucketsOutput::builder()
+            .buckets(Bucket::builder().build()) // no name set
+            .buckets(bucket_named("real-bucket"))
+            .build();
+        let page = map_list_buckets_first_page("t", &out).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].entry.name, "real-bucket");
+    }
+
+    #[test]
+    fn map_continuation_token_preserved_verbatim() {
+        let out = ListBucketsOutput::builder()
+            .buckets(bucket_named("a"))
+            .continuation_token("  opaque+/=token 日本語  ")
+            .build();
+        let page = map_list_buckets_first_page("t", &out).unwrap();
+        assert_eq!(
+            page.continuation.as_ref().map(|c| c.token.as_str()),
+            Some("  opaque+/=token 日本語  ")
+        );
+    }
+
+    #[test]
+    fn map_target_id_copied_everywhere() {
+        let out = ListBucketsOutput::builder()
+            .buckets(bucket_named("only"))
+            .build();
+        let page = map_list_buckets_first_page("exact-target-id", &out).unwrap();
+        match &page.entries[0].identity {
+            crate::vfs::EntryIdentity::S3Bucket(b) => assert_eq!(b.target, "exact-target-id"),
+            other => panic!("expected S3Bucket, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn map_no_continuation_when_absent() {
+        let out = ListBucketsOutput::builder()
+            .buckets(bucket_named("a"))
+            .build();
+        let page = map_list_buckets_first_page("t", &out).unwrap();
+        assert!(page.continuation.is_none());
+    }
+
+    // ── S3-18 correction: pure root-semantics classification (offline) ──
+
+    fn loc(target: &str, bucket: Option<&str>, prefix: &str) -> Location {
+        Location::S3 {
+            target: target.to_string(),
+            bucket: bucket.map(|b| b.to_string()),
+            prefix: prefix.to_string(),
+        }
+    }
+    fn bound_target(bucket: &str) -> S3TargetConfig {
+        S3TargetConfig {
+            id: "t".into(),
+            name: "test".into(),
+            bucket: Some(bucket.to_string()),
+            region: None,
+            profile: None,
+            endpoint_url: None,
+            force_path_style: false,
+        }
+    }
+    fn root_target() -> S3TargetConfig {
+        S3TargetConfig {
+            id: "t".into(),
+            name: "test".into(),
+            bucket: None,
+            region: None,
+            profile: None,
+            endpoint_url: None,
+            force_path_style: false,
+        }
+    }
+
+    #[test]
+    fn account_target_exact_root_allowed() {
+        let p = S3Provider::new(root_target());
+        let l = loc("t", None, "");
+        let r = p.classify_listing_location(&l);
+        assert!(matches!(r, Ok(S3ListingScope::TargetRoot)));
+    }
+
+    #[test]
+    fn account_target_root_with_prefix_rejected() {
+        // Prefixes live inside a bucket; a non-empty root prefix is contradictory
+        // and must fail closed (never normalized into "").
+        for prefix in ["foo", "foo//bar", "foo/../bar", "/"] {
+            let p = S3Provider::new(root_target());
+            let l = loc("t", None, prefix);
+            let err = p.classify_listing_location(&l).unwrap_err();
+            assert!(
+                matches!(err.kind(), io::ErrorKind::InvalidInput),
+                "prefix {prefix:?} should reject, got {err:?}"
+            );
+            // Client must stay uninitialized on the rejected path.
+            assert!(p.client.get().is_none());
+        }
+    }
+
+    #[test]
+    fn bucket_bound_target_cannot_enter_account_root() {
+        let p = S3Provider::new(bound_target("company-artifacts"));
+        let l = loc("t", None, "");
+        let err = p.classify_listing_location(&l).unwrap_err();
+        assert!(matches!(err.kind(), io::ErrorKind::NotFound));
+        // Never reaches ListBuckets; client stays uninitialized.
+        assert!(p.client.get().is_none());
+    }
+
+    #[test]
+    fn bucket_bound_exact_bucket_is_not_list_buckets() {
+        let p = S3Provider::new(bound_target("company-artifacts"));
+        let l = loc("t", Some("company-artifacts"), "");
+        let r = p.classify_listing_location(&l);
+        match r.unwrap() {
+            S3ListingScope::Bucket { bucket, prefix } => {
+                assert_eq!(bucket, "company-artifacts");
+                assert_eq!(prefix, "");
+            }
+            _ => panic!("expected Bucket scope"),
+        }
+        // ListObjectsV2 is S3-20; client stays uninitialized in S3-18.
+        assert!(p.client.get().is_none());
+    }
+
+    #[test]
+    fn bucket_bound_different_bucket_rejected() {
+        let p = S3Provider::new(bound_target("company-artifacts"));
+        let l = loc("t", Some("other-bucket"), "");
+        let err = p.classify_listing_location(&l).unwrap_err();
+        assert!(matches!(err.kind(), io::ErrorKind::NotFound));
+        assert!(p.client.get().is_none());
+    }
+
+    #[test]
+    fn account_target_bucket_location_still_classified_bucket() {
+        let p = S3Provider::new(root_target());
+        let l = loc("t", Some("listed-bucket"), "");
+        let r = p.classify_listing_location(&l);
+        assert!(matches!(r, Ok(S3ListingScope::Bucket { .. })));
+        // No ListBuckets for a bucket scope in S3-18.
+        assert!(p.client.get().is_none());
+    }
+
+    #[test]
+    fn wrong_target_id_fails_closed() {
+        let p = S3Provider::new(root_target());
+        let l = loc("other-target", None, "");
+        let err = p.classify_listing_location(&l).unwrap_err();
+        assert!(matches!(err.kind(), io::ErrorKind::NotFound));
+        assert!(p.client.get().is_none());
     }
 }

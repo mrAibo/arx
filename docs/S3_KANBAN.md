@@ -16,9 +16,9 @@
 
 ## Column summary
 
-- **READY** (1): S3-18
+- **READY** (0): —
 - **DOING** (0): —
-- **REVIEW** (0): —
+- **REVIEW** (1): S3-18
 - **BLOCKED** (0): —
 - **DONE** (18): S3-00..S3-17
 - **BACKLOG** (62): S3-19..S3-80
@@ -200,9 +200,9 @@
 
 ### S3-18 — ListBuckets first page
 - **Phase:** P8
-- **Status:** READY
+- **Status:** REVIEW
 - **Depends on:** S3-17
-- **Allowed files:** src/vfs/s3.rs, docs/S3_KANBAN.md
+- **Allowed files:** src/vfs/s3.rs, src/vfs/mod.rs (tests only), docs/S3_KANBAN.md
 - **Acceptance:** Target-root first page via ListBuckets. Map bucket=>ListedEntry{presentation=bucket name, identity=S3BucketRef}. No Entry.name reconstruction. No create/delete bucket. Tests w/ mocked SDK boundary.
 - **Stop conditions:** Bucket create/delete. Entry.name reconstruction.
 - **Hermes prompt:** Implement target-root first page: ListBuckets => ListedEntry with identity=S3BucketRef (presentation=bucket name only). No name reconstruction. No bucket create/delete. Mock SDK boundary in tests.
