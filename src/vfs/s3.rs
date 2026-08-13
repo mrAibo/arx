@@ -377,8 +377,10 @@ impl VfsProvider for S3Provider {
                 let page =
                     map_list_objects_v2_first_page(&self.target.id, bucket, &wire_prefix, &output)?;
                 // First-page continuation truth: IsTruncated/NextContinuationToken.
-                let continuation =
-                    next_list_objects_v2_continuation(output.is_truncated(), output.next_continuation_token())?;
+                let continuation = next_list_objects_v2_continuation(
+                    output.is_truncated(),
+                    output.next_continuation_token(),
+                )?;
                 Ok(ProviderListingPage {
                     entries: page.entries,
                     continuation,
@@ -530,17 +532,15 @@ fn next_list_objects_v2_continuation(
 ) -> io::Result<Option<ProviderContinuation>> {
     match is_truncated {
         Some(false) => Ok(None),
-        Some(true) => {
-            match next_token {
-                Some(token) if !token.is_empty() => Ok(Some(ProviderContinuation {
-                    token: token.to_string(),
-                })),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "S3 ListObjectsV2 pagination protocol error: missing or empty NextContinuationToken on truncated response",
-                )),
-            }
-        }
+        Some(true) => match next_token {
+            Some(token) if !token.is_empty() => Ok(Some(ProviderContinuation {
+                token: token.to_string(),
+            })),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "S3 ListObjectsV2 pagination protocol error: missing or empty NextContinuationToken on truncated response",
+            )),
+        },
         None => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "S3 ListObjectsV2 pagination protocol error: missing IsTruncated field",
@@ -583,9 +583,11 @@ fn map_list_objects_v2_first_page(
 
         // FOLDER MARKER DEDUP — exact evidence only.
         // CASE A: current-folder marker (wire prefix != "" AND key == wire prefix AND size == 0).
-        let is_current_folder_marker = !wire_prefix.is_empty() && key == wire_prefix && obj.size() == Some(0);
+        let is_current_folder_marker =
+            !wire_prefix.is_empty() && key == wire_prefix && obj.size() == Some(0);
         // CASE B: child-folder marker duplicated by CommonPrefixes (size == 0 AND exact CommonPrefixes contains key).
-        let is_child_marker_deduped = obj.size() == Some(0) && common_prefixes.contains(&key.to_string());
+        let is_child_marker_deduped =
+            obj.size() == Some(0) && common_prefixes.contains(&key.to_string());
 
         if is_current_folder_marker || is_child_marker_deduped {
             // Suppress the marker; identity already represented as virtual folder.
@@ -604,10 +606,15 @@ fn map_list_objects_v2_first_page(
         };
 
         // Size: only if present and non-negative.
-        let size = obj.size().and_then(|s| if s >= 0 { Some(s as u64) } else { None });
+        let size = obj
+            .size()
+            .and_then(|s| if s >= 0 { Some(s as u64) } else { None });
 
         // Last modified: convert DateTime to unix ms if valid.
-        let modified_unix_ms = obj.last_modified().and_then(|dt| dt.to_millis().ok()).and_then(|ms| if ms >= 0 { Some(ms as u64) } else { None });
+        let modified_unix_ms = obj
+            .last_modified()
+            .and_then(|dt| dt.to_millis().ok())
+            .and_then(|ms| if ms >= 0 { Some(ms as u64) } else { None });
 
         entries.push(ListedEntry {
             entry: Entry {

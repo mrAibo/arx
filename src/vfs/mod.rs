@@ -2468,13 +2468,7 @@ mod s3_list_page_tests {
         let registry = ProviderRegistry::new();
         // Target registered with S3-20 implemented; bucket-bound location should
         // route through Bucket scope (ListObjectsV2) rather than TargetRoot.
-        registry.register_s3_targets(&[mk_s3_target(
-            "t",
-            None,
-            None,
-            None,
-            false,
-        )]);
+        registry.register_s3_targets(&[mk_s3_target("t", None, None, None, false)]);
         let loc = Location::S3 {
             target: "t".into(),
             bucket: Some("some-bucket".into()),
