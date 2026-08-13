@@ -14,7 +14,7 @@ use ratatui::layout::Rect;
 use crate::effect_dispatcher::{EffectId, EffectLane, EffectScope};
 use crate::jobs::Job;
 use crate::remote::Host;
-use crate::services::{PaneListingContinuation, PaneLoadId, PaneLoadPurpose};
+use crate::services::{PaneListingContinuation, PaneLoadId, PaneLoadPurpose, PanePageRequestId};
 use crate::terminal::TermPane;
 use crate::vfs::{Location, ProviderRegistry};
 use crate::vfs::{RemoteDeletePlan, RemoteEditSession};
@@ -220,6 +220,7 @@ pub struct AppState {
     // generation to outlive the request; finish_pane_load only clears pending_*.
     pub pane_listing_generations: BTreeMap<Pane, PaneLoadId>,
     pub pane_listing_continuations: BTreeMap<Pane, PaneListingContinuation>,
+    pub pending_next_pages: BTreeMap<Pane, (PanePageRequestId, PaneListingContinuation)>,
     /// Persistent presentation state for the latest accepted pane-load failure.
     pub pane_load_errors: BTreeMap<Pane, PaneLoadUiError>,
     pub infrastructure_lines: Vec<String>,
@@ -348,6 +349,7 @@ impl Default for AppState {
             pending_pane_targets: BTreeMap::new(),
             pane_listing_generations: BTreeMap::new(),
             pane_listing_continuations: BTreeMap::new(),
+            pending_next_pages: BTreeMap::new(),
             pane_load_errors: BTreeMap::new(),
             infrastructure_lines: Vec::new(),
             tree_lines: Vec::new(),
@@ -477,6 +479,7 @@ impl AppState {
     ) {
         self.pane_load_errors.remove(&pane);
         self.pane_listing_continuations.remove(&pane);
+        self.pending_next_pages.remove(&pane);
         self.pending_pane_loads.insert(pane, id);
         self.pending_pane_targets.insert(pane, (location, purpose));
         // advance persistent listing generation; pagination relies on this
@@ -554,6 +557,48 @@ impl AppState {
                 self.pane_listing_continuations.remove(&pane);
             }
             Some(_) => {}
+        }
+    }
+
+    pub fn register_next_page(
+        &mut self,
+        pane: Pane,
+        request_id: PanePageRequestId,
+        continuation: PaneListingContinuation,
+    ) -> bool {
+        if self.pending_next_pages.contains_key(&pane)
+            || self.pane_listing_continuations.get(&pane) != Some(&continuation)
+            || !self.accepts_pane_listing_continuation(pane, &continuation)
+        {
+            return false;
+        }
+        self.pending_next_pages
+            .insert(pane, (request_id, continuation));
+        true
+    }
+
+    pub fn accepts_next_page(
+        &self,
+        pane: Pane,
+        request_id: PanePageRequestId,
+        continuation: &PaneListingContinuation,
+    ) -> bool {
+        self.pending_next_pages
+            .get(&pane)
+            .is_some_and(|(pending, initiating)| {
+                *pending == request_id && initiating == continuation
+            })
+            && self.pane_listing_continuations.get(&pane) == Some(continuation)
+            && self.accepts_pane_listing_continuation(pane, continuation)
+    }
+
+    pub fn finish_next_page(&mut self, pane: Pane, request_id: PanePageRequestId) {
+        if self
+            .pending_next_pages
+            .get(&pane)
+            .is_some_and(|(pending, _)| *pending == request_id)
+        {
+            self.pending_next_pages.remove(&pane);
         }
     }
 

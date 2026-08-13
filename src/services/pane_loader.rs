@@ -11,6 +11,9 @@ use crate::vfs::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PaneLoadId(pub u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PanePageRequestId(pub u64);
+
 /// Pane-layer continuation identity.
 ///
 /// Wraps the provider-side opaque continuation together with the concrete
@@ -48,6 +51,14 @@ pub struct PaneLoadResponse {
     pub result: std::io::Result<PaneLoadPage>,
 }
 
+#[derive(Debug)]
+pub struct PaneNextPageResponse {
+    pub request_id: PanePageRequestId,
+    pub pane: Pane,
+    pub initiating_continuation: PaneListingContinuation,
+    pub result: std::io::Result<PaneLoadPage>,
+}
+
 /// Async VFS directory loader.
 ///
 /// Every request owns a concrete location snapshot. AppState applies a result
@@ -58,20 +69,30 @@ pub struct PaneLoader {
     registry: ProviderRegistry,
     next_id: Arc<AtomicU64>,
     tx: mpsc::UnboundedSender<PaneLoadResponse>,
+    next_page_id: Arc<AtomicU64>,
+    next_page_tx: mpsc::UnboundedSender<PaneNextPageResponse>,
 }
 
 impl PaneLoader {
     pub fn channel(
         registry: ProviderRegistry,
-    ) -> (Self, mpsc::UnboundedReceiver<PaneLoadResponse>) {
+    ) -> (
+        Self,
+        mpsc::UnboundedReceiver<PaneLoadResponse>,
+        mpsc::UnboundedReceiver<PaneNextPageResponse>,
+    ) {
         let (tx, rx) = mpsc::unbounded_channel();
+        let (next_page_tx, next_page_rx) = mpsc::unbounded_channel();
         (
             Self {
                 registry,
                 next_id: Arc::new(AtomicU64::new(1)),
                 tx,
+                next_page_id: Arc::new(AtomicU64::new(1)),
+                next_page_tx,
             },
             rx,
+            next_page_rx,
         )
     }
 
@@ -106,6 +127,45 @@ impl PaneLoader {
         });
         id
     }
+
+    pub fn next_page_request_id(&self) -> PanePageRequestId {
+        PanePageRequestId(self.next_page_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub fn load_next(
+        &self,
+        request_id: PanePageRequestId,
+        pane: Pane,
+        continuation: PaneListingContinuation,
+    ) {
+        let registry = self.registry.clone();
+        let tx = self.next_page_tx.clone();
+        tokio::spawn(async move {
+            let result = registry
+                .list_page(
+                    &continuation.location,
+                    Some(&continuation.provider_continuation),
+                )
+                .await
+                .map(|page| PaneLoadPage {
+                    entries: page.entries,
+                    continuation: page.continuation.map(|provider_continuation| {
+                        PaneListingContinuation {
+                            provider_continuation,
+                            provider_instance: continuation.provider_instance.clone(),
+                            location: continuation.location.clone(),
+                            generation: continuation.generation,
+                        }
+                    }),
+                });
+            let _ = tx.send(PaneNextPageResponse {
+                request_id,
+                pane,
+                initiating_continuation: continuation,
+                result,
+            });
+        });
+    }
 }
 
 #[cfg(test)]
@@ -118,6 +178,7 @@ mod tests {
     #[derive(Debug)]
     struct PageProvider {
         page: ProviderListingPage,
+        expected_continuation: Option<ProviderContinuation>,
     }
 
     #[async_trait::async_trait]
@@ -131,7 +192,7 @@ mod tests {
             _location: &Location,
             continuation: Option<&ProviderContinuation>,
         ) -> std::io::Result<ProviderListingPage> {
-            assert!(continuation.is_none());
+            assert_eq!(continuation, self.expected_continuation.as_ref());
             Ok(self.page.clone())
         }
 
@@ -159,7 +220,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (loader, mut rx) = PaneLoader::channel(crate::vfs::default_registry());
+        let (loader, mut rx, _next_page_rx) = PaneLoader::channel(crate::vfs::default_registry());
         let location = Location::Local(dir.path().to_path_buf());
         let id = loader.load(Pane::Left, location.clone(), PaneLoadPurpose::Refresh);
         let response = rx.recv().await.expect("pane response");
@@ -200,10 +261,11 @@ mod tests {
                     entries: vec![listed.clone()],
                     continuation: Some(provider_continuation.clone()),
                 },
+                expected_continuation: None,
             }),
             CapabilitySet::NONE,
         );
-        let (loader, mut rx) = PaneLoader::channel(registry);
+        let (loader, mut rx, _next_page_rx) = PaneLoader::channel(registry);
         let location = Location::Sftp {
             host: "prod-host".into(),
             path: "/srv/exact".into(),
@@ -222,6 +284,62 @@ mod tests {
         );
         assert_eq!(continuation.location, location);
         assert_eq!(continuation.generation, id);
+    }
+
+    #[tokio::test]
+    async fn next_page_uses_exact_initiating_continuation_and_correlation() {
+        let initiating_token = ProviderContinuation {
+            token: " exact opaque +/= 日本語 ".into(),
+        };
+        let replacement_token = ProviderContinuation {
+            token: " replacement ".into(),
+        };
+        let listed = ListedEntry {
+            entry: Entry {
+                name: "page-two".into(),
+                kind: EntryKind::File,
+                size: Some(2),
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::Other,
+        };
+        let registry = ProviderRegistry::new();
+        registry.insert_sftp(
+            "page-host",
+            Box::new(PageProvider {
+                page: ProviderListingPage {
+                    entries: vec![listed.clone()],
+                    continuation: Some(replacement_token.clone()),
+                },
+                expected_continuation: Some(initiating_token.clone()),
+            }),
+            CapabilitySet::NONE,
+        );
+        let location = Location::Sftp {
+            host: "page-host".into(),
+            path: "/exact/path".into(),
+        };
+        let initiating = PaneListingContinuation {
+            provider_continuation: initiating_token,
+            provider_instance: ProviderRegistry::instance_key_for_location(&location),
+            location: location.clone(),
+            generation: PaneLoadId(41),
+        };
+        let (loader, _first_pages, mut next_pages) = PaneLoader::channel(registry);
+        let request_id = loader.next_page_request_id();
+        loader.load_next(request_id, Pane::Right, initiating.clone());
+        let response = next_pages.recv().await.expect("next-page response");
+
+        assert_eq!(response.request_id, request_id);
+        assert_eq!(response.pane, Pane::Right);
+        assert_eq!(response.initiating_continuation, initiating);
+        let page = response.result.unwrap();
+        assert_eq!(page.entries, vec![listed]);
+        assert_eq!(
+            page.continuation.unwrap().provider_continuation,
+            replacement_token
+        );
+        assert_eq!(response.initiating_continuation.location, location);
     }
 
     // ── S3-14: pane-layer continuation identity model ──

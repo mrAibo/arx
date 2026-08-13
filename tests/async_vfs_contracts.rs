@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use arx::app::{AppState, Pane};
 use arx::jobs::{JobEvent, JobKind, JobManager, JobStatus};
 use arx::services::{
-    PaneLoadId, PaneLoadPurpose, PaneLoader, WorkspaceScanOptions, scan_workspace,
+    PaneListingContinuation, PaneLoadId, PaneLoadPurpose, PaneLoader, PanePageRequestId,
+    WorkspaceScanOptions, scan_workspace,
 };
-use arx::vfs::{Location, ProviderRegistry};
+use arx::vfs::{Location, ProviderContinuation, ProviderRegistry};
 
 #[test]
 fn tui_does_not_reinstall_thread_local_provider_registry() {
@@ -19,10 +20,18 @@ fn tui_does_not_reinstall_thread_local_provider_registry() {
 #[test]
 fn tui_initial_loading_uses_pane_loader() {
     let tui = include_str!("../src/tui.rs");
-    assert!(
-        tui.contains("PaneLoader::channel"),
-        "async PaneLoader is no longer wired into the runtime"
-    );
+    let event_loop_start = tui.find("async fn event_loop(").unwrap();
+    let event_loop_end = tui[event_loop_start..]
+        .find("\nfn normalize_entries(")
+        .map(|offset| event_loop_start + offset)
+        .unwrap();
+    let event_loop = &tui[event_loop_start..event_loop_end];
+
+    assert!(event_loop.contains(
+        "let (pane_loader, mut pane_load_rx, mut pane_next_page_rx) =\n        PaneLoader::channel(state.registry.clone());"
+    ));
+    assert!(event_loop.contains("Some(response) = pane_load_rx.recv() =>"));
+    assert!(event_loop.contains("Some(response) = pane_next_page_rx.recv() =>"));
 }
 
 #[test]
@@ -174,7 +183,7 @@ async fn pane_loader_reads_local_directory_without_location_list_bridge() {
         .await
         .unwrap();
 
-    let (loader, mut rx) = PaneLoader::channel(arx::vfs::default_registry());
+    let (loader, mut rx, _next_page_rx) = PaneLoader::channel(arx::vfs::default_registry());
     let location = Location::Local(dir.path().to_path_buf());
     let id = loader.load(Pane::Right, location.clone(), PaneLoadPurpose::Refresh);
 
@@ -186,6 +195,147 @@ async fn pane_loader_reads_local_directory_without_location_list_bridge() {
     assert_eq!(page.entries.len(), 1);
     assert_eq!(page.entries[0].entry.name, "hello.txt");
     assert!(page.continuation.is_none());
+}
+
+fn continuation(
+    pane: Pane,
+    generation: u64,
+    location: Location,
+    token: &str,
+) -> PaneListingContinuation {
+    let _ = pane;
+    PaneListingContinuation {
+        provider_continuation: ProviderContinuation {
+            token: token.to_string(),
+        },
+        provider_instance: ProviderRegistry::instance_key_for_location(&location),
+        location,
+        generation: PaneLoadId(generation),
+    }
+}
+
+#[test]
+fn next_page_registration_binds_exact_continuation_and_rejects_duplicate_trigger() {
+    let mut state = AppState::default();
+    let location = state.left.location.clone();
+    state.register_pane_load(
+        Pane::Left,
+        PaneLoadId(41),
+        location.clone(),
+        PaneLoadPurpose::Refresh,
+    );
+    let continuation = continuation(Pane::Left, 41, location, "  opaque+/=日本語  ");
+    state.apply_pane_listing_continuation(Pane::Left, Some(continuation.clone()));
+
+    assert!(state.register_next_page(Pane::Left, PanePageRequestId(7), continuation.clone()));
+    assert!(!state.register_next_page(Pane::Left, PanePageRequestId(8), continuation.clone()));
+    assert!(state.accepts_next_page(Pane::Left, PanePageRequestId(7), &continuation));
+}
+
+#[test]
+fn next_page_acceptance_requires_request_generation_location_provider_and_token() {
+    let mut state = AppState::default();
+    let location = Location::S3 {
+        target: "prod".into(),
+        bucket: Some("bucket".into()),
+        prefix: "exact//prefix/".into(),
+    };
+    state.left.location = location.clone();
+    state.register_pane_load(
+        Pane::Left,
+        PaneLoadId(41),
+        location.clone(),
+        PaneLoadPurpose::Refresh,
+    );
+    let current = continuation(Pane::Left, 41, location.clone(), "token-a");
+    state.apply_pane_listing_continuation(Pane::Left, Some(current.clone()));
+    assert!(state.register_next_page(Pane::Left, PanePageRequestId(7), current.clone()));
+
+    let mut wrong = current.clone();
+    wrong.generation = PaneLoadId(42);
+    assert!(!state.accepts_next_page(Pane::Left, PanePageRequestId(7), &wrong));
+    wrong = current.clone();
+    wrong.location = Location::S3 {
+        target: "prod".into(),
+        bucket: Some("bucket".into()),
+        prefix: "exact/prefix/".into(),
+    };
+    assert!(!state.accepts_next_page(Pane::Left, PanePageRequestId(7), &wrong));
+    wrong = current.clone();
+    wrong.provider_instance = ProviderRegistry::instance_key_for_location(&Location::S3 {
+        target: "other".into(),
+        bucket: None,
+        prefix: String::new(),
+    });
+    assert!(!state.accepts_next_page(Pane::Left, PanePageRequestId(7), &wrong));
+    wrong = current.clone();
+    wrong.provider_continuation.token = "token-b".into();
+    assert!(!state.accepts_next_page(Pane::Left, PanePageRequestId(7), &wrong));
+    assert!(!state.accepts_next_page(Pane::Left, PanePageRequestId(8), &current));
+    assert!(state.accepts_next_page(Pane::Left, PanePageRequestId(7), &current));
+}
+
+#[test]
+fn refresh_and_navigation_invalidate_pending_next_page() {
+    for purpose in [
+        PaneLoadPurpose::Refresh,
+        PaneLoadPurpose::Navigate {
+            remember_current: true,
+        },
+    ] {
+        let mut state = AppState::default();
+        let location = state.left.location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(41),
+            location.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        let current = continuation(Pane::Left, 41, location.clone(), "token-a");
+        state.apply_pane_listing_continuation(Pane::Left, Some(current.clone()));
+        assert!(state.register_next_page(Pane::Left, PanePageRequestId(7), current.clone()));
+
+        state.register_pane_load(Pane::Left, PaneLoadId(42), location, purpose);
+        assert!(!state.accepts_next_page(Pane::Left, PanePageRequestId(7), &current));
+    }
+}
+
+#[test]
+fn left_and_right_next_page_requests_are_independent() {
+    let mut state = AppState::default();
+    let left_location = state.left.location.clone();
+    let right_location = state.right.location.clone();
+    state.register_pane_load(
+        Pane::Left,
+        PaneLoadId(41),
+        left_location.clone(),
+        PaneLoadPurpose::Refresh,
+    );
+    state.register_pane_load(
+        Pane::Right,
+        PaneLoadId(42),
+        right_location.clone(),
+        PaneLoadPurpose::Refresh,
+    );
+    let left = continuation(Pane::Left, 41, left_location, "left-token");
+    let right = continuation(Pane::Right, 42, right_location, "right-token");
+    state.apply_pane_listing_continuation(Pane::Left, Some(left.clone()));
+    state.apply_pane_listing_continuation(Pane::Right, Some(right.clone()));
+
+    assert!(state.register_next_page(Pane::Left, PanePageRequestId(7), left.clone()));
+    assert!(state.register_next_page(Pane::Right, PanePageRequestId(8), right.clone()));
+    state.finish_next_page(Pane::Left, PanePageRequestId(7));
+    assert!(!state.accepts_next_page(Pane::Left, PanePageRequestId(7), &left));
+    assert!(state.accepts_next_page(Pane::Right, PanePageRequestId(8), &right));
+}
+
+#[test]
+fn tui_pagination_stays_explicit_virtual_and_provider_neutral() {
+    let tui = include_str!("../src/tui.rs");
+    assert!(tui.contains("VisiblePaneRow::LoadMore"));
+    assert!(tui.contains("Load more…"));
+    assert!(tui.contains("schedule_next_page"));
+    assert!(!tui.contains("load_all_pages"));
 }
 
 #[tokio::test]

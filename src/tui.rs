@@ -12,9 +12,10 @@ use arx::effects::{Effect, EffectEvent};
 use arx::input::contextual_hints_with_file_context;
 use arx::input::{ContextHint, KeyResolution, KeyRouter, command_bar_rows, contextual_hints};
 use arx::services::{
-    DesktopService, FileInfoService, GitService, MutationError, MutationService, PaneLoadPurpose,
-    PaneLoadResponse, PaneLoader, SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions,
-    WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
+    DesktopService, FileInfoService, GitService, MutationError, MutationService,
+    PaneListingContinuation, PaneLoadPurpose, PaneLoadResponse, PaneLoader, PaneNextPageResponse,
+    SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions, WorkspaceScanResponse,
+    WorkspaceScanner, WorkspaceSyncController,
 };
 use arx::vfs::{
     Entry, EntryIdentity, EntryKind, ListedEntry, Location, ProviderId, RemoteEditSession,
@@ -89,7 +90,8 @@ async fn event_loop(
     // Install configured S3 target inventory (offline; no AWS load/client).
     // DESIGN_S3 §10 lazy per-target model: clients appear later inside providers.
     state.registry.register_s3_targets(&config.s3.targets);
-    let (pane_loader, mut pane_load_rx) = PaneLoader::channel(state.registry.clone());
+    let (pane_loader, mut pane_load_rx, mut pane_next_page_rx) =
+        PaneLoader::channel(state.registry.clone());
     let (workspace_scanner, mut workspace_scan_rx) =
         WorkspaceScanner::channel(state.registry.clone());
     let mut left_entries = Vec::new();
@@ -116,6 +118,7 @@ async fn event_loop(
     };
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
     let parent_entry = virtual_parent_entry();
+    let load_more_entry = load_more_entry();
 
     loop {
         if state.should_quit {
@@ -128,17 +131,21 @@ async fn event_loop(
             state.git_status = GitService::status_suffix(&active_location).await;
             state.git_status_location = Some(active_location);
         }
-        let left_visible = apply_filter_with_parent(
+        let left_visible = apply_filter_with_parent_and_continuation(
             &left_entries,
             &state.filter,
             &state.left.location,
             &parent_entry,
+            &load_more_entry,
+            state.pane_listing_continuations.get(&Pane::Left),
         );
-        let right_visible = apply_filter_with_parent(
+        let right_visible = apply_filter_with_parent_and_continuation(
             &right_entries,
             &state.filter,
             &state.right.location,
             &parent_entry,
+            &load_more_entry,
+            state.pane_listing_continuations.get(&Pane::Right),
         );
         let left_filtered: Vec<&Entry> = left_visible.iter().map(VisiblePaneRow::entry).collect();
         let right_filtered: Vec<&Entry> = right_visible.iter().map(VisiblePaneRow::entry).collect();
@@ -148,6 +155,7 @@ async fn event_loop(
             .right
             .cursor
             .min(right_filtered.len().saturating_sub(1));
+        let focused_kind = focused_action_kind(&state, &left_visible, &right_visible);
 
         left_list.select(Some(state.left.cursor));
         split_left_list.select(Some(state.left.split_cursor));
@@ -168,6 +176,7 @@ async fn event_loop(
                 &mut split_left_list,
                 &mut split_right_list,
                 &key_router,
+                focused_kind,
                 editor.is_some(),
                 msg.as_deref(),
             )
@@ -188,6 +197,15 @@ async fn event_loop(
             }
             Some(response) = pane_load_rx.recv() => {
                 apply_pane_load_response(
+                    response,
+                    &mut state,
+                    &mut left_entries,
+                    &mut right_entries,
+                );
+                continue;
+            }
+            Some(response) = pane_next_page_rx.recv() => {
+                apply_next_page_response(
                     response,
                     &mut state,
                     &mut left_entries,
@@ -383,7 +401,9 @@ async fn event_loop(
                                     .await?;
                                 } else {
                                     let ctx = ActionContext::from_state(&state).with_file_context(
-                                        focused.map(|row| row.entry().kind),
+                                        focused
+                                            .and_then(|row| row.action_entry())
+                                            .map(|entry| entry.kind),
                                         editor.is_some(),
                                     );
                                     let action_id = action_to_id(hb.action);
@@ -555,16 +575,23 @@ async fn event_loop(
                                     } else {
                                         (right_visible.get(cursor).copied(), right_filtered.len())
                                     };
-                                    let active_entries: &[&Entry] = if state.active == Pane::Left {
-                                        &left_filtered[..]
+                                    let active_entries: Vec<&Entry> = if state.active == Pane::Left
+                                    {
+                                        left_visible
+                                            .iter()
+                                            .filter_map(VisiblePaneRow::listed_entry)
+                                            .collect()
                                     } else {
-                                        &right_filtered[..]
+                                        right_visible
+                                            .iter()
+                                            .filter_map(VisiblePaneRow::listed_entry)
+                                            .collect()
                                     };
                                     if let Some(effect) = execute_command_target(
                                         &mut state,
                                         item.target,
                                         focused_row,
-                                        active_entries,
+                                        &active_entries,
                                         visible_count,
                                         &workspace_scanner,
                                         &pane_loader,
@@ -608,7 +635,7 @@ async fn event_loop(
                                 state.command_matches = build_command_items_with_file_context(
                                     &state.filter,
                                     &state,
-                                    focused_entry(&state, &left_filtered, &right_filtered)
+                                    focused_visible_entry(&state, &left_visible, &right_visible)
                                         .map(|entry| entry.kind),
                                     editor.is_some(),
                                 );
@@ -624,7 +651,7 @@ async fn event_loop(
                                 state.command_matches = build_command_items_with_file_context(
                                     &state.filter,
                                     &state,
-                                    focused_entry(&state, &left_filtered, &right_filtered)
+                                    focused_visible_entry(&state, &left_visible, &right_visible)
                                         .map(|entry| entry.kind),
                                     editor.is_some(),
                                 );
@@ -803,10 +830,10 @@ async fn event_loop(
                                             build_command_items_with_file_context(
                                                 &state.filter,
                                                 &state,
-                                                focused_entry(
+                                                focused_visible_entry(
                                                     &state,
-                                                    &left_filtered,
-                                                    &right_filtered,
+                                                    &left_visible,
+                                                    &right_visible,
                                                 )
                                                 .map(|entry| entry.kind),
                                                 editor.is_some(),
@@ -1060,7 +1087,10 @@ async fn event_loop(
                         }
                         KeyResolution::Action(action) => {
                             let context = ActionContext::from_state(&state).with_file_context(
-                                entries.get(cursor).map(|entry| entry.kind),
+                                visible_rows
+                                    .get(cursor)
+                                    .and_then(|row| row.action_entry())
+                                    .map(|entry| entry.kind),
                                 editor.is_some(),
                             );
                             match action_availability(action.id(), &context) {
@@ -1131,7 +1161,10 @@ async fn event_loop(
                         }
                         // Ctrl+Space: hash for files, du/df for dirs
                         KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if let Some(entry) = entries.get(cursor) {
+                            if let Some(entry) = visible_rows
+                                .get(cursor)
+                                .and_then(VisiblePaneRow::listed_entry)
+                            {
                                 match entry.kind {
                                     EntryKind::Directory => {
                                         if let Location::Local(dir) = &pane.location {
@@ -1188,6 +1221,12 @@ async fn event_loop(
                             }
                         }
                         KeyCode::Enter => {
+                            if matches!(visible_rows.get(cursor), Some(VisiblePaneRow::LoadMore(_)))
+                            {
+                                let active = state.active;
+                                schedule_next_page(&pane_loader, &mut state, active);
+                                continue;
+                            }
                             if let Some(row) = visible_rows.get(cursor) {
                                 let entry = row.entry();
                                 if let Some(new_location) = row.navigation_target(&pane.location) {
@@ -1289,7 +1328,10 @@ async fn event_loop(
                         }
                         // Ctrl+A: file attributes (permissions/owner)
                         KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if let Some(entry) = entries.get(cursor) {
+                            if let Some(entry) = visible_rows
+                                .get(cursor)
+                                .and_then(VisiblePaneRow::listed_entry)
+                            {
                                 if let Location::Local(dir) = &pane.location {
                                     let p = dir.join(&entry.name);
                                     let size = entry.size.map(format_size).unwrap_or_default();
@@ -1309,7 +1351,10 @@ async fn event_loop(
                         }
                         // Ctrl+I: file info (stat)
                         KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if let Some(entry) = entries.get(cursor) {
+                            if let Some(entry) = visible_rows
+                                .get(cursor)
+                                .and_then(VisiblePaneRow::listed_entry)
+                            {
                                 if let Location::Local(dir) = &pane.location {
                                     let path = dir.join(&entry.name);
                                     let size = entry.size.map(format_size).unwrap_or_default();
@@ -1472,7 +1517,10 @@ async fn event_loop(
                         }
                         // Shift+F3: page file with bat
                         KeyCode::F(3) if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            if let Some(entry) = entries.get(cursor) {
+                            if let Some(entry) = visible_rows
+                                .get(cursor)
+                                .and_then(VisiblePaneRow::listed_entry)
+                            {
                                 if entry.kind != EntryKind::Directory {
                                     let path = match &pane.location {
                                         Location::Local(dir) => dir.join(&entry.name),
@@ -1484,7 +1532,10 @@ async fn event_loop(
                         }
                         // Ctrl+C: copy filename to clipboard
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if let Some(entry) = entries.get(cursor) {
+                            if let Some(entry) = visible_rows
+                                .get(cursor)
+                                .and_then(VisiblePaneRow::listed_entry)
+                            {
                                 let name = &entry.name;
                                 if let Location::Local(dir) = &pane.location {
                                     let full = dir.join(name);
@@ -1750,6 +1801,22 @@ fn normalize_entries(
     entries
 }
 
+fn schedule_next_page(loader: &PaneLoader, state: &mut AppState, pane: Pane) {
+    let Some(continuation) = state.pane_listing_continuations.get(&pane).cloned() else {
+        return;
+    };
+    if !state.accepts_pane_listing_continuation(pane, &continuation)
+        || state.pending_next_pages.contains_key(&pane)
+    {
+        return;
+    }
+    let request_id = loader.next_page_request_id();
+    if state.register_next_page(pane, request_id, continuation.clone()) {
+        loader.load_next(request_id, pane, continuation);
+        state.message = Some("Loading next page…".into());
+    }
+}
+
 fn schedule_pane_load(loader: &PaneLoader, state: &mut AppState, pane: Pane) {
     let location = match pane {
         Pane::Left => state.left.location.clone(),
@@ -1777,6 +1844,131 @@ fn schedule_active_pane_load(loader: &PaneLoader, state: &mut AppState) {
 fn schedule_both_pane_loads(loader: &PaneLoader, state: &mut AppState) {
     schedule_pane_load(loader, state, Pane::Left);
     schedule_pane_load(loader, state, Pane::Right);
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum VisibleRowSelection {
+    Parent,
+    Listed(EntryIdentity),
+    LoadMore,
+}
+
+fn selected_visible_row(
+    state: &AppState,
+    pane: Pane,
+    entries: &[ListedEntry],
+    cursor: usize,
+) -> Option<VisibleRowSelection> {
+    let pane_state = match pane {
+        Pane::Left => &state.left,
+        Pane::Right => &state.right,
+    };
+    let parent = virtual_parent_entry();
+    let load_more = load_more_entry();
+    apply_filter_with_parent_and_continuation(
+        entries,
+        &state.filter,
+        &pane_state.location,
+        &parent,
+        &load_more,
+        state.pane_listing_continuations.get(&pane),
+    )
+    .get(cursor)
+    .map(|row| match row {
+        VisiblePaneRow::Parent(_) => VisibleRowSelection::Parent,
+        VisiblePaneRow::Listed(listed) => VisibleRowSelection::Listed(listed.identity.clone()),
+        VisiblePaneRow::LoadMore(_) => VisibleRowSelection::LoadMore,
+    })
+}
+
+fn visible_index_for_selection(
+    state: &AppState,
+    pane: Pane,
+    entries: &[ListedEntry],
+    selection: &VisibleRowSelection,
+) -> Option<usize> {
+    let pane_state = match pane {
+        Pane::Left => &state.left,
+        Pane::Right => &state.right,
+    };
+    let parent = virtual_parent_entry();
+    let load_more = load_more_entry();
+    apply_filter_with_parent_and_continuation(
+        entries,
+        &state.filter,
+        &pane_state.location,
+        &parent,
+        &load_more,
+        state.pane_listing_continuations.get(&pane),
+    )
+    .iter()
+    .position(|row| match (selection, row) {
+        (VisibleRowSelection::Parent, VisiblePaneRow::Parent(_))
+        | (VisibleRowSelection::LoadMore, VisiblePaneRow::LoadMore(_)) => true,
+        (VisibleRowSelection::Listed(identity), VisiblePaneRow::Listed(listed)) => {
+            identity == &listed.identity
+        }
+        _ => false,
+    })
+}
+
+fn apply_next_page_response(
+    response: PaneNextPageResponse,
+    state: &mut AppState,
+    left_entries: &mut Vec<ListedEntry>,
+    right_entries: &mut Vec<ListedEntry>,
+) {
+    if !state.accepts_next_page(
+        response.pane,
+        response.request_id,
+        &response.initiating_continuation,
+    ) {
+        return;
+    }
+    state.finish_next_page(response.pane, response.request_id);
+    match response.result {
+        Ok(page) => {
+            let entries = match response.pane {
+                Pane::Left => left_entries,
+                Pane::Right => right_entries,
+            };
+            let pane_state = match response.pane {
+                Pane::Left => &state.left,
+                Pane::Right => &state.right,
+            };
+            let primary_selection =
+                selected_visible_row(state, response.pane, entries, pane_state.cursor);
+            let split_selection = pane_state
+                .split
+                .then(|| {
+                    selected_visible_row(state, response.pane, entries, pane_state.split_cursor)
+                })
+                .flatten();
+            entries.extend(page.entries);
+            *entries =
+                normalize_entries(std::mem::take(entries), state.show_hidden, state.sort_mode);
+            state.apply_pane_listing_continuation(response.pane, page.continuation);
+            let primary_index = primary_selection.as_ref().and_then(|selection| {
+                visible_index_for_selection(state, response.pane, entries, selection)
+            });
+            let split_index = split_selection.as_ref().and_then(|selection| {
+                visible_index_for_selection(state, response.pane, entries, selection)
+            });
+            let pane_state = match response.pane {
+                Pane::Left => &mut state.left,
+                Pane::Right => &mut state.right,
+            };
+            if let Some(index) = primary_index {
+                pane_state.cursor = index;
+            }
+            if let Some(index) = split_index {
+                pane_state.split_cursor = index;
+            }
+        }
+        Err(error) => {
+            state.message = Some(format!("Load next page failed: {error}"));
+        }
+    }
 }
 
 fn apply_pane_load_response(
@@ -1909,6 +2101,16 @@ fn apply_filter<'a>(entries: &'a [ListedEntry], filter: &str) -> Vec<&'a ListedE
 }
 
 const VIRTUAL_PARENT_NAME: &str = "..";
+const LOAD_MORE_LABEL: &str = "Load more…";
+
+fn load_more_entry() -> Entry {
+    Entry {
+        name: LOAD_MORE_LABEL.into(),
+        kind: EntryKind::Other,
+        size: None,
+        modified_unix_ms: None,
+    }
+}
 
 fn virtual_parent_entry() -> Entry {
     Entry {
@@ -1923,20 +2125,32 @@ fn virtual_parent_entry() -> Entry {
 enum VisiblePaneRow<'a> {
     Parent(&'a Entry),
     Listed(&'a ListedEntry),
+    LoadMore(&'a Entry),
 }
 
 impl<'a> VisiblePaneRow<'a> {
     fn entry(&self) -> &'a Entry {
         match self {
-            Self::Parent(entry) => entry,
+            Self::Parent(entry) | Self::LoadMore(entry) => entry,
             Self::Listed(listed) => &listed.entry,
         }
     }
 
     fn listed(&self) -> Option<&'a ListedEntry> {
         match self {
-            Self::Parent(_) => None,
+            Self::Parent(_) | Self::LoadMore(_) => None,
             Self::Listed(listed) => Some(listed),
+        }
+    }
+
+    fn listed_entry(&self) -> Option<&'a Entry> {
+        self.listed().map(|listed| &listed.entry)
+    }
+
+    fn action_entry(self) -> Option<&'a Entry> {
+        match self {
+            Self::LoadMore(_) => None,
+            _ => Some(self.entry()),
         }
     }
 
@@ -1944,15 +2158,35 @@ impl<'a> VisiblePaneRow<'a> {
         match self {
             Self::Parent(_) => location.parent(),
             Self::Listed(listed) => listed_entry_navigation_target(location, listed),
+            Self::LoadMore(_) => None,
         }
     }
 }
 
+#[cfg(test)]
 fn apply_filter_with_parent<'a>(
     entries: &'a [ListedEntry],
     filter: &str,
     location: &Location,
     parent_entry: &'a Entry,
+) -> Vec<VisiblePaneRow<'a>> {
+    apply_filter_with_parent_and_continuation(
+        entries,
+        filter,
+        location,
+        parent_entry,
+        parent_entry,
+        None,
+    )
+}
+
+fn apply_filter_with_parent_and_continuation<'a>(
+    entries: &'a [ListedEntry],
+    filter: &str,
+    location: &Location,
+    parent_entry: &'a Entry,
+    load_more_entry: &'a Entry,
+    continuation: Option<&PaneListingContinuation>,
 ) -> Vec<VisiblePaneRow<'a>> {
     let mut visible: Vec<_> = apply_filter(entries, filter)
         .into_iter()
@@ -1965,13 +2199,24 @@ fn apply_filter_with_parent<'a>(
     if location.parent().is_some() {
         visible.insert(0, VisiblePaneRow::Parent(parent_entry));
     }
+    if continuation.is_some() {
+        visible.push(VisiblePaneRow::LoadMore(load_more_entry));
+    }
     visible
 }
 
-fn focused_entry<'a>(
+fn focused_action_kind(
     state: &AppState,
-    left_entries: &[&'a Entry],
-    right_entries: &[&'a Entry],
+    left_entries: &[VisiblePaneRow<'_>],
+    right_entries: &[VisiblePaneRow<'_>],
+) -> Option<EntryKind> {
+    focused_visible_entry(state, left_entries, right_entries).map(|entry| entry.kind)
+}
+
+fn focused_visible_entry<'a>(
+    state: &AppState,
+    left_entries: &[VisiblePaneRow<'a>],
+    right_entries: &[VisiblePaneRow<'a>],
 ) -> Option<&'a Entry> {
     let pane = state.active_pane();
     let cursor = if pane.split && pane.split_active {
@@ -1980,8 +2225,8 @@ fn focused_entry<'a>(
         pane.cursor
     };
     match state.active {
-        Pane::Left => left_entries.get(cursor).copied(),
-        Pane::Right => right_entries.get(cursor).copied(),
+        Pane::Left => left_entries.get(cursor).and_then(|row| row.action_entry()),
+        Pane::Right => right_entries.get(cursor).and_then(|row| row.action_entry()),
     }
 }
 
@@ -2561,6 +2806,7 @@ fn render(
     split_left_list: &mut ListState,
     split_right_list: &mut ListState,
     key_router: &KeyRouter,
+    focused_kind: Option<EntryKind>,
     editor_available: bool,
     message: Option<&str>,
 ) {
@@ -3186,7 +3432,6 @@ fn render(
 
     // Two-row command bar: Row A = Commander core, Row B = Discovery.
     // Derived from the same runtime Keymap that owns keyboard routing.
-    let focused_kind = focused_entry(state, left_entries, right_entries).map(|entry| entry.kind);
     let (row_a, row_b) =
         command_bar_rows(state, key_router.keymap(), focused_kind, editor_available);
     render_command_bar(
@@ -6012,7 +6257,8 @@ mod tests {
         let location = fixture.location();
         let registry = physical_sftp_registry(&host);
         let (dispatcher, mut responses) = EffectDispatcher::channel(registry.clone());
-        let (pane_loader, _pane_responses) = PaneLoader::channel(registry.clone());
+        let (pane_loader, _pane_responses, _next_page_responses) =
+            PaneLoader::channel(registry.clone());
         let mut state = AppState {
             registry: registry.clone(),
             ..AppState::default()
@@ -6067,7 +6313,8 @@ mod tests {
         let location = fixture.location();
         let registry = physical_sftp_registry(&host);
         let (dispatcher, mut responses) = EffectDispatcher::channel(registry.clone());
-        let (pane_loader, _pane_responses) = PaneLoader::channel(registry.clone());
+        let (pane_loader, _pane_responses, _next_page_responses) =
+            PaneLoader::channel(registry.clone());
         let mut state = AppState {
             registry: registry.clone(),
             ..AppState::default()
@@ -6657,7 +6904,7 @@ mod tests {
             host: "identity-seam".into(),
             path: "/page".into(),
         };
-        let (loader, mut responses) = PaneLoader::channel(registry);
+        let (loader, mut responses, _next_page_responses) = PaneLoader::channel(registry);
         let mut state = AppState::default();
         state.left.location = location.clone();
         let id = loader.load(Pane::Left, location.clone(), PaneLoadPurpose::Refresh);
@@ -6750,6 +6997,336 @@ mod tests {
                 prefix: String::new(),
             })
         );
+    }
+
+    #[test]
+    fn load_more_focus_has_no_file_action_context() {
+        let mut state = AppState::default();
+        state.left.split = true;
+        state.left.split_active = true;
+        state.left.split_cursor = 1;
+        let listed = [listed(file("only.txt"))];
+        let load_more = load_more_entry();
+        let rows = [
+            VisiblePaneRow::Listed(&listed[0]),
+            VisiblePaneRow::LoadMore(&load_more),
+        ];
+
+        let focused_kind = focused_action_kind(&state, &rows, &[]);
+        assert_eq!(focused_kind, None);
+        let (row_a, row_b) =
+            command_bar_rows(&state, KeyRouter::default().keymap(), focused_kind, true);
+        assert!(
+            row_a
+                .iter()
+                .chain(&row_b)
+                .filter(|hint| { matches!(hint.action, ActionId::ViewFile | ActionId::EditFile) })
+                .all(|hint| !hint.available)
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_next_page_requires_current_continuation_and_not_pending() {
+        let (loader, _first_pages, mut next_pages) =
+            PaneLoader::channel(arx::vfs::default_registry());
+        let mut state = AppState::default();
+
+        schedule_next_page(&loader, &mut state, Pane::Left);
+        assert!(next_pages.try_recv().is_err());
+
+        let location = state.left.location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(7),
+            location.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        let continuation = page_continuation(PaneLoadId(7), location);
+        state.apply_pane_listing_continuation(Pane::Left, Some(continuation.clone()));
+
+        schedule_next_page(&loader, &mut state, Pane::Left);
+        let response = next_pages
+            .recv()
+            .await
+            .expect("explicit next-page response");
+        assert_eq!(response.initiating_continuation, continuation);
+
+        schedule_next_page(&loader, &mut state, Pane::Left);
+        assert!(next_pages.try_recv().is_err());
+    }
+
+    #[test]
+    fn pagination_virtual_row_is_last_filter_proof_and_provider_neutral() {
+        let parent = virtual_parent_entry();
+        let load_more = load_more_entry();
+        let entries = [listed(file("child.txt"))];
+        let location = Location::Local("/tmp/work".into());
+        let continuation = page_continuation(PaneLoadId(7), location.clone());
+        let no_page = apply_filter_with_parent_and_continuation(
+            &entries, "missing", &location, &parent, &load_more, None,
+        );
+        assert!(matches!(no_page.as_slice(), [VisiblePaneRow::Parent(_)]));
+
+        let visible = apply_filter_with_parent_and_continuation(
+            &entries,
+            "child",
+            &location,
+            &parent,
+            &load_more,
+            Some(&continuation),
+        );
+        assert!(matches!(visible[0], VisiblePaneRow::Parent(_)));
+        assert!(matches!(visible[1], VisiblePaneRow::Listed(_)));
+        assert!(matches!(visible[2], VisiblePaneRow::LoadMore(_)));
+        assert_eq!(visible[2].entry().name, LOAD_MORE_LABEL);
+        assert!(visible[2].listed().is_none());
+        assert!(visible[2].action_entry().is_none());
+
+        let filtered = apply_filter_with_parent_and_continuation(
+            &entries,
+            "does-not-match",
+            &location,
+            &parent,
+            &load_more,
+            Some(&continuation),
+        );
+        assert!(matches!(
+            filtered.as_slice(),
+            [VisiblePaneRow::Parent(_), VisiblePaneRow::LoadMore(_)]
+        ));
+
+        for location in [
+            Location::Local("/tmp".into()),
+            Location::Sftp {
+                host: "host".into(),
+                path: "/srv".into(),
+            },
+            Location::Archive {
+                archive: "/tmp/a.zip".into(),
+                inner_path: "nested".into(),
+            },
+        ] {
+            let rows = apply_filter_with_parent_and_continuation(
+                &entries, "", &location, &parent, &load_more, None,
+            );
+            assert!(
+                !rows
+                    .iter()
+                    .any(|row| matches!(row, VisiblePaneRow::LoadMore(_)))
+            );
+        }
+    }
+
+    fn pagination_state() -> (AppState, Vec<ListedEntry>, PaneListingContinuation) {
+        let mut state = AppState::default();
+        let location = Location::Local("/tmp/work".into());
+        state.left.location = location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(7),
+            location.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        let continuation = page_continuation(PaneLoadId(7), location);
+        state.apply_pane_listing_continuation(Pane::Left, Some(continuation.clone()));
+        assert!(state.register_next_page(
+            Pane::Left,
+            arx::services::PanePageRequestId(9),
+            continuation.clone(),
+        ));
+        (
+            state,
+            vec![listed_with_identity(
+                "z-first",
+                EntryKind::File,
+                EntryIdentity::S3Object(S3ObjectRef {
+                    target: "prod".into(),
+                    bucket: "bucket".into(),
+                    key: "z-key".into(),
+                }),
+            )],
+            continuation,
+        )
+    }
+
+    #[test]
+    fn accepted_page_preserves_both_split_cursor_identities_through_visible_rows() {
+        let (mut state, mut left, initiating) = pagination_state();
+        let split_identity = EntryIdentity::S3Object(S3ObjectRef {
+            target: "prod".into(),
+            bucket: "bucket".into(),
+            key: "y-key".into(),
+        });
+        left.insert(
+            0,
+            listed_with_identity("y-split", EntryKind::File, split_identity.clone()),
+        );
+        let primary_identity = left[1].identity.clone();
+        state.left.split = true;
+        state.left.cursor = 2; // Parent, split row, primary row
+        state.left.split_cursor = 1;
+
+        apply_next_page_response(
+            PaneNextPageResponse {
+                request_id: arx::services::PanePageRequestId(9),
+                pane: Pane::Left,
+                initiating_continuation: initiating,
+                result: Ok(PaneLoadPage {
+                    entries: vec![listed_with_identity(
+                        "a-new",
+                        EntryKind::File,
+                        EntryIdentity::S3Object(S3ObjectRef {
+                            target: "prod".into(),
+                            bucket: "bucket".into(),
+                            key: "a-key".into(),
+                        }),
+                    )],
+                    continuation: None,
+                }),
+            },
+            &mut state,
+            &mut left,
+            &mut Vec::new(),
+        );
+
+        let parent = virtual_parent_entry();
+        let load_more = load_more_entry();
+        let visible = apply_filter_with_parent_and_continuation(
+            &left,
+            &state.filter,
+            &state.left.location,
+            &parent,
+            &load_more,
+            state.pane_listing_continuations.get(&Pane::Left),
+        );
+        assert_eq!(
+            visible[state.left.cursor].listed().map(|row| &row.identity),
+            Some(&primary_identity)
+        );
+        assert_eq!(
+            visible[state.left.split_cursor]
+                .listed()
+                .map(|row| &row.identity),
+            Some(&split_identity)
+        );
+    }
+
+    #[test]
+    fn accepted_page_appends_sorts_replaces_and_finally_clears_token() {
+        let (mut state, mut left, initiating) = pagination_state();
+        state.left.cursor = 1; // virtual Parent then the listed row
+        let selected = left[0].identity.clone();
+        let mut next = initiating.clone();
+        next.provider_continuation.token = " next opaque token ".into();
+        let response = PaneNextPageResponse {
+            request_id: arx::services::PanePageRequestId(9),
+            pane: Pane::Left,
+            initiating_continuation: initiating.clone(),
+            result: Ok(PaneLoadPage {
+                entries: vec![listed_with_identity(
+                    "a-second",
+                    EntryKind::File,
+                    EntryIdentity::S3Object(S3ObjectRef {
+                        target: "prod".into(),
+                        bucket: "bucket".into(),
+                        key: "a-key".into(),
+                    }),
+                )],
+                continuation: Some(next.clone()),
+            }),
+        };
+        apply_next_page_response(response, &mut state, &mut left, &mut Vec::new());
+
+        assert_eq!(
+            left.iter()
+                .map(|e| e.entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-second", "z-first"]
+        );
+        assert_eq!(state.left.cursor, 2);
+        assert_eq!(left[state.left.cursor - 1].identity, selected);
+        assert_eq!(
+            state.pane_listing_continuations.get(&Pane::Left),
+            Some(&next)
+        );
+        assert!(!state.pending_next_pages.contains_key(&Pane::Left));
+
+        assert!(state.register_next_page(
+            Pane::Left,
+            arx::services::PanePageRequestId(10),
+            next.clone(),
+        ));
+        apply_next_page_response(
+            PaneNextPageResponse {
+                request_id: arx::services::PanePageRequestId(10),
+                pane: Pane::Left,
+                initiating_continuation: next,
+                result: Ok(PaneLoadPage {
+                    entries: vec![],
+                    continuation: None,
+                }),
+            },
+            &mut state,
+            &mut left,
+            &mut Vec::new(),
+        );
+        assert!(!state.pane_listing_continuations.contains_key(&Pane::Left));
+    }
+
+    #[test]
+    fn stale_duplicate_and_error_page_responses_mutate_nothing_except_accepted_pending() {
+        let (mut state, mut left, initiating) = pagination_state();
+        let original = left.clone();
+        let stale = PaneNextPageResponse {
+            request_id: arx::services::PanePageRequestId(8),
+            pane: Pane::Left,
+            initiating_continuation: initiating.clone(),
+            result: Ok(PaneLoadPage {
+                entries: vec![listed(file("stale"))],
+                continuation: None,
+            }),
+        };
+        apply_next_page_response(stale, &mut state, &mut left, &mut Vec::new());
+        assert_eq!(left, original);
+        assert!(state.pending_next_pages.contains_key(&Pane::Left));
+
+        apply_next_page_response(
+            PaneNextPageResponse {
+                request_id: arx::services::PanePageRequestId(9),
+                pane: Pane::Left,
+                initiating_continuation: initiating.clone(),
+                result: Err(io::Error::other("offline failure")),
+            },
+            &mut state,
+            &mut left,
+            &mut Vec::new(),
+        );
+        assert_eq!(left, original);
+        assert_eq!(
+            state.pane_listing_continuations.get(&Pane::Left),
+            Some(&initiating)
+        );
+        assert!(!state.pending_next_pages.contains_key(&Pane::Left));
+        assert_eq!(
+            state.message.as_deref(),
+            Some("Load next page failed: offline failure")
+        );
+
+        apply_next_page_response(
+            PaneNextPageResponse {
+                request_id: arx::services::PanePageRequestId(9),
+                pane: Pane::Left,
+                initiating_continuation: initiating,
+                result: Ok(PaneLoadPage {
+                    entries: vec![listed(file("late-duplicate"))],
+                    continuation: None,
+                }),
+            },
+            &mut state,
+            &mut left,
+            &mut Vec::new(),
+        );
+        assert_eq!(left, original);
     }
 
     #[test]
