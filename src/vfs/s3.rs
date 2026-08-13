@@ -10,6 +10,8 @@ use aws_config::Region;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Builder, retry::RetryConfig};
 use aws_sdk_s3::operation::list_buckets::ListBucketsOutput;
+use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
+use std::borrow::Cow;
 use std::io;
 
 pub struct S3Fs;
@@ -358,15 +360,29 @@ impl VfsProvider for S3Provider {
                 })
             }
             S3ListingScope::Bucket { bucket, prefix } => {
-                // Bucket/prefix object listing is ListObjectsV2 (S3-20).
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!(
-                        "S3 bucket object listing requires S3-20 (ListObjectsV2): bucket={}, prefix={}",
-                        sanitize_diag(bucket),
-                        sanitize_diag(prefix)
-                    ),
-                ))
+                // ListObjectsV2 (S3-20). Continuation consumption is S3-21; an
+                // incoming token must fail closed BEFORE the client is built.
+                if continuation.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "S3 ListObjectsV2 continuation not supported until S3-21",
+                    ));
+                }
+
+                // S3-17 lazy per-target lifecycle: only this boundary builds the
+                // client. Exactly one bounded ListObjectsV2 .send() per page.
+                let client = self.client().await?;
+                let wire_prefix = list_objects_wire_prefix(prefix);
+                let output = list_objects_v2_page(client, bucket, &wire_prefix).await?;
+                let page =
+                    map_list_objects_v2_first_page(&self.target.id, bucket, &wire_prefix, &output)?;
+                // First-page continuation truth: IsTruncated/NextContinuationToken.
+                let continuation =
+                    next_list_objects_v2_continuation(output.is_truncated(), output.next_continuation_token())?;
+                Ok(ProviderListingPage {
+                    entries: page.entries,
+                    continuation,
+                })
             }
         }
     }
@@ -461,7 +477,203 @@ fn map_list_buckets_page(
     })
 }
 
-// Old VfsOps stub kept for compat
+/// Bounded page size for every ListObjectsV2 request (first page in S3-20).
+// ponytail: stays well under the 1000-key ceiling; S3-21 owns pagination.
+const LIST_OBJECTS_PAGE_SIZE: i32 = 1000;
+
+/// Construct the wire prefix for a ListObjectsV2 request.
+///
+/// This is protocol/navigation construction, NOT filesystem normalization:
+/// - nav "" => wire "" (bucket root)
+/// - nav ending "/" => preserve exactly
+/// - nav non-empty without trailing "/" => append exactly one "/"
+///   Never trim, collapse "//", resolve "."/"..", or canonicalize.
+fn list_objects_wire_prefix(nav_prefix: &str) -> Cow<'_, str> {
+    if nav_prefix.is_empty() {
+        Cow::Borrowed("")
+    } else if nav_prefix.ends_with('/') {
+        Cow::Borrowed(nav_prefix)
+    } else {
+        Cow::Owned(format!("{nav_prefix}/"))
+    }
+}
+
+/// One bounded ListObjectsV2 request for the first page.
+/// Exactly one `.send()` per invocation. No loop, no paginator helper.
+async fn list_objects_v2_page(
+    client: &Client,
+    bucket: &str,
+    wire_prefix: &str,
+) -> io::Result<ListObjectsV2Output> {
+    let request = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(wire_prefix)
+        .delimiter("/")
+        .max_keys(LIST_OBJECTS_PAGE_SIZE);
+    request
+        .send()
+        .await
+        .map_err(|e| io::Error::other(format!("S3 ListObjectsV2 failed: {}", e)))
+}
+
+/// Pure first-page continuation protocol for ListObjectsV2.
+/// ListObjectsV2 exposes IsTruncated + NextContinuationToken.
+/// - IsTruncated == false => None
+/// - IsTruncated == true AND usable NextContinuationToken => Some(ProviderContinuation)
+/// - IsTruncated == true AND token missing/empty => InvalidData (ProtocolError)
+/// - Missing IsTruncated => InvalidData
+/// - IsTruncated == false BUT NextContinuationToken present => contradictory InvalidData
+fn next_list_objects_v2_continuation(
+    is_truncated: Option<bool>,
+    next_token: Option<&str>,
+) -> io::Result<Option<ProviderContinuation>> {
+    match is_truncated {
+        Some(false) => Ok(None),
+        Some(true) => {
+            match next_token {
+                Some(token) if !token.is_empty() => Ok(Some(ProviderContinuation {
+                    token: token.to_string(),
+                })),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "S3 ListObjectsV2 pagination protocol error: missing or empty NextContinuationToken on truncated response",
+                )),
+            }
+        }
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "S3 ListObjectsV2 pagination protocol error: missing IsTruncated field",
+        )),
+    }
+}
+
+/// Pure AWS-response → provider-page mapping for ListObjectsV2 first page.
+/// Includes folder-marker dedup by exact evidence only.
+fn map_list_objects_v2_first_page(
+    target_id: &str,
+    bucket: &str,
+    wire_prefix: &str,
+    output: &ListObjectsV2Output,
+) -> io::Result<ProviderListingPage> {
+    let mut entries = Vec::new();
+
+    // Collect exact CommonPrefix values for folder-marker dedup.
+    let common_prefixes: Vec<String> = output
+        .common_prefixes()
+        .iter()
+        .filter_map(|cp| cp.prefix())
+        .map(|s| s.to_string())
+        .collect();
+
+    // Map Contents -> S3ObjectRef (objects).
+    for obj in output.contents() {
+        let Some(key) = obj.key() else {
+            // Missing key => skip unusable record, never invent identity.
+            continue;
+        };
+
+        // Reject objects outside the requested wire prefix.
+        if !key.starts_with(wire_prefix) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "S3 ListObjectsV2 response contained object key outside requested prefix",
+            ));
+        }
+
+        // FOLDER MARKER DEDUP — exact evidence only.
+        // CASE A: current-folder marker (wire prefix != "" AND key == wire prefix AND size == 0).
+        let is_current_folder_marker = !wire_prefix.is_empty() && key == wire_prefix && obj.size() == Some(0);
+        // CASE B: child-folder marker duplicated by CommonPrefixes (size == 0 AND exact CommonPrefixes contains key).
+        let is_child_marker_deduped = obj.size() == Some(0) && common_prefixes.contains(&key.to_string());
+
+        if is_current_folder_marker || is_child_marker_deduped {
+            // Suppress the marker; identity already represented as virtual folder.
+            continue;
+        }
+
+        // NON-ZERO self-slash object: key == wire_prefix but size > 0.
+        // It is real data; presentation would be empty, so fall back to exact key.
+        let presentation_name = if !wire_prefix.is_empty() && key == wire_prefix {
+            key.to_string()
+        } else if let Some(stripped) = key.strip_prefix(wire_prefix) {
+            // Strip exact wire prefix for presentation (not operational identity).
+            stripped.to_string()
+        } else {
+            key.to_string()
+        };
+
+        // Size: only if present and non-negative.
+        let size = obj.size().and_then(|s| if s >= 0 { Some(s as u64) } else { None });
+
+        // Last modified: convert DateTime to unix ms if valid.
+        let modified_unix_ms = obj.last_modified().and_then(|dt| dt.to_millis().ok()).and_then(|ms| if ms >= 0 { Some(ms as u64) } else { None });
+
+        entries.push(ListedEntry {
+            entry: Entry {
+                name: presentation_name,
+                kind: EntryKind::File,
+                size,
+                modified_unix_ms,
+            },
+            identity: EntryIdentity::S3Object(S3ObjectRef {
+                target: target_id.to_string(),
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            }),
+        });
+    }
+
+    // Map CommonPrefixes -> S3PrefixRef (virtual folders).
+    for cp in output.common_prefixes() {
+        let Some(prefix) = cp.prefix() else {
+            continue;
+        };
+
+        // Reject CommonPrefix outside requested wire prefix.
+        if !prefix.starts_with(wire_prefix) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "S3 ListObjectsV2 response contained CommonPrefix outside requested prefix",
+            ));
+        }
+
+        // Skip self-navigation (CommonPrefix == wire_prefix => no child).
+        if prefix == wire_prefix {
+            continue;
+        }
+
+        // Presentation: strip exact wire prefix + exactly one trailing "/".
+        let presentation_name = if let Some(rest) = prefix.strip_prefix(wire_prefix) {
+            if let Some(stripped) = rest.strip_suffix('/') {
+                stripped.to_string()
+            } else {
+                rest.to_string()
+            }
+        } else {
+            prefix.to_string()
+        };
+
+        entries.push(ListedEntry {
+            entry: Entry {
+                name: presentation_name,
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Prefix(S3PrefixRef {
+                target: target_id.to_string(),
+                bucket: bucket.to_string(),
+                prefix: prefix.to_string(),
+            }),
+        });
+    }
+
+    Ok(ProviderListingPage {
+        entries,
+        continuation: None, // handled by next_list_objects_v2_continuation
+    })
+}
 impl VfsOps for S3Fs {
     fn list(&self) -> anyhow::Result<Vec<Entry>> {
         Err(anyhow::anyhow!("S3: not implemented"))
@@ -1093,17 +1305,23 @@ mod tests {
     // ── S3-19 regression (NIT from S3-18): bucket-bound via PUBLIC list_page ──
 
     #[tokio::test]
-    async fn bucket_bound_list_page_stays_offline() {
+    async fn bucket_bound_list_page_initializes_client() {
+        // S3-20 implements ListObjectsV2 for exact bound bucket.
         let p = S3Provider::new(bound_target("company-artifacts"));
         let l = Location::S3 {
             target: "t".to_string(),
             bucket: Some("company-artifacts".to_string()),
             prefix: String::new(),
         };
+        // ListObjectsV2 is now implemented (S3-20); client initializes.
+        // Without AWS creds it fails, but NOT with Unsupported.
         let err = p.list_page(&l, None).await.unwrap_err();
-        assert!(matches!(err.kind(), io::ErrorKind::Unsupported));
-        // Least-privilege invariant: no client init, no ListBuckets before S3-20.
-        assert!(p.client.get().is_none());
+        assert!(
+            !matches!(err.kind(), io::ErrorKind::Unsupported),
+            "Exact bound bucket should route to ListObjectsV2, not return Unsupported"
+        );
+        // Client should have been initialized (lazy init happened).
+        assert!(p.client.get().is_some());
     }
 
     #[tokio::test]

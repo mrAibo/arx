@@ -2464,18 +2464,31 @@ mod s3_list_page_tests {
     }
 
     #[tokio::test]
-    async fn registry_s3_routing_still_fail_closed() {
+    async fn registry_s3_routing_bucket_scope_works() {
         let registry = ProviderRegistry::new();
-        // Target registered, but S3 listing is still not implemented (S3-18).
-        registry.register_s3_targets(&[mk_s3_target("t", None, None, None, false)]);
+        // Target registered with S3-20 implemented; bucket-bound location should
+        // route through Bucket scope (ListObjectsV2) rather than TargetRoot.
+        registry.register_s3_targets(&[mk_s3_target(
+            "t",
+            None,
+            None,
+            None,
+            false,
+        )]);
         let loc = Location::S3 {
             target: "t".into(),
             bucket: Some("some-bucket".into()),
             prefix: String::new(),
         };
-        let err = registry.list_page(&loc, None).await;
-        assert!(err.is_err());
-        assert_eq!(err.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+        // ListObjectsV2 is implemented (S3-20); client will be initialized.
+        // Without AWS creds it fails with a different error, but NOT Unsupported.
+        let err = registry.list_page(&loc, None).await.unwrap_err();
+        assert!(
+            !matches!(err.kind(), std::io::ErrorKind::Unsupported),
+            "Bucket scope should route to ListObjectsV2, not return Unsupported"
+        );
+        // Verify it went through Bucket path (target-specific provider created)
+        // Note: without AWS creds it fails, but we confirmed it's not Unsupported.
     }
 
     // ── MAJOR-01: real SFTP registry route, both APIs observe "/srv/data" exactly ──
@@ -2741,7 +2754,7 @@ mod s3_list_page_tests {
     }
 
     #[tokio::test]
-    async fn s3_page_route_is_target_aware_but_still_unsupported() {
+    async fn s3_page_route_bucket_scope_routes_to_list_objects_v2() {
         let registry = ProviderRegistry::new();
         registry.register_s3_targets(&[mk_s3_target(
             "aws-prod",
@@ -2755,13 +2768,12 @@ mod s3_list_page_tests {
             bucket: Some("some-bucket".into()),
             prefix: "".to_string(),
         };
-        // Bucket-bound location reaches the target-aware provider lifecycle but
-        // S3Provider::list_page stays Unsupported: object listing (ListObjectsV2)
-        // is S3-20. No AWS call for bucket listing yet.
-        let result = registry.list_page(&loc, None).await;
-        assert!(matches!(
-            result.unwrap_err().kind(),
-            std::io::ErrorKind::Unsupported
-        ));
+        // Bucket-bound location routes through Bucket scope (ListObjectsV2, S3-20).
+        // With AWS creds it would work; without, it fails differently than Unsupported.
+        let err = registry.list_page(&loc, None).await.unwrap_err();
+        assert!(
+            !matches!(err.kind(), std::io::ErrorKind::Unsupported),
+            "Bucket scope should route to ListObjectsV2, not return Unsupported"
+        );
     }
 }
