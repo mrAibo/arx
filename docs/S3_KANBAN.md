@@ -16,8 +16,8 @@
 
 ## Column summary
 
-- **READY** (1): S3-23
-- **DOING** (0): —
+- **READY** (0): —
+- **DOING** (1): S3-23
 - **REVIEW** (0): —
 - **BLOCKED** (0): —
 - **DONE** (23): S3-00..S3-22
@@ -288,14 +288,27 @@
 - **Stop conditions:** AWS integration required (must allow mocked).
 - **Hermes prompt:** Tests: awkward keys (foo//bar, foo/../bar, foo/./bar, spaces, Unicode, emoji, zero-byte, folder marker) preserve exact identity; display may simplify presentation only. Mocked.
 
-### S3-23 — Enter S3BucketRef
+### S3-23 — Pane ListedEntry seam + Enter S3BucketRef
 - **Phase:** P10
-- **Status:** READY
-- **Depends on:** S3-18..22
-- **Allowed files:** src/app/actions.rs, src/app/remote_workspace.rs (nav)
-- **Acceptance:** Enter target root=>exact bucket via S3BucketRef (never Entry.name). Result Location::S3{same target, bucket exact, prefix ""}. No other nav changes.
-- **Stop conditions:** Entry.name reconstruction.
-- **Hermes prompt:** Nav: entering a bucket uses S3BucketRef => Location::S3{target, bucket exact, prefix ""}. Never Entry.name. No other nav changes.
+- **Status:** DOING
+- **Depends on:** S3-13..15, S3-18..22
+- **Allowed files:** src/services/pane_loader.rs, src/services/mod.rs, src/app/mod.rs, src/app/actions.rs, src/tui.rs, docs/S3_KANBAN.md
+- **Acceptance:**
+  1. Pane first-page loading uses `ProviderRegistry::list_page`, not legacy `list_location_async`.
+  2. `PaneLoadResponse` carries `ListedEntry` identity end-to-end.
+  3. Provider continuation from the first page is wrapped as `PaneListingContinuation` with the exact provider instance, exact `Location`, and exact `PaneLoadId` generation.
+  4. Current pane continuation may be retained for a future next-page card, but S3-23 does not fetch or append page 2.
+  5. Local/SFTP/Archive retain existing presentation and navigation behavior; their page-adapter identity remains `EntryIdentity::Other`.
+  6. TUI backing data never separates `Entry` from `EntryIdentity` by name, hash, or parallel vectors that can drift during sort/filter.
+  7. Enter on `S3Bucket` uses the exact `S3BucketRef`: `Location::S3 { target: exact ref.target, bucket: Some(exact ref.bucket), prefix: "" }`.
+  8. S3 bucket navigation never uses `Entry.name`.
+  9. `S3Prefix` remains non-navigable until S3-24 and never falls through to `Location::child(entry.name)`.
+  10. `S3Object` remains non-directory navigation.
+  11. No S3 virtual-parent behavior; S3-25 owns it.
+  12. No capability flip.
+  13. No page-next fetch or append.
+- **Stop conditions:** Identity reconstruction from presentation, parallel sortable entry/identity storage, page-2 fetch, capability flip, or any required file outside the allowed list.
+- **Hermes prompt:** Preserve provider-listed identity through the pane first-page seam. Enter an S3 bucket only from exact `S3BucketRef`; retain legacy `EntryIdentity::Other` navigation. Store but do not consume continuation. No S3 prefix or parent navigation and no capability change.
 
 ### S3-24 — Enter S3PrefixRef
 - **Phase:** P10
