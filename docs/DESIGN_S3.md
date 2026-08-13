@@ -125,7 +125,7 @@ force_path_style = true      # required by some MinIO/R2 setups
 Location::S3 {
     target: String,       // matches [[s3.targets]].id
     bucket: Option<String>, // None at target root (ListBuckets); Some at bucket root+
-    prefix: String,       // "" at bucket root; internal nav prefix, stored without leading/trailing slash as a UI/navigation convention only — this is NOT normalization of any S3 object key (see §9 KEY vs NAVIGATION PREFIX)
+    prefix: String,       // "" at bucket root; internal nav prefix = exact CommonPrefix with EXACTLY ONE final protocol delimiter removed. May itself end in '/' for repeated-delimiter providers (e.g. provider "foo//" -> nav "foo/"). This is NOT normalization of any S3 object key (see §9 KEY vs NAVIGATION PREFIX).
 }
 ```
 
@@ -174,8 +174,8 @@ struct S3BucketRef {
   - **Current helpers**: `validated_child_path()` and generic `Location::child(name)` **must not** be used to reconstruct existing S3 object identities (they remain valid for Local/SFTP). Newly created S3 prefix/object names use an S3-specific exact-key construction rule (see §17 for prefix markers).
 - **[ARX DESIGN DECISION — KEY vs NAVIGATION PREFIX (S3-DESIGN-FINAL-03)]** Distinguish two concepts explicitly:
   - **`S3ObjectKey`**: the exact, opaque object key as returned by S3 (`S3ObjectRef.key`). Never normalized, never FS-interpreted.
-  - **`S3NavigationPrefix`**: the prefix ARX uses for `ListObjectsV2` (`prefix=`) and for `..`/enter navigation (`S3PrefixRef.prefix`). A navigation prefix may have a canonical UI representation (e.g. trailing-slash display).
-  - Storing a navigation prefix **without** a trailing slash is a UI/navigation representation choice — it does **not** normalize or modify any existing object key. If `ListObjectsV2` requires `foo/bar/` (trailing slash) while ARX stores `foo/bar` internally, that slash is **protocol/navigation construction**, not a change to object identity. The object key stays exactly what S3 returned.
+  - **`S3NavigationPrefix`**: the prefix ARX uses for `ListObjectsV2` (`prefix=`) and for `..`/enter navigation (`S3PrefixRef.prefix`). It is obtained from the exact provider `CommonPrefix` by removing **exactly one** final protocol delimiter (`/` with `Delimiter="/"`). Therefore a navigation prefix **may itself end in `/`** when the provider identity contains repeated delimiters (e.g. provider `foo//` → nav `foo/`, and `list_objects_wire_prefix("foo/") == "foo//"` — the round trip is exact). A trailing `/` in a navigation prefix is **literal namespace structure**, never a protocol delimiter to skip.
+  - The wire `ListObjectsV2` prefix is reconstructed by adding exactly one protocol delimiter to **every** non-empty navigation prefix (unconditionally, even when the nav prefix already ends in `/`). Storing the navigation prefix without inventing extra delimiters is a UI/navigation representation choice — it does **not** normalize or modify any existing object key. If `ListObjectsV2` requires `foo/bar/` (trailing slash) while ARX stores `foo/bar` internally, that slash is **protocol/navigation construction**, not a change to object identity. The object key stays exactly what S3 returned.
 
 ## 10. Provider instance model
 

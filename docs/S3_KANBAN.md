@@ -16,11 +16,11 @@
 
 ## Column summary
 
-- **READY** (2): S3-24, S3-24P
+- **READY** (1): S3-24
 - **DOING** (0): —
 - **REVIEW** (0): —
 - **BLOCKED** (0): —
-- **DONE** (24): S3-00..S3-23
+- **DONE** (26): S3-00..S3-23, S3-24P (PR #98 merged, merge SHA 19d4c04), S3-20R (PR #99 merged, merge SHA pending)
 - **BACKLOG** (56): S3-25..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
@@ -235,7 +235,7 @@
   - Navigation prefix vs wire-prefix vs exact identity:
     - bucket-root nav "" => wire Prefix ""
     - non-empty nav without trailing "/" => append exactly one "/"
-    - already-delimited => preserve exactly
+    - non-empty nav WITH trailing "/" => append exactly one more "/" (the existing trailing "/" is literal namespace structure, NOT a protocol delimiter to skip; see S3-20R)
     - no trim / no "//" collapse / no "." / ".." resolution / no canonicalize
   - Delimiter="/" groups child keys into CommonPrefixes.
   - max_keys=1000; exactly ONE ListObjectsV2 .send() per list_page.
@@ -288,6 +288,21 @@
 - **Stop conditions:** AWS integration required (must allow mocked).
 - **Hermes prompt:** Tests: awkward keys (foo//bar, foo/../bar, foo/./bar, spaces, Unicode, emoji, zero-byte, folder marker) preserve exact identity; display may simplify presentation only. Mocked.
 
+### S3-20R — Reversible S3 navigation/wire-prefix delimiter seam
+- **Phase:** P9 correction / prerequisite for P10 prefix navigation
+- **Status:** DONE (PR #99 merged; merge SHA pending; independent review APPROVED 0/0/0/0, quality+msrv SUCCESS)
+- **Depends on:** S3-20, S3-21, S3-22
+- **Allowed files:** src/vfs/s3.rs, docs/DESIGN_S3.md, docs/S3_KANBAN.md
+- **Acceptance:**
+  1. `list_objects_wire_prefix`: for every non-empty navigation prefix, append EXACTLY ONE `/` UNCONDITIONALLY — the `ends_with('/') => preserve` branch is removed.
+  2. Round-trip invariant holds for repeated-delimiter structure: `nav(P) = P` with exactly one final `/` removed; `wire(nav(P)) == P`. Prove: `"foo/"`→`"foo"`, `"foo//"`→`"foo/"`→`"foo//"`; `"foo/bar/"`→`"foo/bar"`; `"foo/../bar/"`→`"foo/../bar"`; Unicode. No production nav helper introduced (test-only `strip_suffix('/')`).
+  3. CommonPrefix mapping requires `prefix.ends_with('/')` (Delimiter="/" always terminates a returned CommonPrefix). Missing delimiter => `InvalidData` with a safe message that does NOT echo the prefix value and does NOT invent an identity.
+  4. Exact `S3PrefixRef.prefix` remains the unchanged provider value. No normalization, trim, `//` collapse, `Path`/`PathBuf`/`canonicalize`, dot resolution.
+  5. Folder-marker dedup (incl. repeated-slash self/child markers) stays correct: `foo//` self marker suppressed; `foo//child/` child marker deduped to exactly one `S3PrefixRef`.
+  6. `Location::S3.prefix` is the navigation representation = exact `CommonPrefix` with exactly ONE final protocol delimiter removed; it MAY end in `/` for repeated-delimiter providers. DESIGN_S3.md §9 reflects this.
+- **Stop conditions:** Normalization. Capability flip. Production nav-conversion helper in s3.rs (S3-24 owns that in actions.rs). Touching TUI/actions.rs/PaneLoader/Cargo.
+- **Hermes prompt:** Make the wire-prefix seam reversible: append exactly one `/` to every non-empty nav prefix; require CommonPrefix to end in `/` (else InvalidData, no echo); update DESIGN_S3.md §9 wording; tests: wire matrix (empty/plain/literal-trailing-slash/repeated-slashes/nested/dotdot/dot/unicode) + roundtrip table + CommonPrefix validation (exact identity, missing-delimiter rejected, awkward + unicode valid) + repeated-slash marker regression.
+
 ### S3-23 — Pane ListedEntry seam + Enter S3BucketRef
 - **Phase:** P10
 - **Status:** DONE
@@ -313,27 +328,27 @@
 ### S3-24 — Enter S3PrefixRef
 - **Phase:** P10
 - **Status:** READY
-- **Depends on:** S3-23
-- **Allowed files:** src/app/actions.rs
-- **Acceptance:** Navigate into CommonPrefix using exact S3PrefixRef. No string reconstruction from presentation name.
-- **Stop conditions:** Name reconstruction.
-- **Hermes prompt:** Nav into CommonPrefix uses exact S3PrefixRef. No presentation-name reconstruction.
+- **Depends on:** S3-23, S3-20R
+- **Allowed files:** src/app/actions.rs, src/tui.rs (tests only)
+- **Acceptance:** Navigate into `CommonPrefix` using exact `S3PrefixRef`; never reconstruct from presentation name. Remove exactly one final protocol `/` from the exact ref to form `Location::S3.prefix`, preserving every preceding byte, including `//`, `.`, `..`, spaces, and Unicode. Update the existing TUI integration regression so prefix rows navigate while S3 objects and S3 `Other` remain fail-closed. Prove exact ref `foo//` -> nav `foo/`; S3-20R separately proves nav `foo/` -> wire `foo//` (the composed round trip is exact). Because S3-20R now rejects any `CommonPrefix` lacking a trailing `/` (Delimiter="/"), S3-24 may accept only refs that passed that invariant and strip exactly one delimiter — no fallback for a `S3PrefixRef` without trailing `/`.
+- **Stop conditions:** Name reconstruction, removing more than one final delimiter, changing the provider wire seam, or production changes outside `src/app/actions.rs` (+ test-only `src/tui.rs`).
+- **Hermes prompt:** After S3-20R merges, navigate into CommonPrefix from exact `S3PrefixRef`: strip exactly one final protocol `/`, preserve all preceding bytes, and never use presentation name. Production only in actions.rs; update the stale TUI assertion test-only. S3Object and S3 Other remain non-navigable.
 
 ### S3-24P — Pane incremental pagination
 - **Phase:** P10
-- **Status:** READY
+- **Status:** DONE (PR #98 merged; merge SHA 19d4c04; independent two-axis review APPROVED_FOR_COMMIT 29/29, quality+msrv SUCCESS)
 - **Depends on:** S3-23, S3-19, S3-21
 - **Allowed files:** src/services/pane_loader.rs, src/services/mod.rs, src/app/mod.rs, src/tui.rs, tests/async_vfs_contracts.rs
 - **Acceptance:**
   1. Consume the stored `PaneListingContinuation` incrementally; do not reconstruct it.
-  2. Allow at most one pending next-page request per pane.
+  2. Allow at most one pending next-page request per pane (`PanePageRequestId`, separate counter).
   3. Correlate each page by exact listing generation, `Location`, provider instance, and page-request identity.
-  4. Silently discard stale responses without appending rows or mutating continuation state.
+  4. Silently discard stale/duplicate/foreign responses without appending rows or mutating continuation state.
   5. Append complete `ListedEntry` values without separating presentation from operational identity.
   6. Atomically replace the consumed continuation with the returned continuation.
   7. `None` means end-of-list and no `Load more…` row.
   8. A page error keeps already loaded rows and the original continuation for retry.
-  9. No eager or automatic pagination.
+  9. No eager or automatic pagination (only explicit Enter on the `LoadMore` virtual row triggers `schedule_next_page`, the sole `load_next` caller).
   10. No capability flip.
   11. Local/SFTP/Archive behavior remains unchanged.
 - **Stop conditions:** Eager enumeration, duplicate append, stale page append, Entry/identity separation, or capability flip.
