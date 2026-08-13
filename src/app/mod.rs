@@ -22,7 +22,7 @@ use crate::vfs::{RemoteDeletePlan, RemoteEditSession};
 mod actions;
 pub use actions::{
     ACTION_CATALOG, ALL_ACTIONS, Action, ActionCategory, ActionId, ActionMeta, InputContext,
-    action_meta,
+    action_meta, listed_entry_navigation_target,
 };
 mod availability;
 pub use availability::{ActionAvailability, ActionContext, action_availability};
@@ -219,6 +219,7 @@ pub struct AppState {
     // ponytail: separate from pending_* (request state) — pagination needs the
     // generation to outlive the request; finish_pane_load only clears pending_*.
     pub pane_listing_generations: BTreeMap<Pane, PaneLoadId>,
+    pub pane_listing_continuations: BTreeMap<Pane, PaneListingContinuation>,
     /// Persistent presentation state for the latest accepted pane-load failure.
     pub pane_load_errors: BTreeMap<Pane, PaneLoadUiError>,
     pub infrastructure_lines: Vec<String>,
@@ -346,6 +347,7 @@ impl Default for AppState {
             pending_pane_loads: BTreeMap::new(),
             pending_pane_targets: BTreeMap::new(),
             pane_listing_generations: BTreeMap::new(),
+            pane_listing_continuations: BTreeMap::new(),
             pane_load_errors: BTreeMap::new(),
             infrastructure_lines: Vec::new(),
             tree_lines: Vec::new(),
@@ -474,6 +476,7 @@ impl AppState {
         purpose: PaneLoadPurpose,
     ) {
         self.pane_load_errors.remove(&pane);
+        self.pane_listing_continuations.remove(&pane);
         self.pending_pane_loads.insert(pane, id);
         self.pending_pane_targets.insert(pane, (location, purpose));
         // advance persistent listing generation; pagination relies on this
@@ -536,6 +539,22 @@ impl AppState {
             return false;
         }
         true
+    }
+
+    pub fn apply_pane_listing_continuation(
+        &mut self,
+        pane: Pane,
+        continuation: Option<PaneListingContinuation>,
+    ) {
+        match continuation {
+            Some(continuation) if self.accepts_pane_listing_continuation(pane, &continuation) => {
+                self.pane_listing_continuations.insert(pane, continuation);
+            }
+            None => {
+                self.pane_listing_continuations.remove(&pane);
+            }
+            Some(_) => {}
+        }
     }
 
     pub fn register_effect(&mut self, lane: EffectLane, id: EffectId) {
@@ -984,6 +1003,103 @@ mod tests {
 
         let c = cont(42, loc);
         assert!(state.accepts_pane_listing_continuation(Pane::Left, &c));
+    }
+
+    #[test]
+    fn new_load_clears_old_pane_continuation() {
+        let mut state = AppState::default();
+        let location = state.left.location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(42),
+            location.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        state.apply_pane_listing_continuation(Pane::Left, Some(cont(42, location.clone())));
+        assert!(state.pane_listing_continuations.contains_key(&Pane::Left));
+
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(43),
+            location,
+            PaneLoadPurpose::Refresh,
+        );
+
+        assert!(!state.pane_listing_continuations.contains_key(&Pane::Left));
+    }
+
+    #[test]
+    fn accepted_current_continuation_can_be_stored() {
+        let mut state = AppState::default();
+        let location = state.left.location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(42),
+            location.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        let continuation = cont(42, location);
+
+        state.apply_pane_listing_continuation(Pane::Left, Some(continuation.clone()));
+
+        assert_eq!(
+            state.pane_listing_continuations.get(&Pane::Left),
+            Some(&continuation)
+        );
+    }
+
+    #[test]
+    fn stale_continuation_cannot_replace_current() {
+        let mut state = AppState::default();
+        let location = state.left.location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(43),
+            location.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        let current = cont(43, location.clone());
+        state.apply_pane_listing_continuation(Pane::Left, Some(current.clone()));
+
+        state.apply_pane_listing_continuation(Pane::Left, Some(cont(42, location)));
+
+        assert_eq!(
+            state.pane_listing_continuations.get(&Pane::Left),
+            Some(&current)
+        );
+    }
+
+    #[test]
+    fn left_right_continuations_are_independent() {
+        let mut state = AppState::default();
+        let left = state.left.location.clone();
+        let right = state.right.location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(41),
+            left.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        state.register_pane_load(
+            Pane::Right,
+            PaneLoadId(42),
+            right.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        let left_continuation = cont(41, left);
+        let right_continuation = cont(42, right);
+
+        state.apply_pane_listing_continuation(Pane::Left, Some(left_continuation.clone()));
+        state.apply_pane_listing_continuation(Pane::Right, Some(right_continuation.clone()));
+
+        assert_eq!(
+            state.pane_listing_continuations.get(&Pane::Left),
+            Some(&left_continuation)
+        );
+        assert_eq!(
+            state.pane_listing_continuations.get(&Pane::Right),
+            Some(&right_continuation)
+        );
     }
 
     #[test]

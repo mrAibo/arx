@@ -4,7 +4,7 @@ use arx::app::{
     Action, ActionAvailability, ActionContext, ActionId, AppState, CommandItem, CommandKind,
     CommandTarget, OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SessionCallout,
     SortMode, WorkspaceSyncUxState, action_availability, action_meta,
-    build_command_items_with_file_context,
+    build_command_items_with_file_context, listed_entry_navigation_target,
 };
 use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectResponse, EffectScope};
 use arx::effects::{Effect, EffectEvent};
@@ -16,7 +16,10 @@ use arx::services::{
     PaneLoadResponse, PaneLoader, SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions,
     WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
 };
-use arx::vfs::{Entry, EntryKind, Location, ProviderId, RemoteEditSession, RemoteEditState};
+use arx::vfs::{
+    Entry, EntryIdentity, EntryKind, ListedEntry, Location, ProviderId, RemoteEditSession,
+    RemoteEditState,
+};
 use arx::workspace_sync::{
     DiffState, SyncDirection, SyncMode, WorkspaceDiff, WorkspaceSide, WorkspaceSyncOperation,
     WorkspaceSyncPlan,
@@ -125,18 +128,20 @@ async fn event_loop(
             state.git_status = GitService::status_suffix(&active_location).await;
             state.git_status_location = Some(active_location);
         }
-        let left_filtered = apply_filter_with_parent(
+        let left_visible = apply_filter_with_parent(
             &left_entries,
             &state.filter,
             &state.left.location,
             &parent_entry,
         );
-        let right_filtered = apply_filter_with_parent(
+        let right_visible = apply_filter_with_parent(
             &right_entries,
             &state.filter,
             &state.right.location,
             &parent_entry,
         );
+        let left_filtered: Vec<&Entry> = left_visible.iter().map(VisiblePaneRow::entry).collect();
+        let right_filtered: Vec<&Entry> = right_visible.iter().map(VisiblePaneRow::entry).collect();
         // clamp cursors
         state.left.cursor = state.left.cursor.min(left_filtered.len().saturating_sub(1));
         state.right.cursor = state
@@ -344,6 +349,11 @@ async fn event_loop(
                                 } else {
                                     &right_filtered
                                 };
+                                let rows = if state.active == Pane::Left {
+                                    &left_visible
+                                } else {
+                                    &right_visible
+                                };
                                 let cursor = {
                                     let pane = state.active_pane();
                                     if pane.split && pane.split_active {
@@ -352,7 +362,7 @@ async fn event_loop(
                                         pane.cursor
                                     }
                                 };
-                                let focused = entries.get(cursor).copied();
+                                let focused = rows.get(cursor).copied();
                                 let visible_count = entries.len();
 
                                 if hb.available {
@@ -373,7 +383,7 @@ async fn event_loop(
                                     .await?;
                                 } else {
                                     let ctx = ActionContext::from_state(&state).with_file_context(
-                                        focused.map(|e| e.kind),
+                                        focused.map(|row| row.entry().kind),
                                         editor.is_some(),
                                     );
                                     let action_id = action_to_id(hb.action);
@@ -424,14 +434,15 @@ async fn event_loop(
                             state.context_menu_pos = (mouse.column, mouse.row);
                         }
                         MouseEventKind::Drag(MouseButton::Left) => {
-                            let filt = if is_left {
-                                &left_filtered
+                            let rows = if is_left {
+                                &left_visible
                             } else {
-                                &right_filtered
+                                &right_visible
                             };
-                            if let Some(entry) = filt
+                            if let Some(entry) = rows
                                 .get(row)
-                                .filter(|entry| entry.name != VIRTUAL_PARENT_NAME)
+                                .and_then(VisiblePaneRow::listed)
+                                .map(|listed| &listed.entry)
                             {
                                 let pane = if is_left { Pane::Left } else { Pane::Right };
                                 let location = if is_left {
@@ -538,12 +549,12 @@ async fn event_loop(
                                             pane.cursor
                                         }
                                     };
-                                    let (focused_entry, visible_count) =
-                                        if state.active == Pane::Left {
-                                            (left_filtered.get(cursor), left_filtered.len())
-                                        } else {
-                                            (right_filtered.get(cursor), right_filtered.len())
-                                        };
+                                    let (focused_row, visible_count) = if state.active == Pane::Left
+                                    {
+                                        (left_visible.get(cursor).copied(), left_filtered.len())
+                                    } else {
+                                        (right_visible.get(cursor).copied(), right_filtered.len())
+                                    };
                                     let active_entries: &[&Entry] = if state.active == Pane::Left {
                                         &left_filtered[..]
                                     } else {
@@ -552,7 +563,7 @@ async fn event_loop(
                                     if let Some(effect) = execute_command_target(
                                         &mut state,
                                         item.target,
-                                        focused_entry.copied(),
+                                        focused_row,
                                         active_entries,
                                         visible_count,
                                         &workspace_scanner,
@@ -638,18 +649,20 @@ async fn event_loop(
                             }
                             KeyCode::Enter => {
                                 if state.glob_input && !state.filter.is_empty() {
-                                    let filt = if state.active == Pane::Left {
-                                        &left_filtered
-                                    } else {
-                                        &right_filtered
-                                    };
                                     let active = state.active;
                                     let location = state.active_pane().location.clone();
-                                    for e in filt {
-                                        if e.name != VIRTUAL_PARENT_NAME
-                                            && !state.is_selected(active, &location, &e.name)
-                                        {
-                                            state.toggle_selection(active, &location, &e.name);
+                                    let rows = if state.active == Pane::Left {
+                                        &left_visible
+                                    } else {
+                                        &right_visible
+                                    };
+                                    for e in rows.iter().filter_map(VisiblePaneRow::listed) {
+                                        if !state.is_selected(active, &location, &e.entry.name) {
+                                            state.toggle_selection(
+                                                active,
+                                                &location,
+                                                &e.entry.name,
+                                            );
                                         }
                                     }
                                     state.message = Some(format!(
@@ -983,6 +996,11 @@ async fn event_loop(
                     } else {
                         &right_filtered
                     };
+                    let visible_rows = if state.active == Pane::Left {
+                        &left_visible
+                    } else {
+                        &right_visible
+                    };
                     let cursor = {
                         let pane = state.active_pane();
                         if pane.split && pane.split_active {
@@ -1050,7 +1068,7 @@ async fn event_loop(
                                     dispatch_ui_action(
                                         &mut state,
                                         action,
-                                        entries.get(cursor).copied(),
+                                        visible_rows.get(cursor).copied(),
                                         entries,
                                         entries.len(),
                                         &workspace_scanner,
@@ -1170,10 +1188,9 @@ async fn event_loop(
                             }
                         }
                         KeyCode::Enter => {
-                            if let Some(entry) = entries.get(cursor) {
-                                if let Some(new_location) =
-                                    directory_navigation_target(&pane.location, entry)
-                                {
+                            if let Some(row) = visible_rows.get(cursor) {
+                                let entry = row.entry();
+                                if let Some(new_location) = row.navigation_target(&pane.location) {
                                     let active = state.active;
                                     schedule_pane_navigation(
                                         &pane_loader,
@@ -1181,7 +1198,7 @@ async fn event_loop(
                                         active,
                                         new_location,
                                         PaneLoadPurpose::Navigate {
-                                            remember_current: entry.name != VIRTUAL_PARENT_NAME,
+                                            remember_current: row.listed().is_some(),
                                         },
                                     );
                                     state.message = Some("Opening directory…".into());
@@ -1261,9 +1278,10 @@ async fn event_loop(
                         }
                         // Shift+F6: rename file under cursor
                         KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            if let Some(entry) = entries
+                            if let Some(entry) = visible_rows
                                 .get(cursor)
-                                .filter(|entry| entry.name != VIRTUAL_PARENT_NAME)
+                                .and_then(VisiblePaneRow::listed)
+                                .map(|listed| &listed.entry)
                             {
                                 state.cmd = format!("mv '{}' ", entry.name);
                                 state.cmd_input = true;
@@ -1420,17 +1438,15 @@ async fn event_loop(
                         }
                         // *: invert selection on visible entries
                         KeyCode::Char('*') => {
-                            let filt = if state.active == Pane::Left {
-                                &left_filtered
+                            let rows = if state.active == Pane::Left {
+                                &left_visible
                             } else {
-                                &right_filtered
+                                &right_visible
                             };
                             let active = state.active;
                             let location = state.active_pane().location.clone();
-                            for e in filt {
-                                if e.name != VIRTUAL_PARENT_NAME {
-                                    state.toggle_selection(active, &location, &e.name);
-                                }
+                            for e in rows.iter().filter_map(VisiblePaneRow::listed) {
+                                state.toggle_selection(active, &location, &e.entry.name);
                             }
                             state.message = Some(format!(
                                 "Selected {}",
@@ -1719,12 +1735,16 @@ async fn event_loop(
 }
 
 fn normalize_entries(
-    mut entries: Vec<Entry>,
+    mut entries: Vec<ListedEntry>,
     show_hidden: bool,
     sort_mode: SortMode,
-) -> Vec<Entry> {
+) -> Vec<ListedEntry> {
     if !show_hidden {
-        entries.retain(|e| !e.name.starts_with('.'));
+        entries.retain(|listed| {
+            !listed.entry.name.starts_with('.')
+                || (listed.entry.name == VIRTUAL_PARENT_NAME
+                    && !matches!(&listed.identity, EntryIdentity::Other))
+        });
     }
     sort_entries(&mut entries, sort_mode);
     entries
@@ -1762,8 +1782,8 @@ fn schedule_both_pane_loads(loader: &PaneLoader, state: &mut AppState) {
 fn apply_pane_load_response(
     response: PaneLoadResponse,
     state: &mut AppState,
-    left_entries: &mut Vec<Entry>,
-    right_entries: &mut Vec<Entry>,
+    left_entries: &mut Vec<ListedEntry>,
+    right_entries: &mut Vec<ListedEntry>,
 ) {
     if !state.accepts_pane_load(response.pane, response.id, &response.location) {
         return;
@@ -1771,9 +1791,9 @@ fn apply_pane_load_response(
     state.finish_pane_load(response.pane, response.id);
 
     match response.result {
-        Ok(entries) => {
+        Ok(page) => {
             state.pane_load_errors.remove(&response.pane);
-            let entries = normalize_entries(entries, state.show_hidden, state.sort_mode);
+            let entries = normalize_entries(page.entries, state.show_hidden, state.sort_mode);
             let active = state.active == response.pane;
             match response.pane {
                 Pane::Left => {
@@ -1823,6 +1843,7 @@ fn apply_pane_load_response(
                 state.remote_workspace.disable();
                 state.show_diff = false;
             }
+            state.apply_pane_listing_continuation(response.pane, page.continuation);
         }
         Err(error) => {
             // Transactional navigation: current pane location is intentionally
@@ -1841,13 +1862,17 @@ fn apply_pane_load_response(
     }
 }
 
-fn sort_entries(entries: &mut [Entry], mode: SortMode) {
+fn sort_entries(entries: &mut [ListedEntry], mode: SortMode) {
     match mode {
-        SortMode::NameAsc => entries.sort_by_key(|a| a.name.to_lowercase()),
-        SortMode::NameDesc => entries.sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase())),
-        SortMode::SizeAsc => entries.sort_by_key(|a| a.size.unwrap_or(0)),
-        SortMode::SizeDesc => entries.sort_by_key(|b| std::cmp::Reverse(b.size.unwrap_or(0))),
-        SortMode::Kind => entries.sort_by_key(|a| (kind_order(a.kind), a.name.to_lowercase())),
+        SortMode::NameAsc => entries.sort_by_key(|a| a.entry.name.to_lowercase()),
+        SortMode::NameDesc => {
+            entries.sort_by_key(|b| std::cmp::Reverse(b.entry.name.to_lowercase()))
+        }
+        SortMode::SizeAsc => entries.sort_by_key(|a| a.entry.size.unwrap_or(0)),
+        SortMode::SizeDesc => entries.sort_by_key(|b| std::cmp::Reverse(b.entry.size.unwrap_or(0))),
+        SortMode::Kind => {
+            entries.sort_by_key(|a| (kind_order(a.entry.kind), a.entry.name.to_lowercase()))
+        }
     }
 }
 
@@ -1860,21 +1885,22 @@ fn kind_order(k: EntryKind) -> u8 {
     }
 }
 
-fn apply_filter<'a>(entries: &'a [Entry], filter: &str) -> Vec<&'a Entry> {
+fn apply_filter<'a>(entries: &'a [ListedEntry], filter: &str) -> Vec<&'a ListedEntry> {
     if filter.is_empty() {
         entries.iter().collect()
     } else {
         let (name_filter, size_min, size_max) = parse_filter(filter);
         entries
             .iter()
-            .filter(|e| {
-                if !name_filter.is_empty() && !e.name.to_lowercase().contains(&name_filter) {
+            .filter(|listed| {
+                let entry = &listed.entry;
+                if !name_filter.is_empty() && !entry.name.to_lowercase().contains(&name_filter) {
                     return false;
                 }
                 match (size_min, size_max) {
-                    (Some(min), Some(max)) => e.size.is_some_and(|s| s >= min && s <= max),
-                    (Some(min), None) => e.size.is_some_and(|s| s >= min),
-                    (None, Some(max)) => e.size.is_some_and(|s| s <= max),
+                    (Some(min), Some(max)) => entry.size.is_some_and(|s| s >= min && s <= max),
+                    (Some(min), None) => entry.size.is_some_and(|s| s >= min),
+                    (None, Some(max)) => entry.size.is_some_and(|s| s <= max),
                     (None, None) => true,
                 }
             })
@@ -1893,28 +1919,53 @@ fn virtual_parent_entry() -> Entry {
     }
 }
 
+#[derive(Clone, Copy)]
+enum VisiblePaneRow<'a> {
+    Parent(&'a Entry),
+    Listed(&'a ListedEntry),
+}
+
+impl<'a> VisiblePaneRow<'a> {
+    fn entry(&self) -> &'a Entry {
+        match self {
+            Self::Parent(entry) => entry,
+            Self::Listed(listed) => &listed.entry,
+        }
+    }
+
+    fn listed(&self) -> Option<&'a ListedEntry> {
+        match self {
+            Self::Parent(_) => None,
+            Self::Listed(listed) => Some(listed),
+        }
+    }
+
+    fn navigation_target(&self, location: &Location) -> Option<Location> {
+        match self {
+            Self::Parent(_) => location.parent(),
+            Self::Listed(listed) => listed_entry_navigation_target(location, listed),
+        }
+    }
+}
+
 fn apply_filter_with_parent<'a>(
-    entries: &'a [Entry],
+    entries: &'a [ListedEntry],
     filter: &str,
     location: &Location,
     parent_entry: &'a Entry,
-) -> Vec<&'a Entry> {
-    let mut visible = apply_filter(entries, filter);
-    visible.retain(|entry| entry.name != VIRTUAL_PARENT_NAME);
+) -> Vec<VisiblePaneRow<'a>> {
+    let mut visible: Vec<_> = apply_filter(entries, filter)
+        .into_iter()
+        .filter(|listed| {
+            !(matches!(&listed.identity, EntryIdentity::Other)
+                && listed.entry.name == VIRTUAL_PARENT_NAME)
+        })
+        .map(VisiblePaneRow::Listed)
+        .collect();
     if location.parent().is_some() {
-        visible.insert(0, parent_entry);
+        visible.insert(0, VisiblePaneRow::Parent(parent_entry));
     }
     visible
-}
-
-fn directory_navigation_target(location: &Location, entry: &Entry) -> Option<Location> {
-    if entry.name == VIRTUAL_PARENT_NAME {
-        location.parent()
-    } else if entry.kind == EntryKind::Directory {
-        Some(location.child(&entry.name))
-    } else {
-        None
-    }
 }
 
 fn focused_entry<'a>(
@@ -1939,7 +1990,7 @@ fn toggle_selection_and_advance(
     focused: Option<&Entry>,
     visible_count: usize,
 ) {
-    let Some(entry) = focused.filter(|entry| entry.name != VIRTUAL_PARENT_NAME) else {
+    let Some(entry) = focused else {
         return;
     };
     let active = state.active;
@@ -4574,7 +4625,7 @@ fn request_quit(state: &mut AppState, effect_dispatcher: &EffectDispatcher) {
 async fn dispatch_ui_action(
     state: &mut AppState,
     action: Action,
-    focused: Option<&Entry>,
+    focused_row: Option<VisiblePaneRow<'_>>,
     active_entries: &[&Entry],
     visible_count: usize,
     workspace_scanner: &WorkspaceScanner,
@@ -4585,7 +4636,9 @@ async fn dispatch_ui_action(
     configured_editor: Option<&str>,
     key_router: &mut KeyRouter,
 ) -> io::Result<()> {
-    let focused = focused.filter(|entry| entry.name != VIRTUAL_PARENT_NAME);
+    let focused = focused_row
+        .and_then(|row| row.listed())
+        .map(|listed| &listed.entry);
     if matches!(
         action,
         Action::ToggleWorkspaceComparison
@@ -5043,18 +5096,8 @@ async fn dispatch_ui_action(
         Action::Delete => {
             let names: Vec<String> = state
                 .selection_names(state.active, &state.active_pane().location)
-                .map(|names| {
-                    names
-                        .iter()
-                        .filter(|n| *n != VIRTUAL_PARENT_NAME)
-                        .cloned()
-                        .collect()
-                })
-                .or_else(|| {
-                    focused
-                        .filter(|e| e.name != VIRTUAL_PARENT_NAME)
-                        .map(|entry| vec![entry.name.clone()])
-                })
+                .map(|names| names.iter().cloned().collect())
+                .or_else(|| focused.map(|entry| vec![entry.name.clone()]))
                 .unwrap_or_default();
             if names.is_empty() {
                 state.message = Some("Select a file or directory to delete".into());
@@ -5504,7 +5547,7 @@ fn cancel_workspace_sync(state: &mut AppState, sync: &SyncUiRuntime) {
 async fn execute_command_target(
     state: &mut AppState,
     target: CommandTarget,
-    focused: Option<&Entry>,
+    focused: Option<VisiblePaneRow<'_>>,
     active_entries: &[&Entry],
     visible_count: usize,
     workspace_scanner: &WorkspaceScanner,
@@ -5780,8 +5823,8 @@ fn apply_effect_event(state: &mut AppState, event: EffectEvent) {
 fn handle_effect_response(
     response: EffectResponse,
     state: &mut AppState,
-    _left_entries: &mut Vec<Entry>,
-    _right_entries: &mut Vec<Entry>,
+    _left_entries: &mut Vec<ListedEntry>,
+    _right_entries: &mut Vec<ListedEntry>,
     pane_loader: &PaneLoader,
 ) {
     if !state.accepts_effect(response.id, response.lane, &response.scope) {
@@ -5840,13 +5883,18 @@ fn truncate_message(text: &str, max_chars: usize) -> String {
 
 // ponytail: keep for test visibility; selection logic lives in dispatch_ui_action.
 #[allow(dead_code)]
-fn selection_or_cursor(state: &AppState, entries: &[&Entry], cursor: usize) -> Vec<String> {
+fn selection_or_cursor(
+    state: &AppState,
+    entries: &[VisiblePaneRow<'_>],
+    cursor: usize,
+) -> Vec<String> {
     let pane = state.active_pane();
     if let Some(selected) = state.selection_names(state.active, &pane.location) {
         selected.iter().cloned().collect()
     } else if let Some(entry) = entries
         .get(cursor)
-        .filter(|entry| entry.name != VIRTUAL_PARENT_NAME)
+        .and_then(VisiblePaneRow::listed)
+        .map(|listed| &listed.entry)
     {
         vec![entry.name.clone()]
     } else {
@@ -5861,8 +5909,12 @@ mod tests {
     use arx::input::{KeyBinding, KeyStroke, Keymap};
     use arx::jobs::{Job, JobKind, JobResult, JobStatus};
     use arx::process::ProcessService;
-    use arx::services::{PaneLoadId, WorkspaceScanId};
-    use arx::vfs::{Capability, CapabilitySet, ProviderRegistry};
+    use arx::services::{PaneListingContinuation, PaneLoadId, PaneLoadPage, WorkspaceScanId};
+    use arx::vfs::s3::{S3BucketRef, S3ObjectRef, S3PrefixRef};
+    use arx::vfs::{
+        Capability, CapabilitySet, EntryIdentity, ProviderContinuation, ProviderListingPage,
+        ProviderRegistry, VfsProvider,
+    };
     use arx::workspace_sync::{
         WorkspaceDiff, WorkspaceEntry, WorkspaceFingerprint, WorkspaceSyncPlan,
     };
@@ -6239,14 +6291,91 @@ mod tests {
         }
     }
 
+    fn listed(entry: Entry) -> ListedEntry {
+        ListedEntry {
+            entry,
+            identity: EntryIdentity::Other,
+        }
+    }
+
+    fn listed_with_identity(name: &str, kind: EntryKind, identity: EntryIdentity) -> ListedEntry {
+        ListedEntry {
+            entry: Entry {
+                name: name.into(),
+                kind,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity,
+        }
+    }
+
+    fn page(entries: Vec<Entry>) -> PaneLoadPage {
+        PaneLoadPage {
+            entries: entries.into_iter().map(listed).collect(),
+            continuation: None,
+        }
+    }
+
+    fn page_continuation(id: PaneLoadId, location: Location) -> PaneListingContinuation {
+        PaneListingContinuation {
+            provider_continuation: ProviderContinuation {
+                token: "  opaque+/=token 日本語  ".into(),
+            },
+            provider_instance: ProviderRegistry::instance_key_for_location(&location),
+            location,
+            generation: id,
+        }
+    }
+
+    #[derive(Debug)]
+    struct IdentityPageProvider {
+        entry: ListedEntry,
+    }
+
+    #[async_trait::async_trait]
+    impl VfsProvider for IdentityPageProvider {
+        fn list(&self, _path: &str) -> std::io::Result<Vec<Entry>> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+
+        async fn list_page(
+            &self,
+            _location: &Location,
+            continuation: Option<&ProviderContinuation>,
+        ) -> std::io::Result<ProviderListingPage> {
+            assert!(continuation.is_none());
+            Ok(ProviderListingPage {
+                entries: vec![self.entry.clone()],
+                continuation: None,
+            })
+        }
+
+        fn read_head(&self, _path: &str, _lines: usize) -> std::io::Result<Vec<String>> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+
+        fn copy_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+
+        fn move_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+
+        fn delete_files(&self, _dir: &str, _names: &[String]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+    }
+
     #[test]
     fn selection_from_other_pane_is_not_a_mutation_target() {
         let mut state = AppState::default();
         let left_location = state.left.location.clone();
         state.toggle_selection(Pane::Left, &left_location, "left-only.txt");
         state.active = Pane::Right;
-        let right_entries = [file("right.txt")];
-        let visible = right_entries.iter().collect::<Vec<_>>();
+        let right_entries = [listed(file("right.txt"))];
+        let visible = [VisiblePaneRow::Listed(&right_entries[0])];
 
         assert_eq!(selection_or_cursor(&state, &visible, 0), vec!["right.txt"]);
     }
@@ -6258,8 +6387,8 @@ mod tests {
         let original = state.left.location.clone();
         state.toggle_selection(Pane::Left, &original, "foo.txt");
         state.left.location = Location::Local("/b".into());
-        let current_entries = [file("bar.txt")];
-        let visible = current_entries.iter().collect::<Vec<_>>();
+        let current_entries = [listed(file("bar.txt"))];
+        let visible = [VisiblePaneRow::Listed(&current_entries[0])];
 
         assert_eq!(selection_or_cursor(&state, &visible, 0), vec!["bar.txt"]);
         assert_eq!(state.selection_count(Pane::Left, &state.left.location), 0);
@@ -6312,13 +6441,13 @@ mod tests {
     #[test]
     fn virtual_parent_is_always_visible_exactly_once_away_from_root() {
         let entries = [
-            Entry {
+            listed(Entry {
                 name: "..".into(),
                 kind: EntryKind::Directory,
                 size: None,
                 modified_unix_ms: None,
-            },
-            file("child.txt"),
+            }),
+            listed(file("child.txt")),
         ];
         let parent = virtual_parent_entry();
 
@@ -6338,14 +6467,16 @@ mod tests {
             },
         ];
         for location in non_roots {
-            let visible = apply_filter_with_parent(&entries, "does-not-match", &location, &parent);
+            let visible = apply_filter_with_parent(&entries, "", &location, &parent);
             assert_eq!(
                 visible
                     .iter()
-                    .map(|entry| entry.name.as_str())
+                    .map(|row| row.entry().name.as_str())
                     .collect::<Vec<_>>(),
-                vec![".."]
+                vec!["..", "child.txt"]
             );
+            assert!(matches!(visible[0], VisiblePaneRow::Parent(_)));
+            assert!(matches!(visible[1], VisiblePaneRow::Listed(_)));
         }
 
         let roots = [
@@ -6357,7 +6488,9 @@ mod tests {
         ];
         for location in roots {
             let visible = apply_filter_with_parent(&entries, "", &location, &parent);
-            assert!(!visible.iter().any(|entry| entry.name == ".."));
+            assert_eq!(visible.len(), 1);
+            assert!(matches!(visible[0], VisiblePaneRow::Listed(_)));
+            assert_eq!(visible[0].entry().name, "child.txt");
         }
     }
 
@@ -6369,12 +6502,254 @@ mod tests {
         state.left.location = location.clone();
 
         assert_eq!(
-            directory_navigation_target(&location, &parent),
+            VisiblePaneRow::Parent(&parent).navigation_target(&location),
             Some(Location::Local("/tmp".into()))
         );
-        assert!(selection_or_cursor(&state, &[&parent], 0).is_empty());
-        toggle_selection_and_advance(&mut state, Some(&parent), 1);
+        assert!(selection_or_cursor(&state, &[VisiblePaneRow::Parent(&parent)], 0).is_empty());
+        toggle_selection_and_advance(&mut state, None, 1);
         assert_eq!(state.selection_count(Pane::Left, &location), 0);
+    }
+
+    #[test]
+    fn sort_keeps_identity_attached() {
+        let bucket = EntryIdentity::S3Bucket(S3BucketRef {
+            target: "prod".into(),
+            bucket: "z-bucket".into(),
+        });
+        let object = EntryIdentity::S3Object(S3ObjectRef {
+            target: "prod".into(),
+            bucket: "b".into(),
+            key: "a-key".into(),
+        });
+        let mut entries = vec![
+            listed_with_identity("z-display", EntryKind::Directory, bucket.clone()),
+            listed_with_identity("a-display", EntryKind::File, object.clone()),
+        ];
+
+        sort_entries(&mut entries, SortMode::NameAsc);
+
+        assert_eq!(entries[0].entry.name, "a-display");
+        assert_eq!(entries[0].identity, object);
+        assert_eq!(entries[1].identity, bucket);
+    }
+
+    #[test]
+    fn filter_keeps_identity_attached() {
+        let exact = EntryIdentity::S3Prefix(S3PrefixRef {
+            target: "prod".into(),
+            bucket: "bucket".into(),
+            prefix: "exact//prefix/".into(),
+        });
+        let entries = vec![
+            listed_with_identity("needle", EntryKind::Directory, exact.clone()),
+            listed(file("other")),
+        ];
+
+        let filtered = apply_filter(&entries, "needle");
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].identity, exact);
+    }
+
+    #[test]
+    fn duplicate_presentation_names_do_not_collapse_identity() {
+        let entries = vec![
+            listed_with_identity(
+                "duplicate",
+                EntryKind::Directory,
+                EntryIdentity::S3Bucket(S3BucketRef {
+                    target: "one".into(),
+                    bucket: "bucket-one".into(),
+                }),
+            ),
+            listed_with_identity(
+                "duplicate",
+                EntryKind::Directory,
+                EntryIdentity::S3Bucket(S3BucketRef {
+                    target: "two".into(),
+                    bucket: "bucket-two".into(),
+                }),
+            ),
+        ];
+
+        let filtered = apply_filter(&entries, "duplicate");
+
+        assert_eq!(filtered.len(), 2);
+        assert_ne!(filtered[0].identity, filtered[1].identity);
+    }
+
+    #[test]
+    fn enter_s3_bucket_uses_exact_ref() {
+        let listed = listed_with_identity(
+            "DISPLAY-NAME-THAT-MUST-NOT-BE-USED",
+            EntryKind::Directory,
+            EntryIdentity::S3Bucket(S3BucketRef {
+                target: "Aws-PROD".into(),
+                bucket: "Company-ARTIFACTS".into(),
+            }),
+        );
+        let current = Location::S3 {
+            target: "other".into(),
+            bucket: None,
+            prefix: String::new(),
+        };
+
+        assert_eq!(
+            VisiblePaneRow::Listed(&listed).navigation_target(&current),
+            Some(Location::S3 {
+                target: "Aws-PROD".into(),
+                bucket: Some("Company-ARTIFACTS".into()),
+                prefix: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn hidden_filter_only_exempts_structured_exact_dot_dot() {
+        let entries = vec![
+            listed_with_identity(".legacy", EntryKind::File, EntryIdentity::Other),
+            listed_with_identity(
+                ".structured",
+                EntryKind::File,
+                EntryIdentity::S3Object(S3ObjectRef {
+                    target: "prod".into(),
+                    bucket: "bucket".into(),
+                    key: ".structured".into(),
+                }),
+            ),
+            listed_with_identity(
+                "..",
+                EntryKind::Directory,
+                EntryIdentity::S3Bucket(S3BucketRef {
+                    target: "prod".into(),
+                    bucket: "bucket".into(),
+                }),
+            ),
+        ];
+
+        let normalized = normalize_entries(entries, false, SortMode::NameAsc);
+
+        assert_eq!(normalized.len(), 1);
+        assert!(matches!(
+            &normalized[0].identity,
+            EntryIdentity::S3Bucket(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pane_loader_identity_reaches_exact_bucket_enter() {
+        let registry = ProviderRegistry::new();
+        registry.insert_sftp(
+            "identity-seam",
+            Box::new(IdentityPageProvider {
+                entry: listed_with_identity(
+                    "..",
+                    EntryKind::Directory,
+                    EntryIdentity::S3Bucket(S3BucketRef {
+                        target: "Aws-PROD".into(),
+                        bucket: "Company-ARTIFACTS".into(),
+                    }),
+                ),
+            }),
+            CapabilitySet::NONE,
+        );
+        let location = Location::Sftp {
+            host: "identity-seam".into(),
+            path: "/page".into(),
+        };
+        let (loader, mut responses) = PaneLoader::channel(registry);
+        let mut state = AppState::default();
+        state.left.location = location.clone();
+        let id = loader.load(Pane::Left, location.clone(), PaneLoadPurpose::Refresh);
+        state.register_pane_load(Pane::Left, id, location.clone(), PaneLoadPurpose::Refresh);
+        let response = responses.recv().await.expect("pane response");
+        let mut left_entries = Vec::new();
+        let mut right_entries = Vec::new();
+
+        apply_pane_load_response(response, &mut state, &mut left_entries, &mut right_entries);
+        let parent = virtual_parent_entry();
+        let visible = apply_filter_with_parent(&left_entries, "", &location, &parent);
+        let listed_row = visible
+            .iter()
+            .copied()
+            .find(|row| row.listed().is_some())
+            .expect("provider-listed row");
+
+        assert_eq!(
+            listed_row.navigation_target(&location),
+            Some(Location::S3 {
+                target: "Aws-PROD".into(),
+                bucket: Some("Company-ARTIFACTS".into()),
+                prefix: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn unsupported_s3_rows_fail_closed_on_enter() {
+        let current = Location::S3 {
+            target: "prod".into(),
+            bucket: Some("bucket".into()),
+            prefix: String::new(),
+        };
+        let prefix = listed_with_identity(
+            "prefix-display",
+            EntryKind::Directory,
+            EntryIdentity::S3Prefix(S3PrefixRef {
+                target: "prod".into(),
+                bucket: "bucket".into(),
+                prefix: "exact/prefix/".into(),
+            }),
+        );
+        let object = listed_with_identity(
+            "object-displayed-as-directory",
+            EntryKind::Directory,
+            EntryIdentity::S3Object(S3ObjectRef {
+                target: "prod".into(),
+                bucket: "bucket".into(),
+                key: "exact/object".into(),
+            }),
+        );
+
+        assert_eq!(
+            VisiblePaneRow::Listed(&prefix).navigation_target(&current),
+            None
+        );
+        assert_eq!(
+            VisiblePaneRow::Listed(&object).navigation_target(&current),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_listed_dot_dot_remains_listed_identity() {
+        let listed = listed_with_identity(
+            "..",
+            EntryKind::Directory,
+            EntryIdentity::S3Bucket(S3BucketRef {
+                target: "exact-target".into(),
+                bucket: "exact-bucket".into(),
+            }),
+        );
+        let parent = virtual_parent_entry();
+        let current = Location::S3 {
+            target: "exact-target".into(),
+            bucket: None,
+            prefix: String::new(),
+        };
+        let entries = [listed];
+        let visible = apply_filter_with_parent(&entries, "", &current, &parent);
+
+        assert_eq!(visible.len(), 1);
+        assert!(matches!(visible[0], VisiblePaneRow::Listed(_)));
+        assert_eq!(
+            visible[0].navigation_target(&current),
+            Some(Location::S3 {
+                target: "exact-target".into(),
+                bucket: Some("exact-bucket".into()),
+                prefix: String::new(),
+            })
+        );
     }
 
     #[test]
@@ -6510,7 +6885,7 @@ mod tests {
             },
         );
         state.active = Pane::Right;
-        let mut left_entries = vec![file("current.txt")];
+        let mut left_entries = vec![listed(file("current.txt"))];
         let mut right_entries = Vec::new();
 
         apply_pane_load_response(
@@ -6521,7 +6896,7 @@ mod tests {
                 purpose: PaneLoadPurpose::Navigate {
                     remember_current: true,
                 },
-                result: Ok(vec![file("foo.txt")]),
+                result: Ok(page(vec![file("foo.txt")])),
             },
             &mut state,
             &mut left_entries,
@@ -6538,7 +6913,7 @@ mod tests {
         let mut state = AppState::default();
         let original = state.left.location.clone();
         let target = Location::Local("/target".into());
-        let mut left_entries = vec![file("current.txt")];
+        let mut left_entries = vec![listed(file("current.txt"))];
         let mut right_entries = Vec::new();
 
         state.register_pane_load(
@@ -6565,7 +6940,8 @@ mod tests {
         );
 
         assert_eq!(state.left.location, original);
-        assert_eq!(left_entries, vec![file("current.txt")]);
+        assert_eq!(left_entries, vec![listed(file("current.txt"))]);
+        assert!(!state.pane_listing_continuations.contains_key(&Pane::Left));
         assert_eq!(
             state
                 .pane_load_errors
@@ -6590,7 +6966,7 @@ mod tests {
                 purpose: PaneLoadPurpose::Navigate {
                     remember_current: true,
                 },
-                result: Ok(Vec::new()),
+                result: Ok(page(Vec::new())),
             },
             &mut state,
             &mut left_entries,
@@ -6599,6 +6975,167 @@ mod tests {
 
         assert_eq!(state.left.location, target);
         assert!(!state.pane_load_errors.contains_key(&Pane::Left));
+    }
+
+    #[test]
+    fn accepted_first_page_stores_exact_continuation() {
+        let mut state = AppState::default();
+        let location = state.left.location.clone();
+        let id = PaneLoadId(11);
+        state.register_pane_load(Pane::Left, id, location.clone(), PaneLoadPurpose::Refresh);
+        let continuation = page_continuation(id, location.clone());
+        let mut left_entries = Vec::new();
+        let mut right_entries = Vec::new();
+
+        apply_pane_load_response(
+            PaneLoadResponse {
+                id,
+                pane: Pane::Left,
+                location,
+                purpose: PaneLoadPurpose::Refresh,
+                result: Ok(PaneLoadPage {
+                    entries: vec![listed(file("loaded.txt"))],
+                    continuation: Some(continuation.clone()),
+                }),
+            },
+            &mut state,
+            &mut left_entries,
+            &mut right_entries,
+        );
+
+        assert_eq!(
+            state.pane_listing_continuations.get(&Pane::Left),
+            Some(&continuation)
+        );
+        assert_eq!(left_entries[0].entry.name, "loaded.txt");
+    }
+
+    #[test]
+    fn stale_response_cannot_attach_continuation_to_new_generation() {
+        let mut state = AppState::default();
+        let location = state.left.location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(11),
+            location.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(12),
+            location.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        let mut left_entries = vec![listed(file("current.txt"))];
+        let mut right_entries = Vec::new();
+
+        apply_pane_load_response(
+            PaneLoadResponse {
+                id: PaneLoadId(11),
+                pane: Pane::Left,
+                location: location.clone(),
+                purpose: PaneLoadPurpose::Refresh,
+                result: Ok(PaneLoadPage {
+                    entries: vec![listed(file("stale.txt"))],
+                    continuation: Some(page_continuation(PaneLoadId(11), location)),
+                }),
+            },
+            &mut state,
+            &mut left_entries,
+            &mut right_entries,
+        );
+
+        assert_eq!(left_entries, vec![listed(file("current.txt"))]);
+        assert!(!state.pane_listing_continuations.contains_key(&Pane::Left));
+        assert_eq!(
+            state.pending_pane_loads.get(&Pane::Left),
+            Some(&PaneLoadId(12))
+        );
+    }
+
+    #[test]
+    fn refresh_and_navigation_clear_previous_continuation() {
+        let mut state = AppState::default();
+        let current = state.left.location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(10),
+            current.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        state.apply_pane_listing_continuation(
+            Pane::Left,
+            Some(page_continuation(PaneLoadId(10), current.clone())),
+        );
+
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(11),
+            current,
+            PaneLoadPurpose::Refresh,
+        );
+        assert!(!state.pane_listing_continuations.contains_key(&Pane::Left));
+
+        let target = Location::Local("/next".into());
+        state.apply_pane_listing_continuation(
+            Pane::Left,
+            Some(page_continuation(
+                PaneLoadId(11),
+                state.left.location.clone(),
+            )),
+        );
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(12),
+            target,
+            PaneLoadPurpose::Navigate {
+                remember_current: true,
+            },
+        );
+        assert!(!state.pane_listing_continuations.contains_key(&Pane::Left));
+    }
+
+    #[test]
+    fn pane_swap_immediate_reload_clears_stale_continuations() {
+        let mut state = AppState::default();
+        let left = state.left.location.clone();
+        let right = state.right.location.clone();
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(10),
+            left.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        state.register_pane_load(
+            Pane::Right,
+            PaneLoadId(20),
+            right.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        state.apply_pane_listing_continuation(
+            Pane::Left,
+            Some(page_continuation(PaneLoadId(10), left)),
+        );
+        state.apply_pane_listing_continuation(
+            Pane::Right,
+            Some(page_continuation(PaneLoadId(20), right)),
+        );
+
+        std::mem::swap(&mut state.left, &mut state.right);
+        state.register_pane_load(
+            Pane::Left,
+            PaneLoadId(30),
+            state.left.location.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+        state.register_pane_load(
+            Pane::Right,
+            PaneLoadId(31),
+            state.right.location.clone(),
+            PaneLoadPurpose::Refresh,
+        );
+
+        assert!(state.pane_listing_continuations.is_empty());
     }
 
     #[test]

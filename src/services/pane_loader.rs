@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 use crate::app::Pane;
-use crate::vfs::{Entry, Location, ProviderContinuation, ProviderInstanceKey, ProviderRegistry};
+use crate::vfs::{
+    ListedEntry, Location, ProviderContinuation, ProviderInstanceKey, ProviderRegistry,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PaneLoadId(pub u64);
@@ -24,6 +26,12 @@ pub struct PaneListingContinuation {
     pub generation: PaneLoadId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneLoadPage {
+    pub entries: Vec<ListedEntry>,
+    pub continuation: Option<PaneListingContinuation>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneLoadPurpose {
     Refresh,
@@ -37,7 +45,7 @@ pub struct PaneLoadResponse {
     pub pane: Pane,
     pub location: Location,
     pub purpose: PaneLoadPurpose,
-    pub result: std::io::Result<Vec<Entry>>,
+    pub result: std::io::Result<PaneLoadPage>,
 }
 
 /// Async VFS directory loader.
@@ -72,7 +80,22 @@ impl PaneLoader {
         let registry = self.registry.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = registry.list_location_async(&location).await;
+            let result = registry
+                .list_page(&location, None)
+                .await
+                .map(|page| PaneLoadPage {
+                    entries: page.entries,
+                    continuation: page.continuation.map(|provider_continuation| {
+                        PaneListingContinuation {
+                            provider_continuation,
+                            provider_instance: ProviderRegistry::instance_key_for_location(
+                                &location,
+                            ),
+                            location: location.clone(),
+                            generation: id,
+                        }
+                    }),
+                });
             let _ = tx.send(PaneLoadResponse {
                 id,
                 pane,
@@ -88,6 +111,46 @@ impl PaneLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vfs::{
+        CapabilitySet, Entry, EntryIdentity, EntryKind, ProviderListingPage, VfsProvider,
+    };
+
+    #[derive(Debug)]
+    struct PageProvider {
+        page: ProviderListingPage,
+    }
+
+    #[async_trait::async_trait]
+    impl VfsProvider for PageProvider {
+        fn list(&self, _path: &str) -> std::io::Result<Vec<Entry>> {
+            panic!("legacy list must not be called")
+        }
+
+        async fn list_page(
+            &self,
+            _location: &Location,
+            continuation: Option<&ProviderContinuation>,
+        ) -> std::io::Result<ProviderListingPage> {
+            assert!(continuation.is_none());
+            Ok(self.page.clone())
+        }
+
+        fn read_head(&self, _path: &str, _lines: usize) -> std::io::Result<Vec<String>> {
+            panic!("read_head must not be called")
+        }
+
+        fn copy_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("copy_files must not be called")
+        }
+
+        fn move_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("move_files must not be called")
+        }
+
+        fn delete_files(&self, _dir: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("delete_files must not be called")
+        }
+    }
 
     #[tokio::test]
     async fn local_load_is_async_and_correlated() {
@@ -105,7 +168,60 @@ mod tests {
         assert_eq!(response.pane, Pane::Left);
         assert_eq!(response.location, location);
         assert_eq!(response.purpose, PaneLoadPurpose::Refresh);
-        assert_eq!(response.result.unwrap().len(), 1);
+        let page = response.result.unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert!(
+            page.entries
+                .iter()
+                .all(|listed| listed.identity == crate::vfs::EntryIdentity::Other)
+        );
+        assert!(page.continuation.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_page_wrapper_preserves_exact_identity_and_continuation() {
+        let provider_continuation = ProviderContinuation {
+            token: "  opaque+/=token 日本語  ".into(),
+        };
+        let listed = ListedEntry {
+            entry: Entry {
+                name: "display".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::Other,
+        };
+        let registry = ProviderRegistry::new();
+        registry.insert_sftp(
+            "prod-host",
+            Box::new(PageProvider {
+                page: ProviderListingPage {
+                    entries: vec![listed.clone()],
+                    continuation: Some(provider_continuation.clone()),
+                },
+            }),
+            CapabilitySet::NONE,
+        );
+        let (loader, mut rx) = PaneLoader::channel(registry);
+        let location = Location::Sftp {
+            host: "prod-host".into(),
+            path: "/srv/exact".into(),
+        };
+
+        let id = loader.load(Pane::Right, location.clone(), PaneLoadPurpose::Refresh);
+        let response = rx.recv().await.expect("pane response");
+        let page = response.result.unwrap();
+        let continuation = page.continuation.expect("provider continuation");
+
+        assert_eq!(page.entries, vec![listed]);
+        assert_eq!(continuation.provider_continuation, provider_continuation);
+        assert_eq!(
+            continuation.provider_instance,
+            ProviderInstanceKey::SftpHost("prod-host".into())
+        );
+        assert_eq!(continuation.location, location);
+        assert_eq!(continuation.generation, id);
     }
 
     // ── S3-14: pane-layer continuation identity model ──

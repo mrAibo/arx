@@ -472,7 +472,6 @@ pub fn action_meta(id: ActionId) -> Option<&'static ActionMeta> {
     ACTION_CATALOG.iter().find(|meta| meta.id == id)
 }
 
-#[allow(dead_code)]
 pub fn listed_entry_navigation_target(
     current: &crate::vfs::Location,
     listed: &crate::vfs::ListedEntry,

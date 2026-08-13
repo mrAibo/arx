@@ -17,8 +17,8 @@
 ## Column summary
 
 - **READY** (0): —
-- **DOING** (1): S3-23
-- **REVIEW** (0): —
+- **DOING** (0): —
+- **REVIEW** (1): S3-23
 - **BLOCKED** (0): —
 - **DONE** (23): S3-00..S3-22
 - **BACKLOG** (57): S3-24..S3-80
@@ -290,9 +290,9 @@
 
 ### S3-23 — Pane ListedEntry seam + Enter S3BucketRef
 - **Phase:** P10
-- **Status:** DOING
+- **Status:** REVIEW
 - **Depends on:** S3-13..15, S3-18..22
-- **Allowed files:** src/services/pane_loader.rs, src/services/mod.rs, src/app/mod.rs, src/app/actions.rs, src/tui.rs, docs/S3_KANBAN.md
+- **Allowed files:** src/services/pane_loader.rs, src/services/mod.rs, src/app/mod.rs, src/app/actions.rs, src/tui.rs, tests/async_vfs_contracts.rs (test-only compile consumer), docs/S3_KANBAN.md
 - **Acceptance:**
   1. Pane first-page loading uses `ProviderRegistry::list_page`, not legacy `list_location_async`.
   2. `PaneLoadResponse` carries `ListedEntry` identity end-to-end.
