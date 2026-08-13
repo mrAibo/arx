@@ -482,7 +482,19 @@ pub fn listed_entry_navigation_target(
             bucket: Some(reference.bucket.clone()),
             prefix: String::new(),
         }),
-        crate::vfs::EntryIdentity::S3Prefix(_) | crate::vfs::EntryIdentity::S3Object(_) => None,
+        crate::vfs::EntryIdentity::S3Prefix(reference) => {
+            // S3-20R guarantees every provider-produced CommonPrefix ends in the
+            // Delimiter="/"; here we remove exactly one final protocol delimiter
+            // to recover the navigation prefix. A malformed ref without it fails
+            // closed (None) rather than inventing or preserving a delimiter.
+            let nav_prefix = reference.prefix.strip_suffix('/')?;
+            Some(crate::vfs::Location::S3 {
+                target: reference.target.clone(),
+                bucket: Some(reference.bucket.clone()),
+                prefix: nav_prefix.to_owned(),
+            })
+        }
+        crate::vfs::EntryIdentity::S3Object(_) => None,
         crate::vfs::EntryIdentity::Other
             if listed.entry.kind == crate::vfs::EntryKind::Directory
                 && matches!(
@@ -713,14 +725,53 @@ mod tests {
     }
 
     #[test]
-    fn s3_prefix_not_entered_yet() {
+    fn s3_prefix_navigation_uses_exact_ref_and_removes_one_final_delimiter() {
+        for (display, target, bucket, prefix, expected_prefix) in [
+            (
+                "DISPLAY-NAME-THAT-MUST-NOT-BE-USED",
+                "aws-prod",
+                "Company-Artifacts",
+                "foo/bar/",
+                "foo/bar",
+            ),
+            ("display", "target", "bucket", "foo//bar/", "foo//bar"),
+            ("display", "target", "bucket", "foo/../bar/", "foo/../bar"),
+            ("display", "target", "bucket", "foo/./bar/", "foo/./bar"),
+            ("display", "target", "bucket", "日本語/資料/", "日本語/資料"),
+            ("display", "target", "bucket", "foo//", "foo/"),
+        ] {
+            let listed = listed(
+                display,
+                EntryKind::Directory,
+                EntryIdentity::S3Prefix(S3PrefixRef {
+                    target: target.into(),
+                    bucket: bucket.into(),
+                    prefix: prefix.into(),
+                }),
+            );
+
+            assert_eq!(
+                listed_entry_navigation_target(&Location::Local("/ignored".into()), &listed),
+                Some(Location::S3 {
+                    target: target.into(),
+                    bucket: Some(bucket.into()),
+                    prefix: expected_prefix.into(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn s3_prefix_malformed_without_final_delimiter_fails_closed() {
+        // S3-20R validates CommonPrefix delimiter provider-side, so any ref
+        // without a trailing '/' is malformed; navigation must not preserve it.
         let listed = listed(
-            "display",
+            "DISPLAY-NAME-THAT-MUST-NOT-BE-USED",
             EntryKind::Directory,
             EntryIdentity::S3Prefix(S3PrefixRef {
-                target: "aws-prod".into(),
-                bucket: "Company-Artifacts".into(),
-                prefix: "exact/prefix".into(),
+                target: "target".into(),
+                bucket: "bucket".into(),
+                prefix: "no-final-delimiter".into(),
             }),
         );
 

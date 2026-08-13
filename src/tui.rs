@@ -6933,7 +6933,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_s3_rows_fail_closed_on_enter() {
+    fn s3_object_and_other_rows_fail_closed_on_enter_but_s3_prefix_navigates() {
         let current = Location::S3 {
             target: "prod".into(),
             bucket: Some("bucket".into()),
@@ -6958,14 +6958,58 @@ mod tests {
             }),
         );
 
+        // S3Prefix is now navigable: exactly one final delimiter removed.
         assert_eq!(
             VisiblePaneRow::Listed(&prefix).navigation_target(&current),
-            None
+            Some(Location::S3 {
+                target: "prod".into(),
+                bucket: Some("bucket".into()),
+                prefix: "exact/prefix".into(),
+            })
         );
+        // S3Object still does not navigate.
         assert_eq!(
             VisiblePaneRow::Listed(&object).navigation_target(&current),
             None
         );
+    }
+
+    #[test]
+    fn s3_prefix_navigation_uses_exact_ref_not_display_name_and_preserves_repeated_slash() {
+        let current = Location::S3 {
+            target: "prod".into(),
+            bucket: Some("bucket".into()),
+            prefix: String::new(),
+        };
+        let prefix = listed_with_identity(
+            "DISPLAY-WRONG-MUST-NOT-LEAK",
+            EntryKind::Directory,
+            EntryIdentity::S3Prefix(S3PrefixRef {
+                target: "prod".into(),
+                bucket: "bucket".into(),
+                prefix: "foo//".into(),
+            }),
+        );
+
+        let target = VisiblePaneRow::Listed(&prefix).navigation_target(&current);
+        assert_eq!(
+            target,
+            Some(Location::S3 {
+                target: "prod".into(),
+                bucket: Some("bucket".into()),
+                // provider "foo//" -> nav "foo/" (one delimiter removed, repeated slash kept)
+                prefix: "foo/".into(),
+            })
+        );
+        // The display name must not leak into the produced location.
+        let loc = target.unwrap();
+        match &loc {
+            Location::S3 { prefix, .. } => {
+                assert_ne!(*prefix, "DISPLAY-WRONG-MUST-NOT-LEAK".to_string());
+                assert!(!prefix.contains("DISPLAY-WRONG"));
+            }
+            _ => panic!("expected S3 location, got {loc:?}"),
+        }
     }
 
     #[test]

@@ -16,12 +16,12 @@
 
 ## Column summary
 
-- **READY** (1): S3-24
+- **READY** (1): S3-25
 - **DOING** (0): —
 - **REVIEW** (0): —
 - **BLOCKED** (0): —
-- **DONE** (26): S3-00..S3-23, S3-24P (PR #98 merged, merge SHA 19d4c04), S3-20R (PR #99 merged, merge SHA pending)
-- **BACKLOG** (56): S3-25..S3-80
+- **DONE** (27): S3-00..S3-24, S3-24P (PR #98 merged, merge SHA 19d4c04), S3-20R (PR #99 merged, merge SHA 2e7fe21), S3-24 (PR #100 merged, merge SHA pending)
+- **BACKLOG** (55): S3-26..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
 
@@ -327,7 +327,7 @@
 
 ### S3-24 — Enter S3PrefixRef
 - **Phase:** P10
-- **Status:** READY
+- **Status:** DONE (PR #100 merged; merge SHA pending; independent two-axis review APPROVED 0/0/0/0, quality+msrv SUCCESS)
 - **Depends on:** S3-23, S3-20R
 - **Allowed files:** src/app/actions.rs, src/tui.rs (tests only)
 - **Acceptance:** Navigate into `CommonPrefix` using exact `S3PrefixRef`; never reconstruct from presentation name. Remove exactly one final protocol `/` from the exact ref to form `Location::S3.prefix`, preserving every preceding byte, including `//`, `.`, `..`, spaces, and Unicode. Update the existing TUI integration regression so prefix rows navigate while S3 objects and S3 `Other` remain fail-closed. Prove exact ref `foo//` -> nav `foo/`; S3-20R separately proves nav `foo/` -> wire `foo//` (the composed round trip is exact). Because S3-20R now rejects any `CommonPrefix` lacking a trailing `/` (Delimiter="/"), S3-24 may accept only refs that passed that invariant and strip exactly one delimiter — no fallback for a `S3PrefixRef` without trailing `/`.
@@ -354,14 +354,19 @@
 - **Stop conditions:** Eager enumeration, duplicate append, stale page append, Entry/identity separation, or capability flip.
 - **Hermes prompt:** Add explicit, stale-safe pane next-page loading from the exact stored continuation. Preserve listing generation and `ListedEntry` identity, append once, replace continuation atomically, retain rows/token on page error, and render `Load more…` only while a continuation exists. No eager pagination or capability change.
 
-### S3-25 — Virtual parent
+### S3-25 — Contextual virtual S3 parent
 - **Phase:** P10
-- **Status:** BACKLOG
+- **Status:** READY
 - **Depends on:** S3-23, S3-24
-- **Allowed files:** src/app/actions.rs
-- **Acceptance:** Virtual '..' for S3: prefix child=>parent nav prefix; bucket root=>target root only if not bucket-bound; bucket-bound root has no account escape. Virtual .. never an S3 object key. Tests.
-- **Stop conditions:** Turning .. into object key.
-- **Hermes prompt:** Implement virtual '..': prefix=>parent nav prefix; bucket root=>target root (unless bucket-bound). Virtual .. is nav only, never an S3 key. Tests.
+- **Allowed files:** src/vfs/mod.rs, src/app/actions.rs, src/tui.rs, docs/S3_KANBAN.md
+- **Acceptance:** Contextual S3 virtual-parent navigation that preserves account-style target-root and bucket-bound least-privilege semantics, awkward repeated-slash prefixes, literal `.`/`..` segments, and Local/SFTP/Archive parent behavior, using exactly ONE authoritative configured-target inventory (ProviderRegistry). Virtual `..` is UI/navigation state only — never S3ObjectRef, S3PrefixRef, object key, or provider-listed EntryIdentity.
+  - `Location::parent()` stays fail-closed for `Location::S3` (context-free; must not guess account-root or read S3TargetConfig). Add a contextual app-level resolver instead.
+  - ProviderRegistry gains a narrow read-only accessor `s3_target_binding(target_id) -> Option<S3TargetBinding>` (AccountRoot | BucketBound(exact bucket)), reading the EXISTING `s3_targets` inventory only — no second inventory, no config/SDK exposure.
+  - `navigation_parent_target(current, registry)` in actions.rs: Local/SFTP/Archive delegate to existing `current.parent()` unchanged; S3 looks up binding, enforces current bucket == bound exactly (bucket-bound), computes parent prefix via `rfind('/')` segment removal (`"foo//"` -> `"foo/"`, `"foo/../bar"` -> `"foo/.."`), target-root and bucket-bound-root are terminal (`None`), unknown target fails closed. No `trim_end_matches`/`Path`/canonicalize/`//`-collapse/Unicode-normalize.
+  - TUI: all three parent decisions (virtual-Parent visibility, Parent-row Enter, Backspace) MUST use the same contextual resolver — no divergence between visibility and navigation.
+  - Least-privilege: a bucket-bound target NEVER navigates from its bucket root to `bucket: None` (would enable ListBuckets/s3:ListAllMyBuckets). Tested directly.
+- **Stop conditions:** Turning `..` into an object key/EntryIdentity; guessing account-root in `Location::parent()`; a second target inventory; AWS/network/client/pagination/capability change; production edits outside the allowed files.
+- **Hermes prompt:** One writer implements S3-25 across vfs/mod.rs + app/actions.rs + tui.rs: narrow registry binding accessor, contextual `navigation_parent_target`, and unify TUI's three parent decisions onto it. LUNA runs the parallel read-only S3-26 capability gate audit. No merge, no S3-26.
 
 ### S3-26 — Enable List capability
 - **Phase:** P10
