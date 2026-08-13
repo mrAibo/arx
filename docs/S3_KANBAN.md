@@ -16,9 +16,9 @@
 
 ## Column summary
 
-- **READY** (1): S3-21
+- **READY** (0): —
 - **DOING** (0): —
-- **REVIEW** (0): —
+- **REVIEW** (1): S3-21
 - **BLOCKED** (0): —
 - **DONE** (21): S3-00..S3-20
 - **BACKLOG** (59): S3-22..S3-80
@@ -251,10 +251,23 @@
 
 ### S3-21 — ListObjectsV2 pagination
 - **Phase:** P9
-- **Status:** READY
+- **Status:** REVIEW
 - **Depends on:** S3-20
-- **Allowed files:** src/vfs/s3.rs
-- **Acceptance:** Support NextContinuationToken. Same invariants: missing token while truncated=>ProtocolError; repeated token=>ProtocolError; no full-bucket eager loop.
+- **Allowed files:** src/vfs/s3.rs, docs/S3_KANBAN.md
+- **Acceptance:**
+  - Bucket-scope `ProviderContinuation.token` is passed verbatim as `ListObjectsV2` `ContinuationToken`.
+  - No trim/decode/re-encode/normalization.
+  - Empty consumed token => `InvalidData` before client/AWS.
+  - Request retains exact bucket + wire prefix + `Delimiter="/"` + `max_keys=1000`.
+  - Exactly one `ListObjectsV2` request per `list_page` invocation.
+  - No paginator, eager loop, or `StartAfter`.
+  - `IsTruncated=false` + no token => end.
+  - `IsTruncated=false` + token => `InvalidData`.
+  - `IsTruncated=true` requires non-empty `NextContinuationToken`.
+  - Returned token identical to consumed token => `InvalidData`.
+  - Advancing token preserved exactly.
+  - Same `Contents`/`CommonPrefixes`/folder-marker mapper for every page.
+  - Continuation token values never appear in diagnostics.
 - **Stop conditions:** Eager loop.
 - **Hermes prompt:** ListObjectsV2 pagination via NextContinuationToken. ProtocolError on missing/non-advancing token. No eager full-bucket loop.
 
