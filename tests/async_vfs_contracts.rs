@@ -182,9 +182,10 @@ async fn pane_loader_reads_local_directory_without_location_list_bridge() {
 
     assert_eq!(response.id, id);
     assert_eq!(response.location, location);
-    let entries = response.result.unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].name, "hello.txt");
+    let page = response.result.unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].entry.name, "hello.txt");
+    assert!(page.continuation.is_none());
 }
 
 #[tokio::test]

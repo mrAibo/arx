@@ -17,7 +17,8 @@ pub use git::GitService;
 pub use infrastructure::InfrastructureService;
 pub use mutation::{MutationError, MutationProgress, MutationService, TrashOutcome};
 pub use pane_loader::{
-    PaneListingContinuation, PaneLoadId, PaneLoadPurpose, PaneLoadResponse, PaneLoader,
+    PaneListingContinuation, PaneLoadId, PaneLoadPage, PaneLoadPurpose, PaneLoadResponse,
+    PaneLoader,
 };
 pub use preview::{PreviewService, format_bounded_preview};
 pub use tree::TreeService;
