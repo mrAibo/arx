@@ -18,10 +18,10 @@
 
 - **READY** (0): —
 - **DOING** (0): —
-- **REVIEW** (1): S3-19
+- **REVIEW** (1): S3-20
 - **BLOCKED** (0): —
-- **DONE** (19): S3-00..S3-18
-- **BACKLOG** (61): S3-20..S3-80
+- **DONE** (20): S3-00..S3-19
+- **BACKLOG** (60): S3-21..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
 
@@ -200,7 +200,7 @@
 
 ### S3-18 — ListBuckets first page
 - **Phase:** P8
-- **Status:** REVIEW
+- **Status:** DONE
 - **Depends on:** S3-17
 - **Allowed files:** src/vfs/s3.rs, src/vfs/mod.rs (tests only), docs/S3_KANBAN.md
 - **Acceptance:** Target-root first page via ListBuckets. Map bucket=>ListedEntry{presentation=bucket name, identity=S3BucketRef}. No Entry.name reconstruction. No create/delete bucket. Tests w/ mocked SDK boundary.
@@ -209,9 +209,9 @@
 
 ### S3-19 — ListBuckets pagination
 - **Phase:** P8
-- **Status:** REVIEW
+- **Status:** DONE
 - **Depends on:** S3-18
-- **Allowed files:** src/vfs/s3.rs
+- **Allowed files:** src/vfs/s3.rs, docs/S3_KANBAN.md, docs/DESIGN_S3.md
 - **Acceptance:** Incremental ListBuckets pagination via ProviderContinuation.
   - ProviderContinuation.token passed verbatim as ListBuckets ContinuationToken (no trim/decode/normalize).
   - Every request bounded by LIST_BUCKETS_PAGE_SIZE (1000).
@@ -228,12 +228,26 @@
 
 ### S3-20 — ListObjectsV2 first page
 - **Phase:** P9
-- **Status:** BACKLOG
-- **Depends on:** S3-17, S3-18
-- **Allowed files:** src/vfs/s3.rs
-- **Acceptance:** List bucket root/prefix: ListObjectsV2 Prefix=exact nav prefix, Delimiter="/". Contents=>S3ObjectRef; CommonPrefixes=>S3PrefixRef. Handle folder-marker duplication. No normalization.
-- **Stop conditions:** Normalization.
-- **Hermes prompt:** ListObjectsV2 first page: Prefix=exact nav prefix, Delimiter="/". Contents=>S3ObjectRef, CommonPrefixes=>S3PrefixRef. Handle folder-marker dup. No normalization.
+- **Status:** REVIEW
+- **Depends on:** S3-17, S3-18, S3-19
+- **Allowed files:** src/vfs/s3.rs, src/vfs/mod.rs (tests only), docs/S3_KANBAN.md
+- **Acceptance:** One bounded ListObjectsV2 first-page request for Bucket scope.
+  - Navigation prefix vs wire-prefix vs exact identity:
+    - bucket-root nav "" => wire Prefix ""
+    - non-empty nav without trailing "/" => append exactly one "/"
+    - already-delimited => preserve exactly
+    - no trim / no "//" collapse / no "." / ".." resolution / no canonicalize
+  - Delimiter="/" groups child keys into CommonPrefixes.
+  - max_keys=1000; exactly ONE ListObjectsV2 .send() per list_page.
+  - Exact Contents => S3ObjectRef (key authoritative, never transformed).
+  - Exact CommonPrefixes => S3PrefixRef (delimiter slash kept).
+  - Presentation name = prefix-stripped for display only (never operational identity).
+  - Folder-marker dedup: zero-byte self marker (key==wire prefix) suppressed; zero-byte child marker matched by exact CommonPrefix deduped. Non-zero slash objects preserved; unmatched zero-byte slash objects preserved as S3ObjectRef. No blanket ends_with('/') drop.
+  - First-page IsTruncated / NextContinuationToken truth: false+no token=>end; true+token=>continuation; true+(missing|empty)=>InvalidData; false+token=>InvalidData (contradictory); missing IsTruncated=>InvalidData.
+  - continuation input (Some) remains S3-21: Unsupported before client init.
+  - ListBuckets / TargetRoot behavior unchanged; exact bound bucket initializes lazy client.
+- **Stop conditions:** Normalization. Continuation input consumption (S3-21).
+- **Hermes prompt:** ListObjectsV2 first page: wire prefix from nav (no normalization), Delimiter="/", max_keys=1000, one send. Contents=>S3ObjectRef, CommonPrefixes=>S3PrefixRef. Exact-evidence folder-marker dedup only. First-page IsTruncated/NextContinuationToken truth. Continuation input is S3-21.
 
 ### S3-21 — ListObjectsV2 pagination
 - **Phase:** P9

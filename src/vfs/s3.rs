@@ -531,7 +531,13 @@ fn next_list_objects_v2_continuation(
     next_token: Option<&str>,
 ) -> io::Result<Option<ProviderContinuation>> {
     match is_truncated {
-        Some(false) => Ok(None),
+        Some(false) => match next_token {
+            None => Ok(None),
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "S3 ListObjectsV2 pagination protocol error: IsTruncated=false with NextContinuationToken present",
+            )),
+        },
         Some(true) => match next_token {
             Some(token) if !token.is_empty() => Ok(Some(ProviderContinuation {
                 token: token.to_string(),
@@ -1022,7 +1028,9 @@ mod tests {
     // ── S3-18: ListBuckets first-page mapping (offline, pure fixtures) ──
 
     use aws_sdk_s3::operation::list_buckets::ListBucketsOutput;
-    use aws_sdk_s3::types::Bucket;
+    use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
+    use aws_sdk_s3::primitives::DateTime;
+    use aws_sdk_s3::types::{Bucket, CommonPrefix, Object};
 
     fn bucket_named(name: &str) -> Bucket {
         Bucket::builder().name(name).build()
@@ -1240,6 +1248,310 @@ mod tests {
         assert!(p.client.get().is_none());
     }
 
+    // ── S3-20: offline ListObjectsV2 first-page mapping matrix ──
+
+    #[test]
+    fn wire_prefix_bucket_root_is_empty() {
+        assert_eq!(list_objects_wire_prefix(""), "");
+    }
+    #[test]
+    fn wire_prefix_nested_appends_delimiter() {
+        assert_eq!(list_objects_wire_prefix("foo/bar"), "foo/bar/");
+    }
+    #[test]
+    fn wire_prefix_existing_delimiter_preserved() {
+        assert_eq!(list_objects_wire_prefix("foo/bar/"), "foo/bar/");
+    }
+    #[test]
+    fn wire_prefix_awkward_double_slash_preserved() {
+        assert_eq!(list_objects_wire_prefix("foo//bar"), "foo//bar/");
+    }
+    #[test]
+    fn wire_prefix_dotdot_preserved() {
+        assert_eq!(list_objects_wire_prefix("foo/../bar"), "foo/../bar/");
+    }
+
+    fn mk_object(key: &str, size: Option<i64>) -> Object {
+        let mut b = Object::builder().key(key);
+        if let Some(s) = size {
+            b = b.size(s);
+        }
+        b.build()
+    }
+    fn mk_object_with_time(key: &str, size: i64, secs: i64) -> Object {
+        Object::builder()
+            .key(key)
+            .size(size)
+            .last_modified(DateTime::from_secs(secs))
+            .build()
+    }
+    fn mk_common_prefix(prefix: &str) -> CommonPrefix {
+        CommonPrefix::builder().prefix(prefix).build()
+    }
+    fn mk_list_out(
+        contents: Vec<Object>,
+        prefixes: Vec<CommonPrefix>,
+        is_truncated: Option<bool>,
+        token: Option<&str>,
+    ) -> ListObjectsV2Output {
+        let mut b = ListObjectsV2Output::builder();
+        for c in contents {
+            b = b.contents(c);
+        }
+        for p in prefixes {
+            b = b.common_prefixes(p);
+        }
+        if let Some(t) = is_truncated {
+            b = b.is_truncated(t);
+        }
+        if let Some(tok) = token {
+            b = b.next_continuation_token(tok);
+        }
+        b.build()
+    }
+
+    #[test]
+    fn object_direct_exact_identity_and_relative_presentation() {
+        let out = mk_list_out(
+            vec![mk_object("foo/bar.txt", Some(10))],
+            vec![],
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        let e = &page.entries[0];
+        assert_eq!(e.entry.name, "bar.txt");
+        match &e.identity {
+            EntryIdentity::S3Object(o) => {
+                assert_eq!(o.target, "t");
+                assert_eq!(o.bucket, "b");
+                assert_eq!(o.key, "foo/bar.txt");
+            }
+            other => panic!("expected S3Object, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn object_awkward_double_slash_identity_exact() {
+        let out = mk_list_out(
+            vec![mk_object("foo//bar.txt", Some(1))],
+            vec![],
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        match &page.entries[0].identity {
+            EntryIdentity::S3Object(o) => assert_eq!(o.key, "foo//bar.txt"),
+            other => panic!("expected S3Object, got {:?}", other),
+        }
+        // Presentation is relative; awkward slash preserved in name, not normalized.
+        assert_eq!(page.entries[0].entry.name, "/bar.txt");
+    }
+
+    #[test]
+    fn object_size_preserved() {
+        let out = mk_list_out(
+            vec![mk_object("foo/x", Some(42))],
+            vec![],
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        assert_eq!(page.entries[0].entry.size, Some(42));
+    }
+
+    #[test]
+    fn object_last_modified_preserved_when_valid() {
+        let out = mk_list_out(
+            vec![mk_object_with_time("foo/x", 1, 1_700_000_000)],
+            vec![],
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        assert_eq!(
+            page.entries[0].entry.modified_unix_ms,
+            Some(1_700_000_000_000)
+        );
+    }
+
+    #[test]
+    fn object_missing_key_skipped() {
+        // AWS object with no key field (key() == None) is unusable; skip it.
+        let out = ListObjectsV2Output::builder()
+            .contents(Object::builder().size(1).build())
+            .is_truncated(false)
+            .build();
+        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        assert!(page.entries.is_empty());
+    }
+
+    #[test]
+    fn object_outside_requested_prefix_rejected() {
+        let out = mk_list_out(
+            vec![mk_object("other/bar.txt", Some(1))],
+            vec![],
+            Some(false),
+            None,
+        );
+        let err = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn common_prefix_exact_identity_and_relative_presentation() {
+        let out = mk_list_out(
+            vec![],
+            vec![mk_common_prefix("foo/bar/")],
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        let e = &page.entries[0];
+        assert_eq!(e.entry.name, "bar");
+        match &e.identity {
+            EntryIdentity::S3Prefix(p) => {
+                assert_eq!(p.target, "t");
+                assert_eq!(p.bucket, "b");
+                assert_eq!(p.prefix, "foo/bar/");
+            }
+            other => panic!("expected S3Prefix, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn common_prefix_outside_requested_prefix_rejected() {
+        let out = mk_list_out(
+            vec![],
+            vec![mk_common_prefix("other/bar/")],
+            Some(false),
+            None,
+        );
+        let err = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn self_common_prefix_not_emitted_as_child() {
+        // AWS returns the requested prefix itself as a CommonPrefix -> not a child,
+        // skipped (no self-navigation entry).
+        let out = mk_list_out(vec![], vec![mk_common_prefix("foo/")], Some(false), None);
+        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        assert!(page.entries.is_empty());
+    }
+
+    #[test]
+    fn current_zero_byte_folder_marker_suppressed() {
+        let out = mk_list_out(vec![mk_object("foo/", Some(0))], vec![], Some(false), None);
+        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        assert!(page.entries.is_empty());
+    }
+
+    #[test]
+    fn child_zero_byte_marker_deduped_against_common_prefix() {
+        let out = mk_list_out(
+            vec![mk_object("foo/bar/", Some(0))],
+            vec![mk_common_prefix("foo/bar/")],
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert!(matches!(
+            page.entries[0].identity,
+            EntryIdentity::S3Prefix(_)
+        ));
+    }
+
+    #[test]
+    fn nonzero_trailing_slash_object_preserved() {
+        let out = mk_list_out(
+            vec![mk_object("foo/special/", Some(7))],
+            vec![],
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        match &page.entries[0].identity {
+            EntryIdentity::S3Object(o) => assert_eq!(o.key, "foo/special/"),
+            other => panic!("expected S3Object, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unmatched_zero_byte_slash_object_preserved() {
+        let out = mk_list_out(
+            vec![mk_object("foo/special/", Some(0))],
+            vec![],
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        match &page.entries[0].identity {
+            EntryIdentity::S3Object(o) => assert_eq!(o.key, "foo/special/"),
+            other => panic!("expected S3Object, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn first_page_not_truncated_is_end() {
+        let out = mk_list_out(vec![], vec![], Some(false), None);
+        let cont =
+            next_list_objects_v2_continuation(out.is_truncated(), out.next_continuation_token())
+                .unwrap();
+        assert!(cont.is_none());
+    }
+
+    #[test]
+    fn first_page_truncated_token_preserved() {
+        let out = mk_list_out(vec![], vec![], Some(true), Some("opaque-token"));
+        let cont =
+            next_list_objects_v2_continuation(out.is_truncated(), out.next_continuation_token())
+                .unwrap()
+                .unwrap();
+        assert_eq!(cont.token, "opaque-token");
+    }
+
+    #[test]
+    fn first_page_truncated_missing_token_rejected() {
+        let out = mk_list_out(vec![], vec![], Some(true), None);
+        let err =
+            next_list_objects_v2_continuation(out.is_truncated(), out.next_continuation_token())
+                .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn first_page_truncated_empty_token_rejected() {
+        let out = mk_list_out(vec![], vec![], Some(true), Some(""));
+        let err =
+            next_list_objects_v2_continuation(out.is_truncated(), out.next_continuation_token())
+                .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn false_with_next_token_rejected_as_contradictory() {
+        let out = mk_list_out(vec![], vec![], Some(false), Some("opaque-token"));
+        let err =
+            next_list_objects_v2_continuation(out.is_truncated(), out.next_continuation_token())
+                .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn missing_is_truncated_rejected() {
+        let out = mk_list_out(vec![], vec![], None, None);
+        let err =
+            next_list_objects_v2_continuation(out.is_truncated(), out.next_continuation_token())
+                .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
     #[test]
     fn wrong_target_id_fails_closed() {
         let p = S3Provider::new(root_target());
@@ -1311,24 +1623,20 @@ mod tests {
 
     // ── S3-19 regression (NIT from S3-18): bucket-bound via PUBLIC list_page ──
 
-    #[tokio::test]
-    async fn bucket_bound_list_page_initializes_client() {
-        // S3-20 implements ListObjectsV2 for exact bound bucket.
+    #[test]
+    fn bucket_bound_exact_bucket_classifies_to_list_objects_v2_scope() {
+        // S3-20 implements ListObjectsV2 for exact bound bucket. Offline check:
+        // the location classifies to Bucket scope (no ListBuckets, no client init).
         let p = S3Provider::new(bound_target("company-artifacts"));
-        let l = Location::S3 {
-            target: "t".to_string(),
-            bucket: Some("company-artifacts".to_string()),
-            prefix: String::new(),
-        };
-        // ListObjectsV2 is now implemented (S3-20); client initializes.
-        // Without AWS creds it fails, but NOT with Unsupported.
-        let err = p.list_page(&l, None).await.unwrap_err();
-        assert!(
-            !matches!(err.kind(), io::ErrorKind::Unsupported),
-            "Exact bound bucket should route to ListObjectsV2, not return Unsupported"
-        );
-        // Client should have been initialized (lazy init happened).
-        assert!(p.client.get().is_some());
+        let l = loc("t", Some("company-artifacts"), "");
+        match p.classify_listing_location(&l).unwrap() {
+            S3ListingScope::Bucket { bucket, prefix } => {
+                assert_eq!(bucket, "company-artifacts");
+                assert_eq!(prefix, "");
+            }
+            other => panic!("expected Bucket scope, got {:?}", other),
+        }
+        assert!(p.client.get().is_none());
     }
 
     #[tokio::test]

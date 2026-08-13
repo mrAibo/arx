@@ -2463,26 +2463,21 @@ mod s3_list_page_tests {
         assert_eq!(err.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
     }
 
-    #[tokio::test]
-    async fn registry_s3_routing_bucket_scope_works() {
+    #[test]
+    fn registry_resolves_exact_s3_target_provider_for_bucket_scope() {
+        // Offline: provider_for_page_location must resolve the exact configured
+        // S3Target instance for a bucket scope, without invoking list_page/AWS.
         let registry = ProviderRegistry::new();
-        // Target registered with S3-20 implemented; bucket-bound location should
-        // route through Bucket scope (ListObjectsV2) rather than TargetRoot.
         registry.register_s3_targets(&[mk_s3_target("t", None, None, None, false)]);
         let loc = Location::S3 {
             target: "t".into(),
             bucket: Some("some-bucket".into()),
             prefix: String::new(),
         };
-        // ListObjectsV2 is implemented (S3-20); client will be initialized.
-        // Without AWS creds it fails with a different error, but NOT Unsupported.
-        let err = registry.list_page(&loc, None).await.unwrap_err();
-        assert!(
-            !matches!(err.kind(), std::io::ErrorKind::Unsupported),
-            "Bucket scope should route to ListObjectsV2, not return Unsupported"
-        );
-        // Verify it went through Bucket path (target-specific provider created)
-        // Note: without AWS creds it fails, but we confirmed it's not Unsupported.
+        let provider = registry.provider_for_page_location(&loc).unwrap();
+        // Exact S3Target instance identity (stable Arc, same as direct resolve).
+        let direct = registry.resolve_s3_provider("t").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&provider, &direct));
     }
 
     // ── MAJOR-01: real SFTP registry route, both APIs observe "/srv/data" exactly ──
@@ -2747,8 +2742,10 @@ mod s3_list_page_tests {
         );
     }
 
-    #[tokio::test]
-    async fn s3_page_route_bucket_scope_routes_to_list_objects_v2() {
+    #[test]
+    fn s3_provider_for_page_location_resolves_configured_target() {
+        // Offline: a configured S3 target (with profile/region) resolves to its
+        // exact S3Target provider instance for a bucket scope, no AWS call.
         let registry = ProviderRegistry::new();
         registry.register_s3_targets(&[mk_s3_target(
             "aws-prod",
@@ -2762,12 +2759,8 @@ mod s3_list_page_tests {
             bucket: Some("some-bucket".into()),
             prefix: "".to_string(),
         };
-        // Bucket-bound location routes through Bucket scope (ListObjectsV2, S3-20).
-        // With AWS creds it would work; without, it fails differently than Unsupported.
-        let err = registry.list_page(&loc, None).await.unwrap_err();
-        assert!(
-            !matches!(err.kind(), std::io::ErrorKind::Unsupported),
-            "Bucket scope should route to ListObjectsV2, not return Unsupported"
-        );
+        let provider = registry.provider_for_page_location(&loc).unwrap();
+        let direct = registry.resolve_s3_provider("aws-prod").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&provider, &direct));
     }
 }
