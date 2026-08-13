@@ -18,7 +18,7 @@ pub use infrastructure::InfrastructureService;
 pub use mutation::{MutationError, MutationProgress, MutationService, TrashOutcome};
 pub use pane_loader::{
     PaneListingContinuation, PaneLoadId, PaneLoadPage, PaneLoadPurpose, PaneLoadResponse,
-    PaneLoader,
+    PaneLoader, PaneNextPageResponse, PanePageRequestId,
 };
 pub use preview::{PreviewService, format_bounded_preview};
 pub use tree::TreeService;
