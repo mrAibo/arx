@@ -16,12 +16,12 @@
 
 ## Column summary
 
-- **READY** (0): —
+- **READY** (2): S3-24, S3-24P
 - **DOING** (0): —
-- **REVIEW** (1): S3-23
+- **REVIEW** (0): —
 - **BLOCKED** (0): —
-- **DONE** (23): S3-00..S3-22
-- **BACKLOG** (57): S3-24..S3-80
+- **DONE** (24): S3-00..S3-23
+- **BACKLOG** (56): S3-25..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
 
@@ -290,7 +290,7 @@
 
 ### S3-23 — Pane ListedEntry seam + Enter S3BucketRef
 - **Phase:** P10
-- **Status:** REVIEW
+- **Status:** DONE
 - **Depends on:** S3-13..15, S3-18..22
 - **Allowed files:** src/services/pane_loader.rs, src/services/mod.rs, src/app/mod.rs, src/app/actions.rs, src/tui.rs, tests/async_vfs_contracts.rs (test-only compile consumer), docs/S3_KANBAN.md
 - **Acceptance:**
@@ -312,12 +312,32 @@
 
 ### S3-24 — Enter S3PrefixRef
 - **Phase:** P10
-- **Status:** BACKLOG
+- **Status:** READY
 - **Depends on:** S3-23
 - **Allowed files:** src/app/actions.rs
 - **Acceptance:** Navigate into CommonPrefix using exact S3PrefixRef. No string reconstruction from presentation name.
 - **Stop conditions:** Name reconstruction.
 - **Hermes prompt:** Nav into CommonPrefix uses exact S3PrefixRef. No presentation-name reconstruction.
+
+### S3-24P — Pane incremental pagination
+- **Phase:** P10
+- **Status:** READY
+- **Depends on:** S3-23, S3-19, S3-21
+- **Allowed files:** src/services/pane_loader.rs, src/services/mod.rs, src/app/mod.rs, src/tui.rs, tests/async_vfs_contracts.rs
+- **Acceptance:**
+  1. Consume the stored `PaneListingContinuation` incrementally; do not reconstruct it.
+  2. Allow at most one pending next-page request per pane.
+  3. Correlate each page by exact listing generation, `Location`, provider instance, and page-request identity.
+  4. Silently discard stale responses without appending rows or mutating continuation state.
+  5. Append complete `ListedEntry` values without separating presentation from operational identity.
+  6. Atomically replace the consumed continuation with the returned continuation.
+  7. `None` means end-of-list and no `Load more…` row.
+  8. A page error keeps already loaded rows and the original continuation for retry.
+  9. No eager or automatic pagination.
+  10. No capability flip.
+  11. Local/SFTP/Archive behavior remains unchanged.
+- **Stop conditions:** Eager enumeration, duplicate append, stale page append, Entry/identity separation, or capability flip.
+- **Hermes prompt:** Add explicit, stale-safe pane next-page loading from the exact stored continuation. Preserve listing generation and `ListedEntry` identity, append once, replace continuation atomically, retain rows/token on page error, and render `Load more…` only while a continuation exists. No eager pagination or capability change.
 
 ### S3-25 — Virtual parent
 - **Phase:** P10
@@ -331,11 +351,11 @@
 ### S3-26 — Enable List capability
 - **Phase:** P10
 - **Status:** BACKLOG
-- **Depends on:** S3-18..25
+- **Depends on:** S3-18..25, S3-24P
 - **Allowed files:** src/vfs/capabilities.rs, src/vfs/s3.rs
-- **Acceptance:** Only now enable S3 List capability. Precondition S3-18..25 complete+tested. Change only capability declaration/tests. No Read/Write/Delete/Mkdir yet.
+- **Acceptance:** Only now enable S3 List capability. Preconditions: S3-18..25 complete and tested; consumer pagination complete and tested through S3-24P. Change only capability declaration/tests. No Read/Write/Delete/Mkdir yet.
 - **Stop conditions:** Enabling Read/Write/Delete/Mkdir.
-- **Hermes prompt:** Flip S3 List capability ONLY after S3-18..25 done+tested. No other capability. Change capability decl/tests only.
+- **Hermes prompt:** Flip S3 List capability ONLY after S3-18..25 and S3-24P are done and tested. No other capability. Change capability declaration/tests only.
 
 ### S3-27 — S3 bounded Range GET
 - **Phase:** P11
