@@ -472,6 +472,33 @@ pub fn action_meta(id: ActionId) -> Option<&'static ActionMeta> {
     ACTION_CATALOG.iter().find(|meta| meta.id == id)
 }
 
+#[allow(dead_code)]
+pub fn listed_entry_navigation_target(
+    current: &crate::vfs::Location,
+    listed: &crate::vfs::ListedEntry,
+) -> Option<crate::vfs::Location> {
+    match &listed.identity {
+        crate::vfs::EntryIdentity::S3Bucket(reference) => Some(crate::vfs::Location::S3 {
+            target: reference.target.clone(),
+            bucket: Some(reference.bucket.clone()),
+            prefix: String::new(),
+        }),
+        crate::vfs::EntryIdentity::S3Prefix(_) | crate::vfs::EntryIdentity::S3Object(_) => None,
+        crate::vfs::EntryIdentity::Other
+            if listed.entry.kind == crate::vfs::EntryKind::Directory
+                && matches!(
+                    current,
+                    crate::vfs::Location::Local(_)
+                        | crate::vfs::Location::Sftp { .. }
+                        | crate::vfs::Location::Archive { .. }
+                ) =>
+        {
+            Some(current.child(&listed.entry.name))
+        }
+        crate::vfs::EntryIdentity::Other => None,
+    }
+}
+
 /// High-level input ownership.
 ///
 /// This is intentionally derived from the current `AppState` instead of
@@ -541,6 +568,22 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vfs::{
+        Entry, EntryIdentity, EntryKind, ListedEntry, Location,
+        s3::{S3BucketRef, S3ObjectRef, S3PrefixRef},
+    };
+
+    fn listed(name: &str, kind: EntryKind, identity: EntryIdentity) -> ListedEntry {
+        ListedEntry {
+            entry: Entry {
+                name: name.into(),
+                kind,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity,
+        }
+    }
 
     #[test]
     fn every_action_has_catalog_metadata() {
@@ -619,6 +662,170 @@ mod tests {
         state.remote_workspace.preview_open = true;
         state.remote_workspace.ux = crate::app::WorkspaceSyncUxState::Launching { plan_id };
         assert_eq!(state.input_context(), InputContext::SyncJob);
+    }
+
+    #[test]
+    fn bucket_navigation_uses_ref_not_presentation() {
+        let listed = listed(
+            "DISPLAY-NAME-THAT-MUST-NOT-BE-USED",
+            EntryKind::Directory,
+            EntryIdentity::S3Bucket(S3BucketRef {
+                target: "aws-prod".into(),
+                bucket: "Company-Artifacts".into(),
+            }),
+        );
+
+        assert_eq!(
+            listed_entry_navigation_target(
+                &Location::S3 {
+                    target: "other-target".into(),
+                    bucket: None,
+                    prefix: "ignored".into(),
+                },
+                &listed,
+            ),
+            Some(Location::S3 {
+                target: "aws-prod".into(),
+                bucket: Some("Company-Artifacts".into()),
+                prefix: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn bucket_case_preserved_exactly() {
+        let listed = listed(
+            "display",
+            EntryKind::Directory,
+            EntryIdentity::S3Bucket(S3BucketRef {
+                target: "Aws-PROD".into(),
+                bucket: "Company-ARTIFACTS".into(),
+            }),
+        );
+
+        assert_eq!(
+            listed_entry_navigation_target(&Location::Local("/ignored".into()), &listed),
+            Some(Location::S3 {
+                target: "Aws-PROD".into(),
+                bucket: Some("Company-ARTIFACTS".into()),
+                prefix: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn s3_prefix_not_entered_yet() {
+        let listed = listed(
+            "display",
+            EntryKind::Directory,
+            EntryIdentity::S3Prefix(S3PrefixRef {
+                target: "aws-prod".into(),
+                bucket: "Company-Artifacts".into(),
+                prefix: "exact/prefix".into(),
+            }),
+        );
+
+        assert_eq!(
+            listed_entry_navigation_target(&Location::Local("/ignored".into()), &listed),
+            None
+        );
+    }
+
+    #[test]
+    fn s3_object_not_directory_navigation() {
+        let listed = listed(
+            "display",
+            EntryKind::Directory,
+            EntryIdentity::S3Object(S3ObjectRef {
+                target: "aws-prod".into(),
+                bucket: "Company-Artifacts".into(),
+                key: "exact/object".into(),
+            }),
+        );
+
+        assert_eq!(
+            listed_entry_navigation_target(&Location::Local("/ignored".into()), &listed),
+            None
+        );
+    }
+
+    #[test]
+    fn s3_other_does_not_fallback_to_name() {
+        let listed = listed(
+            "DISPLAY-NAME-THAT-MUST-NOT-BE-USED",
+            EntryKind::Directory,
+            EntryIdentity::Other,
+        );
+
+        assert_eq!(
+            listed_entry_navigation_target(
+                &Location::S3 {
+                    target: "aws-prod".into(),
+                    bucket: Some("Company-Artifacts".into()),
+                    prefix: String::new(),
+                },
+                &listed,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn local_other_directory_unchanged() {
+        let listed = listed("child", EntryKind::Directory, EntryIdentity::Other);
+
+        assert_eq!(
+            listed_entry_navigation_target(&Location::Local("/parent".into()), &listed),
+            Some(Location::Local("/parent/child".into()))
+        );
+    }
+
+    #[test]
+    fn sftp_other_directory_unchanged() {
+        let listed = listed("child", EntryKind::Directory, EntryIdentity::Other);
+
+        assert_eq!(
+            listed_entry_navigation_target(
+                &Location::Sftp {
+                    host: "host".into(),
+                    path: "/parent".into(),
+                },
+                &listed,
+            ),
+            Some(Location::Sftp {
+                host: "host".into(),
+                path: "/parent/child".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn archive_other_directory_unchanged() {
+        let listed = listed("child", EntryKind::Directory, EntryIdentity::Other);
+
+        assert_eq!(
+            listed_entry_navigation_target(
+                &Location::Archive {
+                    archive: "/archive.zip".into(),
+                    inner_path: "parent".into(),
+                },
+                &listed,
+            ),
+            Some(Location::Archive {
+                archive: "/archive.zip".into(),
+                inner_path: "parent/child".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn other_non_directory_is_not_entered() {
+        let listed = listed("file", EntryKind::File, EntryIdentity::Other);
+
+        assert_eq!(
+            listed_entry_navigation_target(&Location::Local("/parent".into()), &listed),
+            None
+        );
     }
 
     #[test]
