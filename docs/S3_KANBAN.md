@@ -16,12 +16,12 @@
 
 ## Column summary
 
-- **READY** (1): S3-22
+- **READY** (1): S3-23
 - **DOING** (0): —
 - **REVIEW** (0): —
 - **BLOCKED** (0): —
-- **DONE** (22): S3-00..S3-21
-- **BACKLOG** (58): S3-23..S3-80
+- **DONE** (23): S3-00..S3-22
+- **BACKLOG** (57): S3-24..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
 
@@ -273,16 +273,24 @@
 
 ### S3-22 — Awkward key listing tests
 - **Phase:** P9
-- **Status:** READY
+- **Status:** DONE
 - **Depends on:** S3-20, S3-21
-- **Allowed files:** src/vfs/s3.rs (tests)
-- **Acceptance:** Fixture keys foo//bar.txt, foo/../bar.txt, foo/./bar.txt, space, Unicode, emoji, zero-byte, folder marker. Verify display may simplify presentation only; identity exact. Mocked OK.
+- **Allowed files:** src/vfs/s3.rs (TESTS ONLY), docs/S3_KANBAN.md
+- **Acceptance:**
+  - Test `ListObjectsV2` fixture mapping for awkward keys.
+  - Exact `S3ObjectRef.key` / `S3PrefixRef.prefix` always remains the exact provider value.
+  - `Entry.name` remains presentation-only.
+  - No test may derive expected operational identity from `Entry.name`.
+  - No `Path` / `PathBuf` / `components` / `canonicalize` / filesystem normalization.
+  - No AWS client/network.
+  - No production behavior modification.
+  - Existing S3-20/S3-21 folder-marker and pagination tests stay green.
 - **Stop conditions:** AWS integration required (must allow mocked).
 - **Hermes prompt:** Tests: awkward keys (foo//bar, foo/../bar, foo/./bar, spaces, Unicode, emoji, zero-byte, folder marker) preserve exact identity; display may simplify presentation only. Mocked.
 
 ### S3-23 — Enter S3BucketRef
 - **Phase:** P10
-- **Status:** BACKLOG
+- **Status:** READY
 - **Depends on:** S3-18..22
 - **Allowed files:** src/app/actions.rs, src/app/remote_workspace.rs (nav)
 - **Acceptance:** Enter target root=>exact bucket via S3BucketRef (never Entry.name). Result Location::S3{same target, bucket exact, prefix ""}. No other nav changes.
