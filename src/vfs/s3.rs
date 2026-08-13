@@ -360,24 +360,29 @@ impl VfsProvider for S3Provider {
                 })
             }
             S3ListingScope::Bucket { bucket, prefix } => {
-                // ListObjectsV2 (S3-20). Continuation consumption is S3-21; an
-                // incoming token must fail closed BEFORE the client is built.
-                if continuation.is_some() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "S3 ListObjectsV2 continuation not supported until S3-21",
-                    ));
-                }
+                // Validate continuation offline before the lazy AWS client exists.
+                // The token is provider-owned and remains byte-for-byte opaque.
+                let consumed = match continuation {
+                    Some(c) if c.token.is_empty() => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "S3 ListObjectsV2 pagination protocol error: empty continuation token",
+                        ));
+                    }
+                    Some(c) => Some(c.token.as_str()),
+                    None => None,
+                };
 
                 // S3-17 lazy per-target lifecycle: only this boundary builds the
                 // client. Exactly one bounded ListObjectsV2 .send() per page.
                 let client = self.client().await?;
                 let wire_prefix = list_objects_wire_prefix(prefix);
-                let output = list_objects_v2_page(client, bucket, &wire_prefix).await?;
+                let output = list_objects_v2_page(client, bucket, &wire_prefix, consumed).await?;
                 let page =
-                    map_list_objects_v2_first_page(&self.target.id, bucket, &wire_prefix, &output)?;
-                // First-page continuation truth: IsTruncated/NextContinuationToken.
+                    map_list_objects_v2_page(&self.target.id, bucket, &wire_prefix, &output)?;
+                // Per-page continuation truth: IsTruncated/NextContinuationToken.
                 let continuation = next_list_objects_v2_continuation(
+                    consumed,
                     output.is_truncated(),
                     output.next_continuation_token(),
                 )?;
@@ -479,8 +484,8 @@ fn map_list_buckets_page(
     })
 }
 
-/// Bounded page size for every ListObjectsV2 request (first page in S3-20).
-// ponytail: stays well under the 1000-key ceiling; S3-21 owns pagination.
+/// Bounded page size for every ListObjectsV2 request.
+// ponytail: one page is the unit of work; no eager enumeration.
 const LIST_OBJECTS_PAGE_SIZE: i32 = 1000;
 
 /// Construct the wire prefix for a ListObjectsV2 request.
@@ -500,33 +505,51 @@ fn list_objects_wire_prefix(nav_prefix: &str) -> Cow<'_, str> {
     }
 }
 
-/// One bounded ListObjectsV2 request for the first page.
-/// Exactly one `.send()` per invocation. No loop, no paginator helper.
-async fn list_objects_v2_page(
+/// Build one bounded ListObjectsV2 request for any page.
+fn list_objects_v2_request(
     client: &Client,
     bucket: &str,
     wire_prefix: &str,
-) -> io::Result<ListObjectsV2Output> {
-    let request = client
+    continuation: Option<&str>,
+) -> aws_sdk_s3::operation::list_objects_v2::builders::ListObjectsV2FluentBuilder {
+    let mut request = client
         .list_objects_v2()
         .bucket(bucket)
         .prefix(wire_prefix)
         .delimiter("/")
         .max_keys(LIST_OBJECTS_PAGE_SIZE);
+    if let Some(token) = continuation {
+        request = request.continuation_token(token);
+    }
     request
-        .send()
-        .await
-        .map_err(|e| io::Error::other(format!("S3 ListObjectsV2 failed: {}", e)))
 }
 
-/// Pure first-page continuation protocol for ListObjectsV2.
+/// Send one bounded ListObjectsV2 request. No loop, no paginator helper.
+/// Exactly one `.send()` per invocation.
+async fn list_objects_v2_page(
+    client: &Client,
+    bucket: &str,
+    wire_prefix: &str,
+    continuation: Option<&str>,
+) -> io::Result<ListObjectsV2Output> {
+    list_objects_v2_request(client, bucket, wire_prefix, continuation)
+        .send()
+        .await
+        // The SDK error may include the request URI, whose query can contain
+        // the opaque continuation token. Keep diagnostics factual and redacted.
+        .map_err(|_| io::Error::other("S3 ListObjectsV2 request failed"))
+}
+
+/// Pure per-page continuation protocol for ListObjectsV2.
 /// ListObjectsV2 exposes IsTruncated + NextContinuationToken.
 /// - IsTruncated == false => None
 /// - IsTruncated == true AND usable NextContinuationToken => Some(ProviderContinuation)
 /// - IsTruncated == true AND token missing/empty => InvalidData (ProtocolError)
+/// - Returned token identical to consumed token => InvalidData (non-advancing)
 /// - Missing IsTruncated => InvalidData
 /// - IsTruncated == false BUT NextContinuationToken present => contradictory InvalidData
 fn next_list_objects_v2_continuation(
+    consumed: Option<&str>,
     is_truncated: Option<bool>,
     next_token: Option<&str>,
 ) -> io::Result<Option<ProviderContinuation>> {
@@ -539,9 +562,15 @@ fn next_list_objects_v2_continuation(
             )),
         },
         Some(true) => match next_token {
-            Some(token) if !token.is_empty() => Ok(Some(ProviderContinuation {
-                token: token.to_string(),
-            })),
+            Some(token) if !token.is_empty() && Some(token) != consumed => {
+                Ok(Some(ProviderContinuation {
+                    token: token.to_string(),
+                }))
+            }
+            Some(token) if Some(token) == consumed => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "S3 ListObjectsV2 pagination protocol error: continuation token did not advance",
+            )),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "S3 ListObjectsV2 pagination protocol error: missing or empty NextContinuationToken on truncated response",
@@ -554,9 +583,9 @@ fn next_list_objects_v2_continuation(
     }
 }
 
-/// Pure AWS-response → provider-page mapping for ListObjectsV2 first page.
+/// Pure AWS-response → provider-page mapping for every ListObjectsV2 page.
 /// Includes folder-marker dedup by exact evidence only.
-fn map_list_objects_v2_first_page(
+fn map_list_objects_v2_page(
     target_id: &str,
     bucket: &str,
     wire_prefix: &str,
@@ -1271,6 +1300,38 @@ mod tests {
         assert_eq!(list_objects_wire_prefix("foo/../bar"), "foo/../bar/");
     }
 
+    #[test]
+    fn list_objects_request_shape_is_stable_across_pages() {
+        let sdk = aws_config::SdkConfig::builder()
+            .region(Region::new("us-east-1"))
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        let settings = S3ClientSettings {
+            region: None,
+            profile: None,
+            endpoint_url: None,
+            force_path_style: false,
+        };
+        let client = Client::from_conf(build_s3_config(&settings, &sdk));
+        let opaque = "  opaque+/=token 日本語  ";
+
+        for continuation in [None, Some(opaque)] {
+            let input =
+                list_objects_v2_request(&client, "Company-Artifacts", "foo//bar/", continuation)
+                    .as_input()
+                    .clone()
+                    .build()
+                    .unwrap();
+
+            assert_eq!(input.bucket(), Some("Company-Artifacts"));
+            assert_eq!(input.prefix(), Some("foo//bar/"));
+            assert_eq!(input.delimiter(), Some("/"));
+            assert_eq!(input.max_keys(), Some(1000));
+            assert_eq!(input.continuation_token(), continuation);
+            assert_eq!(input.start_after(), None);
+        }
+    }
+
     fn mk_object(key: &str, size: Option<i64>) -> Object {
         let mut b = Object::builder().key(key);
         if let Some(s) = size {
@@ -1318,7 +1379,7 @@ mod tests {
             Some(false),
             None,
         );
-        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
         assert_eq!(page.entries.len(), 1);
         let e = &page.entries[0];
         assert_eq!(e.entry.name, "bar.txt");
@@ -1340,7 +1401,7 @@ mod tests {
             Some(false),
             None,
         );
-        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
         match &page.entries[0].identity {
             EntryIdentity::S3Object(o) => assert_eq!(o.key, "foo//bar.txt"),
             other => panic!("expected S3Object, got {:?}", other),
@@ -1357,7 +1418,7 @@ mod tests {
             Some(false),
             None,
         );
-        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
         assert_eq!(page.entries[0].entry.size, Some(42));
     }
 
@@ -1369,7 +1430,7 @@ mod tests {
             Some(false),
             None,
         );
-        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
         assert_eq!(
             page.entries[0].entry.modified_unix_ms,
             Some(1_700_000_000_000)
@@ -1383,7 +1444,7 @@ mod tests {
             .contents(Object::builder().size(1).build())
             .is_truncated(false)
             .build();
-        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
         assert!(page.entries.is_empty());
     }
 
@@ -1395,7 +1456,7 @@ mod tests {
             Some(false),
             None,
         );
-        let err = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap_err();
+        let err = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -1407,7 +1468,7 @@ mod tests {
             Some(false),
             None,
         );
-        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
         assert_eq!(page.entries.len(), 1);
         let e = &page.entries[0];
         assert_eq!(e.entry.name, "bar");
@@ -1429,7 +1490,7 @@ mod tests {
             Some(false),
             None,
         );
-        let err = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap_err();
+        let err = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -1438,14 +1499,14 @@ mod tests {
         // AWS returns the requested prefix itself as a CommonPrefix -> not a child,
         // skipped (no self-navigation entry).
         let out = mk_list_out(vec![], vec![mk_common_prefix("foo/")], Some(false), None);
-        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
         assert!(page.entries.is_empty());
     }
 
     #[test]
     fn current_zero_byte_folder_marker_suppressed() {
         let out = mk_list_out(vec![mk_object("foo/", Some(0))], vec![], Some(false), None);
-        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
         assert!(page.entries.is_empty());
     }
 
@@ -1457,7 +1518,7 @@ mod tests {
             Some(false),
             None,
         );
-        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
         assert_eq!(page.entries.len(), 1);
         assert!(matches!(
             page.entries[0].identity,
@@ -1473,7 +1534,7 @@ mod tests {
             Some(false),
             None,
         );
-        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
         assert_eq!(page.entries.len(), 1);
         match &page.entries[0].identity {
             EntryIdentity::S3Object(o) => assert_eq!(o.key, "foo/special/"),
@@ -1489,7 +1550,7 @@ mod tests {
             Some(false),
             None,
         );
-        let page = map_list_objects_v2_first_page("t", "b", "foo/", &out).unwrap();
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
         assert_eq!(page.entries.len(), 1);
         match &page.entries[0].identity {
             EntryIdentity::S3Object(o) => assert_eq!(o.key, "foo/special/"),
@@ -1500,55 +1561,102 @@ mod tests {
     #[test]
     fn first_page_not_truncated_is_end() {
         let out = mk_list_out(vec![], vec![], Some(false), None);
+        let cont = next_list_objects_v2_continuation(
+            None,
+            out.is_truncated(),
+            out.next_continuation_token(),
+        )
+        .unwrap();
+        assert!(cont.is_none());
+    }
+
+    #[test]
+    fn next_page_repeated_token_protocol_error() {
+        let err = next_list_objects_v2_continuation(
+            Some("sensitive-token"),
+            Some(true),
+            Some("sensitive-token"),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!err.to_string().contains("sensitive-token"));
+    }
+
+    #[test]
+    fn next_page_advancing_token_preserved_verbatim() {
+        let returned = "  next+/=token 日本語  ";
         let cont =
-            next_list_objects_v2_continuation(out.is_truncated(), out.next_continuation_token())
+            next_list_objects_v2_continuation(Some("consumed-token"), Some(true), Some(returned))
+                .unwrap()
                 .unwrap();
+        assert_eq!(cont.token, returned);
+    }
+
+    #[test]
+    fn list_objects_final_next_page_is_end() {
+        let cont =
+            next_list_objects_v2_continuation(Some("consumed-token"), Some(false), None).unwrap();
         assert!(cont.is_none());
     }
 
     #[test]
     fn first_page_truncated_token_preserved() {
         let out = mk_list_out(vec![], vec![], Some(true), Some("opaque-token"));
-        let cont =
-            next_list_objects_v2_continuation(out.is_truncated(), out.next_continuation_token())
-                .unwrap()
-                .unwrap();
+        let cont = next_list_objects_v2_continuation(
+            None,
+            out.is_truncated(),
+            out.next_continuation_token(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(cont.token, "opaque-token");
     }
 
     #[test]
     fn first_page_truncated_missing_token_rejected() {
         let out = mk_list_out(vec![], vec![], Some(true), None);
-        let err =
-            next_list_objects_v2_continuation(out.is_truncated(), out.next_continuation_token())
-                .unwrap_err();
+        let err = next_list_objects_v2_continuation(
+            None,
+            out.is_truncated(),
+            out.next_continuation_token(),
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn first_page_truncated_empty_token_rejected() {
         let out = mk_list_out(vec![], vec![], Some(true), Some(""));
-        let err =
-            next_list_objects_v2_continuation(out.is_truncated(), out.next_continuation_token())
-                .unwrap_err();
+        let err = next_list_objects_v2_continuation(
+            None,
+            out.is_truncated(),
+            out.next_continuation_token(),
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn false_with_next_token_rejected_as_contradictory() {
         let out = mk_list_out(vec![], vec![], Some(false), Some("opaque-token"));
-        let err =
-            next_list_objects_v2_continuation(out.is_truncated(), out.next_continuation_token())
-                .unwrap_err();
+        let err = next_list_objects_v2_continuation(
+            None,
+            out.is_truncated(),
+            out.next_continuation_token(),
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn missing_is_truncated_rejected() {
         let out = mk_list_out(vec![], vec![], None, None);
-        let err =
-            next_list_objects_v2_continuation(out.is_truncated(), out.next_continuation_token())
-                .unwrap_err();
+        let err = next_list_objects_v2_continuation(
+            None,
+            out.is_truncated(),
+            out.next_continuation_token(),
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -1665,6 +1773,18 @@ mod tests {
         };
         let err = p.list_page(&l, Some(&cont)).await.unwrap_err();
         assert!(matches!(err.kind(), io::ErrorKind::InvalidData));
+        assert!(p.client.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn list_objects_empty_consumed_token_rejected_offline() {
+        let p = S3Provider::new(bound_target("company-artifacts"));
+        let l = loc("t", Some("company-artifacts"), "foo");
+        let cont = ProviderContinuation {
+            token: String::new(),
+        };
+        let err = p.list_page(&l, Some(&cont)).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(p.client.get().is_none());
     }
 }

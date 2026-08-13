@@ -16,12 +16,12 @@
 
 ## Column summary
 
-- **READY** (1): S3-21
+- **READY** (1): S3-22
 - **DOING** (0): —
 - **REVIEW** (0): —
 - **BLOCKED** (0): —
-- **DONE** (21): S3-00..S3-20
-- **BACKLOG** (59): S3-22..S3-80
+- **DONE** (22): S3-00..S3-21
+- **BACKLOG** (58): S3-23..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
 
@@ -251,16 +251,29 @@
 
 ### S3-21 — ListObjectsV2 pagination
 - **Phase:** P9
-- **Status:** READY
+- **Status:** DONE
 - **Depends on:** S3-20
-- **Allowed files:** src/vfs/s3.rs
-- **Acceptance:** Support NextContinuationToken. Same invariants: missing token while truncated=>ProtocolError; repeated token=>ProtocolError; no full-bucket eager loop.
+- **Allowed files:** src/vfs/s3.rs, docs/S3_KANBAN.md
+- **Acceptance:**
+  - Bucket-scope `ProviderContinuation.token` is passed verbatim as `ListObjectsV2` `ContinuationToken`.
+  - No trim/decode/re-encode/normalization.
+  - Empty consumed token => `InvalidData` before client/AWS.
+  - Request retains exact bucket + wire prefix + `Delimiter="/"` + `max_keys=1000`.
+  - Exactly one `ListObjectsV2` request per `list_page` invocation.
+  - No paginator, eager loop, or `StartAfter`.
+  - `IsTruncated=false` + no token => end.
+  - `IsTruncated=false` + token => `InvalidData`.
+  - `IsTruncated=true` requires non-empty `NextContinuationToken`.
+  - Returned token identical to consumed token => `InvalidData`.
+  - Advancing token preserved exactly.
+  - Same `Contents`/`CommonPrefixes`/folder-marker mapper for every page.
+  - Continuation token values never appear in diagnostics.
 - **Stop conditions:** Eager loop.
 - **Hermes prompt:** ListObjectsV2 pagination via NextContinuationToken. ProtocolError on missing/non-advancing token. No eager full-bucket loop.
 
 ### S3-22 — Awkward key listing tests
 - **Phase:** P9
-- **Status:** BACKLOG
+- **Status:** READY
 - **Depends on:** S3-20, S3-21
 - **Allowed files:** src/vfs/s3.rs (tests)
 - **Acceptance:** Fixture keys foo//bar.txt, foo/../bar.txt, foo/./bar.txt, space, Unicode, emoji, zero-byte, folder marker. Verify display may simplify presentation only; identity exact. Mocked OK.
