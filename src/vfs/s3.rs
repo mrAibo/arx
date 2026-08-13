@@ -490,16 +490,23 @@ const LIST_OBJECTS_PAGE_SIZE: i32 = 1000;
 
 /// Construct the wire prefix for a ListObjectsV2 request.
 ///
-/// This is protocol/navigation construction, NOT filesystem normalization:
-/// - nav "" => wire "" (bucket root)
-/// - nav ending "/" => preserve exactly
-/// - nav non-empty without trailing "/" => append exactly one "/"
-///   Never trim, collapse "//", resolve "."/"..", or canonicalize.
+/// Three distinct values exist (see `docs/DESIGN_S3.md`): the exact provider
+/// `CommonPrefix`, the navigation `Location::S3.prefix`, and this wire prefix.
+///
+/// The wire prefix is protocol/navigation construction, NOT filesystem
+/// normalization:
+/// - nav `""` => wire `""` (bucket root)
+/// - nav non-empty => append EXACTLY ONE `/` UNCONDITIONALLY, even when `nav`
+///   already ends in `/` (that trailing slash is literal namespace structure,
+///   not a protocol delimiter to skip).
+///
+/// This keeps the seam reversible: `nav(P)` removes one delimiter from the
+/// exact provider prefix, and `wire(nav(P))` re-adds it, so
+/// `wire(nav(P)) == P` for every valid repeated-delimiter prefix.
+/// Never trim, collapse `//`, resolve `./`/`../`, or canonicalize.
 fn list_objects_wire_prefix(nav_prefix: &str) -> Cow<'_, str> {
     if nav_prefix.is_empty() {
         Cow::Borrowed("")
-    } else if nav_prefix.ends_with('/') {
-        Cow::Borrowed(nav_prefix)
     } else {
         Cow::Owned(format!("{nav_prefix}/"))
     }
@@ -671,6 +678,20 @@ fn map_list_objects_v2_page(
         let Some(prefix) = cp.prefix() else {
             continue;
         };
+
+        // A returned CommonPrefix with Delimiter="/" MUST end in that delimiter
+        // (it groups keys sharing the prefix up to the delimiter). A missing
+        // delimiter is a malformed/misconfigured provider response: reject it
+        // rather than inventing the missing `/` or transforming the value.
+        // This makes the future S3-24 nav conversion formally reversible
+        // (provider exact prefix - one delimiter = nav prefix). The error does
+        // not echo the prefix value.
+        if !prefix.ends_with('/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "S3 ListObjectsV2 response contained CommonPrefix without delimiter",
+            ));
+        }
 
         // Reject CommonPrefix outside requested wire prefix.
         if !prefix.starts_with(wire_prefix) {
@@ -1284,20 +1305,34 @@ mod tests {
         assert_eq!(list_objects_wire_prefix(""), "");
     }
     #[test]
+    fn wire_prefix_plain_nav_adds_delimiter() {
+        assert_eq!(list_objects_wire_prefix("foo"), "foo/");
+    }
+    #[test]
+    fn wire_prefix_literal_trailing_slash_adds_protocol_delimiter() {
+        // The existing trailing "/" is literal namespace structure, NOT a
+        // protocol delimiter to skip. S3-20R: always append exactly one.
+        assert_eq!(list_objects_wire_prefix("foo/"), "foo//");
+    }
+    #[test]
+    fn wire_prefix_repeated_literal_slashes_preserved() {
+        assert_eq!(list_objects_wire_prefix("foo//bar"), "foo//bar/");
+    }
+    #[test]
     fn wire_prefix_nested_appends_delimiter() {
         assert_eq!(list_objects_wire_prefix("foo/bar"), "foo/bar/");
     }
     #[test]
-    fn wire_prefix_existing_delimiter_preserved() {
-        assert_eq!(list_objects_wire_prefix("foo/bar/"), "foo/bar/");
-    }
-    #[test]
-    fn wire_prefix_awkward_double_slash_preserved() {
-        assert_eq!(list_objects_wire_prefix("foo//bar"), "foo//bar/");
-    }
-    #[test]
     fn wire_prefix_dotdot_preserved() {
         assert_eq!(list_objects_wire_prefix("foo/../bar"), "foo/../bar/");
+    }
+    #[test]
+    fn wire_prefix_dot_preserved() {
+        assert_eq!(list_objects_wire_prefix("foo/./bar"), "foo/./bar/");
+    }
+    #[test]
+    fn wire_prefix_unicode_preserved() {
+        assert_eq!(list_objects_wire_prefix("日本語/資料"), "日本語/資料/");
     }
 
     #[test]
@@ -1996,5 +2031,137 @@ mod tests {
         let err = p.list_page(&l, Some(&cont)).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(p.client.get().is_none());
+    }
+
+    // ── S3-20R: reversible nav/wire delimiter seam ──
+
+    // Roundtrip invariant: for every valid exact provider CommonPrefix P,
+    // nav(P) removes exactly one final '/' and wire(nav(P)) == P. This holds
+    // even for repeated-delimiter structure. No production nav helper is added;
+    // this pins the seam contract only.
+    #[test]
+    fn wire_nav_roundtrip_preserves_repeated_delimiters() {
+        let cases: &[(&str, &str)] = &[
+            ("foo/", "foo"),
+            ("foo//", "foo/"),
+            ("foo///", "foo//"),
+            ("foo/bar/", "foo/bar"),
+            ("foo//bar/", "foo//bar"),
+            ("foo/../bar/", "foo/../bar"),
+            ("foo/./bar/", "foo/./bar"),
+            ("日本語/資料/", "日本語/資料"),
+        ];
+        for (exact, nav) in cases {
+            let nav_computed = exact
+                .strip_suffix('/')
+                .expect("valid CommonPrefix delimiter");
+            assert_eq!(nav_computed, *nav, "nav of {exact}");
+            assert_eq!(
+                list_objects_wire_prefix(nav_computed),
+                *exact,
+                "roundtrip of {exact}"
+            );
+        }
+    }
+
+    #[test]
+    fn common_prefix_exact_identity_preserved_with_repeated_delimiter() {
+        // wire "foo/" (nav "foo" + one delimiter); CommonPrefix "foo//" is a
+        // child of that wire and carries the repeated literal slash.
+        let out = mk_list_out(vec![], vec![mk_common_prefix("foo//")], Some(false), None);
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
+        let prefix_entries: Vec<&S3PrefixRef> = page
+            .entries
+            .iter()
+            .filter_map(|e| match &e.identity {
+                EntryIdentity::S3Prefix(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prefix_entries.len(), 1);
+        assert_eq!(prefix_entries[0].prefix, "foo//");
+    }
+
+    #[test]
+    fn common_prefix_missing_delimiter_rejected() {
+        // Delimiter="/" => every CommonPrefix MUST end in '/'. "foo/child" is
+        // malformed; reject without inventing an identity. wire is a proper
+        // parent so the record reaches the delimiter check (not self-skip).
+        let out = mk_list_out(
+            vec![],
+            vec![mk_common_prefix("foo/child")],
+            Some(false),
+            None,
+        );
+        let err = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn common_prefix_awkward_valid_repeated_delimiter_accepted() {
+        let out = mk_list_out(
+            vec![],
+            vec![mk_common_prefix("foo/../child/")],
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_page("t", "b", "foo/../", &out).unwrap();
+        assert!(page.entries.iter().any(|e| matches!(
+            &e.identity,
+            EntryIdentity::S3Prefix(p) if p.prefix == "foo/../child/"
+        )));
+    }
+
+    #[test]
+    fn common_prefix_unicode_valid() {
+        let out = mk_list_out(
+            vec![],
+            vec![mk_common_prefix("日本語/資料/")],
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_page("t", "b", "日本語/", &out).unwrap();
+        assert!(page.entries.iter().any(|e| matches!(
+            &e.identity,
+            EntryIdentity::S3Prefix(p) if p.prefix == "日本語/資料/"
+        )));
+    }
+
+    // Repeated-slash current-folder marker must stay suppressed after the
+    // unconditional wire-delimiter change (wire == key == CommonPrefix).
+    #[test]
+    fn repeated_slash_current_folder_marker_suppressed() {
+        let out = mk_list_out(
+            vec![mk_object("foo//", Some(0))],
+            vec![mk_common_prefix("foo//")],
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_page("t", "b", "foo//", &out).unwrap();
+        // Both the zero-byte self marker and the self CommonPrefix are suppressed.
+        assert_eq!(page.entries.len(), 0);
+    }
+
+    #[test]
+    fn repeated_slash_child_marker_deduped_to_one_prefix() {
+        // wire "foo//"; zero-byte child marker key "foo//child/" is deduped
+        // against the exact CommonPrefix, leaving exactly one S3PrefixRef.
+        let out = mk_list_out(
+            vec![mk_object("foo//child/", Some(0))],
+            vec![mk_common_prefix("foo//child/")],
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_page("t", "b", "foo//", &out).unwrap();
+        let prefix_count = page
+            .entries
+            .iter()
+            .filter(|e| matches!(&e.identity, EntryIdentity::S3Prefix(_)))
+            .count();
+        assert_eq!(prefix_count, 1);
+        assert!(page.entries.iter().any(|e| matches!(
+            &e.identity,
+            EntryIdentity::S3Prefix(p) if p.prefix == "foo//child/"
+        )));
     }
 }
