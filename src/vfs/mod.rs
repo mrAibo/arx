@@ -2463,19 +2463,21 @@ mod s3_list_page_tests {
         assert_eq!(err.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
     }
 
-    #[tokio::test]
-    async fn registry_s3_routing_still_fail_closed() {
+    #[test]
+    fn registry_resolves_exact_s3_target_provider_for_bucket_scope() {
+        // Offline: provider_for_page_location must resolve the exact configured
+        // S3Target instance for a bucket scope, without invoking list_page/AWS.
         let registry = ProviderRegistry::new();
-        // Target registered, but S3 listing is still not implemented (S3-18).
         registry.register_s3_targets(&[mk_s3_target("t", None, None, None, false)]);
         let loc = Location::S3 {
             target: "t".into(),
             bucket: Some("some-bucket".into()),
             prefix: String::new(),
         };
-        let err = registry.list_page(&loc, None).await;
-        assert!(err.is_err());
-        assert_eq!(err.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+        let provider = registry.provider_for_page_location(&loc).unwrap();
+        // Exact S3Target instance identity (stable Arc, same as direct resolve).
+        let direct = registry.resolve_s3_provider("t").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&provider, &direct));
     }
 
     // ── MAJOR-01: real SFTP registry route, both APIs observe "/srv/data" exactly ──
@@ -2740,8 +2742,10 @@ mod s3_list_page_tests {
         );
     }
 
-    #[tokio::test]
-    async fn s3_page_route_is_target_aware_but_still_unsupported() {
+    #[test]
+    fn s3_provider_for_page_location_resolves_configured_target() {
+        // Offline: a configured S3 target (with profile/region) resolves to its
+        // exact S3Target provider instance for a bucket scope, no AWS call.
         let registry = ProviderRegistry::new();
         registry.register_s3_targets(&[mk_s3_target(
             "aws-prod",
@@ -2755,13 +2759,8 @@ mod s3_list_page_tests {
             bucket: Some("some-bucket".into()),
             prefix: "".to_string(),
         };
-        // Bucket-bound location reaches the target-aware provider lifecycle but
-        // S3Provider::list_page stays Unsupported: object listing (ListObjectsV2)
-        // is S3-20. No AWS call for bucket listing yet.
-        let result = registry.list_page(&loc, None).await;
-        assert!(matches!(
-            result.unwrap_err().kind(),
-            std::io::ErrorKind::Unsupported
-        ));
+        let provider = registry.provider_for_page_location(&loc).unwrap();
+        let direct = registry.resolve_s3_provider("aws-prod").unwrap();
+        assert!(std::sync::Arc::ptr_eq(&provider, &direct));
     }
 }
