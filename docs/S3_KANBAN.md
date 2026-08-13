@@ -17,8 +17,8 @@
 ## Column summary
 
 - **READY** (0): —
-- **DOING** (1): S3-22
-- **REVIEW** (0): —
+- **DOING** (0): —
+- **REVIEW** (1): S3-22
 - **BLOCKED** (0): —
 - **DONE** (22): S3-00..S3-21
 - **BACKLOG** (58): S3-23..S3-80
@@ -273,7 +273,7 @@
 
 ### S3-22 — Awkward key listing tests
 - **Phase:** P9
-- **Status:** DOING
+- **Status:** REVIEW
 - **Depends on:** S3-20, S3-21
 - **Allowed files:** src/vfs/s3.rs (TESTS ONLY), docs/S3_KANBAN.md
 - **Acceptance:**

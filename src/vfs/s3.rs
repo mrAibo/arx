@@ -1558,6 +1558,216 @@ mod tests {
         }
     }
 
+    // ── S3-22: adversarial ListObjectsV2 identity regressions (offline) ──
+
+    #[test]
+    fn object_adversarial_identity_matrix_preserves_literal_keys() {
+        let expected = [
+            "foo/../bar.txt",
+            "foo/./bar.txt",
+            "foo/file name with spaces.txt",
+            "foo/каталог/файл.txt",
+            "foo/日本語/資料.txt",
+            "foo/emoji/🧙‍♂️.txt",
+            "foo/empty.bin",
+        ];
+        let out = mk_list_out(
+            expected
+                .iter()
+                .map(|key| mk_object(key, Some(if *key == "foo/empty.bin" { 0 } else { 1 })))
+                .collect(),
+            vec![],
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
+
+        assert_eq!(page.entries.len(), expected.len());
+        for key in expected {
+            assert_eq!(
+                page.entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.identity
+                            == EntryIdentity::S3Object(S3ObjectRef {
+                                target: "t".into(),
+                                bucket: "b".into(),
+                                key: key.into(),
+                            })
+                    })
+                    .count(),
+                1,
+                "expected exact object identity for {key:?} exactly once"
+            );
+        }
+        let empty = page
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.identity
+                    == EntryIdentity::S3Object(S3ObjectRef {
+                        target: "t".into(),
+                        bucket: "b".into(),
+                        key: "foo/empty.bin".into(),
+                    })
+            })
+            .unwrap();
+        assert_eq!(empty.entry.kind, EntryKind::File);
+        assert_eq!(empty.entry.size, Some(0));
+    }
+
+    #[test]
+    fn common_prefix_adversarial_identity_matrix_preserves_literal_prefixes() {
+        let expected = ["foo//nested/", "foo/../nested/", "foo/日本語/"];
+        let out = mk_list_out(
+            vec![],
+            expected
+                .iter()
+                .map(|prefix| mk_common_prefix(prefix))
+                .collect(),
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
+
+        assert_eq!(page.entries.len(), expected.len());
+        for prefix in expected {
+            assert_eq!(
+                page.entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.identity
+                            == EntryIdentity::S3Prefix(S3PrefixRef {
+                                target: "t".into(),
+                                bucket: "b".into(),
+                                prefix: prefix.into(),
+                            })
+                    })
+                    .count(),
+                1,
+                "expected exact prefix identity for {prefix:?} exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn adversarial_marker_identity_interactions_are_exact() {
+        let out = mk_list_out(
+            vec![
+                mk_object("foo//nested/", Some(0)),
+                mk_object("foo//special/", Some(0)),
+                mk_object("foo/../special/", Some(1)),
+            ],
+            vec![mk_common_prefix("foo//nested/")],
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
+        let expected = [
+            EntryIdentity::S3Prefix(S3PrefixRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                prefix: "foo//nested/".into(),
+            }),
+            EntryIdentity::S3Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                key: "foo//special/".into(),
+            }),
+            EntryIdentity::S3Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                key: "foo/../special/".into(),
+            }),
+        ];
+
+        assert_eq!(page.entries.len(), expected.len());
+        for identity in expected {
+            assert_eq!(
+                page.entries
+                    .iter()
+                    .filter(|entry| entry.identity == identity)
+                    .count(),
+                1,
+                "expected marker interaction identity exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_adversarial_page_emits_exact_identity_set() {
+        let out = mk_list_out(
+            vec![
+                mk_object("foo//bar.txt", Some(1)),
+                mk_object("foo/../bar.txt", Some(1)),
+                mk_object("foo/./bar.txt", Some(1)),
+                mk_object("foo/file name.txt", Some(1)),
+                mk_object("foo/日本語.txt", Some(1)),
+                mk_object("foo/🧙‍♂️.txt", Some(1)),
+                mk_object("foo/empty.bin", Some(0)),
+                mk_object("foo//nested/", Some(0)),
+            ],
+            vec![mk_common_prefix("foo//nested/")],
+            Some(false),
+            None,
+        );
+        let page = map_list_objects_v2_page("t", "b", "foo/", &out).unwrap();
+        let expected = [
+            EntryIdentity::S3Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                key: "foo//bar.txt".into(),
+            }),
+            EntryIdentity::S3Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                key: "foo/../bar.txt".into(),
+            }),
+            EntryIdentity::S3Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                key: "foo/./bar.txt".into(),
+            }),
+            EntryIdentity::S3Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                key: "foo/file name.txt".into(),
+            }),
+            EntryIdentity::S3Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                key: "foo/日本語.txt".into(),
+            }),
+            EntryIdentity::S3Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                key: "foo/🧙‍♂️.txt".into(),
+            }),
+            EntryIdentity::S3Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                key: "foo/empty.bin".into(),
+            }),
+            EntryIdentity::S3Prefix(S3PrefixRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                prefix: "foo//nested/".into(),
+            }),
+        ];
+
+        assert_eq!(page.entries.len(), expected.len());
+        for identity in expected {
+            assert_eq!(
+                page.entries
+                    .iter()
+                    .filter(|entry| entry.identity == identity)
+                    .count(),
+                1,
+                "expected identity exactly once"
+            );
+        }
+    }
+
     #[test]
     fn first_page_not_truncated_is_end() {
         let out = mk_list_out(vec![], vec![], Some(false), None);
