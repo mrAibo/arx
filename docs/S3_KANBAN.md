@@ -16,11 +16,11 @@
 
 ## Column summary
 
-- **READY** (0): —
+- **READY** (1): S3-26
 - **DOING** (0): —
-- **REVIEW** (1): S3-26A
-- **BLOCKED** (1): S3-26
-- **DONE** (28): S3-00..S3-25, S3-24P (PR #98 merged, merge SHA 19d4c04), S3-20R (PR #99 merged, merge SHA 2e7fe21), S3-24 (PR #100 merged, merge SHA f38273a), S3-25 (PR #101 merged, merge SHA 85afb6a)
+- **REVIEW** (0): —
+- **BLOCKED** (0): —
+- **DONE** (29): S3-00..S3-25, S3-24P (PR #98 merged, merge SHA 19d4c04), S3-20R (PR #99 merged, merge SHA 2e7fe21), S3-24 (PR #100 merged, merge SHA f38273a), S3-25 (PR #101 merged, merge SHA 85afb6a), S3-26A (PR #102 merged, merge SHA 6967ba2; STOP GATE C PASS)
 - **BACKLOG** (54): S3-27..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
@@ -370,7 +370,7 @@
 
 ### S3-26 — Enable List capability
 - **Phase:** P10
-- **Status:** BLOCKED (on STOP GATE C — see S3-26A; independent review found capability-surface leaks: Copy provider-pair policy, direct Shift+F6 rename, workspace compare/sync, name-based selection)
+- **Status:** READY (STOP GATE C PASSED on exact tree 6967ba2; not yet authorized — requires orchestrator capability-flip go-ahead)
 - **Depends on:** S3-18..25, S3-24P, S3-26A
 - **Allowed files:** src/vfs/capabilities.rs, src/vfs/s3.rs
 - **Acceptance:** Only now enable S3 List capability. Preconditions: S3-18..25 complete and tested; consumer pagination complete and tested through S3-24P. Change only capability declaration/tests. No Read/Write/Delete/Mkdir yet.
@@ -379,7 +379,7 @@
 
 ### S3-26A — List-only action/selection surface hardening
 - **Phase:** P10
-- **Status:** REVIEW (PR #102 open; STOP IN REVIEW — do not merge; exact review + STOP GATE C audit required before S3-26)
+- **Status:** DONE (PR #102 merged; merge SHA 6967ba2; independent two-axis review APPROVED 0/0/0/0, quality+msrv SUCCESS; STOP GATE C PASS on exact tree 6967ba2)
 - **Depends on:** S3-25, S3-24P
 - **Allowed files:** src/app/availability.rs, src/tui.rs, docs/S3_KANBAN.md
 - **Acceptance:** Make a hypothetical S3 capability set of ONLY `{List}` expose navigation/listing only — no transfer, mutation, workspace sync, or identity-unsafe selection.
