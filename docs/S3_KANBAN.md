@@ -16,13 +16,13 @@
 
 ## Column summary
 
-- **READY** (1): S3-31
+- **READY** (1): S3-54
 - **DOING** (0): —
 - **REVIEW** (0): —
 - **BLOCKED** (0): —
-- **DONE** (36): S3-00..S3-25, S3-24P (PR #98 merged, merge SHA 19d4c04), S3-20R (PR #99 merged, merge SHA 2e7fe21), S3-24 (PR #100 merged, merge SHA f38273a), S3-25 (PR #101 merged, merge SHA 85afb6a), S3-26A (PR #102 merged, merge SHA 6967ba2; STOP GATE C PASS), S3-27R (PR #105 merged, merge SHA 1568e35), S3-26 (PR #104 merged, merge SHA 9c27a84), S3-27 (PR #106 merged, merge SHA a49b94b), S3-28 (PR #107 merged, merge SHA 1fd6bec), S3-29 (PR #108 merged, merge SHA 242dff6), S3-30 (PR #109 merged, merge SHA d74fb55; P11 READ/F3 GATE PASS)
-- **BACKLOG** (49): S3-32..S3-80
-- **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
+- **DONE** (59): S3-00..S3-30, S3-31, S3-31R, S3-32..S3-42 (P11R), S3-42S, S3-43, S3-44..S3-50, S3-51, S3-52, S3-53
+- **BACKLOG** (24): S3-55..S3-80
+- **PARKED** (14): S3-81..S3-97
 
 ---
 
@@ -514,7 +514,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-31 — TransferMethod::S3
 - **Phase:** P12
-- **Status:** READY (S3-30 DONE; P11 READ/F3 GATE PASS on d74fb55)
+- **Status:** DONE (consolidated via P11R; see close-out tables)
 - **Depends on:** S3-30
 - **Allowed files:** src/transfer/mod.rs
 - **Acceptance:** Add S3 as explicit TransferMethod. No executor yet. Planner still returns unsupported until availability says executor exists. No shell fallback. No aws CLI.
@@ -523,7 +523,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-32 — Local→S3 planner route
 - **Phase:** P12
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-31
 - **Allowed files:** src/transfer/mod.rs
 - **Acceptance:** Recognize Local→S3 as candidate TransferMethod::S3. Reject if executor unavailable. Tests: correct route; S3→S3 unsupported; SFTP→S3 unsupported. No upload impl.
@@ -532,7 +532,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-33 — S3→Local planner route
 - **Phase:** P12
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-31
 - **Allowed files:** src/transfer/mod.rs
 - **Acceptance:** Recognize S3→Local. Same constraints. Keep unsupported: S3→S3, SFTP↔S3, S3 move.
@@ -541,7 +541,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-34 — PutObject executor
 - **Phase:** P13
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-33
 - **Allowed files:** src/transfer/s3_upload.rs (new) or src/transfer/executor.rs
 - **Acceptance:** Upload one small local regular file to S3. Exact dest: frozen S3 target/bucket/key. PutObject. No multipart, no recursive dir, no F5 exposure yet. Truthful physical result.
@@ -550,7 +550,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-35 — Upload overwrite semantics
 - **Phase:** P13
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-34
 - **Allowed files:** src/transfer/s3_upload.rs
 - **Acceptance:** Define/enforce overwrite per frozen TransferPlan. No silent conflict invention. Tests: new object; existing dest; permission denied; network failure.
@@ -559,7 +559,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-36 — Upload Job integration
 - **Phase:** P13
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-34, S3-35
 - **Allowed files:** src/jobs/mod.rs, src/transfer/executor.rs
 - **Acceptance:** Run small upload through Job lifecycle: Queued/Running/Completed/Failed/Cancelled. No fake progress % if SDK can't prove bytes.
@@ -568,7 +568,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-37 — GetObject download to staged file
 - **Phase:** P14
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-33
 - **Allowed files:** src/transfer/s3_download.rs (new)
 - **Acceptance:** Download exact S3ObjectRef to temporary/staged local file. Never stream directly into final if failure could expose partial success. No final rename yet.
@@ -577,7 +577,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-38 — Safe local commit
 - **Phase:** P14
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-37
 - **Allowed files:** src/transfer/s3_download.rs
 - **Acceptance:** After success: close, flush/fsync per project policy, rename staged=>final. Failure/cancel: clean staged. Cleanup failure: report factual leftover path.
@@ -586,7 +586,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-39 — Download Job integration
 - **Phase:** P14
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-37, S3-38
 - **Allowed files:** src/jobs/mod.rs, src/transfer/executor.rs
 - **Acceptance:** S3→Local through Job lifecycle. Cancellation must not leave final path falsely looking successful.
@@ -595,7 +595,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-40 — Enable Local→S3 F5
 - **Phase:** P15
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-36, S3-39
 - **Allowed files:** src/app/availability.rs
 - **Acceptance:** Expose F5 only for implemented Local→S3 route. Availability via TransferPlanner/executor, NOT Capability::Copy. Physical smoke: single small file upload.
@@ -604,7 +604,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-41 — Enable S3→Local F5
 - **Phase:** P15
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-39
 - **Allowed files:** src/app/availability.rs
 - **Acceptance:** Expose F5 for implemented S3→Local route. Exact object identity. Physical smoke: single small object download.
@@ -613,7 +613,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-42 — Write capability review
 - **Phase:** P15
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-40, S3-41
 - **Allowed files:** src/vfs/capabilities.rs
 - **Acceptance:** Decide if Write semantics satisfied. If yes enable Write. If ambiguous (provider mutation beyond transfer dest) document interpretation before flip. Do NOT enable Copy.
@@ -622,7 +622,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-43 — Multipart threshold calculation
 - **Phase:** P16
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** STOP GATE D
 - **Allowed files:** src/transfer/s3_multipart.rs (new, pure)
 - **Acceptance:** Pure logic: part sizing per S3 constraints. No network. Tests: threshold boundary; large; very large; part-count limit.
@@ -631,7 +631,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-44 — CreateMultipartUpload
 - **Phase:** P16
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-43
 - **Allowed files:** src/transfer/s3_multipart.rs
 - **Acceptance:** Start multipart, preserve upload_id in op state. No UploadPart loop. Failure: truthful.
@@ -640,7 +640,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-45 — Upload one multipart part
 - **Phase:** P16
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-44
 - **Allowed files:** src/transfer/s3_multipart.rs
 - **Acceptance:** Upload exactly one numbered part. Return ETag/part completion evidence required by Complete. No loop.
@@ -649,7 +649,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-46 — Sequential multipart loop
 - **Phase:** P16
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-45
 - **Allowed files:** src/transfer/s3_multipart.rs
 - **Acceptance:** Upload multiple parts sequentially (no concurrency). Record progress only from bytes actually accepted.
@@ -658,7 +658,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-47 — CompleteMultipartUpload
 - **Phase:** P16
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-46
 - **Allowed files:** src/transfer/s3_multipart.rs
 - **Acceptance:** Complete only after all parts succeeded. Failure: do not claim object completed.
@@ -667,7 +667,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-48 — AbortMultipartUpload
 - **Phase:** P16
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-44, S3-47
 - **Allowed files:** src/transfer/s3_multipart.rs
 - **Acceptance:** Best-effort abort after failure/cancel once upload_id exists. Distinguish: confirmed / failed / unknown. Never hide possible orphan.
@@ -676,7 +676,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-49 — Multipart cancellation
 - **Phase:** P16
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-48
 - **Allowed files:** src/jobs/mod.rs, src/transfer/s3_multipart.rs
 - **Acceptance:** Connect Job cancel to multipart state: stop scheduling new parts, attempt abort, preserve physical truth. Stubbed-failure tests.
@@ -685,7 +685,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-50 — Multipart progress
 - **Phase:** P16
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-46, S3-49
 - **Allowed files:** src/transfer/s3_multipart.rs, src/jobs/mod.rs
 - **Acceptance:** Report factual bytes progress. No fake ETA. No % if total unknown. Local upload total known: bytes_done/total_bytes.
@@ -703,7 +703,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-52 — Upload verification
 - **Phase:** P17
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-51, S3-47
 - **Allowed files:** src/transfer/s3_upload.rs
 - **Acceptance:** After physical upload, verify with strongest trustworthy evidence. Return Verified/Inconclusive/Failed. Completion != verification success. Do not rewrite Job physical outcome.
@@ -712,7 +712,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-53 — Download verification
 - **Phase:** P17
-- **Status:** BACKLOG
+- **Status:** DONE (consolidated via P11R / BIG PACK; see close-out tables)
 - **Depends on:** S3-51, S3-38
 - **Allowed files:** src/transfer/s3_download.rs
 - **Acceptance:** Verify downloaded bytes via available trustworthy S3 evidence. If insufficient: Inconclusive. Never fake Verified from size alone unless design allows.
