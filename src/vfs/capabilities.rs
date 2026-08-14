@@ -75,14 +75,17 @@ pub const WEBDAV_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
 
 /// S3 implements listing/navigation (ListBuckets, ListObjectsV2), bounded
 /// preview reads (GetObject Range), single-object basic transfers
-/// (upload = PutObject via `Write`; download = GetObject via `Read`), and
-/// prefix creation (Mkdir = empty-object marker via `create_s3_prefix_marker_at`).
-/// Delete/Copy/Move/Rename/Symlink/Chmod/ServerSideCopy remain unimplemented.
+/// (upload = PutObject via `Write`; download = GetObject via `Read`),
+/// prefix creation (Mkdir = empty-object marker via `create_s3_prefix_marker_at`),
+/// and exact single-object deletion (Delete = `delete_s3_at`, prefix-marker
+/// only via `prove_empty_s3_prefix_at`).
+/// Copy/Move/Rename/Symlink/Chmod/ServerSideCopy remain unimplemented.
 pub const S3_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::List)
     .with(Capability::Read)
     .with(Capability::Write)
-    .with(Capability::Mkdir);
+    .with(Capability::Mkdir)
+    .with(Capability::Delete);
 
 /// Built-in capability declaration for a provider kind.
 ///
@@ -127,7 +130,7 @@ mod tests {
         assert!(S3_CAPABILITIES.supports(Capability::Read));
         assert!(S3_CAPABILITIES.supports(Capability::Write));
         assert!(S3_CAPABILITIES.supports(Capability::Mkdir));
-        assert!(!S3_CAPABILITIES.supports(Capability::Delete));
+        assert!(S3_CAPABILITIES.supports(Capability::Delete));
         assert!(!S3_CAPABILITIES.supports(Capability::Copy));
         assert!(!S3_CAPABILITIES.supports(Capability::Move));
         assert!(!S3_CAPABILITIES.supports(Capability::Rename));
@@ -159,7 +162,7 @@ mod tests {
         assert!(S3_CAPABILITIES.supports(Capability::Read));
         assert!(S3_CAPABILITIES.supports(Capability::Write));
         assert!(S3_CAPABILITIES.supports(Capability::Mkdir));
-        assert!(!S3_CAPABILITIES.supports(Capability::Delete));
+        assert!(S3_CAPABILITIES.supports(Capability::Delete));
         assert!(!S3_CAPABILITIES.supports(Capability::Copy));
         assert!(!S3_CAPABILITIES.supports(Capability::Move));
         assert!(!S3_CAPABILITIES.supports(Capability::Rename));
