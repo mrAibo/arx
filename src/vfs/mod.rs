@@ -963,6 +963,16 @@ impl ProviderRegistry {
             .await
     }
 
+    /// S3-native exact object delete seam (S3-58).
+    ///
+    /// Deletes ONE exact `S3ObjectRef` via the target's typed provider.
+    /// Validates target identity, bucket binding, and non-empty bucket/key.
+    /// No prefix recursion, no bucket delete, no `DeleteObjects` batch.
+    pub async fn delete_s3_object_exact(&self, object: &s3::S3ObjectRef) -> std::io::Result<()> {
+        let provider = self.resolve_s3_provider_typed(&object.target)?;
+        provider.delete_object_exact(object).await
+    }
+
     /// Resolve the concrete `S3Target(id)` provider for a transfer operation.
     ///
     /// Returns the SAME `Arc<S3Provider>` already registered under
