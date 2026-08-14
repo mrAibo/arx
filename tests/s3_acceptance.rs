@@ -37,8 +37,8 @@ pub fn maybe_skip_minio() -> Option<ProviderRegistry> {
         eprintln!("ARX_MINIO_TEST not set; skipping MinIO acceptance");
         return None;
     }
-    let endpoint = std::env::var("AWS_ENDPOINT_URL")
-        .unwrap_or_else(|_| "http://localhost:9000".to_string());
+    let endpoint =
+        std::env::var("AWS_ENDPOINT_URL").unwrap_or_else(|_| "http://localhost:9000".to_string());
     let registry = ProviderRegistry::new();
     registry.register_s3_targets(&[S3TargetConfig {
         id: "minio".to_string(),
@@ -119,7 +119,6 @@ pub fn assert_no_secret_leak(s: &str) {
 }
 
 /// Run a future under a timeout guard so a stalled endpoint cannot hang CI.
-#[cfg(feature = "tokio")]
 pub async fn with_timeout<F, T>(dur: std::time::Duration, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
