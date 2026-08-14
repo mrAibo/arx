@@ -438,21 +438,31 @@
 
 ### S3-30 — Enable Read capability
 - **Phase:** P11
-- **Status:** DONE (PR #109 merged; merge SHA d74fb55; P11 READ/F3 GATE PASS; POST-FLIP frozen-tree audit A/B/C BLOCKER 0 MAJOR 0, 1 MINOR S3 F3 handler-wiring debt)
+- **Status:** DONE (PR #109 merged; merge SHA d74fb55; P11 READ/F3 GATE PASS; POST-FLIP frozen-tree audit A/B/C BLOCKER 0 MAJOR 0; F3 handler-wiring debt resolved by S3-30R)
 - **Depends on:** S3-29
 - **Allowed files:** src/vfs/capabilities.rs
 - **Acceptance:** Flip S3 Read capability only after F3 passes. No Write.
 - **Stop conditions:** Write enable.
 - **Hermes prompt:** Flip S3 Read capability ONLY after S3-29 passes. No Write.
 
+### S3-30R — S3 F3 dispatch correction
+- **Phase:** P11
+- **Status:** DONE (PR #111 merged; P11 F3 fully user-visible)
+- **Depends on:** S3-30
+- **Allowed files:** src/tui.rs, docs/S3_KANBAN.md
+- **Acceptance:** S3 regular `S3Object` row + Read => `Action::ViewFile` dispatches `Effect::PreviewLocation { location, listed }` carrying the exact `S3ObjectRef` (same lane as SFTP). Local/Archive keep their own preview paths. No separate S3 preview impl; no `Entry.name` as operation target.
+- **Stop conditions:** S3 F3 using `Entry.name`; separate S3 preview implementation.
+- **Hermes prompt:** Change the `ProviderId::Sftp` preview-route condition to `ProviderId::Sftp | ProviderId::S3`. Correct old wording that called the missing wiring merely "MINOR debt": P11 safety gate was fail-closed, real user-visible F3 completed only after S3-30R.
+
 > ### ✅ STOP GATE C+ — P11 SAFE S3 READ / F3 MILESTONE PASS (frozen tree d74fb55)
 > - **Capability flip:** S3 `NONE.with(List)` → `NONE.with(List).with(Read)` (S3-30).
 > - **Surface:** Enter/Back/Refresh + F3 preview read on regular S3Object. All mutations/transfer/workspace/name-selection remain disabled.
 > - **Identity:** F3 availability routes via exact `S3ObjectRef` (S3-27R seam); S3-27 bounded/fail-closed GetObject; S3-28 truthful BoundedRead (no POSIX/F4).
-> - **POST-FLIP frozen-tree audit** (3 parallel tracks, exact tree e63e714): A PASS, B PASS (1 MINOR: S3 F3 handler not yet wired through identity seam — fail-closed no-op, safe), C PASS → **BLOCKER 0, MAJOR 0, MINOR 1, NIT 0**.
+> - **POST-FLIP frozen-tree audit** (3 parallel tracks, exact tree e63e714): A PASS, B PASS (1 MINOR at the time: S3 F3 handler not yet wired through identity seam — fail-closed no-op, safe), C PASS → **BLOCKER 0, MAJOR 0, MINOR 1, NIT 0**.
+> - **Resolved by S3-30R:** the S3 F3 handler-wiring debt is closed — `ProviderId::S3` now routes `Action::ViewFile` through `Effect::PreviewLocation { location, listed }` carrying the exact `S3ObjectRef` (see S3-30R). Old wording calling this merely "MINOR debt" was corrected: P11 safety gate was fail-closed, but real user-visible F3 became complete only after S3-30R.
 > - **Axis safety:** LIST_SAFE ✅ · READ_SAFE ✅ · F3_EXACT_IDENTITY ✅ · BOUNDED_NETWORK ✅ · F4_DISABLED ✅ · TRANSFER_DISABLED ✅ · MUTATION_DISABLED ✅ · SELECTION_SAFE ✅ · WORKSPACE_SAFE ✅.
 > - **Exact-head CI:** quality SUCCESS, msrv SUCCESS.
-> - **Debt (recorded, not in scope):** S3 F3 preview handler wiring (tui.rs) to extend `matches!(...Sftp)` → `Sftp | S3` so F3 actually previews through the already-correct seam; currently S3 F3 is a safe fail-closed no-op. STOP GATE C NIT (Mkdir/Symlink/HardLink availability-only guard) still pending until S3 first gains a mutation capability.
+> - **Debt (recorded, not in scope):** STOP GATE C NIT (Mkdir/Symlink/HardLink availability-only guard) still pending until S3 first gains a mutation capability. S3 F3 handler-wiring debt was resolved by S3-30R.
 
 ### S3-31 — TransferMethod::S3
 - **Phase:** P12
