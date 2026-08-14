@@ -1,18 +1,23 @@
-//! S3 → Local upload core (S3-34/35). Typed internal API only at this seam
-//! stage; the executor body is implemented by the S3-34/35 card.
+//! S3 → Local upload core (S3-34/35).
 //!
-//! Invariants (enforced by the implementer, not here):
+//! Invariants enforced here:
 //! - exact `S3ObjectRef` bucket/key authority; no name-based reconstruction
 //! - single PutObject, no multipart, no hidden retry (SDK retries stay disabled)
 //! - `BASIC_TRANSFER_MAX_BYTES` guard before any PutObject
 //! - explicit overwrite policy via HeadObject preflight, fail closed
 //! - cancellation truth: no fake-abort semantics for a single PutObject
+//! - diagnostics are sanitized: no key, credentials, signed query, or auth header
 
 use crate::transfer::S3TransferSpec;
+use crate::vfs::S3ObjectRef;
 use crate::vfs::s3::S3Provider;
+use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_sdk_s3::primitives::ByteStream;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Temporary single-put ceiling for the basic transfer pack. NOT an S3 service
 /// limit; S3-43 may later replace/redefine threshold logic.
@@ -30,21 +35,151 @@ pub enum S3OverwritePolicy {
 /// Result of an upload: bytes physically written.
 pub type UploadOutcome = u64;
 
+/// Pure outcome of the overwrite preflight, mapped from the HeadObject call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeadState {
+    /// Object is absent (NoSuchKey) — PutObject is permitted.
+    Missing,
+    /// Object exists — policy decides whether PutObject is allowed.
+    Exists,
+    /// HeadObject denied (AccessDenied) — factual failure, never treated as missing.
+    AccessDenied,
+    /// Any other error (network, throttling, unknown) — factual failure.
+    Unknown,
+}
+
+/// Pure overwrite-policy verdict, computed from `HeadState` + policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverwriteVerdict {
+    Put,
+    Conflict,
+    Denied,
+    Unknown,
+}
+
 /// Upload a single regular local file to the exact S3 destination ref.
 ///
-/// Seam signature only — implemented by S3-34/35. The default body is a
-/// placeholder so the module compiles before the core lands.
+/// S3-34/35 core. Validates locally, asserts exact identity, enforces the
+/// single-put size ceiling, runs a HeadObject preflight for the overwrite
+/// policy, then issues ONE physical PutObject. No multipart, no recursive,
+/// no hidden retry (SDK retries stay disabled by the client factory).
 #[allow(dead_code)]
 pub(crate) async fn upload_one(
-    _provider: &S3Provider,
-    _spec: &S3TransferSpec,
-    _policy: S3OverwritePolicy,
-    _cancel: Arc<AtomicBool>,
-) -> std::io::Result<UploadOutcome> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "S3 upload core not implemented (S3-34/35)",
-    ))
+    provider: &S3Provider,
+    spec: &S3TransferSpec,
+    policy: S3OverwritePolicy,
+    cancel: Arc<AtomicBool>,
+) -> io::Result<UploadOutcome> {
+    // 1. Extract the UploadOne payload.
+    let (local_source, destination) = match spec {
+        S3TransferSpec::UploadOne {
+            local_source,
+            destination,
+        } => (local_source, destination),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "S3TransferSpec is not UploadOne",
+            ));
+        }
+    };
+
+    // 2. Pre-request cancellation: zero mutation, no client, no network.
+    if cancel.load(Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "upload cancelled before request",
+        ));
+    }
+
+    // 3. Validate the local source (exists + regular file) and read its size.
+    //    Pure local syscall — never a mutation and never reaches AWS.
+    let meta = tokio::fs::metadata(local_source).await.map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("S3 upload local source not readable: {}", e),
+        )
+    })?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "S3 upload local source is not a regular file",
+        ));
+    }
+    let file_size = meta.len();
+
+    // 4. Fail-closed identity validation BEFORE any AWS client/auth/network work.
+    //    - exact target id match
+    //    - if the provider is bucket-bound, the destination bucket must match
+    validate_upload_identity(&provider.target.id, &provider.target.bucket, destination)?;
+
+    // 5. Re-assert the key cannot escape its navigation prefix (bucket-root escape).
+    assert_key_safe(&destination.key)?;
+
+    // 6. Temporary single-put limit: refuse anything above the ceiling BEFORE PutObject.
+    check_single_put_size(file_size)?;
+
+    // 7. Get the (shared, lazily built) AWS client — no second client is created.
+    let client = provider.client().await?;
+
+    // 8. Overwrite preflight: safe HeadObject read, then a pure policy decision.
+    let head = client
+        .head_object()
+        .bucket(&destination.bucket)
+        .key(&destination.key)
+        .send()
+        .await;
+    let state = match head {
+        Ok(_) => HeadState::Exists,
+        Err(sdk_err) => classify_head_error(&sdk_err.into_service_error()),
+    };
+    match decide_overwrite(policy, state) {
+        OverwriteVerdict::Put => {}
+        OverwriteVerdict::Conflict => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "S3 object already exists (overwrite forbidden)",
+            ));
+        }
+        OverwriteVerdict::Denied => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "S3 PutObject preflight denied (access denied)",
+            ));
+        }
+        OverwriteVerdict::Unknown => {
+            return Err(io::Error::other("S3 PutObject preflight failed"));
+        }
+    }
+
+    // 9. Final pre-request cancellation check: if cancelled now, no PutObject
+    //    has been issued and the HeadObject above was a read-only probe, so the
+    //    operation is still zero-mutation.
+    if cancel.load(Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "upload cancelled before request",
+        ));
+    }
+
+    // 10. Exactly one PutObject, to the exact destination bucket/key. The body
+    //     is a streaming ByteStream (no full-file allocation).
+    let body = ByteStream::from_path(local_source).await.map_err(|e| {
+        io::Error::other(format!("S3 upload failed to open local source stream: {e}"))
+    })?;
+    let put = client
+        .put_object()
+        .bucket(&destination.bucket)
+        .key(&destination.key)
+        .body(body)
+        .send()
+        .await;
+
+    match put {
+        Ok(_) => Ok(file_size),
+        // Static, sanitized diagnostic: no key, credential, or signed query leaks.
+        Err(_) => Err(io::Error::other("S3 PutObject upload failed")),
+    }
 }
 
 /// Convenience: resolve the upload destination path for a `UploadOne` spec.
@@ -53,5 +188,311 @@ pub(crate) fn upload_local_source(spec: &S3TransferSpec) -> Option<PathBuf> {
     match spec {
         S3TransferSpec::UploadOne { local_source, .. } => Some(local_source.clone()),
         _ => None,
+    }
+}
+
+/// Pure identity gate: exact target id match, and (if bucket-bound) exact
+/// bucket match. Runs before any AWS work.
+pub(crate) fn validate_upload_identity(
+    provider_target_id: &str,
+    provider_bucket: &Option<String>,
+    dest: &S3ObjectRef,
+) -> io::Result<()> {
+    if dest.target != provider_target_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "S3 target mismatch: destination target id does not match provider",
+        ));
+    }
+    if let Some(bound) = provider_bucket
+        && bound != &dest.bucket
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "S3 bucket escape rejected: destination bucket is outside the bound target",
+        ));
+    }
+    Ok(())
+}
+
+/// Pure key-safety re-assertion: reject a NUL and any `..` path segment that
+/// would escape the navigation prefix. Keys may legitimately contain `/`.
+fn assert_key_safe(key: &str) -> io::Result<()> {
+    if key.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "S3 key contains a NUL byte",
+        ));
+    }
+    for seg in key.split('/') {
+        if seg == ".." {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "S3 key escapes its prefix via \"..\"",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Pure single-put size guard. Refuse anything above `BASIC_TRANSFER_MAX_BYTES`
+/// BEFORE any PutObject (S3-43 may later introduce multipart).
+pub(crate) fn check_single_put_size(size: u64) -> io::Result<()> {
+    if size > BASIC_TRANSFER_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file requires multipart S3 upload",
+        ));
+    }
+    Ok(())
+}
+
+/// Pure: map a HeadObject service error into a `HeadState`. Only the error
+/// `code()` is inspected; the message is discarded so no credential or signed
+/// query leaks. A missing object is `NoSuchKey`; `AccessDenied` is NEVER
+/// inferred as missing; everything else is `Unknown` (factual failure).
+pub(crate) fn classify_head_error(svc: &HeadObjectError) -> HeadState {
+    match svc.code() {
+        Some("NoSuchKey") => HeadState::Missing,
+        Some("AccessDenied") => HeadState::AccessDenied,
+        _ => HeadState::Unknown,
+    }
+}
+
+/// Pure overwrite-policy decision. Missing => always Put. Exists => Put only
+/// when `Confirmed`, else Conflict. AccessDenied/Unknown => factual failure.
+pub(crate) fn decide_overwrite(policy: S3OverwritePolicy, state: HeadState) -> OverwriteVerdict {
+    match (state, policy) {
+        (HeadState::Missing, _) => OverwriteVerdict::Put,
+        (HeadState::Exists, S3OverwritePolicy::Forbid) => OverwriteVerdict::Conflict,
+        (HeadState::Exists, S3OverwritePolicy::Confirmed) => OverwriteVerdict::Put,
+        (HeadState::AccessDenied, _) => OverwriteVerdict::Denied,
+        (HeadState::Unknown, _) => OverwriteVerdict::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::S3TargetConfig;
+    use crate::vfs::s3::S3Provider;
+    use aws_sdk_s3::error::ErrorMetadata;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::tempdir;
+
+    // ── BASIC_TRANSFER_MAX_BYTES boundary (metadata only, no huge alloc) ──
+
+    #[test]
+    fn single_put_size_boundary() {
+        // Exactly the ceiling is allowed; one byte over is not.
+        assert!(check_single_put_size(BASIC_TRANSFER_MAX_BYTES).is_ok());
+        assert!(check_single_put_size(BASIC_TRANSFER_MAX_BYTES + 1).is_err());
+        assert!(check_single_put_size(0).is_ok());
+    }
+
+    #[test]
+    fn single_put_size_error_kind() {
+        let e = check_single_put_size(BASIC_TRANSFER_MAX_BYTES + 1).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+    }
+
+    // ── Overwrite policy branches (pure helpers, real logic) ──
+
+    fn head_state_for(code: &str) -> HeadState {
+        classify_head_error(&HeadObjectError::generic(
+            ErrorMetadata::builder().code(code).build(),
+        ))
+    }
+
+    #[test]
+    fn missing_object_permits_put_under_both_policies() {
+        let missing = head_state_for("NoSuchKey");
+        assert_eq!(missing, HeadState::Missing);
+        assert_eq!(
+            decide_overwrite(S3OverwritePolicy::Forbid, missing),
+            OverwriteVerdict::Put
+        );
+        assert_eq!(
+            decide_overwrite(S3OverwritePolicy::Confirmed, missing),
+            OverwriteVerdict::Put
+        );
+    }
+
+    #[test]
+    fn existing_object_conflicts_under_forbid() {
+        let exists = HeadState::Exists;
+        assert_eq!(
+            decide_overwrite(S3OverwritePolicy::Forbid, exists),
+            OverwriteVerdict::Conflict
+        );
+    }
+
+    #[test]
+    fn existing_object_puts_under_confirmed() {
+        let exists = HeadState::Exists;
+        assert_eq!(
+            decide_overwrite(S3OverwritePolicy::Confirmed, exists),
+            OverwriteVerdict::Put
+        );
+    }
+
+    #[test]
+    fn access_denied_never_inferred_missing() {
+        let denied = head_state_for("AccessDenied");
+        assert_eq!(denied, HeadState::AccessDenied);
+        assert_eq!(
+            decide_overwrite(S3OverwritePolicy::Forbid, denied),
+            OverwriteVerdict::Denied
+        );
+        assert_eq!(
+            decide_overwrite(S3OverwritePolicy::Confirmed, denied),
+            OverwriteVerdict::Denied
+        );
+    }
+
+    #[test]
+    fn unknown_head_error_fails_factually() {
+        // A network/timeout/throttling error has no code -> Unknown.
+        let unknown = head_state_for("InternalError");
+        assert_eq!(unknown, HeadState::Unknown);
+        assert_eq!(
+            decide_overwrite(S3OverwritePolicy::Forbid, unknown),
+            OverwriteVerdict::Unknown
+        );
+        assert_eq!(
+            decide_overwrite(S3OverwritePolicy::Confirmed, unknown),
+            OverwriteVerdict::Unknown
+        );
+    }
+
+    // ── Identity: target/bucket mismatch rejected before any client ──
+
+    fn bound_provider() -> S3Provider {
+        S3Provider::new(S3TargetConfig {
+            id: "tgt".into(),
+            name: "tgt".into(),
+            bucket: Some("bk".into()),
+            region: None,
+            profile: None,
+            endpoint_url: None,
+            force_path_style: false,
+        })
+    }
+
+    #[test]
+    fn identity_target_mismatch_rejected() {
+        let p = bound_provider();
+        let dest = S3ObjectRef {
+            target: "other".into(),
+            bucket: "bk".into(),
+            key: "a.txt".into(),
+        };
+        let e = validate_upload_identity(&p.target.id, &p.target.bucket, &dest).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn identity_bucket_mismatch_rejected() {
+        let p = bound_provider();
+        let dest = S3ObjectRef {
+            target: "tgt".into(),
+            bucket: "other-bk".into(),
+            key: "a.txt".into(),
+        };
+        let e = validate_upload_identity(&p.target.id, &p.target.bucket, &dest).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn identity_match_accepted() {
+        let p = bound_provider();
+        let dest = S3ObjectRef {
+            target: "tgt".into(),
+            bucket: "bk".into(),
+            key: "a.txt".into(),
+        };
+        assert!(validate_upload_identity(&p.target.id, &p.target.bucket, &dest).is_ok());
+    }
+
+    #[test]
+    fn unbound_provider_accepts_any_bucket() {
+        let p = S3Provider::new(S3TargetConfig {
+            id: "tgt".into(),
+            name: "tgt".into(),
+            bucket: None,
+            region: None,
+            profile: None,
+            endpoint_url: None,
+            force_path_style: false,
+        });
+        let dest = S3ObjectRef {
+            target: "tgt".into(),
+            bucket: "any-bk".into(),
+            key: "a.txt".into(),
+        };
+        assert!(validate_upload_identity(&p.target.id, &p.target.bucket, &dest).is_ok());
+    }
+
+    // ── Key safety: bucket-root escape re-assertion ──
+
+    #[test]
+    fn key_safety_rejects_traversal() {
+        assert!(assert_key_safe("../escape").is_err());
+        assert!(assert_key_safe("a/../../b").is_err());
+        assert!(assert_key_safe("a\0b").is_err());
+    }
+
+    #[test]
+    fn key_safety_accepts_nested_prefix() {
+        assert!(assert_key_safe("dir/sub/a.txt").is_ok());
+        assert!(assert_key_safe("a.txt").is_ok());
+    }
+
+    // ── Cancellation: pre-request => Cancelled, no client/network ──
+
+    #[tokio::test]
+    async fn pre_request_cancellation_returns_interrupted() {
+        let p = bound_provider();
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        tokio::fs::write(&src, b"data").await.unwrap();
+        let dest = S3ObjectRef {
+            target: "tgt".into(),
+            bucket: "bk".into(),
+            key: "a.txt".into(),
+        };
+        let spec = S3TransferSpec::UploadOne {
+            local_source: src,
+            destination: dest,
+        };
+        let cancel = Arc::new(AtomicBool::new(true));
+        let e = upload_one(&p, &spec, S3OverwritePolicy::Forbid, cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Interrupted);
+    }
+
+    // ── Non-regular / missing local source rejected before client ──
+
+    #[tokio::test]
+    async fn missing_local_source_rejected() {
+        let p = bound_provider();
+        let src = PathBuf::from("/nonexistent/arx/upload/path.txt");
+        let dest = S3ObjectRef {
+            target: "tgt".into(),
+            bucket: "bk".into(),
+            key: "a.txt".into(),
+        };
+        let spec = S3TransferSpec::UploadOne {
+            local_source: src,
+            destination: dest,
+        };
+        // With cancel clear, the missing local source is rejected at the local
+        // stat step (before any client/network).
+        let cancel = Arc::new(AtomicBool::new(false));
+        let e = upload_one(&p, &spec, S3OverwritePolicy::Forbid, cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
     }
 }
