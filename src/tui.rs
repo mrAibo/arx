@@ -5,6 +5,7 @@ use arx::app::{
     CommandTarget, OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SessionCallout,
     SortMode, WorkspaceSyncUxState, action_availability, action_meta,
     build_command_items_with_file_context, listed_entry_navigation_target,
+    navigation_parent_target,
 };
 use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectResponse, EffectScope};
 use arx::effects::{Effect, EffectEvent};
@@ -18,8 +19,8 @@ use arx::services::{
     WorkspaceScanner, WorkspaceSyncController,
 };
 use arx::vfs::{
-    Entry, EntryIdentity, EntryKind, ListedEntry, Location, ProviderId, RemoteEditSession,
-    RemoteEditState,
+    Entry, EntryIdentity, EntryKind, ListedEntry, Location, ProviderId, ProviderRegistry,
+    RemoteEditSession, RemoteEditState,
 };
 use arx::workspace_sync::{
     DiffState, SyncDirection, SyncMode, WorkspaceDiff, WorkspaceSide, WorkspaceSyncOperation,
@@ -135,6 +136,7 @@ async fn event_loop(
             &left_entries,
             &state.filter,
             &state.left.location,
+            &state.registry,
             &parent_entry,
             &load_more_entry,
             state.pane_listing_continuations.get(&Pane::Left),
@@ -143,6 +145,7 @@ async fn event_loop(
             &right_entries,
             &state.filter,
             &state.right.location,
+            &state.registry,
             &parent_entry,
             &load_more_entry,
             state.pane_listing_continuations.get(&Pane::Right),
@@ -1229,7 +1232,10 @@ async fn event_loop(
                             }
                             if let Some(row) = visible_rows.get(cursor) {
                                 let entry = row.entry();
-                                if let Some(new_location) = row.navigation_target(&pane.location) {
+                                let pane_location = pane.location.clone();
+                                if let Some(new_location) =
+                                    row.navigation_target(&pane_location, &state.registry)
+                                {
                                     let active = state.active;
                                     schedule_pane_navigation(
                                         &pane_loader,
@@ -1243,7 +1249,7 @@ async fn event_loop(
                                     state.message = Some("Opening directory…".into());
                                 } else if is_archive(&entry.name) {
                                     // Open archive file
-                                    if let Location::Local(dir) = &pane.location {
+                                    if let Location::Local(dir) = &pane_location {
                                         let archive_path = dir.join(&entry.name);
                                         let target = Location::Archive {
                                             archive: archive_path,
@@ -1287,7 +1293,8 @@ async fn event_loop(
                             }
                         }
                         KeyCode::Backspace => {
-                            if let Some(new_loc) = pane.location.parent() {
+                            let loc = pane.location.clone();
+                            if let Some(new_loc) = navigation_parent_target(&loc, &state.registry) {
                                 let active = state.active;
                                 schedule_pane_navigation(
                                     &pane_loader,
@@ -1869,6 +1876,7 @@ fn selected_visible_row(
         entries,
         &state.filter,
         &pane_state.location,
+        &state.registry,
         &parent,
         &load_more,
         state.pane_listing_continuations.get(&pane),
@@ -1897,6 +1905,7 @@ fn visible_index_for_selection(
         entries,
         &state.filter,
         &pane_state.location,
+        &state.registry,
         &parent,
         &load_more,
         state.pane_listing_continuations.get(&pane),
@@ -2154,9 +2163,13 @@ impl<'a> VisiblePaneRow<'a> {
         }
     }
 
-    fn navigation_target(&self, location: &Location) -> Option<Location> {
+    fn navigation_target(
+        &self,
+        location: &Location,
+        registry: &ProviderRegistry,
+    ) -> Option<Location> {
         match self {
-            Self::Parent(_) => location.parent(),
+            Self::Parent(_) => navigation_parent_target(location, registry),
             Self::Listed(listed) => listed_entry_navigation_target(location, listed),
             Self::LoadMore(_) => None,
         }
@@ -2168,12 +2181,14 @@ fn apply_filter_with_parent<'a>(
     entries: &'a [ListedEntry],
     filter: &str,
     location: &Location,
+    registry: &ProviderRegistry,
     parent_entry: &'a Entry,
 ) -> Vec<VisiblePaneRow<'a>> {
     apply_filter_with_parent_and_continuation(
         entries,
         filter,
         location,
+        registry,
         parent_entry,
         parent_entry,
         None,
@@ -2184,6 +2199,7 @@ fn apply_filter_with_parent_and_continuation<'a>(
     entries: &'a [ListedEntry],
     filter: &str,
     location: &Location,
+    registry: &ProviderRegistry,
     parent_entry: &'a Entry,
     load_more_entry: &'a Entry,
     continuation: Option<&PaneListingContinuation>,
@@ -2196,7 +2212,7 @@ fn apply_filter_with_parent_and_continuation<'a>(
         })
         .map(VisiblePaneRow::Listed)
         .collect();
-    if location.parent().is_some() {
+    if navigation_parent_target(location, registry).is_some() {
         visible.insert(0, VisiblePaneRow::Parent(parent_entry));
     }
     if continuation.is_some() {
@@ -6557,6 +6573,31 @@ mod tests {
         }
     }
 
+    fn test_registry() -> ProviderRegistry {
+        let registry = ProviderRegistry::new();
+        registry.register_s3_targets(&[
+            arx::config::S3TargetConfig {
+                id: "acc".into(),
+                name: "acc".into(),
+                bucket: None,
+                region: None,
+                profile: None,
+                endpoint_url: None,
+                force_path_style: false,
+            },
+            arx::config::S3TargetConfig {
+                id: "bkt".into(),
+                name: "bkt".into(),
+                bucket: Some("company-artifacts".into()),
+                region: None,
+                profile: None,
+                endpoint_url: None,
+                force_path_style: false,
+            },
+        ]);
+        registry
+    }
+
     fn page(entries: Vec<Entry>) -> PaneLoadPage {
         PaneLoadPage {
             entries: entries.into_iter().map(listed).collect(),
@@ -6687,6 +6728,7 @@ mod tests {
 
     #[test]
     fn virtual_parent_is_always_visible_exactly_once_away_from_root() {
+        let registry = test_registry();
         let entries = [
             listed(Entry {
                 name: "..".into(),
@@ -6714,7 +6756,7 @@ mod tests {
             },
         ];
         for location in non_roots {
-            let visible = apply_filter_with_parent(&entries, "", &location, &parent);
+            let visible = apply_filter_with_parent(&entries, "", &location, &registry, &parent);
             assert_eq!(
                 visible
                     .iter()
@@ -6734,7 +6776,7 @@ mod tests {
             },
         ];
         for location in roots {
-            let visible = apply_filter_with_parent(&entries, "", &location, &parent);
+            let visible = apply_filter_with_parent(&entries, "", &location, &registry, &parent);
             assert_eq!(visible.len(), 1);
             assert!(matches!(visible[0], VisiblePaneRow::Listed(_)));
             assert_eq!(visible[0].entry().name, "child.txt");
@@ -6744,12 +6786,13 @@ mod tests {
     #[test]
     fn virtual_parent_navigates_but_is_not_a_mutation_target() {
         let parent = virtual_parent_entry();
+        let registry = test_registry();
         let location = Location::Local("/tmp/work".into());
         let mut state = AppState::default();
         state.left.location = location.clone();
 
         assert_eq!(
-            VisiblePaneRow::Parent(&parent).navigation_target(&location),
+            VisiblePaneRow::Parent(&parent).navigation_target(&location, &registry),
             Some(Location::Local("/tmp".into()))
         );
         assert!(selection_or_cursor(&state, &[VisiblePaneRow::Parent(&parent)], 0).is_empty());
@@ -6827,6 +6870,7 @@ mod tests {
 
     #[test]
     fn enter_s3_bucket_uses_exact_ref() {
+        let registry = test_registry();
         let listed = listed_with_identity(
             "DISPLAY-NAME-THAT-MUST-NOT-BE-USED",
             EntryKind::Directory,
@@ -6842,7 +6886,7 @@ mod tests {
         };
 
         assert_eq!(
-            VisiblePaneRow::Listed(&listed).navigation_target(&current),
+            VisiblePaneRow::Listed(&listed).navigation_target(&current, &registry),
             Some(Location::S3 {
                 target: "Aws-PROD".into(),
                 bucket: Some("Company-ARTIFACTS".into()),
@@ -6904,7 +6948,7 @@ mod tests {
             host: "identity-seam".into(),
             path: "/page".into(),
         };
-        let (loader, mut responses, _next_page_responses) = PaneLoader::channel(registry);
+        let (loader, mut responses, _next_page_responses) = PaneLoader::channel(registry.clone());
         let mut state = AppState::default();
         state.left.location = location.clone();
         let id = loader.load(Pane::Left, location.clone(), PaneLoadPurpose::Refresh);
@@ -6915,7 +6959,7 @@ mod tests {
 
         apply_pane_load_response(response, &mut state, &mut left_entries, &mut right_entries);
         let parent = virtual_parent_entry();
-        let visible = apply_filter_with_parent(&left_entries, "", &location, &parent);
+        let visible = apply_filter_with_parent(&left_entries, "", &location, &registry, &parent);
         let listed_row = visible
             .iter()
             .copied()
@@ -6923,7 +6967,7 @@ mod tests {
             .expect("provider-listed row");
 
         assert_eq!(
-            listed_row.navigation_target(&location),
+            listed_row.navigation_target(&location, &registry),
             Some(Location::S3 {
                 target: "Aws-PROD".into(),
                 bucket: Some("Company-ARTIFACTS".into()),
@@ -6934,6 +6978,7 @@ mod tests {
 
     #[test]
     fn s3_object_and_other_rows_fail_closed_on_enter_but_s3_prefix_navigates() {
+        let registry = test_registry();
         let current = Location::S3 {
             target: "prod".into(),
             bucket: Some("bucket".into()),
@@ -6960,7 +7005,7 @@ mod tests {
 
         // S3Prefix is now navigable: exactly one final delimiter removed.
         assert_eq!(
-            VisiblePaneRow::Listed(&prefix).navigation_target(&current),
+            VisiblePaneRow::Listed(&prefix).navigation_target(&current, &registry),
             Some(Location::S3 {
                 target: "prod".into(),
                 bucket: Some("bucket".into()),
@@ -6969,13 +7014,14 @@ mod tests {
         );
         // S3Object still does not navigate.
         assert_eq!(
-            VisiblePaneRow::Listed(&object).navigation_target(&current),
+            VisiblePaneRow::Listed(&object).navigation_target(&current, &registry),
             None
         );
     }
 
     #[test]
     fn s3_prefix_navigation_uses_exact_ref_not_display_name_and_preserves_repeated_slash() {
+        let registry = test_registry();
         let current = Location::S3 {
             target: "prod".into(),
             bucket: Some("bucket".into()),
@@ -6991,7 +7037,7 @@ mod tests {
             }),
         );
 
-        let target = VisiblePaneRow::Listed(&prefix).navigation_target(&current);
+        let target = VisiblePaneRow::Listed(&prefix).navigation_target(&current, &registry);
         assert_eq!(
             target,
             Some(Location::S3 {
@@ -7014,6 +7060,7 @@ mod tests {
 
     #[test]
     fn provider_listed_dot_dot_remains_listed_identity() {
+        let registry = test_registry();
         let listed = listed_with_identity(
             "..",
             EntryKind::Directory,
@@ -7029,12 +7076,12 @@ mod tests {
             prefix: String::new(),
         };
         let entries = [listed];
-        let visible = apply_filter_with_parent(&entries, "", &current, &parent);
+        let visible = apply_filter_with_parent(&entries, "", &current, &registry, &parent);
 
         assert_eq!(visible.len(), 1);
         assert!(matches!(visible[0], VisiblePaneRow::Listed(_)));
         assert_eq!(
-            visible[0].navigation_target(&current),
+            visible[0].navigation_target(&current, &registry),
             Some(Location::S3 {
                 target: "exact-target".into(),
                 bucket: Some("exact-bucket".into()),
@@ -7101,13 +7148,14 @@ mod tests {
 
     #[test]
     fn pagination_virtual_row_is_last_filter_proof_and_provider_neutral() {
+        let registry = test_registry();
         let parent = virtual_parent_entry();
         let load_more = load_more_entry();
         let entries = [listed(file("child.txt"))];
         let location = Location::Local("/tmp/work".into());
         let continuation = page_continuation(PaneLoadId(7), location.clone());
         let no_page = apply_filter_with_parent_and_continuation(
-            &entries, "missing", &location, &parent, &load_more, None,
+            &entries, "missing", &location, &registry, &parent, &load_more, None,
         );
         assert!(matches!(no_page.as_slice(), [VisiblePaneRow::Parent(_)]));
 
@@ -7115,6 +7163,7 @@ mod tests {
             &entries,
             "child",
             &location,
+            &registry,
             &parent,
             &load_more,
             Some(&continuation),
@@ -7130,6 +7179,7 @@ mod tests {
             &entries,
             "does-not-match",
             &location,
+            &registry,
             &parent,
             &load_more,
             Some(&continuation),
@@ -7151,7 +7201,7 @@ mod tests {
             },
         ] {
             let rows = apply_filter_with_parent_and_continuation(
-                &entries, "", &location, &parent, &load_more, None,
+                &entries, "", &location, &registry, &parent, &load_more, None,
             );
             assert!(
                 !rows
@@ -7195,6 +7245,7 @@ mod tests {
 
     #[test]
     fn accepted_page_preserves_both_split_cursor_identities_through_visible_rows() {
+        let registry = test_registry();
         let (mut state, mut left, initiating) = pagination_state();
         let split_identity = EntryIdentity::S3Object(S3ObjectRef {
             target: "prod".into(),
@@ -7239,6 +7290,7 @@ mod tests {
             &left,
             &state.filter,
             &state.left.location,
+            &registry,
             &parent,
             &load_more,
             state.pane_listing_continuations.get(&Pane::Left),
@@ -8111,5 +8163,209 @@ mod tests {
             job_id: "sync-other".into(),
         };
         assert!(session_callout_text(&state, &KeyRouter::default()).is_some());
+    }
+
+    // ── S3-25: contextual S3 parent regression tests (through the seam) ──
+
+    #[test]
+    fn account_bucket_root_shows_virtual_parent() {
+        let registry = test_registry();
+        let parent = virtual_parent_entry();
+        let location = Location::S3 {
+            target: "acc".into(),
+            bucket: Some("anything".into()),
+            prefix: String::new(),
+        };
+        let entries: [ListedEntry; 0] = [];
+        let visible = apply_filter_with_parent(&entries, "", &location, &registry, &parent);
+        assert!(matches!(visible.first(), Some(VisiblePaneRow::Parent(_))));
+    }
+
+    #[test]
+    fn bucket_bound_root_has_no_virtual_parent() {
+        let registry = test_registry();
+        let parent = virtual_parent_entry();
+        let location = Location::S3 {
+            target: "bkt".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: String::new(),
+        };
+        let entries: [ListedEntry; 0] = [];
+        let visible = apply_filter_with_parent(&entries, "", &location, &registry, &parent);
+        assert!(visible.is_empty());
+    }
+
+    #[test]
+    fn nested_s3_prefix_shows_parent() {
+        let registry = test_registry();
+        let parent = virtual_parent_entry();
+        let location = Location::S3 {
+            target: "bkt".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: "foo/bar".into(),
+        };
+        let entries: [ListedEntry; 0] = [];
+        let visible = apply_filter_with_parent(&entries, "", &location, &registry, &parent);
+        assert!(matches!(visible.first(), Some(VisiblePaneRow::Parent(_))));
+    }
+
+    #[test]
+    fn s3_target_root_has_no_parent() {
+        let registry = test_registry();
+        let parent = virtual_parent_entry();
+        let location = Location::S3 {
+            target: "acc".into(),
+            bucket: None,
+            prefix: String::new(),
+        };
+        let entries: [ListedEntry; 0] = [];
+        let visible = apply_filter_with_parent(&entries, "", &location, &registry, &parent);
+        assert!(visible.is_empty());
+    }
+
+    #[test]
+    fn parent_enter_uses_contextual_s3_parent() {
+        let registry = test_registry();
+        let parent = virtual_parent_entry();
+        let location = Location::S3 {
+            target: "acc".into(),
+            bucket: Some("anything".into()),
+            prefix: String::new(),
+        };
+        let nav = VisiblePaneRow::Parent(&parent).navigation_target(&location, &registry);
+        assert_eq!(
+            nav,
+            Some(Location::S3 {
+                target: "acc".into(),
+                bucket: None,
+                prefix: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn backspace_same_target_as_parent_enter() {
+        let registry = test_registry();
+        let parent = virtual_parent_entry();
+        let location = Location::S3 {
+            target: "acc".into(),
+            bucket: Some("anything".into()),
+            prefix: "foo/bar".into(),
+        };
+        // Backspace computes via navigation_parent_target; Parent Enter computes via
+        // VisiblePaneRow::Parent(...).navigation_target. Both must agree.
+        let via_backspace = navigation_parent_target(&location, &registry);
+        let via_parent_enter =
+            VisiblePaneRow::Parent(&parent).navigation_target(&location, &registry);
+        assert_eq!(via_backspace, via_parent_enter);
+        assert_eq!(
+            via_backspace,
+            Some(Location::S3 {
+                target: "acc".into(),
+                bucket: Some("anything".into()),
+                prefix: "foo".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn awkward_double_slash_parent_exact() {
+        let registry = test_registry();
+        let parent = virtual_parent_entry();
+        let location = Location::S3 {
+            target: "bkt".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: "foo//bar".into(),
+        };
+        let nav = VisiblePaneRow::Parent(&parent).navigation_target(&location, &registry);
+        assert_eq!(
+            nav,
+            Some(Location::S3 {
+                target: "bkt".into(),
+                bucket: Some("company-artifacts".into()),
+                prefix: "foo/".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn provider_listed_dot_dot_stays_listed_identity() {
+        let registry = test_registry();
+        let parent = virtual_parent_entry();
+        let listed = listed_with_identity(
+            "..",
+            EntryKind::Directory,
+            EntryIdentity::S3Bucket(S3BucketRef {
+                target: "bkt".into(),
+                bucket: "company-artifacts".into(),
+            }),
+        );
+        let location = Location::S3 {
+            target: "bkt".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: String::new(),
+        };
+        let entries = [listed];
+        let visible = apply_filter_with_parent(&entries, "", &location, &registry, &parent);
+        // A provider-listed ".." row is NOT reclassified as the virtual Parent row.
+        assert_eq!(visible.len(), 1);
+        assert!(matches!(visible[0], VisiblePaneRow::Listed(_)));
+        assert!(!matches!(visible[0], VisiblePaneRow::Parent(_)));
+    }
+
+    #[test]
+    fn load_more_ordering_with_parent() {
+        let registry = test_registry();
+        let parent = virtual_parent_entry();
+        let load_more = load_more_entry();
+        let entries = [listed(file("child.txt"))];
+        let location = Location::S3 {
+            target: "acc".into(),
+            bucket: Some("anything".into()),
+            prefix: String::new(),
+        };
+        let continuation = page_continuation(PaneLoadId(7), location.clone());
+        let visible = apply_filter_with_parent_and_continuation(
+            &entries,
+            "",
+            &location,
+            &registry,
+            &parent,
+            &load_more,
+            Some(&continuation),
+        );
+        assert!(matches!(visible[0], VisiblePaneRow::Parent(_)));
+        assert!(matches!(visible[1], VisiblePaneRow::Listed(_)));
+        assert!(matches!(visible[2], VisiblePaneRow::LoadMore(_)));
+    }
+
+    #[test]
+    fn load_more_ordering_bucket_bound_root_no_parent() {
+        let registry = test_registry();
+        let parent = virtual_parent_entry();
+        let load_more = load_more_entry();
+        let entries = [listed(file("child.txt"))];
+        let location = Location::S3 {
+            target: "bkt".into(),
+            bucket: Some("company-artifacts".into()),
+            prefix: String::new(),
+        };
+        let continuation = page_continuation(PaneLoadId(7), location.clone());
+        let visible = apply_filter_with_parent_and_continuation(
+            &entries,
+            "",
+            &location,
+            &registry,
+            &parent,
+            &load_more,
+            Some(&continuation),
+        );
+        assert!(matches!(visible[0], VisiblePaneRow::Listed(_)));
+        assert!(matches!(visible[1], VisiblePaneRow::LoadMore(_)));
+        assert!(
+            !visible
+                .iter()
+                .any(|r| matches!(r, VisiblePaneRow::Parent(_)))
+        );
     }
 }

@@ -510,6 +510,81 @@ pub fn listed_entry_navigation_target(
     }
 }
 
+/// Contextual parent resolver — the single authority for virtual `..` navigation.
+///
+/// `Location::parent()` stays context-free and fail-closed for `Location::S3`
+/// (it cannot know account-root vs bucket-bound semantics). This helper consults
+/// the one authoritative configured-target inventory (`ProviderRegistry`) so S3
+/// parent navigation is correct for both binding modes, while Local/SFTP/Archive
+/// keep their existing `parent()` behavior unchanged.
+///
+/// Bucket-bound targets NEVER escape to the account root (would enable
+/// ListBuckets / s3:ListAllMyBuckets): at a bucket-bound root the parent is
+/// `None`. Target root (`bucket: None`, `prefix: ""`) is terminal. Unknown
+/// targets fail closed. Navigation prefixes use string/namespace semantics:
+/// remove the final segment via `rfind('/')` — no `trim_end_matches`, `Path`,
+/// canonicalize, `//`-collapse, or `.`/`..` resolution.
+pub fn navigation_parent_target(
+    current: &crate::vfs::Location,
+    registry: &crate::vfs::ProviderRegistry,
+) -> Option<crate::vfs::Location> {
+    use crate::vfs::{Location, S3TargetBinding};
+    match current {
+        Location::Local(_) | Location::Sftp { .. } | Location::Archive { .. } => current.parent(),
+        Location::S3 {
+            target,
+            bucket,
+            prefix,
+        } => {
+            let binding = registry.s3_target_binding(target)?;
+            match (bucket, &binding) {
+                // Bucket root of a bucket-bound target: terminal, no escape.
+                (Some(current_bucket), S3TargetBinding::BucketBound(bound)) => {
+                    if current_bucket != bound {
+                        return None;
+                    }
+                    if prefix.is_empty() {
+                        return None;
+                    }
+                    Some(location_with_parent_prefix(target, bucket, prefix))
+                }
+                // Bucket root of an account-style target: expose target root.
+                (Some(_), S3TargetBinding::AccountRoot) => {
+                    if prefix.is_empty() {
+                        return Some(Location::S3 {
+                            target: target.clone(),
+                            bucket: None,
+                            prefix: String::new(),
+                        });
+                    }
+                    Some(location_with_parent_prefix(target, bucket, prefix))
+                }
+                // Target root: terminal.
+                (None, _) => None,
+            }
+        }
+    }
+}
+
+/// Parent prefix = remove the final navigation segment via the final literal
+/// '/'. Repeated slashes, literal '.' / '..' segments, and Unicode are preserved
+/// verbatim; only the last segment is dropped.
+fn location_with_parent_prefix(
+    target: &str,
+    bucket: &Option<String>,
+    prefix: &str,
+) -> crate::vfs::Location {
+    let parent_prefix = match prefix.rfind('/') {
+        Some(index) => &prefix[..index],
+        None => "",
+    };
+    crate::vfs::Location::S3 {
+        target: target.to_string(),
+        bucket: bucket.clone(),
+        prefix: parent_prefix.to_string(),
+    }
+}
+
 /// High-level input ownership.
 ///
 /// This is intentionally derived from the current `AppState` instead of
@@ -893,5 +968,200 @@ mod tests {
 
         state.apply(Action::Quit);
         assert!(state.should_quit);
+    }
+
+    // ── S3-25: navigation_parent_target ──
+
+    fn nav_registry() -> crate::vfs::ProviderRegistry {
+        let registry = crate::vfs::ProviderRegistry::new();
+        registry.register_s3_targets(&[
+            crate::config::S3TargetConfig {
+                id: "acc".into(),
+                name: "acc".into(),
+                bucket: None,
+                region: None,
+                profile: None,
+                endpoint_url: None,
+                force_path_style: false,
+            },
+            crate::config::S3TargetConfig {
+                id: "bkt".into(),
+                name: "bkt".into(),
+                bucket: Some("company-artifacts".into()),
+                region: None,
+                profile: None,
+                endpoint_url: None,
+                force_path_style: false,
+            },
+        ]);
+        registry
+    }
+
+    fn s3(target: &str, bucket: Option<&str>, prefix: &str) -> Location {
+        Location::S3 {
+            target: target.to_string(),
+            bucket: bucket.map(|b| b.to_string()),
+            prefix: prefix.to_string(),
+        }
+    }
+
+    #[test]
+    fn target_root_has_no_parent() {
+        let registry = nav_registry();
+        let current = s3("acc", None, "");
+        assert_eq!(navigation_parent_target(&current, &registry), None);
+    }
+
+    #[test]
+    fn account_bucket_root_parent_is_target_root() {
+        let registry = nav_registry();
+        let current = s3("acc", Some("anything"), "");
+        assert_eq!(
+            navigation_parent_target(&current, &registry),
+            Some(s3("acc", None, ""))
+        );
+    }
+
+    #[test]
+    fn bucket_bound_root_has_no_parent() {
+        let registry = nav_registry();
+        let current = s3("bkt", Some("company-artifacts"), "");
+        assert_eq!(navigation_parent_target(&current, &registry), None);
+    }
+
+    #[test]
+    fn bucket_bound_wrong_bucket_fails_closed() {
+        let registry = nav_registry();
+        let current = s3("bkt", Some("other-bucket"), "");
+        assert_eq!(navigation_parent_target(&current, &registry), None);
+    }
+
+    #[test]
+    fn unknown_target_fails_closed() {
+        let registry = nav_registry();
+        let current = s3("ghost", Some("x"), "");
+        assert_eq!(navigation_parent_target(&current, &registry), None);
+    }
+
+    #[test]
+    fn prefix_single_segment_to_bucket_root() {
+        let registry = nav_registry();
+        let current = s3("bkt", Some("company-artifacts"), "foo");
+        assert_eq!(
+            navigation_parent_target(&current, &registry),
+            Some(s3("bkt", Some("company-artifacts"), ""))
+        );
+    }
+
+    #[test]
+    fn nested_prefix_strips_last_segment() {
+        let registry = nav_registry();
+        let current = s3("bkt", Some("company-artifacts"), "foo/bar");
+        assert_eq!(
+            navigation_parent_target(&current, &registry),
+            Some(s3("bkt", Some("company-artifacts"), "foo"))
+        );
+    }
+
+    #[test]
+    fn repeated_slash_literal_prefix() {
+        let registry = nav_registry();
+        let current = s3("bkt", Some("company-artifacts"), "foo/");
+        assert_eq!(
+            navigation_parent_target(&current, &registry),
+            Some(s3("bkt", Some("company-artifacts"), "foo"))
+        );
+    }
+
+    #[test]
+    fn repeated_double_slash_prefix() {
+        let registry = nav_registry();
+        let current = s3("bkt", Some("company-artifacts"), "foo//");
+        assert_eq!(
+            navigation_parent_target(&current, &registry),
+            Some(s3("bkt", Some("company-artifacts"), "foo/"))
+        );
+    }
+
+    #[test]
+    fn awkward_double_slash_nested_prefix() {
+        let registry = nav_registry();
+        let current = s3("bkt", Some("company-artifacts"), "foo//bar");
+        assert_eq!(
+            navigation_parent_target(&current, &registry),
+            Some(s3("bkt", Some("company-artifacts"), "foo/"))
+        );
+    }
+
+    #[test]
+    fn dotdot_is_literal_prefix() {
+        let registry = nav_registry();
+        let current = s3("bkt", Some("company-artifacts"), "foo/../bar");
+        assert_eq!(
+            navigation_parent_target(&current, &registry),
+            Some(s3("bkt", Some("company-artifacts"), "foo/.."))
+        );
+    }
+
+    #[test]
+    fn dot_is_literal_prefix() {
+        let registry = nav_registry();
+        let current = s3("bkt", Some("company-artifacts"), "foo/./bar");
+        assert_eq!(
+            navigation_parent_target(&current, &registry),
+            Some(s3("bkt", Some("company-artifacts"), "foo/."))
+        );
+    }
+
+    #[test]
+    fn unicode_parent_prefix() {
+        let registry = nav_registry();
+        let current = s3("bkt", Some("company-artifacts"), "日本語/資料");
+        assert_eq!(
+            navigation_parent_target(&current, &registry),
+            Some(s3("bkt", Some("company-artifacts"), "日本語"))
+        );
+    }
+
+    #[test]
+    fn local_parent_unchanged() {
+        let registry = nav_registry();
+        let current = Location::Local("/a/b".into());
+        assert_eq!(
+            navigation_parent_target(&current, &registry),
+            Some(Location::Local("/a".into()))
+        );
+    }
+
+    #[test]
+    fn sftp_parent_unchanged() {
+        let registry = nav_registry();
+        let current = Location::Sftp {
+            host: "h".into(),
+            path: "/a/b".into(),
+        };
+        assert_eq!(
+            navigation_parent_target(&current, &registry),
+            Some(Location::Sftp {
+                host: "h".into(),
+                path: "/a".into()
+            })
+        );
+    }
+
+    #[test]
+    fn archive_parent_unchanged() {
+        let registry = nav_registry();
+        let current = Location::Archive {
+            archive: "/x.zip".into(),
+            inner_path: "a/b".into(),
+        };
+        assert_eq!(
+            navigation_parent_target(&current, &registry),
+            Some(Location::Archive {
+                archive: "/x.zip".into(),
+                inner_path: "a".into()
+            })
+        );
     }
 }

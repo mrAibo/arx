@@ -479,6 +479,14 @@ struct RegisteredProvider {
 /// Provider *capabilities* are keyed by provider class (`ProviderId`), while
 /// provider *instances* are keyed by the concrete resource. This distinction
 /// is essential for multiple SFTP hosts and multiple archive files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum S3TargetBinding {
+    /// `config.bucket == None` — whole-account / target-root listing.
+    AccountRoot,
+    /// `config.bucket == Some(bucket)` — bound to exactly this bucket.
+    BucketBound(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderRegistry {
     providers: Arc<RwLock<HashMap<ProviderInstanceKey, RegisteredProvider>>>,
@@ -512,6 +520,19 @@ impl ProviderRegistry {
         for target in targets {
             inventory.insert(target.id.clone(), target.clone());
         }
+    }
+
+    /// Narrow read-only view of a target's binding. `None` for unknown ids.
+    pub fn s3_target_binding(&self, target_id: &str) -> Option<S3TargetBinding> {
+        let inventory = self
+            .s3_targets
+            .read()
+            .expect("s3 target inventory poisoned");
+        let config = inventory.get(target_id)?;
+        Some(match &config.bucket {
+            None => S3TargetBinding::AccountRoot,
+            Some(bucket) => S3TargetBinding::BucketBound(bucket.clone()),
+        })
     }
 
     pub fn insert(
@@ -2269,6 +2290,77 @@ mod tests {
         assert_ne!(key_a, key_b);
         assert!(matches!(key_a, ProviderInstanceKey::SftpHost(h) if h == "host-a"));
         assert!(matches!(key_b, ProviderInstanceKey::SftpHost(h) if h == "host-b"));
+    }
+
+    // ── S3-25: S3TargetBinding inventory views ──
+
+    fn s3_binding_registry() -> ProviderRegistry {
+        let registry = ProviderRegistry::new();
+        registry.register_s3_targets(&[
+            crate::config::S3TargetConfig {
+                id: "acc".into(),
+                name: "acc".into(),
+                bucket: None,
+                region: None,
+                profile: None,
+                endpoint_url: None,
+                force_path_style: false,
+            },
+            crate::config::S3TargetConfig {
+                id: "bkt".into(),
+                name: "bkt".into(),
+                bucket: Some("company-artifacts".into()),
+                region: None,
+                profile: None,
+                endpoint_url: None,
+                force_path_style: false,
+            },
+        ]);
+        registry
+    }
+
+    #[test]
+    fn account_target_binding() {
+        let registry = s3_binding_registry();
+        assert_eq!(
+            registry.s3_target_binding("acc"),
+            Some(S3TargetBinding::AccountRoot)
+        );
+    }
+
+    #[test]
+    fn bucket_bound_target_binding() {
+        let registry = s3_binding_registry();
+        assert_eq!(
+            registry.s3_target_binding("bkt"),
+            Some(S3TargetBinding::BucketBound("company-artifacts".into()))
+        );
+    }
+
+    #[test]
+    fn unknown_target_binding_none() {
+        let registry = s3_binding_registry();
+        assert_eq!(registry.s3_target_binding("nope"), None);
+    }
+
+    #[test]
+    fn exact_id_no_normalization() {
+        let registry = ProviderRegistry::new();
+        registry.register_s3_targets(&[crate::config::S3TargetConfig {
+            id: "  prod  ".into(),
+            name: "prod".into(),
+            bucket: Some("b".into()),
+            region: None,
+            profile: None,
+            endpoint_url: None,
+            force_path_style: false,
+        }]);
+        // ids are stored verbatim: lookup by exact id succeeds, normalized id fails
+        assert_eq!(
+            registry.s3_target_binding("  prod  "),
+            Some(S3TargetBinding::BucketBound("b".into()))
+        );
+        assert_eq!(registry.s3_target_binding("prod"), None);
     }
 }
 
