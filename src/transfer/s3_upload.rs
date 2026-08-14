@@ -113,16 +113,13 @@ pub(crate) async fn upload_one(
     //    - if the provider is bucket-bound, the destination bucket must match
     validate_upload_identity(&provider.target.id, &provider.target.bucket, destination)?;
 
-    // 5. Re-assert the key cannot escape its navigation prefix (bucket-root escape).
-    assert_key_safe(&destination.key)?;
-
-    // 6. Temporary single-put limit: refuse anything above the ceiling BEFORE PutObject.
+    // 5. Temporary single-put limit: refuse anything above the ceiling BEFORE PutObject.
     check_single_put_size(file_size)?;
 
-    // 7. Get the (shared, lazily built) AWS client — no second client is created.
+    // 6. Get the (shared, lazily built) AWS client — no second client is created.
     let client = provider.client().await?;
 
-    // 8. Overwrite preflight: safe HeadObject read, then a pure policy decision.
+    // 7. Overwrite preflight: safe HeadObject read, then a pure policy decision.
     let head = client
         .head_object()
         .bucket(&destination.bucket)
@@ -152,7 +149,7 @@ pub(crate) async fn upload_one(
         }
     }
 
-    // 9. Final pre-request cancellation check: if cancelled now, no PutObject
+    // 8. Final pre-request cancellation check: if cancelled now, no PutObject
     //    has been issued and the HeadObject above was a read-only probe, so the
     //    operation is still zero-mutation.
     if cancel.load(Ordering::Relaxed) {
@@ -162,7 +159,7 @@ pub(crate) async fn upload_one(
         ));
     }
 
-    // 10. Exactly one PutObject, to the exact destination bucket/key. The body
+    // 9. Exactly one PutObject, to the exact destination bucket/key. The body
     //     is a streaming ByteStream (no full-file allocation).
     let body = ByteStream::from_path(local_source).await.map_err(|e| {
         io::Error::other(format!("S3 upload failed to open local source stream: {e}"))
@@ -215,26 +212,6 @@ pub(crate) fn validate_upload_identity(
     Ok(())
 }
 
-/// Pure key-safety re-assertion: reject a NUL and any `..` path segment that
-/// would escape the navigation prefix. Keys may legitimately contain `/`.
-fn assert_key_safe(key: &str) -> io::Result<()> {
-    if key.contains('\0') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "S3 key contains a NUL byte",
-        ));
-    }
-    for seg in key.split('/') {
-        if seg == ".." {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "S3 key escapes its prefix via \"..\"",
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Pure single-put size guard. Refuse anything above `BASIC_TRANSFER_MAX_BYTES`
 /// BEFORE any PutObject (S3-43 may later introduce multipart).
 pub(crate) fn check_single_put_size(size: u64) -> io::Result<()> {
@@ -275,6 +252,7 @@ pub(crate) fn decide_overwrite(policy: S3OverwritePolicy, state: HeadState) -> O
 mod tests {
     use super::*;
     use crate::config::S3TargetConfig;
+    use crate::transfer::s3_upload_destination_ref;
     use crate::vfs::s3::S3Provider;
     use aws_sdk_s3::error::ErrorMetadata;
     use std::sync::atomic::AtomicBool;
@@ -433,19 +411,55 @@ mod tests {
         assert!(validate_upload_identity(&p.target.id, &p.target.bucket, &dest).is_ok());
     }
 
-    // ── Key safety: bucket-root escape re-assertion ──
+    // ── S3 keys are opaque: no filesystem-traversal semantics (S3-42S) ──
+    //
+    // The LOCAL child filename is validated at the construction boundary by
+    // `validate_child_name` (via `s3_upload_destination_ref`). The assembled
+    // S3 key is an opaque string, so the navigation prefix is never rescanned
+    // for "."/".."/"//" — those are legal key contents.
 
     #[test]
-    fn key_safety_rejects_traversal() {
-        assert!(assert_key_safe("../escape").is_err());
-        assert!(assert_key_safe("a/../../b").is_err());
-        assert!(assert_key_safe("a\0b").is_err());
+    fn opaque_key_accepts_dotdot_segment() {
+        let dest = s3_upload_destination_ref("tgt", "bk", "foo/../bar", "a.txt").unwrap();
+        assert_eq!(dest.key, "foo/../bar/a.txt");
     }
 
     #[test]
-    fn key_safety_accepts_nested_prefix() {
-        assert!(assert_key_safe("dir/sub/a.txt").is_ok());
-        assert!(assert_key_safe("a.txt").is_ok());
+    fn opaque_key_accepts_dot_segment() {
+        let dest = s3_upload_destination_ref("tgt", "bk", "foo/./bar", "a.txt").unwrap();
+        assert_eq!(dest.key, "foo/./bar/a.txt");
+    }
+
+    #[test]
+    fn opaque_key_accepts_double_slash() {
+        let dest = s3_upload_destination_ref("tgt", "bk", "foo//bar", "a.txt").unwrap();
+        assert_eq!(dest.key, "foo//bar/a.txt");
+    }
+
+    #[test]
+    fn opaque_key_accepts_unicode() {
+        let dest = s3_upload_destination_ref("tgt", "bk", "日本語/../資料", "file.txt").unwrap();
+        assert_eq!(dest.key, "日本語/../資料/file.txt");
+    }
+
+    // Local child-name boundary still rejects filesystem-unsafe names.
+    #[test]
+    fn local_child_dotdot_rejected() {
+        assert!(s3_upload_destination_ref("tgt", "bk", "p", "..").is_err());
+    }
+
+    #[test]
+    fn local_child_slash_rejected() {
+        assert!(s3_upload_destination_ref("tgt", "bk", "p", "foo/bar").is_err());
+    }
+
+    // Exact destination ref unchanged verbatim (target/bucket/key as built).
+    #[test]
+    fn exact_destination_ref_unchanged() {
+        let dest = s3_upload_destination_ref("tgt", "bk", "pre/fix", "name.txt").unwrap();
+        assert_eq!(dest.target, "tgt");
+        assert_eq!(dest.bucket, "bk");
+        assert_eq!(dest.key, "pre/fix/name.txt");
     }
 
     // ── Cancellation: pre-request => Cancelled, no client/network ──
