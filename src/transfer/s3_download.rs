@@ -133,12 +133,11 @@ pub(crate) async fn download_one(
 
     let mut body = match get_obj {
         Ok(out) => out.body.into_async_read(),
-        Err(sdk_err) => {
+        Err(_) => {
             let _ = remove_staged(&staged_path).await;
-            return Err(io::Error::other(format!(
-                "S3 GetObject failed: {}",
-                sdk_err
-            )));
+            // ponytail: static label only — never interpolate the SDK error
+            // (signed query / key / auth fragments can leak through it).
+            return Err(io::Error::other("S3 GetObject download failed"));
         }
     };
 
@@ -164,10 +163,10 @@ pub(crate) async fn download_one(
             Ok(n) => n,
             Err(e) => {
                 let _ = remove_staged(&staged_path).await;
-                return Err(io::Error::new(
-                    e.kind(),
-                    format!("read from S3 stream failed: {}", e),
-                ));
+                // ponytail: preserve IO kind (cancellation/EOF semantics) but
+                // use a static label — the stream error can carry body-signing
+                // details we must not surface.
+                return Err(io::Error::new(e.kind(), "S3 download stream read failed"));
             }
         };
 
