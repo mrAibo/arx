@@ -126,7 +126,7 @@ mod tests {
         assert!(S3_CAPABILITIES.supports(Capability::List));
         assert!(S3_CAPABILITIES.supports(Capability::Read));
         assert!(S3_CAPABILITIES.supports(Capability::Write));
-        assert!(!S3_CAPABILITIES.supports(Capability::Mkdir));
+        assert!(S3_CAPABILITIES.supports(Capability::Mkdir));
         assert!(!S3_CAPABILITIES.supports(Capability::Delete));
         assert!(!S3_CAPABILITIES.supports(Capability::Copy));
         assert!(!S3_CAPABILITIES.supports(Capability::Move));
@@ -154,11 +154,11 @@ mod tests {
     }
 
     #[test]
-    fn s3_list_and_read_only() {
+    fn s3_capabilities_contract() {
         assert!(S3_CAPABILITIES.supports(Capability::List));
         assert!(S3_CAPABILITIES.supports(Capability::Read));
         assert!(S3_CAPABILITIES.supports(Capability::Write));
-        assert!(!S3_CAPABILITIES.supports(Capability::Mkdir));
+        assert!(S3_CAPABILITIES.supports(Capability::Mkdir));
         assert!(!S3_CAPABILITIES.supports(Capability::Delete));
         assert!(!S3_CAPABILITIES.supports(Capability::Copy));
         assert!(!S3_CAPABILITIES.supports(Capability::Move));
