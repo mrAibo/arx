@@ -973,6 +973,66 @@ impl ProviderRegistry {
         provider.delete_object_exact(object).await
     }
 
+    /// S3-native exact delete seam (S3-58 / S3-55 Phase 8).
+    ///
+    /// Deletes ONE exact object identified by `key` under the `Location::S3`.
+    /// The key is taken verbatim from the frozen selection — no normalization,
+    /// no prefix recursion, no bucket delete. Bucket must be present (target
+    /// root => Unsupported; bucket creation is out of scope).
+    // ponytail: seam derives target/bucket from the Location, so a Location
+    // cannot reach another target's provider.
+    pub async fn delete_s3_at(&self, location: &Location, key: &str) -> std::io::Result<()> {
+        let Location::S3 { target, bucket, .. } = location else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "delete_s3_at requires Location::S3",
+            ));
+        };
+        let bucket = bucket.clone().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "bucket creation is not supported",
+            )
+        })?;
+        let object = s3::S3ObjectRef {
+            target: target.to_string(),
+            bucket,
+            key: key.to_string(),
+        };
+        self.delete_s3_object_exact(&object).await
+    }
+
+    /// S3-native empty-prefix-marker proof seam (S3-58P / S3-55 Phase 8).
+    ///
+    /// Returns `Ok(true)` ONLY when `prefix` names an empty marker (exactly one
+    /// zero-byte object equal to the prefix). All other cases => `Ok(false)`
+    /// (fail closed). Never paginates; never normalizes the prefix.
+    pub async fn prove_empty_s3_prefix_at(
+        &self,
+        location: &Location,
+        prefix: &str,
+    ) -> std::io::Result<bool> {
+        let Location::S3 { target, bucket, .. } = location else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "prove_empty_s3_prefix_at requires Location::S3",
+            ));
+        };
+        let bucket = bucket.clone().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "bucket creation is not supported",
+            )
+        })?;
+        let provider = self.resolve_s3_provider_typed(target)?;
+        let prefix_ref = s3::S3PrefixRef {
+            target: target.to_string(),
+            bucket,
+            prefix: prefix.to_string(),
+        };
+        provider.prove_empty_prefix_marker(&prefix_ref).await
+    }
+
     /// Resolve the concrete `S3Target(id)` provider for a transfer operation.
     ///
     /// Returns the SAME `Arc<S3Provider>` already registered under
