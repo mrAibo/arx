@@ -5780,9 +5780,49 @@ async fn dispatch_ui_action(
                             return;
                         }
                         Some(entry) if entry.kind == arx::vfs::EntryKind::Directory => {
-                            match provider.list_async(&target.path).await {
-                                Ok(children) if !children.is_empty() => {
-                                    let _ = jobs.publish_event(
+                            // S3: a "directory" is a prefix. Deletion is only safe
+                            // when it is an empty marker (exactly one zero-byte
+                            // object equal to the prefix). Anything else fails
+                            // closed — no recursive prefix deletion.
+                            if let arx::vfs::Location::S3 { .. } = &location {
+                                match registry
+                                    .prove_empty_s3_prefix_at(&location, &target.path)
+                                    .await
+                                {
+                                    Ok(true) => {} // empty marker — allowed
+                                    Ok(false) => {
+                                        let _ = jobs.publish_event(
+                                            &tx,
+                                            arx::jobs::JobEvent::Failed {
+                                                id: job.id.clone(),
+                                                error: format!(
+                                                    "S3 prefix '{}' is not an empty marker. Recursive prefix delete is not supported. Nothing was deleted.",
+                                                    target.name
+                                                ),
+                                                result: None,
+                                            },
+                                        );
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        let _ = jobs.publish_event(
+                                            &tx,
+                                            arx::jobs::JobEvent::Failed {
+                                                id: job.id.clone(),
+                                                error: format!(
+                                                    "Cannot verify S3 prefix '{}' is empty: {}. Nothing was deleted.",
+                                                    target.name, e
+                                                ),
+                                                result: None,
+                                            },
+                                        );
+                                        return;
+                                    }
+                                }
+                            } else {
+                                match provider.list_async(&target.path).await {
+                                    Ok(children) if !children.is_empty() => {
+                                        let _ = jobs.publish_event(
                                         &tx,
                                         arx::jobs::JobEvent::Failed {
                                             id: job.id.clone(),
@@ -5793,11 +5833,11 @@ async fn dispatch_ui_action(
                                             result: None,
                                         },
                                     );
-                                    return;
-                                }
-                                Ok(_) => {} // empty directory — allowed
-                                Err(e) => {
-                                    let _ = jobs.publish_event(
+                                        return;
+                                    }
+                                    Ok(_) => {} // empty directory — allowed
+                                    Err(e) => {
+                                        let _ = jobs.publish_event(
                                         &tx,
                                         arx::jobs::JobEvent::Failed {
                                             id: job.id.clone(),
@@ -5808,7 +5848,8 @@ async fn dispatch_ui_action(
                                             result: None,
                                         },
                                     );
-                                    return;
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -5825,11 +5866,18 @@ async fn dispatch_ui_action(
                         break;
                     }
 
-                    let result = match target.kind {
-                        arx::vfs::EntryKind::Directory => {
-                            registry.remove_dir_at(&location, &target.path).await
+                    let result = if let arx::vfs::Location::S3 { .. } = &location {
+                        // S3: one exact DeleteObject per frozen target key.
+                        // No prefix recursion, no bucket delete. The key is the
+                        // frozen selection path, taken verbatim.
+                        registry.delete_s3_at(&location, &target.path).await
+                    } else {
+                        match target.kind {
+                            arx::vfs::EntryKind::Directory => {
+                                registry.remove_dir_at(&location, &target.path).await
+                            }
+                            _ => registry.remove_file_at(&location, &target.path).await,
                         }
-                        _ => registry.remove_file_at(&location, &target.path).await,
                     };
 
                     match result {
