@@ -193,6 +193,11 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
                 reason: "Select a regular file to view".into(),
             }
         }
+        ActionId::EditFile if ctx.active_provider == ProviderId::S3 => {
+            ActionAvailability::Disabled {
+                reason: "S3 remote editing is not supported".into(),
+            }
+        }
         ActionId::EditFile
             if !ctx.active_capabilities.contains_all(
                 CapabilitySet::NONE
@@ -468,6 +473,52 @@ mod tests {
         let ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
         let availability = action_availability(ActionId::BeginChmod, &ctx);
         assert!(availability.reason().is_some());
+    }
+
+    // S3-42R: S3 EditFile (F4) stays fail-closed even after the Write flip.
+    // List+Read+Write + focused file + editor configured must still be Disabled.
+    #[test]
+    fn s3_edit_is_disabled_even_with_read_write_and_editor() {
+        let caps = CapabilitySet::NONE
+            .with(Capability::List)
+            .with(Capability::Read)
+            .with(Capability::Write);
+        let mut ctx = context(ProviderId::S3, caps);
+        ctx.editor_available = true;
+        ctx.focused_kind = Some(EntryKind::File);
+        let availability = action_availability(ActionId::EditFile, &ctx);
+        assert!(
+            matches!(availability, ActionAvailability::Disabled { .. }),
+            "S3 EditFile must be Disabled regardless of Read+Write+editor; got {availability:?}"
+        );
+        assert_eq!(
+            availability.reason(),
+            Some("S3 remote editing is not supported")
+        );
+    }
+
+    // SFTP Read+Write + file + editor remains Available (regression).
+    #[test]
+    fn sftp_edit_availability_regression() {
+        let mut ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+        ctx.editor_available = true;
+        ctx.focused_kind = Some(EntryKind::File);
+        assert!(matches!(
+            action_availability(ActionId::EditFile, &ctx),
+            ActionAvailability::Available
+        ));
+    }
+
+    // Local Read+Write + file + editor remains Available (regression).
+    #[test]
+    fn local_edit_availability_regression() {
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        ctx.editor_available = true;
+        ctx.focused_kind = Some(EntryKind::File);
+        assert!(matches!(
+            action_availability(ActionId::EditFile, &ctx),
+            ActionAvailability::Available
+        ));
     }
 
     #[test]
