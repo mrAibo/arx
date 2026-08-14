@@ -20,7 +20,7 @@
 - **DOING** (0): —
 - **REVIEW** (0): —
 - **BLOCKED** (0): —
-- **DONE** (29): S3-00..S3-25, S3-24P (PR #98 merged, merge SHA 19d4c04), S3-20R (PR #99 merged, merge SHA 2e7fe21), S3-24 (PR #100 merged, merge SHA f38273a), S3-25 (PR #101 merged, merge SHA 85afb6a), S3-26A (PR #102 merged, merge SHA 6967ba2; STOP GATE C PASS)
+- **DONE** (30): S3-00..S3-25, S3-24P (PR #98 merged, merge SHA 19d4c04), S3-20R (PR #99 merged, merge SHA 2e7fe21), S3-24 (PR #100 merged, merge SHA f38273a), S3-25 (PR #101 merged, merge SHA 85afb6a), S3-26A (PR #102 merged, merge SHA 6967ba2; STOP GATE C PASS), S3-27R
 - **BACKLOG** (54): S3-27..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
@@ -394,10 +394,25 @@
 - **Stop conditions:** Enabling any S3 capability; S3 rename; redesigning selection storage; touching `src/vfs/*`, `src/services/*`, `src/transfer/*`, `src/app/mod.rs`, `src/app/actions.rs`, `Cargo.toml`, `Cargo.lock`, `docs/DESIGN_S3.md`.
 - **Hermes prompt:** Disjoint writers — TERRA on `src/app/availability.rs` only (Copy matrix, S3 ToggleSelect disable, workspace compare/sync block); SOL on `src/tui.rs` only (Shift+F6 Local-only, direct S3 selection no-op). No shared production files. One integration owner (SOL) cherry-picks both onto `s3/s3-26a-list-surface-hardening` after review. STOP IN REVIEW, no merge, no S3-26.
 
+### S3-27R — exact ListedEntry preview identity seam
+- **Phase:** P10
+- **Status:** DONE (after merge)
+- **Depends on:** S3-25
+- **Allowed files:** src/vfs/mod.rs, src/effects.rs, src/process/mod.rs, src/tui.rs, docs/S3_KANBAN.md
+- **Acceptance:**
+  1. `VfsProvider::read_listed_prefix_bytes` default trait method: `Other` -> legacy `read_prefix_bytes` via validated path; structured identities (S3Object/S3Prefix/S3Bucket) -> Unsupported (fail closed).
+  2. `ProviderRegistry::read_listed_prefix_bytes_at` uses `provider_for_page_location` resolver (same as `list_page`), calls provider's `read_listed_prefix_bytes`. No name flattening.
+  3. `Effect::PreviewLocation` carries `ListedEntry` (presentation + exact `EntryIdentity`) — no `name`/`total_size` fields.
+  4. `ProcessService` executes via `registry.read_listed_prefix_bytes_at(&location, &listed, MAX_TEXT_PREVIEW_BYTES)`. Preview formatter uses `listed.entry.name`/`listed.entry.size` for title/formatting only.
+  5. TUI `dispatch_ui_action` uses `VisiblePaneRow::Listed(&ListedEntry)` for remote preview — never reduces to `&Entry` before constructing effect.
+  6. Tests A–H (identity survives UI/effect boundary; SFTP Other uses legacy; S3 identity never invokes name path; S3Prefix/S3Bucket fail closed; mismatched target fails closed untouched; Parent/LoadMore no preview target; duplicate names distinct identities).
+- **Stop conditions:** Any S3 GetObject/Read implementation; capability flips; touching files outside allowed list.
+- **Hermes prompt:** Add identity-aware preview boundary so S3 preview later uses exact S3ObjectRef identity, never Entry.name. Keep legacy behavior intact. 4 production files + docs + tests.
+
 ### S3-27 — S3 bounded Range GET
 - **Phase:** P11
 - **Status:** BACKLOG
-- **Depends on:** STOP GATE C
+- **Depends on:** STOP GATE C, S3-27R
 - **Allowed files:** src/vfs/s3.rs
 - **Acceptance:** read_prefix_bytes for exact S3ObjectRef via GetObject Range: bytes=0..N. Respect bounded-read semantics. No full download. No F3 availability yet.
 - **Stop conditions:** Full object download. F3 enable.
@@ -415,7 +430,7 @@
 ### S3-29 — Enable S3 F3
 - **Phase:** P11
 - **Status:** BACKLOG
-- **Depends on:** S3-28
+- **Depends on:** S3-28, S3-27R
 - **Allowed files:** src/app/availability.rs
 - **Acceptance:** Allow F3 for regular S3 object when Read implemented. Use exact S3ObjectRef. Reuse existing text/line limit, binary refusal, invalid UTF-8 handling. No F4.
 - **Stop conditions:** Enabling F4.

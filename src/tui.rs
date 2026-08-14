@@ -4918,6 +4918,8 @@ async fn dispatch_ui_action(
     let focused = focused_row
         .and_then(|row| row.listed())
         .map(|listed| &listed.entry);
+    // ponytail: keep the ListedEntry (exact identity) for preview, not &Entry
+    let focused_listed = focused_row.and_then(|row| row.listed());
     if matches!(
         action,
         Action::ToggleWorkspaceComparison
@@ -4956,32 +4958,32 @@ async fn dispatch_ui_action(
             toggle_selection_and_advance(state, focused, visible_count);
         }
         Action::ViewFile => {
-            let Some(entry) = focused.filter(|entry| entry.kind == EntryKind::File) else {
+            let Some(listed) = focused_listed.filter(|listed| listed.entry.kind == EntryKind::File)
+            else {
                 state.message = Some("Select a regular file to view".into());
                 return Ok(());
             };
             let location = state.active_pane().location.clone();
-            // SFTP: dispatch preview intent, network I/O runs inside effect lane
+            // SFTP: dispatch preview intent, network I/O runs inside effect lane.
+            // Forward the exact ListedEntry identity — never reduce to &entry.name.
             if matches!(location.provider_id(), arx::vfs::ProviderId::Sftp) {
-                let name = entry.name.clone();
-                let total_size = entry.size;
                 let id = effect_dispatcher.dispatch(
                     EffectLane::Preview,
                     EffectScope::Location(location.clone()),
                     Effect::PreviewLocation {
                         location,
-                        name: name.clone(),
-                        total_size,
+                        listed: listed.clone(),
                     },
                 );
                 state.register_effect(EffectLane::Preview, id);
-                state.message = Some(format!("Loading preview: {name}"));
+                state.message = Some(format!("Loading preview: {}", listed.entry.name));
                 return Ok(());
             }
             let Location::Local(base) = &location else {
                 state.message = Some("File preview is currently local-only".into());
                 return Ok(());
             };
+            let entry = focused.expect("file filtered above");
             let path = base.join(&entry.name);
             let id = effect_dispatcher.dispatch(
                 EffectLane::Preview,
@@ -6191,8 +6193,8 @@ mod tests {
     use arx::services::{PaneListingContinuation, PaneLoadId, PaneLoadPage, WorkspaceScanId};
     use arx::vfs::s3::{S3BucketRef, S3ObjectRef, S3PrefixRef};
     use arx::vfs::{
-        Capability, CapabilitySet, EntryIdentity, ProviderContinuation, ProviderListingPage,
-        ProviderRegistry, VfsProvider,
+        Capability, CapabilitySet, Entry, EntryIdentity, EntryKind, ListedEntry,
+        ProviderContinuation, ProviderListingPage, ProviderRegistry, VfsProvider,
     };
     use arx::workspace_sync::{
         WorkspaceDiff, WorkspaceEntry, WorkspaceFingerprint, WorkspaceSyncPlan,
@@ -8715,5 +8717,27 @@ mod tests {
 
         invert_selection(&mut state, &rows);
         assert_eq!(state.selection_count(Pane::Left, &location), 0);
+    }
+
+    // S3-27R G: Parent/LoadMore cannot create a preview target because they
+    // have no ListedEntry identity.
+    #[test]
+    fn preview_target_not_constructed_for_parent_or_load_more() {
+        let entry = Entry {
+            name: "x".into(),
+            kind: EntryKind::File,
+            size: None,
+            modified_unix_ms: None,
+        };
+        let parent = VisiblePaneRow::Parent(&entry);
+        let load_more = VisiblePaneRow::LoadMore(&entry);
+        assert!(parent.listed().is_none());
+        assert!(load_more.listed().is_none());
+        // Listed preserves identity — preview target constructible only here.
+        let listed = ListedEntry {
+            entry: entry.clone(),
+            identity: EntryIdentity::Other,
+        };
+        assert!(VisiblePaneRow::Listed(&listed).listed().is_some());
     }
 }

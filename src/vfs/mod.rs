@@ -355,6 +355,34 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// Identity-aware bounded prefix read for a listed entry.
+    ///
+    /// Default: `EntryIdentity::Other` delegates to `read_prefix_bytes` via the
+    /// legacy `parent + name` path (exact same validation as
+    /// `read_prefix_bytes_at`). Structured provider-native identities
+    /// (S3Object/S3Prefix/S3Bucket) fail closed by default so the generic layer
+    /// never reconstructs an S3 key from `entry.name` — the concrete provider
+    /// overrides this for its native identity.
+    // ponytail: default seam; S3 overrides in S3-27, no name->key rewrite here
+    async fn read_listed_prefix_bytes(
+        &self,
+        location: &Location,
+        listed: &ListedEntry,
+        max_bytes: usize,
+    ) -> std::io::Result<BoundedRead> {
+        match &listed.identity {
+            EntryIdentity::Other => {
+                let parent_path = Location::legacy_listing_path(location)?;
+                let path = validated_child_path(&parent_path, &listed.entry.name)?;
+                self.read_prefix_bytes(&path, max_bytes).await
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "read_listed_prefix_bytes requires a provider-native identity override",
+            )),
+        }
+    }
+
     /// Write bytes atomically only if the current target still matches the
     /// exact frozen content, Unix mode, and ownership captured before editing.
     /// Default: unsupported.
@@ -870,6 +898,26 @@ impl ProviderRegistry {
         let (provider, parent_path) = self.provider_for_location(location)?;
         let path = validated_child_path(&parent_path, name)?;
         provider.read_prefix_bytes(&path, max_bytes).await
+    }
+
+    /// Identity-aware bounded prefix read at a location.
+    ///
+    /// Resolves the concrete provider instance via the same resolver as
+    /// `list_page` (so `Location::S3` maps to its `S3Target` instance, never the
+    /// legacy fail-closed `S3` path) and dispatches the provider's
+    /// `read_listed_prefix_bytes` identity seam. No name flattening: the exact
+    /// `ListedEntry` identity is forwarded untouched.
+    // ponytail: mirrors list_page routing; identity wins, no name->key rewrite
+    pub async fn read_listed_prefix_bytes_at(
+        &self,
+        location: &Location,
+        listed: &ListedEntry,
+        max_bytes: usize,
+    ) -> std::io::Result<BoundedRead> {
+        let provider = self.provider_for_page_location(location)?;
+        provider
+            .read_listed_prefix_bytes(location, listed, max_bytes)
+            .await
     }
 
     pub async fn write_file_bytes_if_unchanged_at(
@@ -2854,5 +2902,229 @@ mod s3_list_page_tests {
         let provider = registry.provider_for_page_location(&loc).unwrap();
         let direct = registry.resolve_s3_provider("aws-prod").unwrap();
         assert!(std::sync::Arc::ptr_eq(&provider, &direct));
+    }
+
+    // ── S3-27R: identity-aware preview seam (B, C, D, E, F) ──
+
+    struct PreviewSeamMockProvider {
+        read_calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl std::fmt::Debug for PreviewSeamMockProvider {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("PreviewSeamMockProvider").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VfsProvider for PreviewSeamMockProvider {
+        fn list(&self, _path: &str) -> std::io::Result<Vec<Entry>> {
+            panic!("mock: list not called")
+        }
+        fn read_head(&self, _path: &str, _lines: usize) -> std::io::Result<Vec<String>> {
+            panic!("mock: read_head not called")
+        }
+        fn copy_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("mock: copy_files not called")
+        }
+        fn move_files(&self, _src: &str, _dst: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("mock: move_files not called")
+        }
+        fn delete_files(&self, _dir: &str, _names: &[String]) -> std::io::Result<usize> {
+            panic!("mock: delete_files not called")
+        }
+        async fn read_prefix_bytes(
+            &self,
+            path: &str,
+            _max_bytes: usize,
+        ) -> std::io::Result<BoundedRead> {
+            self.read_calls
+                .lock()
+                .expect("mock poisoned")
+                .push(path.to_string());
+            Ok(BoundedRead {
+                bytes: b"data".to_vec(),
+                truncated: false,
+                unix_mode: None,
+                unix_uid: None,
+                unix_gid: None,
+            })
+        }
+    }
+
+    fn listed_other(name: &str, size: Option<u64>) -> ListedEntry {
+        ListedEntry {
+            entry: Entry {
+                name: name.into(),
+                kind: EntryKind::File,
+                size,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::Other,
+        }
+    }
+
+    fn listed_s3_object(target: &str, bucket: &str, key: &str) -> ListedEntry {
+        ListedEntry {
+            entry: Entry {
+                name: "display.txt".into(),
+                kind: EntryKind::File,
+                size: Some(10),
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Object(s3::S3ObjectRef {
+                target: target.into(),
+                bucket: bucket.into(),
+                key: key.into(),
+            }),
+        }
+    }
+
+    // S3-27R B: SFTP (Other) still uses the legacy name path.
+    #[tokio::test]
+    async fn s3_27r_other_delegates_to_legacy_name() {
+        let mock = PreviewSeamMockProvider {
+            read_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let loc = Location::Sftp {
+            host: "h".into(),
+            path: "/srv/data".into(),
+        };
+        let listed = listed_other("file.txt", Some(4));
+        let res = mock.read_listed_prefix_bytes(&loc, &listed, 100).await;
+        assert!(res.is_ok());
+        let calls = mock.read_calls.lock().unwrap();
+        assert_eq!(*calls, vec!["/srv/data/file.txt".to_string()]);
+    }
+
+    // S3-27R C: structured S3 identity never invokes validated_child_path(name).
+    #[tokio::test]
+    async fn s3_27r_s3object_never_reconstructs_name() {
+        let mock = PreviewSeamMockProvider {
+            read_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let loc = Location::Sftp {
+            host: "h".into(),
+            path: "/srv/data".into(),
+        };
+        let listed = listed_s3_object("Prod", "Bucket", "foo/../REAL//x.txt");
+        let err = mock
+            .read_listed_prefix_bytes(&loc, &listed, 100)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(mock.read_calls.lock().unwrap().is_empty());
+    }
+
+    // S3-27R D: S3Prefix fails closed.
+    #[tokio::test]
+    async fn s3_27r_s3prefix_fails_closed() {
+        let mock = PreviewSeamMockProvider {
+            read_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let listed = ListedEntry {
+            entry: Entry {
+                name: "p".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Prefix(s3::S3PrefixRef {
+                target: "Prod".into(),
+                bucket: "B".into(),
+                prefix: "x/".into(),
+            }),
+        };
+        let err = mock
+            .read_listed_prefix_bytes(
+                &Location::Sftp {
+                    host: "h".into(),
+                    path: "/".into(),
+                },
+                &listed,
+                100,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(mock.read_calls.lock().unwrap().is_empty());
+    }
+
+    // S3-27R E: S3Bucket fails closed.
+    #[tokio::test]
+    async fn s3_27r_s3bucket_fails_closed() {
+        let mock = PreviewSeamMockProvider {
+            read_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let listed = ListedEntry {
+            entry: Entry {
+                name: "b".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Bucket(s3::S3BucketRef {
+                target: "Prod".into(),
+                bucket: "B".into(),
+            }),
+        };
+        let err = mock
+            .read_listed_prefix_bytes(
+                &Location::Sftp {
+                    host: "h".into(),
+                    path: "/".into(),
+                },
+                &listed,
+                100,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(mock.read_calls.lock().unwrap().is_empty());
+    }
+
+    // S3-27R F: S3Object + mismatched Location target fails closed, identity/location untouched.
+    #[tokio::test]
+    async fn s3_27r_mismatched_target_fails_closed_untouched() {
+        let mock = PreviewSeamMockProvider {
+            read_calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let loc = Location::Sftp {
+            host: "other".into(),
+            path: "/".into(),
+        };
+        let listed = listed_s3_object("Prod", "Bucket", "foo/../REAL//x.txt");
+        let err = mock
+            .read_listed_prefix_bytes(&loc, &listed, 100)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(mock.read_calls.lock().unwrap().is_empty());
+        // identity and location untouched — seam never rewrites either value
+        assert_eq!(
+            listed.identity,
+            EntryIdentity::S3Object(s3::S3ObjectRef {
+                target: "Prod".into(),
+                bucket: "Bucket".into(),
+                key: "foo/../REAL//x.txt".into(),
+            })
+        );
+    }
+
+    // S3-27R F (registry): S3 location with unknown target fails closed at provider boundary.
+    #[tokio::test]
+    async fn s3_27r_registry_s3_location_fails_closed() {
+        let registry = ProviderRegistry::new();
+        let listed = listed_s3_object("Prod", "Bucket", "k.txt");
+        let loc = Location::S3 {
+            target: "unknown".into(),
+            bucket: Some("Bucket".into()),
+            prefix: String::new(),
+        };
+        let err = registry
+            .read_listed_prefix_bytes_at(&loc, &listed, 100)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown S3 target"));
     }
 }
