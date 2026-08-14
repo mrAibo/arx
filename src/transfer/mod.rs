@@ -14,10 +14,10 @@ pub enum TransferMethod {
     Rsync,
     Sftp,
     Scp,
-    /// S3 data-movement executor. Reserved by S3-31R; the planner does not
-    /// select it yet (returns Unsupported for any S3 pair). Constructible so
-    /// later S3-31/32/33 cards can populate it without touching this seam.
-    // ponytail: variant only; no executor wired in S3-31R
+    /// S3 data-movement executor. Selected only for a Local<->S3 `Copy` with an
+    /// available S3 executor and a frozen `S3TransferSpec`; `execute_transfer`
+    /// still refuses it until the executor card lands.
+    // ponytail: planner selection only (S3-31/32/33); executor stays fail-closed
     S3,
 }
 
@@ -34,8 +34,8 @@ pub struct TransferPlan {
     pub destination: Location,
     pub intent: TransferIntent,
     pub method: TransferMethod,
-    /// Frozen S3 payload for this plan. Plumbing only in S3-31R; populated by
-    /// later S3-31/32/33 planner cards. None for non-S3 transfers.
+    /// Frozen S3 payload for this plan, carried verbatim from the request.
+    /// None for non-S3 transfers.
     pub s3_spec: Option<S3TransferSpec>,
 }
 
@@ -44,9 +44,8 @@ pub struct ExecutorAvailability {
     pub native: bool,
     pub rsync: bool,
     pub sftp: bool,
-    /// S3 data-movement executor availability. Reserved by S3-31R; not enabled
-    /// by the planner yet.
-    // ponytail: field only; planner ignores until the S3 executor lands
+    /// S3 data-movement executor availability. Required (together with a frozen
+    /// `S3TransferSpec`) for the planner to select `TransferMethod::S3`.
     pub s3: bool,
 }
 
@@ -79,8 +78,8 @@ pub struct TransferRequest {
     pub intent: TransferIntent,
     pub executors: ExecutorAvailability,
     pub delete_extraneous: bool,
-    /// Frozen S3 payload for this request. Plumbing only in S3-31R; populated by
-    /// later cards. None for non-S3 transfers.
+    /// Frozen S3 payload for this request, built by the caller (TUI/planner).
+    /// The planner never reconstructs it. None for non-S3 transfers.
     pub s3_spec: Option<S3TransferSpec>,
 }
 
@@ -156,11 +155,20 @@ impl TransferPlanner {
     }
 
     fn choose_method(request: &TransferRequest) -> Result<TransferMethod, TransferPlanError> {
-        // S3 data movement is not enabled in S3-31R: refuse any plan that
-        // touches an S3 provider until the executor + later planner cards land.
+        // Every S3-touching plan is decided here and never falls through to the
+        // legacy Local/Local, Local<->Sftp or same-provider native branches.
         if request.source_provider == ProviderId::S3
             || request.destination_provider == ProviderId::S3
         {
+            if Self::is_s3_pair(request) && request.executors.s3 {
+                // The frozen spec is the sole bucket/key authority; without it
+                // there is nothing to execute and no name-based fallback.
+                return if request.s3_spec.is_some() {
+                    Ok(TransferMethod::S3)
+                } else {
+                    Err(Self::unsupported(request))
+                };
+            }
             return Err(Self::unsupported(request));
         }
 
@@ -201,6 +209,17 @@ impl TransferPlanner {
             (request.source_provider, request.destination_provider),
             (ProviderId::Local, ProviderId::Sftp) | (ProviderId::Sftp, ProviderId::Local)
         )
+    }
+
+    /// Local<->S3 `Copy` is the only S3 shape the planner supports. `Move`
+    /// needs a copy/verify/delete transaction and `Synchronize` needs
+    /// destructive-diff support; neither exists for S3.
+    fn is_s3_pair(request: &TransferRequest) -> bool {
+        request.intent == TransferIntent::Copy
+            && matches!(
+                (request.source_provider, request.destination_provider),
+                (ProviderId::Local, ProviderId::S3) | (ProviderId::S3, ProviderId::Local)
+            )
     }
 
     fn native_operation_supported(request: &TransferRequest) -> bool {
@@ -280,7 +299,7 @@ pub fn s3_spec_for_objects(objects: &[S3ObjectRef]) -> Result<&S3ObjectRef, Tran
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vfs::capabilities::{LOCAL_CAPABILITIES, S3_CAPABILITIES, SFTP_CAPABILITIES};
+    use crate::vfs::capabilities::{LOCAL_CAPABILITIES, SFTP_CAPABILITIES, builtin_capabilities};
     use std::path::PathBuf;
 
     fn local(path: &str) -> Location {
@@ -463,38 +482,231 @@ mod tests {
         ));
     }
 
-    // ── S3-31R: S3 seam ──
+    // ── S3-31/32/33: planner selection matrix (S3-31R seam) ──
 
-    #[test]
-    fn planner_refuses_s3_pair_in_s3_31r() {
-        let error = TransferPlanner::plan(TransferRequest {
-            source: local("/src"),
-            destination: s3("tgt", Some("bk")),
-            source_provider: ProviderId::Local,
-            destination_provider: ProviderId::S3,
-            source_capabilities: LOCAL_CAPABILITIES,
-            destination_capabilities: S3_CAPABILITIES,
-            intent: TransferIntent::Copy,
+    fn object() -> S3ObjectRef {
+        S3ObjectRef {
+            target: "tgt".into(),
+            bucket: "bk".into(),
+            key: "a.txt".into(),
+        }
+    }
+
+    fn upload_spec() -> S3TransferSpec {
+        S3TransferSpec::UploadOne {
+            local_source: PathBuf::from("/src/a.txt"),
+            destination: object(),
+        }
+    }
+
+    fn download_spec() -> S3TransferSpec {
+        S3TransferSpec::DownloadOne {
+            source: object(),
+            local_destination: PathBuf::from("/dst/a.txt"),
+        }
+    }
+
+    fn location_for(provider: ProviderId) -> Location {
+        match provider {
+            ProviderId::Local => local("/src/a.txt"),
+            ProviderId::Sftp => sftp("prod", "/dst"),
+            ProviderId::Archive => Location::Archive {
+                archive: PathBuf::from("/a.zip"),
+                inner_path: String::new(),
+            },
+            ProviderId::S3 => s3("tgt", Some("bk")),
+            ProviderId::WebDAV => unreachable!("WebDAV is not part of the S3 planner matrix"),
+        }
+    }
+
+    /// Every legacy executor is available on purpose: an S3-touching request
+    /// must never fall through to the Native/Rsync/Sftp branches.
+    fn s3_request(
+        source_provider: ProviderId,
+        destination_provider: ProviderId,
+        intent: TransferIntent,
+        s3_executor: bool,
+        s3_spec: Option<S3TransferSpec>,
+    ) -> TransferRequest {
+        TransferRequest {
+            source: location_for(source_provider),
+            destination: location_for(destination_provider),
+            source_provider,
+            destination_provider,
+            source_capabilities: builtin_capabilities(source_provider),
+            destination_capabilities: builtin_capabilities(destination_provider),
+            intent,
             executors: ExecutorAvailability {
                 native: true,
-                rsync: false,
-                sftp: false,
-                s3: true,
+                rsync: true,
+                sftp: true,
+                s3: s3_executor,
             },
             delete_extraneous: false,
-            s3_spec: None,
-        })
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            TransferPlanError::Unsupported {
-                source: ProviderId::Local,
-                destination: ProviderId::S3,
-                intent: TransferIntent::Copy
-            }
-        ));
-        // The S3 executor variant is constructible but never selected here.
-        let _ = TransferMethod::S3;
+            s3_spec,
+        }
+    }
+
+    #[track_caller]
+    fn assert_unsupported(request: TransferRequest, case: &str) {
+        let expected = (
+            request.source_provider,
+            request.destination_provider,
+            request.intent,
+        );
+        match TransferPlanner::plan(request) {
+            Err(TransferPlanError::Unsupported {
+                source,
+                destination,
+                intent,
+            }) => assert_eq!((source, destination, intent), expected, "{case}"),
+            other => panic!("{case}: expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_to_s3_copy_with_executor_and_spec_selects_s3() {
+        let spec = upload_spec();
+        let plan = TransferPlanner::plan(s3_request(
+            ProviderId::Local,
+            ProviderId::S3,
+            TransferIntent::Copy,
+            true,
+            Some(spec.clone()),
+        ))
+        .unwrap();
+        assert_eq!(plan.method, TransferMethod::S3);
+        assert_eq!(plan.s3_spec, Some(spec));
+    }
+
+    #[test]
+    fn s3_to_local_copy_with_executor_and_spec_selects_s3() {
+        let spec = download_spec();
+        let plan = TransferPlanner::plan(s3_request(
+            ProviderId::S3,
+            ProviderId::Local,
+            TransferIntent::Copy,
+            true,
+            Some(spec.clone()),
+        ))
+        .unwrap();
+        assert_eq!(plan.method, TransferMethod::S3);
+        assert_eq!(plan.s3_spec, Some(spec));
+    }
+
+    #[test]
+    fn s3_copy_without_s3_executor_is_unsupported() {
+        assert_unsupported(
+            s3_request(
+                ProviderId::Local,
+                ProviderId::S3,
+                TransferIntent::Copy,
+                false,
+                Some(upload_spec()),
+            ),
+            "local->s3 copy, no executor, spec present",
+        );
+        assert_unsupported(
+            s3_request(
+                ProviderId::Local,
+                ProviderId::S3,
+                TransferIntent::Copy,
+                false,
+                None,
+            ),
+            "local->s3 copy, no executor, no spec",
+        );
+        assert_unsupported(
+            s3_request(
+                ProviderId::S3,
+                ProviderId::Local,
+                TransferIntent::Copy,
+                false,
+                Some(download_spec()),
+            ),
+            "s3->local copy, no executor",
+        );
+    }
+
+    #[test]
+    fn s3_copy_without_frozen_spec_is_unsupported() {
+        // No name-based fallback: the frozen spec is the only bucket/key source.
+        assert_unsupported(
+            s3_request(
+                ProviderId::Local,
+                ProviderId::S3,
+                TransferIntent::Copy,
+                true,
+                None,
+            ),
+            "local->s3 copy, executor, no spec",
+        );
+        assert_unsupported(
+            s3_request(
+                ProviderId::S3,
+                ProviderId::Local,
+                TransferIntent::Copy,
+                true,
+                None,
+            ),
+            "s3->local copy, executor, no spec",
+        );
+    }
+
+    #[test]
+    fn s3_pairs_other_than_local_are_unsupported() {
+        for (source, destination) in [
+            (ProviderId::S3, ProviderId::S3),
+            (ProviderId::S3, ProviderId::Sftp),
+            (ProviderId::Sftp, ProviderId::S3),
+            (ProviderId::Archive, ProviderId::S3),
+            (ProviderId::S3, ProviderId::Archive),
+        ] {
+            assert_unsupported(
+                s3_request(
+                    source,
+                    destination,
+                    TransferIntent::Copy,
+                    true,
+                    Some(upload_spec()),
+                ),
+                &format!("{source:?}->{destination:?} copy"),
+            );
+        }
+    }
+
+    #[test]
+    fn s3_move_and_synchronize_are_unsupported() {
+        assert_unsupported(
+            s3_request(
+                ProviderId::Local,
+                ProviderId::S3,
+                TransferIntent::Move,
+                true,
+                Some(upload_spec()),
+            ),
+            "local->s3 move",
+        );
+        assert_unsupported(
+            s3_request(
+                ProviderId::S3,
+                ProviderId::Local,
+                TransferIntent::Move,
+                true,
+                Some(download_spec()),
+            ),
+            "s3->local move",
+        );
+        assert_unsupported(
+            s3_request(
+                ProviderId::Local,
+                ProviderId::S3,
+                TransferIntent::Synchronize,
+                true,
+                Some(upload_spec()),
+            ),
+            "local->s3 synchronize",
+        );
     }
 
     #[test]
