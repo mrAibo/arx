@@ -7,6 +7,10 @@
 //! Results are classified factually: PASS / FAIL / NOT_RUN(reason). We never
 //! convert NOT_RUN into PASS, and we never weaken assertions to make a case pass.
 
+// test-only helpers; some are only used by the emulator or MinIO acceptance
+// test file, which may not be compiled in every configuration.
+#![allow(dead_code)]
+
 use arx::config::S3TargetConfig;
 use arx::vfs::{Location, ProviderRegistry};
 

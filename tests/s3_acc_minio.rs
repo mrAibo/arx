@@ -108,8 +108,7 @@ fn hexify(s: &str) -> String {
 async fn minio_connect_and_bucket_bound() {
     let Some(reg) = s3_acceptance::maybe_skip_minio() else { return; };
     // CONNECT + BUCKET_BOUND_ROOT: bucket root listing must succeed.
-    let page = reg.list_page(&minio_root(), None).await.expect("bucket root list");
-    assert!(page.entries.len() >= 0, "bucket root listing succeeds");
+    let _page = reg.list_page(&minio_root(), None).await.expect("bucket root list");
 }
 
 #[tokio::test]
