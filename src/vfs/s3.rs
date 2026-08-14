@@ -498,13 +498,7 @@ impl VfsProvider for S3Provider {
         let reader = out.body.into_async_read();
         let (body, truncated) = read_bounded_body(reader, params.probe_len).await?;
         let bytes: Vec<u8> = body.into_iter().take(max_bytes).collect();
-        Ok(BoundedRead {
-            bytes,
-            truncated,
-            unix_mode: None,
-            unix_uid: None,
-            unix_gid: None,
-        })
+        Ok(s3_bounded_read(bytes, truncated))
     }
 }
 
@@ -635,12 +629,34 @@ fn build_get_object_params(refr: &S3ObjectRef, max_bytes: usize) -> io::Result<G
     })
 }
 
+/// The ONLY `BoundedRead` constructor the S3 provider uses.
+///
+/// S3 objects carry no POSIX metadata (mode/uid/gid), so these fields are
+/// always `None`. Because every S3 `BoundedRead` has `None` unix fields,
+/// `BoundedRead::into_revision()` can never succeed for S3 — a preview can
+/// never become a `RemoteEditRevision`. Isolating construction here keeps the
+/// "no POSIX fields for S3" invariant in exactly one auditable place and makes
+/// it impossible for a sibling read path to forget it.
+fn s3_bounded_read(bytes: Vec<u8>, truncated: bool) -> BoundedRead {
+    BoundedRead {
+        bytes,
+        truncated,
+        unix_mode: None,
+        unix_uid: None,
+        unix_gid: None,
+    }
+}
+
 /// Read at most `probe_len` bytes from an `AsyncRead` and stop.
 ///
 /// `Take` enforces the cap even if the endpoint ignores the Range header, so an
-/// unbounded stream is never collected. Truncation is provable from the local
-/// length: seeing the cap means more bytes exist (or the object is exactly
-/// `probe_len` > `max_bytes`), below the cap means the object fit the preview.
+/// unbounded stream is never collected. Truncation is PROVABLE from the local
+/// length (conservative, never claims complete when uncertain):
+/// - `buf.len() < probe_len` → stream EOF reached before cap → object PROVES
+///   ended at ≤ max_bytes → `truncated = false`.
+/// - `buf.len() == probe_len` → cap reached → object ≥ max_bytes + 1 bytes
+///   (could be exactly or much larger) → `truncated = true`.
+///   This is the only truncation decision; no metadata parsing, no heuristics.
 // ponytail: take() is the whole bound; no Content-Length parsing needed.
 async fn read_bounded_body<R: tokio::io::AsyncRead>(
     reader: R,
@@ -664,13 +680,7 @@ async fn read_bounded_body<R: tokio::io::AsyncRead>(
 // ponytail: code() is the only signal inspected; the message is discarded.
 fn map_get_object_error(svc: &GetObjectError) -> io::Result<BoundedRead> {
     match svc {
-        err if err.code() == Some("InvalidRange") => Ok(BoundedRead {
-            bytes: Vec::new(),
-            truncated: false,
-            unix_mode: None,
-            unix_uid: None,
-            unix_gid: None,
-        }),
+        err if err.code() == Some("InvalidRange") => Ok(s3_bounded_read(Vec::new(), false)),
         _ => Err(io::Error::other("S3 GetObject preview request failed")),
     }
 }
@@ -2627,5 +2637,152 @@ mod tests {
             );
             assert!(!msg.contains("secret-key"), "no key leak for {code}");
         }
+    }
+
+    // ── S3-28: truthful BoundedRead boundary tests (pure, no AWS) ──
+
+    // Test oracle: mirrors production preview mapping exactly.
+    // `probe_len = max_bytes + 1`, local `take(max_bytes)`, isolated constructor.
+    async fn preview_object(object: &[u8], max_bytes: usize) -> BoundedRead {
+        let probe_len = max_bytes + 1;
+        let (buf, truncated) = read_bounded_body(object, probe_len)
+            .await
+            .expect("read_bounded_body must not fail on pure in-memory readers");
+        let bytes: Vec<u8> = buf.into_iter().take(max_bytes).collect();
+        s3_bounded_read(bytes, truncated)
+    }
+
+    fn binary_payload(len: usize) -> Vec<u8> {
+        // Deterministic but arbitrary binary: 0x00, 0xFF, control bytes, non-UTF8
+        (0..len as u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(11))
+            .collect()
+    }
+
+    fn invalid_utf8_payload() -> Vec<u8> {
+        // Standalone continuation byte (0x80), partial 3-byte lead (0xE2 0x28),
+        // overlong lead (0xC0 0x80), and valid ascii mix
+        vec![0xE2, 0x28, 0xFF, 0x80, 0xC0, 0x80, 0x41, 0x42, 0x43]
+    }
+
+    const N: usize = 16;
+
+    #[tokio::test]
+    async fn bounded_read_boundary_zero_bytes() {
+        let r = preview_object(&[], N).await;
+        assert_eq!(r.bytes, Vec::<u8>::new());
+        assert!(!r.truncated, "real zero-byte object → not truncated");
+        assert!(r.bytes.len() <= N);
+        assert!(r.unix_mode.is_none() && r.unix_uid.is_none() && r.unix_gid.is_none());
+        assert!(
+            r.into_revision().is_err(),
+            "S3 BoundedRead never usable as edit revision (no POSIX fields)"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_read_boundary_one_byte() {
+        let obj = binary_payload(1);
+        let r = preview_object(&obj, N).await;
+        assert_eq!(r.bytes, obj, "single byte preserved exactly");
+        assert!(!r.truncated, "1 byte < N → object proved ended");
+        assert!(r.bytes.len() <= N);
+        assert!(r.unix_mode.is_none() && r.unix_uid.is_none() && r.unix_gid.is_none());
+        assert!(r.into_revision().is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_read_boundary_n_minus_1() {
+        let obj = binary_payload(N - 1);
+        let r = preview_object(&obj, N).await;
+        assert_eq!(r.bytes, obj, "N-1 bytes preserved exactly");
+        assert!(!r.truncated, "N-1 bytes < N → object proved ended");
+        assert!(r.bytes.len() <= N);
+        assert!(r.unix_mode.is_none() && r.unix_uid.is_none() && r.unix_gid.is_none());
+        assert!(r.into_revision().is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_read_boundary_exact_n() {
+        let obj = binary_payload(N);
+        let r = preview_object(&obj, N).await;
+        assert_eq!(r.bytes, obj, "exact N bytes preserved exactly");
+        assert!(
+            !r.truncated,
+            "exact N bytes < probe(N+1) → object proved ended"
+        );
+        assert!(r.bytes.len() <= N);
+        assert!(r.unix_mode.is_none() && r.unix_uid.is_none() && r.unix_gid.is_none());
+        assert!(r.into_revision().is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_read_boundary_n_plus_1() {
+        let obj = binary_payload(N + 1);
+        let r = preview_object(&obj, N).await;
+        assert_eq!(r.bytes, &obj[..N], "first N bytes preserved; N+1st dropped");
+        assert!(r.truncated, "N+1 bytes ≥ probe(N+1) → truncated");
+        assert_eq!(r.bytes.len(), N);
+        assert!(r.unix_mode.is_none() && r.unix_uid.is_none() && r.unix_gid.is_none());
+        assert!(r.into_revision().is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_read_boundary_large() {
+        let obj = binary_payload(1000);
+        let r = preview_object(&obj, N).await;
+        assert_eq!(r.bytes, &obj[..N], "first N bytes preserved; rest dropped");
+        assert!(r.truncated, "large object ≥ probe → truncated");
+        assert_eq!(r.bytes.len(), N);
+        assert!(r.unix_mode.is_none() && r.unix_uid.is_none() && r.unix_gid.is_none());
+        assert!(r.into_revision().is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_read_binary_preserved_at_all_boundaries() {
+        // Binary data preserved exactly at every boundary length
+        for len in [0, 1, N - 1, N, N + 1, 1000] {
+            let obj = binary_payload(len);
+            let r = preview_object(&obj, N).await;
+            let expected_len = std::cmp::min(len, N);
+            assert_eq!(
+                r.bytes,
+                &obj[..expected_len],
+                "binary preserved at len={len}"
+            );
+            assert!(r.unix_mode.is_none() && r.unix_uid.is_none() && r.unix_gid.is_none());
+            assert!(r.into_revision().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_read_invalid_utf8_preserved_at_all_boundaries() {
+        // Invalid UTF-8 sequences preserved exactly; formatter owns rejection
+        let obj = invalid_utf8_payload();
+        for len in [0, 1, N - 1, N, N + 1, 1000] {
+            let slice = if obj.len() >= len { &obj[..len] } else { &obj };
+            let r = preview_object(slice, N).await;
+            let expected_len = std::cmp::min(slice.len(), N);
+            assert_eq!(
+                r.bytes,
+                &slice[..expected_len],
+                "invalid UTF-8 preserved at len={len}"
+            );
+            assert!(r.unix_mode.is_none() && r.unix_uid.is_none() && r.unix_gid.is_none());
+            assert!(r.into_revision().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_read_error_mapping_zero_byte_consistency() {
+        // The InvalidRange (416) path for zero-byte objects matches the probe path:
+        // both produce empty bytes, !truncated, no POSIX fields, unusable revision.
+        let invalid_range =
+            GetObjectError::generic(ErrorMetadata::builder().code("InvalidRange").build());
+        let r = map_get_object_error(&invalid_range).unwrap();
+        assert_eq!(r.bytes, Vec::<u8>::new());
+        assert!(!r.truncated);
+        assert!(r.unix_mode.is_none() && r.unix_uid.is_none() && r.unix_gid.is_none());
+        assert!(r.into_revision().is_err());
     }
 }
