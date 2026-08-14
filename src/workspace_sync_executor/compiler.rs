@@ -534,6 +534,7 @@ fn compile_transfer_plan(
         intent: TransferIntent::Copy,
         executors: availability,
         delete_extraneous: false,
+        s3_spec: None,
     })
     .map_err(|error| SyncCompileError::TransferPlan {
         path: path.to_string(),

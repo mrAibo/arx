@@ -5169,6 +5169,7 @@ async fn dispatch_ui_action(
                 intent: arx::transfer::TransferIntent::Copy,
                 executors,
                 delete_extraneous: false,
+                s3_spec: None,
             };
             let plan = match arx::transfer::TransferPlanner::plan(request) {
                 Ok(p) => p,
@@ -5286,6 +5287,7 @@ async fn dispatch_ui_action(
                 intent: arx::transfer::TransferIntent::Move,
                 executors,
                 delete_extraneous: false,
+                s3_spec: None,
             };
             let plan = match arx::transfer::TransferPlanner::plan(request) {
                 Ok(p) => p,

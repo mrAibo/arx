@@ -60,6 +60,10 @@ pub async fn execute_transfer(
             method: plan.method,
             reason: "SCP executor is not implemented".into(),
         }),
+        TransferMethod::S3 => Err(TransferExecutionError::InvalidPlan {
+            method: plan.method,
+            reason: "S3 transfer executor is not enabled yet".into(),
+        }),
     }
 }
 
@@ -299,6 +303,7 @@ mod tests {
             destination: local(dst.path().to_path_buf()),
             intent: TransferIntent::Copy,
             method: TransferMethod::Native,
+            s3_spec: None,
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let mut progress = Vec::new();
@@ -325,6 +330,7 @@ mod tests {
             destination: local(dst.path().to_path_buf()),
             intent: TransferIntent::Move,
             method: TransferMethod::Native,
+            s3_spec: None,
         };
         let cancel = Arc::new(AtomicBool::new(true));
         let error = execute_transfer(&plan, &["a.txt".into()], cancel, |_| {})
@@ -346,6 +352,7 @@ mod tests {
             destination: sftp("prod", "/dst"),
             intent: TransferIntent::Copy,
             method: TransferMethod::Rsync,
+            s3_spec: None,
         };
         let args = build_rsync_args(&plan, Some("file.txt")).unwrap();
         let rendered = args
@@ -380,6 +387,7 @@ mod tests {
             destination: sftp("b", "/dst"),
             intent: TransferIntent::Copy,
             method: TransferMethod::Rsync,
+            s3_spec: None,
         };
         let cancel = Arc::new(AtomicBool::new(false));
 
@@ -396,6 +404,7 @@ mod tests {
             destination: sftp("prod", "/dst"),
             intent: TransferIntent::Move,
             method: TransferMethod::Rsync,
+            s3_spec: None,
         };
         let cancel = Arc::new(AtomicBool::new(false));
 
