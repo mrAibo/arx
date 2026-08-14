@@ -5605,6 +5605,44 @@ async fn dispatch_ui_action(
                 return Ok(());
             }
 
+            // S3: freeze plan for confirmation (no mutation yet). Key is derived
+            // from the frozen Location prefix + selected name — no dependency on
+            // the (currently deferred) S3 listing path. A trailing-slash name is
+            // a prefix marker (Directory); everything else is a File object.
+            if let arx::vfs::Location::S3 { prefix, .. } = &state.active_pane().location {
+                let targets: Vec<arx::vfs::RemoteDeleteTarget> = names
+                    .iter()
+                    .map(|name| {
+                        if name.ends_with('/') {
+                            arx::vfs::RemoteDeleteTarget {
+                                name: name.clone(),
+                                kind: arx::vfs::EntryKind::Directory,
+                                path: name.clone(),
+                            }
+                        } else {
+                            let key = if prefix.is_empty() {
+                                name.clone()
+                            } else {
+                                format!("{prefix}/{name}")
+                            };
+                            arx::vfs::RemoteDeleteTarget {
+                                name: name.clone(),
+                                kind: arx::vfs::EntryKind::File,
+                                path: key,
+                            }
+                        }
+                    })
+                    .collect();
+                state.pending_delete = Some(arx::vfs::RemoteDeletePlan {
+                    location: state.active_pane().location.clone(),
+                    targets,
+                    created_at: std::time::Instant::now(),
+                });
+                state.message =
+                    Some("Press Enter to confirm permanent deletion, Escape to cancel".into());
+                return Ok(());
+            }
+
             // Local: existing trash path
             let Location::Local(dir) = state.active_pane().location.clone() else {
                 state.message = Some("Trash is currently available for local files only".into());
