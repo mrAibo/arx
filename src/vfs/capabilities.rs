@@ -73,12 +73,14 @@ pub const WEBDAV_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::List)
     .with(Capability::Read);
 
-/// S3 implements listing/navigation (ListBuckets, ListObjectsV2) and bounded
-/// preview reads (GetObject Range). Write/Mkdir/Delete/Copy/Move/Rename/
-/// Symlink/Chmod/ServerSideCopy remain unimplemented.
+/// S3 implements listing/navigation (ListBuckets, ListObjectsV2), bounded
+/// preview reads (GetObject Range), and single-object basic transfers
+/// (upload = PutObject via `Write`; download = GetObject via `Read`).
+/// Mkdir/Delete/Copy/Move/Rename/Symlink/Chmod/ServerSideCopy remain unimplemented.
 pub const S3_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::List)
-    .with(Capability::Read);
+    .with(Capability::Read)
+    .with(Capability::Write);
 
 /// Built-in capability declaration for a provider kind.
 ///
@@ -121,7 +123,7 @@ mod tests {
         assert!(!WEBDAV_CAPABILITIES.supports(Capability::Delete));
         assert!(S3_CAPABILITIES.supports(Capability::List));
         assert!(S3_CAPABILITIES.supports(Capability::Read));
-        assert!(!S3_CAPABILITIES.supports(Capability::Write));
+        assert!(S3_CAPABILITIES.supports(Capability::Write));
         assert!(!S3_CAPABILITIES.supports(Capability::Mkdir));
         assert!(!S3_CAPABILITIES.supports(Capability::Delete));
         assert!(!S3_CAPABILITIES.supports(Capability::Copy));
@@ -153,7 +155,7 @@ mod tests {
     fn s3_list_and_read_only() {
         assert!(S3_CAPABILITIES.supports(Capability::List));
         assert!(S3_CAPABILITIES.supports(Capability::Read));
-        assert!(!S3_CAPABILITIES.supports(Capability::Write));
+        assert!(S3_CAPABILITIES.supports(Capability::Write));
         assert!(!S3_CAPABILITIES.supports(Capability::Mkdir));
         assert!(!S3_CAPABILITIES.supports(Capability::Delete));
         assert!(!S3_CAPABILITIES.supports(Capability::Copy));
