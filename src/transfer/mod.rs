@@ -2,6 +2,9 @@ pub mod executor;
 pub mod probe;
 #[allow(dead_code)]
 pub mod sftp_copy;
+// ponytail: S3 cores land in S3-34/37; seam only until then
+pub mod s3_download;
+pub mod s3_upload;
 
 use crate::vfs::{
     Capability, CapabilitySet, Location, ProviderId, S3ObjectRef, validate_child_name,
