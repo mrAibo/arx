@@ -690,7 +690,8 @@ async fn event_loop(
                                             &right_visible
                                         };
                                         for e in rows.iter().filter_map(VisiblePaneRow::listed) {
-                                            if !state.is_selected(active, &location, &e.entry.name) {
+                                            if !state.is_selected(active, &location, &e.entry.name)
+                                            {
                                                 state.toggle_selection(
                                                     active,
                                                     &location,
@@ -703,7 +704,9 @@ async fn event_loop(
                                             state.selection_count(active, &location)
                                         ));
                                     } else {
-                                        state.message = Some("Selection by name is not supported for S3".into());
+                                        state.message = Some(
+                                            "Selection by name is not supported for S3".into(),
+                                        );
                                     }
                                     state.filter.clear();
                                 } else if state.go_input && !state.filter.is_empty() {
@@ -1516,7 +1519,8 @@ async fn event_loop(
                                     state.selection_count(active, &location)
                                 ));
                             } else {
-                                state.message = Some("Selection by name is not supported for S3".into());
+                                state.message =
+                                    Some("Selection by name is not supported for S3".into());
                             }
                         }
                         // +: enter glob-select mode (uses filter buffer)
