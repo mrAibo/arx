@@ -312,27 +312,9 @@ async fn multipart_upload(
     on_progress: &mut impl FnMut(TransferProgress),
 ) -> io::Result<UploadOutcome> {
     let parts = s3_multipart::multipart_parts(&plan);
-    // A. CreateMultipartUpload (ONE send, NO retry).
-    //    No abort needed on create failure — no upload_id was minted.
-    let create = client
-        .create_multipart_upload()
-        .bucket(&destination.bucket)
-        .key(&destination.key)
-        .send()
-        .await;
 
-    let upload_id = match create {
-        Ok(resp) => resp.upload_id().unwrap_or_default().to_string(),
-        Err(_) => {
-            return Err(io::Error::other("S3 CreateMultipartUpload failed"));
-        }
-    };
-
-    if upload_id.is_empty() {
-        return Err(io::Error::other(
-            "S3 CreateMultipartUpload returned empty upload id",
-        ));
-    }
+    // A. CreateMultipartUpload. No abort needed on failure — no upload_id yet.
+    let upload_id = create_multipart_upload(client, &destination).await?;
 
     let mut op = MultipartOperation::new(destination.clone(), upload_id, plan);
     let part_count = op.plan.part_count as usize;
@@ -343,70 +325,16 @@ async fn multipart_upload(
         total: part_count,
     });
 
-    // B. Sequential UploadPart loop (NO concurrency).
-    //    Each part streams from a bounded file offset — no full-part allocation.
+    // B. Sequential UploadPart loop (NO concurrency). Each part streams from a
+    //    bounded file offset — no full-part allocation. A cancellation check
+    //    sits at the TOP of every iteration; an in-flight part is let to settle.
     for part_spec in parts.iter() {
-        // Cancellation check at the TOP of each iteration.
-        // Path C: cancel arrives while a previous UploadPart was in flight —
-        // let it settle, stop here.
         if cancel.load(Ordering::Relaxed) {
             let outcome = attempt_abort(client, &op).await;
             return Err(abort_or_recovery(outcome, &op));
         }
-
-        let part_number = part_spec.number;
-        let part_offset = part_spec.offset;
-        let part_len = part_spec.len;
-
-        // Build a bounded, offset-streaming ByteStream from the local file.
-        // FsBuilder with `.file()` opens the file, seeks to offset, and reads
-        // exactly `part_len` bytes through a streaming Take<File>. The part
-        // body is never collected into a contiguous buffer.
-        let file = tokio::fs::File::open(local_source).await.map_err(|e| {
-            io::Error::other(format!(
-                "S3 UploadPart {part_number} failed to open source: {e}"
-            ))
-        })?;
-
-        let body = ByteStream::read_from()
-            .file(file)
-            .offset(part_offset)
-            .length(Length::Exact(part_len))
-            .build()
-            .await
-            .map_err(|e| {
-                io::Error::other(format!(
-                    "S3 UploadPart {part_number} failed to build stream: {e}"
-                ))
-            })?;
-
-        let upload_resp = client
-            .upload_part()
-            .bucket(&op.destination.bucket)
-            .key(&op.destination.key)
-            .upload_id(&op.upload_id)
-            .part_number(part_number)
-            .content_length(part_len as i64)
-            .body(body)
-            .send()
-            .await;
-
-        match upload_resp {
-            Ok(resp) => {
-                let etag = resp.e_tag().unwrap_or_default().to_string();
-                // Truthful rejection: missing/empty ETag means the remote state
-                // is incomplete — do not claim this part succeeded.
-                if etag.is_empty() {
-                    let outcome = attempt_abort(client, &op).await;
-                    return Err(abort_or_recovery(outcome, &op));
-                }
-
-                op.record_part(UploadedPart {
-                    number: part_number,
-                    etag,
-                })?;
-
-                // Progress after a successfully recorded part.
+        match upload_one_multipart_part(client, local_source, &mut op, part_spec).await {
+            Ok(()) => {
                 let done = op.completed_parts.len();
                 on_progress(TransferProgress {
                     completed: done,
@@ -422,6 +350,97 @@ async fn multipart_upload(
     }
 
     // C. All parts succeeded — CompleteMultipartUpload (ONE send, NO retry).
+    complete_multipart_upload(client, &op, file_size, part_count, on_progress).await
+}
+
+/// Create the multipart upload and return the upload id. ONE send, NO retry.
+async fn create_multipart_upload(
+    client: &aws_sdk_s3::Client,
+    destination: &S3ObjectRef,
+) -> io::Result<String> {
+    let resp = client
+        .create_multipart_upload()
+        .bucket(&destination.bucket)
+        .key(&destination.key)
+        .send()
+        .await
+        .map_err(|_| io::Error::other("S3 CreateMultipartUpload failed"))?;
+    let upload_id = resp.upload_id().unwrap_or_default().to_string();
+    if upload_id.is_empty() {
+        return Err(io::Error::other(
+            "S3 CreateMultipartUpload returned empty upload id",
+        ));
+    }
+    Ok(upload_id)
+}
+
+/// Upload exactly one part from a bounded, offset-streamed file range.
+/// NEVER collects the part into a contiguous buffer. ONE send, NO retry.
+async fn upload_one_multipart_part(
+    client: &aws_sdk_s3::Client,
+    local_source: &std::path::Path,
+    op: &mut MultipartOperation,
+    part_spec: &s3_multipart::MultipartPart,
+) -> io::Result<()> {
+    let part_number = part_spec.number;
+    let part_offset = part_spec.offset;
+    let part_len = part_spec.len;
+
+    // FsBuilder opens the file, seeks to offset, and reads exactly `part_len`
+    // bytes through a streaming Take<File>. The body is never buffered whole.
+    let file = tokio::fs::File::open(local_source).await.map_err(|e| {
+        io::Error::other(format!(
+            "S3 UploadPart {part_number} failed to open source: {e}"
+        ))
+    })?;
+
+    let body = ByteStream::read_from()
+        .file(file)
+        .offset(part_offset)
+        .length(Length::Exact(part_len))
+        .build()
+        .await
+        .map_err(|e| {
+            io::Error::other(format!(
+                "S3 UploadPart {part_number} failed to build stream: {e}"
+            ))
+        })?;
+
+    let resp = client
+        .upload_part()
+        .bucket(&op.destination.bucket)
+        .key(&op.destination.key)
+        .upload_id(&op.upload_id)
+        .part_number(part_number)
+        .content_length(part_len as i64)
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| io::Error::other(format!("S3 UploadPart {part_number} failed")))?;
+
+    let etag = resp.e_tag().unwrap_or_default().to_string();
+    // Truthful rejection: missing/empty ETag means the remote state is
+    // incomplete — do not claim this part succeeded.
+    if etag.is_empty() {
+        return Err(io::Error::other(
+            "S3 UploadPart returned empty ETag — remote state is incomplete",
+        ));
+    }
+    op.record_part(UploadedPart {
+        number: part_number,
+        etag,
+    })
+}
+
+/// Complete the multipart upload with all recorded parts in ascending order.
+/// ONE send, NO retry. 100% progress only after Complete succeeds.
+async fn complete_multipart_upload(
+    client: &aws_sdk_s3::Client,
+    op: &MultipartOperation,
+    file_size: u64,
+    part_count: usize,
+    on_progress: &mut impl FnMut(TransferProgress),
+) -> io::Result<UploadOutcome> {
     let ordered = op.ordered_parts();
     let mut completed_multipart = aws_sdk_s3::types::CompletedMultipartUpload::builder();
     for p in &ordered {
@@ -433,18 +452,16 @@ async fn multipart_upload(
         );
     }
 
-    let complete_resp = client
+    match client
         .complete_multipart_upload()
         .bucket(&op.destination.bucket)
         .key(&op.destination.key)
         .upload_id(&op.upload_id)
         .multipart_upload(completed_multipart.build())
         .send()
-        .await;
-
-    match complete_resp {
+        .await
+    {
         Ok(_) => {
-            // 100% only after Complete succeeds.
             on_progress(TransferProgress {
                 completed: part_count,
                 total: part_count,
@@ -452,10 +469,9 @@ async fn multipart_upload(
             Ok(file_size)
         }
         Err(_) => {
-            // Complete failure: DO NOT claim Completed. Attempt best-effort abort
-            // of the (possibly partial) multipart upload, but report the truthful
-            // completion-unknown outcome regardless of the abort result.
-            let _ = attempt_abort(client, &op).await;
+            // Complete failure: DO NOT claim Completed. Attempt best-effort
+            // abort, but report the truthful completion-unknown outcome.
+            let _ = attempt_abort(client, op).await;
             Err(io::Error::other(
                 "S3 CompleteMultipartUpload failed; remote state unknown",
             ))
