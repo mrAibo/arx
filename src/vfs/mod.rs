@@ -9,6 +9,7 @@ pub mod sftp;
 pub mod webdav;
 
 pub use capabilities::{Capability, CapabilitySet};
+pub use s3::{S3ObjectRef, S3BucketRef, S3PrefixRef};
 
 // ── Provider Registry (new architecture — phased migration) ──
 // ponytail: add ProviderId + VfsProvider + Registry alongside old Location enum.
@@ -88,9 +89,52 @@ mod provider_registry_tests {
         );
         assert_eq!(registry.instance_count(), 2);
     }
+
+    #[test]
+    fn s3_transfer_provider_is_same_instance_as_listing_provider() {
+        let registry = ProviderRegistry::new();
+        registry.register_s3_targets(&[crate::config::S3TargetConfig {
+            id: "aws-prod".to_string(),
+            name: "aws-prod".to_string(),
+            bucket: None,
+            region: Some("eu-central-1".to_string()),
+            profile: Some("prod".to_string()),
+            endpoint_url: None,
+            force_path_style: false,
+        }]);
+
+        let listing = registry
+            .provider_for_page_location(&Location::S3 {
+                target: "aws-prod".to_string(),
+                bucket: Some("some-bucket".into()),
+                prefix: "".to_string(),
+            })
+            .unwrap();
+
+        let transfer = registry.s3_provider_for_transfer("aws-prod").unwrap();
+
+        // Same underlying S3Provider allocation (same data pointer).
+        let listing_ptr = Arc::as_ptr(&listing) as *const u8;
+        let transfer_ptr = Arc::as_ptr(&transfer) as *const u8;
+        assert_eq!(
+            listing_ptr, transfer_ptr,
+            "listing and transfer must share one S3Provider instance"
+        );
+
+        // Unknown target fails.
+        assert!(registry.s3_provider_for_transfer("nope").is_err());
+    }
 }
 
 impl std::error::Error for VfsError {}
+
+/// Registry resolution errors (distinct from `VfsError`, which is the
+/// provider-operation error taxonomy).
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryError {
+    #[error("unknown S3 target: {0}")]
+    NotFound(String),
+}
 
 impl From<std::io::Error> for VfsError {
     fn from(e: std::io::Error) -> Self {
@@ -498,8 +542,14 @@ pub enum ProviderInstanceKey {
 }
 
 #[derive(Debug, Clone)]
-struct RegisteredProvider {
-    provider: Arc<dyn VfsProvider>,
+pub struct RegisteredProvider {
+    pub provider: Arc<dyn VfsProvider>,
+    /// Concrete S3 provider when this instance is an `S3Target(id)`; `None`
+    /// otherwise. For S3 registrations this aliases the exact `provider` Arc
+    /// (same underlying `S3Provider`), so the transfer path reuses the listing
+    /// client — no second client cache.
+    // ponytail: same-instance alias; resolve_s3_provider populates both
+    pub s3: Option<Arc<s3::S3Provider>>,
 }
 
 /// Cloneable, async-safe provider registry.
@@ -602,7 +652,7 @@ impl ProviderRegistry {
         self.providers
             .write()
             .expect("provider registry poisoned")
-            .insert(key, RegisteredProvider { provider });
+            .insert(key, RegisteredProvider { provider, s3: None });
         self.capabilities
             .write()
             .expect("provider capabilities poisoned")
@@ -772,6 +822,7 @@ impl ProviderRegistry {
         let mut providers = self.providers.write().expect("provider registry poisoned");
         let registered = providers.entry(key).or_insert_with(|| RegisteredProvider {
             provider: Arc::clone(&provider),
+            s3: None,
         });
         let provider = Arc::clone(&registered.provider);
         drop(providers);
@@ -834,13 +885,43 @@ impl ProviderRegistry {
                 )
             })?;
 
-        let provider: Arc<dyn VfsProvider> = Arc::new(s3::S3Provider::new(target));
+        // ponytail: BOTH arcs alias the same S3Provider allocation — no second
+        // client cache; transfer + listing share one provider instance.
+        let s3_provider: Arc<s3::S3Provider> = Arc::new(s3::S3Provider::new(target));
+        let provider: Arc<dyn VfsProvider> = s3_provider.clone();
 
         let mut providers = self.providers.write().expect("provider registry poisoned");
         let registered = providers.entry(key).or_insert_with(|| RegisteredProvider {
             provider: Arc::clone(&provider),
+            s3: Some(s3_provider.clone()),
         });
         Ok(Arc::clone(&registered.provider))
+    }
+
+    /// Resolve the concrete `S3Target(id)` provider for a transfer operation.
+    ///
+    /// Returns the SAME `Arc<S3Provider>` already registered under
+    /// `ProviderInstanceKey::S3Target(target_id)` (the listing path uses the same
+    /// resolver, so the AWS client is shared — no second client cache). Unknown
+    /// target id fails factually with `RegistryError::NotFound`.
+    // ponytail: reuses resolve_s3_provider (list_page's resolver); no second inventory
+    pub fn s3_provider_for_transfer(
+        &self,
+        target_id: &str,
+    ) -> Result<Arc<s3::S3Provider>, RegistryError> {
+        self.resolve_s3_provider(target_id)
+            .map_err(|_| RegistryError::NotFound(target_id.to_string()))?;
+        let key = ProviderInstanceKey::S3Target(target_id.to_string());
+        let registered = self
+            .providers
+            .read()
+            .expect("provider registry poisoned")
+            .get(&key)
+            .cloned();
+        match registered.and_then(|r| r.s3) {
+            Some(s3) => Ok(s3),
+            None => Err(RegistryError::NotFound(target_id.to_string())),
+        }
     }
 
     pub fn list_location(&self, loc: &Location) -> std::io::Result<Vec<Entry>> {
