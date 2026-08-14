@@ -51,6 +51,29 @@ All P11R cards merged; STOP GATE D frozen-tree audit = BLOCKER 0 / MAJOR 0 (3 pa
 
 ---
 
+## HERMES BIG PACK — CLOSE-OUT (S3-42S, S3-43, S3-44..50, S3-51..53)
+
+**Baseline:** `5a4880a` (S3-42R docs-close). **Final HEAD:** `cbce568`.
+
+Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, fmt, clippy, tests, 1.88, quality, msrv, frozen-tree review B0/M0, clean tree). All criteria met on every merged card.
+
+| Card | PR | Merge SHA | Note |
+|------|----|-----------|------|
+| S3-42S | #124 | `9bd18f1` | Opaque upload keys (nav-prefix + sanitized child, never Entry.name) |
+| S3-43 | #125 | `bcf2725` | Pure multipart plan (`src/transfer/s3_multipart.rs`) |
+| S3-44..50 | #126 | `ac44a68` | Multipart runtime: sequential part PUT/GET, cancel truth, part-count progress, physical MinIO roundtrip byte-exact. Stop Gate E (frozen SHA ac44a68) = BLOCKER 0 / MAJOR 0 (3 tracks). |
+| S3-51..53 | #129 | `cbce568` | Integrity-evidence model (`integrity.rs`: size + ETag, NOT universal hash) + upload/download post-transfer verification (read-only, partial never verified). Stop Gate (frozen SHA 4c84445) = B0/M0 (2 tracks). |
+
+**Capability surface after pack:** unchanged — S3 = `List + Read + Write`. Verification is evidence-only; it does not add capability, does not rewrite physical outcome, does not compute a content hash.
+
+**Physical acceptance (live MinIO, `arx-minio-test`):** multipart 70 MiB roundtrip byte-exact with upload verify (HeadObject size+ETag); download local size == remote; cancellation after 1 part → abort attempted, object never appears. Awkward-key (`..`/`//`/Unicode) prefix skipped with honest comment (MinIO rejects; verbatim proven offline in S3-42S unit tests).
+
+**Out-of-scope debt (recorded, not blocking this pack):** two `unreachable!()` in `src/vfs/sftp.rs` pre-exist the S3 work and are outside the S3 transfer runtime — flagged as separate follow-up, must not block the S3 capability flip.
+
+**Next:** S3-54 (prefix-marker primitive) is now READY.
+
+---
+
 ---
 
 
@@ -669,12 +692,12 @@ All P11R cards merged; STOP GATE D frozen-tree audit = BLOCKER 0 / MAJOR 0 (3 pa
 - **Stop conditions:** Fake ETA / fake %.
 - **Hermes prompt:** Multipart progress: factual bytes_done/total. No fake ETA, no % if unknown.
 
-### S3-51 — S3 checksum evidence model
+### S3-51 — S3 integrity-evidence model
 - **Phase:** P17
-- **Status:** BACKLOG
+- **Status:** DONE (BIG PACK PR #129 merged; merge SHA cbce568; exact-head quality+msrv SUCCESS; Stop Gate 4c84445 BLOCKER 0 / MAJOR 0)
 - **Depends on:** STOP GATE E
-- **Allowed files:** src/vfs/s3.rs
-- **Acceptance:** Represent S3 integrity evidence: size, ETag, VersionId, checksum fields. Do NOT treat ETag as universal content hash. No WorkspaceFingerprint yet.
+- **Allowed files:** src/transfer/integrity.rs (new, pure). NOTE: BIG PACK relocated this from the originally-planned `src/vfs/s3.rs` to the transfer layer so upload/download verification (S3-52/53) share one model without pulling vfs into transfer.
+- **Acceptance:** Represent S3 integrity evidence: size, ETag (Option<String>). `etag_matches` trims surrounding quotes, returns None when either side absent (unknown, not mismatch). Do NOT treat ETag as universal content hash. No WorkspaceFingerprint.
 - **Stop conditions:** ETag=>content_hash. WorkspaceFingerprint.
 - **Hermes prompt:** Model S3 evidence (size/ETag/VersionId/checksum). ETag is NOT universal content hash. No WorkspaceFingerprint.
 
@@ -698,7 +721,7 @@ All P11R cards merged; STOP GATE D frozen-tree audit = BLOCKER 0 / MAJOR 0 (3 pa
 
 ### S3-54 — Prefix creation primitive
 - **Phase:** P18
-- **Status:** BACKLOG
+- **Status:** READY (S3-50 DONE; Stop Gate E PASS on ac44a68)
 - **Depends on:** S3-50 / STOP GATE E
 - **Allowed files:** src/vfs/s3.rs
 - **Acceptance:** Create empty virtual folder marker: PutObject key ending '/', empty body. Inside bucket only. No bucket creation.
