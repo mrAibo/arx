@@ -43,6 +43,7 @@ All P11R cards merged; STOP GATE D frozen-tree audit = BLOCKER 0 / MAJOR 0 (3 pa
 | S3-36/39 | #117 | `5ebbd1c` | executor integration (registry provider resolve + dispatch) |
 | S3-40/41 | #118 | `c03e4ac` | F5 availability + Copy wiring (frozen S3ObjectRef, Move stays unavailable) |
 | S3-42 | #119 | `755f438` | Write capability flip + MinIO physical acceptance (`NotFound` classifier fix) |
+| S3-42R | #122 | `23dbc2d` | keep S3 F4 (EditFile) fail-closed after Write flip |
 
 **Capability surface after pack:** S3 = `List + Read + Write`. Mkdir/Delete/Copy/Move/Rename/Symlink remain unimplemented. Copy available Local↔S3 (single object); Move/Sync unavailable for S3.
 
