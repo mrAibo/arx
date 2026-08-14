@@ -16,12 +16,12 @@
 
 ## Column summary
 
-- **READY** (0): —
+- **READY** (7): S3-62E, S3-63E, S3-64E, S3-65E, S3-66, S3-67, S3-69
 - **DOING** (0): —
 - **REVIEW** (0): —
-- **BLOCKED** (0): —
+- **BLOCKED** (5): S3-62, S3-63, S3-64, S3-65 (real AWS env required), S3-68
 - **DONE** (67): S3-00..S3-30, S3-31, S3-31R, S3-32..S3-42 (P11R), S3-42S, S3-43, S3-44..S3-50, S3-51, S3-52, S3-53, S3-54(R), S3-55(R/F7/Ph4/Ph8), S3-57, S3-58, S3·58P, S3-61
-- **BACKLOG** (16): S3-62..S3-80
+- **BACKLOG** (12): S3-70..S3-80
 - **PARKED** (14): S3-81..S3-97
 
 ---
@@ -822,68 +822,92 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 - **Stop conditions:** Recursive prefix delete.
 - **Hermes prompt:** Enable Delete after S3-58/59/60. Delete != recursive prefix delete. Tests enforce.
 
-### S3-62 — AWS basic acceptance
+### S3-62 — AWS basic acceptance (REAL AWS)
 - **Phase:** P20
-- **Status:** BACKLOG
+- **Status:** BLOCKED
+- **Block reason:** AWS_DISPOSABLE_ACCEPTANCE_ENV_REQUIRED — real disposable AWS S3 environment unavailable in this session (only MinIO reachable via AWS_ENDPOINT_URL override).
 - **Depends on:** STOP GATE F
 - **Allowed files:** manual / tests with disposable AWS bucket
 - **Acceptance:** Disposable AWS bucket: target root, bucket-bound root, prefix nav, Unicode, zero-byte, folder marker, F3, small upload, small download. No production bucket.
 - **Stop conditions:** Production bucket.
 - **Hermes prompt:** Physical AWS acceptance (disposable bucket): root/bucket-bound/prefix/Unicode/zero-byte/marker/F3/upload/download.
 
-### S3-63 — AWS pagination acceptance
+### S3-62E — AWS-emulator basic acceptance (Moto/LocalStack)
 - **Phase:** P20
-- **Status:** BACKLOG
+- **Status:** READY
+- **Depends on:** STOP GATE F
+- **Allowed files:** tests/s3_acceptance/ (env-gated ARX_MINIO_TEST-style gate, separate emulator endpoint)
+- **Acceptance:** Same matrix as S3-62 but against AWS-emulated endpoint (Moto server :5000 / LocalStack). Independent AWS-shaped emulator, NOT MinIO. Classify result EMULATED PASS.
+- **Note:** Does NOT satisfy S3-68 AWS=SUPPORTED claim; real AWS (S3-62A) remains required for that.
+
+### S3-63 — AWS pagination acceptance (REAL AWS)
+- **Phase:** P20
+- **Status:** BLOCKED
+- **Block reason:** AWS_DISPOSABLE_ACCEPTANCE_ENV_REQUIRED (depends on S3-62 real).
 - **Depends on:** S3-62
 - **Allowed files:** tests
-- **Acceptance:** Fixture >1000 objects (or forces page size). Verify page1/continuation/page2, no dup, no missing, no UI freeze.
-- **Stop conditions:** UI freeze.
-- **Hermes prompt:** AWS pagination acceptance: >1000 objs, page1/continuation/page2, no dup/missing, no freeze.
+- **Acceptance:** Fixture >1000 objects. Verify page1/continuation/page2, no dup, no missing, no UI freeze.
 
-### S3-64 — AWS multipart acceptance
+### S3-63E — AWS-emulator pagination acceptance
 - **Phase:** P20
-- **Status:** BACKLOG
+- **Status:** READY
+- **Depends on:** S3-62E
+- **Allowed files:** tests/s3_acceptance/
+- **Acceptance:** >1000 objects under Moto/LocalStack. page1/continuation/page2, no dup/missing, no freeze. EMULATED PASS.
+
+### S3-64 — AWS multipart acceptance (REAL AWS)
+- **Phase:** P20
+- **Status:** BLOCKED
+- **Block reason:** AWS_DISPOSABLE_ACCEPTANCE_ENV_REQUIRED (depends on S3-62 real).
 - **Depends on:** S3-62
 - **Allowed files:** tests
 - **Acceptance:** Large disposable object: init/parts/progress/complete/verify. Second run: cancel/abort/no silent orphan.
-- **Stop conditions:** Silent orphan.
-- **Hermes prompt:** AWS multipart acceptance: large obj init/parts/complete/verify; cancel/abort/no orphan.
 
-### S3-65 — AWS permission failure matrix
+### S3-64E — AWS-emulator multipart acceptance
 - **Phase:** P20
-- **Status:** BACKLOG
+- **Status:** READY
+- **Depends on:** S3-62E
+- **Allowed files:** tests/s3_acceptance/
+- **Acceptance:** Multipart against Moto/LocalStack: init/parts/complete/verify; cancel/abort/no orphan. EMULATED PASS.
+
+### S3-65 — AWS permission failure matrix (REAL AWS)
+- **Phase:** P20
+- **Status:** BLOCKED
+- **Block reason:** AWS_DISPOSABLE_ACCEPTANCE_ENV_REQUIRED + controlled restricted IAM identity unavailable.
 - **Depends on:** S3-62
 - **Allowed files:** tests
-- **Acceptance:** Controlled denial: ListBuckets/ListObjects/Get/Put/Delete denied. Bucket-bound target still works without ListAllMyBuckets when bucket perms allow.
-- **Stop conditions:** —
-- **Hermes prompt:** AWS perm matrix: deny ListBuckets/Objects/Get/Put/Delete. Bucket-bound works without ListAllMyBuckets.
+- **Acceptance:** Controlled denial: ListBuckets/ListObjects/Get/Put/Delete denied. Bucket-bound target works without ListAllMyBuckets. Session-token creds through SDK chain.
+
+### S3-65E — AWS-emulator permission/STS simulation
+- **Phase:** P20
+- **Status:** READY
+- **Depends on:** S3-62E
+- **Allowed files:** tests/s3_acceptance/
+- **Acceptance:** Moto bucket-policy / LocalStack IAM-limited denial of ListBuckets/Objects/Get/Put/Delete. STS session-token plumbing (AssumeRole/GetSessionToken) through SDK chain; no token leakage. SIMULATED PASS (note: Moto/LocalStack IAM semantics are not full AWS IAM — record limitation).
 
 ### S3-66 — MinIO target
 - **Phase:** P21
-- **Status:** BACKLOG
-- **Depends on:** S3-65
+- **Status:** READY
+- **Depends on:** STOP GATE F
 - **Allowed files:** tests / config
-- **Acceptance:** Disposable MinIO via endpoint_url (+force_path_style if needed). Prove connection, bucket listing/bound, prefix listing.
-- **Stop conditions:** —
-- **Hermes prompt:** MinIO target: endpoint_url (+force_path_style), connection + bucket/prefix listing.
+- **Acceptance:** Disposable MinIO (arx-minio-test) via endpoint_url + force_path_style. Same production S3Provider. Connection, bucket listing/bound, prefix listing, Unicode, zero-byte, marker, pagination >1000. Never label MinIO as AWS.
+- **Stop conditions:** MinIO-special executor (must use same S3Provider).
 
 ### S3-67 — MinIO transfer acceptance
 - **Phase:** P21
-- **Status:** BACKLOG
+- **Status:** READY
 - **Depends on:** S3-66
 - **Allowed files:** tests
-- **Acceptance:** F3, small upload, small download, multipart, cancel, prefix marker, single delete, Unicode.
-- **Stop conditions:** —
-- **Hermes prompt:** MinIO transfer: F3/upload/download/multipart/cancel/marker/delete/Unicode.
+- **Acceptance:** F3, small upload, small download, multipart, cancel, prefix marker, single delete, empty-marker delete, Unicode, byte-exact roundtrip.
 
 ### S3-68 — Compatibility truth
 - **Phase:** P21
-- **Status:** BACKLOG
-- **Depends on:** S3-66, S3-67
+- **Status:** BLOCKED
+- **Block reason:** Requires S3-62..65 real-AWS PASS for AWS=SUPPORTED claim; real AWS env unavailable. MinIO PASS alone is insufficient per pack rules.
+- **Depends on:** S3-66, S3-67 (MinIO) AND S3-62..65 (real AWS)
 - **Allowed files:** docs/DESIGN_S3.md or README
-- **Acceptance:** After AWS+MinIO: mark AWS S3=SUPPORTED, MinIO=SUPPORTED. Do NOT claim R2/Wasabi/generic unless physically tested.
+- **Acceptance:** After MinIO+emulator: classify MinIO=PHYSICALLY ACCEPTED, AWS=PHYSICAL ACCEPTANCE PENDING. Do NOT claim AWS SUPPORTED until S3-62A..65A run.
 - **Stop conditions:** Claiming untested compatibility.
-- **Hermes prompt:** Mark AWS=SUPPORTED, MinIO=SUPPORTED only. No R2/Wasabi/generic claim without test.
 
 ### S3-69 — Commander labels
 - **Phase:** P22
