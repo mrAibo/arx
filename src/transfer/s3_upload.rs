@@ -10,9 +10,13 @@
 //! - diagnostics are sanitized: no key, credentials, signed query, or auth header
 //! - progress reported as part counts via `TransferProgress`; no 100% before
 //!   Complete success
+//! - post-transfer verification: a SEPARATE HeadObject after PutObject /
+//!   CompleteMultipartUpload asserts the remote size + ETag equal the expected
+//!   values; READ-ONLY on the local file (never rewritten or touched)
 
 use crate::transfer::S3TransferSpec;
 use crate::transfer::executor::TransferProgress;
+use crate::transfer::integrity::ObjectIntegrity;
 use crate::transfer::s3_multipart::{self};
 use crate::vfs::S3ObjectRef;
 use crate::vfs::s3::S3Provider;
@@ -240,6 +244,7 @@ pub(crate) async fn upload_one(
         s3_multipart::UploadStrategy::SinglePut => {
             single_put(
                 client,
+                provider,
                 local_source,
                 destination.clone(),
                 file_size,
@@ -255,6 +260,7 @@ pub(crate) async fn upload_one(
                 plan,
                 client,
                 cancel,
+                provider,
                 on_progress,
             )
             .await
@@ -267,6 +273,7 @@ pub(crate) async fn upload_one(
 /// Single PutObject path: <= 64 MiB.
 async fn single_put(
     client: &aws_sdk_s3::Client,
+    provider: &S3Provider,
     local_source: &std::path::Path,
     destination: S3ObjectRef,
     file_size: u64,
@@ -284,11 +291,18 @@ async fn single_put(
         .await;
 
     match put {
-        Ok(_) => {
+        Ok(resp) => {
             on_progress(TransferProgress {
                 completed: 1,
                 total: 1,
             });
+            let put_etag = resp.e_tag().map(|s| s.to_string());
+            verify_uploaded_object(
+                provider,
+                &destination,
+                ObjectIntegrity::new(file_size, put_etag),
+            )
+            .await?;
             Ok(file_size)
         }
         Err(_) => Err(io::Error::other("S3 PutObject upload failed")),
@@ -302,6 +316,7 @@ async fn single_put(
 /// Sequential, non-concurrent part uploads with offset streaming. Each part
 /// is a bounded ByteStream built from a seeked file handle — the part body
 /// is never loaded into memory as a contiguous buffer.
+#[allow(clippy::too_many_arguments)]
 async fn multipart_upload(
     local_source: &std::path::Path,
     destination: S3ObjectRef,
@@ -309,6 +324,7 @@ async fn multipart_upload(
     plan: s3_multipart::MultipartPlan,
     client: &aws_sdk_s3::Client,
     cancel: Arc<AtomicBool>,
+    provider: &S3Provider,
     on_progress: &mut impl FnMut(TransferProgress),
 ) -> io::Result<UploadOutcome> {
     let parts = s3_multipart::multipart_parts(&plan);
@@ -350,7 +366,7 @@ async fn multipart_upload(
     }
 
     // C. All parts succeeded — CompleteMultipartUpload (ONE send, NO retry).
-    complete_multipart_upload(client, &op, file_size, part_count, on_progress).await
+    complete_multipart_upload(client, &op, file_size, part_count, provider, on_progress).await
 }
 
 /// Create the multipart upload and return the upload id. ONE send, NO retry.
@@ -439,6 +455,7 @@ async fn complete_multipart_upload(
     op: &MultipartOperation,
     file_size: u64,
     part_count: usize,
+    provider: &S3Provider,
     on_progress: &mut impl FnMut(TransferProgress),
 ) -> io::Result<UploadOutcome> {
     let ordered = op.ordered_parts();
@@ -461,11 +478,18 @@ async fn complete_multipart_upload(
         .send()
         .await
     {
-        Ok(_) => {
+        Ok(resp) => {
             on_progress(TransferProgress {
                 completed: part_count,
                 total: part_count,
             });
+            let complete_etag = resp.e_tag().map(|s| s.to_string());
+            verify_uploaded_object(
+                provider,
+                &op.destination,
+                ObjectIntegrity::new(file_size, complete_etag),
+            )
+            .await?;
             Ok(file_size)
         }
         Err(_) => {
@@ -476,6 +500,59 @@ async fn complete_multipart_upload(
                 "S3 CompleteMultipartUpload failed; remote state unknown",
             ))
         }
+    }
+}
+
+// ── Post-transfer verification ──────────────────────────────────────────────
+
+/// Pure comparison of expected vs remote-reported size + ETag. ETag equality
+/// only (never a content hash). A missing ETag on EITHER side is treated as
+/// unknown — NOT a mismatch — so absence does not assert failure; it simply
+/// cannot confirm. Size mismatch, or a definite ETag mismatch, is an error.
+fn integrity_consistent(
+    expected: &ObjectIntegrity,
+    remote_size: u64,
+    remote_etag: Option<String>,
+) -> io::Result<()> {
+    if remote_size != expected.size {
+        return Err(io::Error::other(
+            "S3 uploaded object verification failed: size/ETag mismatch",
+        ));
+    }
+    if let Some(false) = ObjectIntegrity::etag_matches(&expected.etag, &remote_etag) {
+        return Err(io::Error::other(
+            "S3 uploaded object verification failed: size/ETag mismatch",
+        ));
+    }
+    Ok(())
+}
+
+/// Post-transfer verification: after the PutObject / CompleteMultipartUpload
+/// succeeded, do a SEPARATE HeadObject and assert the remote size + ETag match
+/// what we expected. This is READ-ONLY on the local file — it never rewrites,
+/// truncates, or touches the physical source. It only compares remote-reported
+/// facts.
+async fn verify_uploaded_object(
+    provider: &S3Provider,
+    destination: &S3ObjectRef,
+    expected: ObjectIntegrity,
+) -> io::Result<()> {
+    let client = provider.client().await?;
+    let resp = client
+        .head_object()
+        .bucket(&destination.bucket)
+        .key(&destination.key)
+        .send()
+        .await;
+    match resp {
+        Ok(r) => {
+            let remote_size = r.content_length().unwrap_or(0) as u64;
+            let remote_etag = r.e_tag().map(|s| s.to_string());
+            integrity_consistent(&expected, remote_size, remote_etag)
+        }
+        Err(_) => Err(io::Error::other(
+            "S3 uploaded object verification failed: head after complete errored",
+        )),
     }
 }
 
@@ -899,6 +976,8 @@ mod tests {
             "S3 UploadPart duplicate part number — remote state is inconsistent",
             "S3 multipart upload cancellation could not confirm remote cleanup; orphaned multipart data may remain",
             "S3 CompleteMultipartUpload failed; remote state unknown",
+            "S3 uploaded object verification failed: size/ETag mismatch",
+            "S3 uploaded object verification failed: head after complete errored",
         ];
         for msg in &msgs {
             assert!(
@@ -914,6 +993,38 @@ mod tests {
                 msg
             );
         }
+    }
+
+    // ── Post-transfer verification (pure comparison logic) ───────────────────
+
+    #[test]
+    fn integrity_consistent_size_and_etag_match() {
+        let expected = ObjectIntegrity::new(100, Some("\"abc123\"".into()));
+        let remote_etag = Some("abc123".into()); // surrounding quotes tolerated
+        assert!(integrity_consistent(&expected, 100, remote_etag).is_ok());
+    }
+
+    #[test]
+    fn integrity_consistent_size_mismatch_fails() {
+        let expected = ObjectIntegrity::new(100, Some("abc".into()));
+        let err = integrity_consistent(&expected, 50, Some("abc".into())).unwrap_err();
+        assert!(err.to_string().contains("size/ETag mismatch"));
+    }
+
+    #[test]
+    fn integrity_consistent_etag_mismatch_fails() {
+        let expected = ObjectIntegrity::new(100, Some("abc".into()));
+        let err = integrity_consistent(&expected, 100, Some("xyz".into())).unwrap_err();
+        assert!(err.to_string().contains("size/ETag mismatch"));
+    }
+
+    #[test]
+    fn integrity_consistent_etag_absent_on_one_side_ok() {
+        // Unknown ETag (None on either side) must not assert mismatch.
+        let expected = ObjectIntegrity::new(100, None);
+        assert!(integrity_consistent(&expected, 100, Some("abc".into())).is_ok());
+        let expected2 = ObjectIntegrity::new(100, Some("abc".into()));
+        assert!(integrity_consistent(&expected2, 100, None).is_ok());
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────
@@ -1256,7 +1367,15 @@ mod physical_acceptance {
             .key(&object.key)
             .send()
             .await;
-        assert!(head.is_ok(), "uploaded object must exist at exact key");
+        let head = head.expect("uploaded object must exist at exact key");
+        // Post-transfer verification already ran inside upload_one (a separate
+        // HeadObject asserting size + ETag). Reinforce with an explicit size
+        // assertion: remote content_length must equal the uploaded size.
+        assert_eq!(
+            head.content_length().unwrap_or(0) as u64,
+            payload_size as u64,
+            "remote size must match uploaded size"
+        );
 
         // Download back via s3_download::download_one and compare.
         let dst = dir.path().join("download.bin");
