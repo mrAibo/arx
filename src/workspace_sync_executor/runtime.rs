@@ -445,16 +445,22 @@ impl WorkspaceSyncExecutor {
                 transfer,
                 name,
                 ..
-            } => execute_transfer(transfer, std::slice::from_ref(name), cancel, |_| {})
-                .await
-                .map(|_| ())
-                .map_err(|error| match error {
-                    TransferExecutionError::Cancelled { .. } => StepExecutionResult::Cancelled,
-                    other => StepExecutionResult::Failed(SyncExecutionError::Transfer {
-                        path: relative_path.clone(),
-                        error: other.to_string(),
-                    }),
+            } => execute_transfer(
+                transfer,
+                std::slice::from_ref(name),
+                &self.registry,
+                cancel,
+                |_| {},
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| match error {
+                TransferExecutionError::Cancelled { .. } => StepExecutionResult::Cancelled,
+                other => StepExecutionResult::Failed(SyncExecutionError::Transfer {
+                    path: relative_path.clone(),
+                    error: other.to_string(),
                 }),
+            }),
             PhysicalSyncStep::DeleteFile {
                 relative_path,
                 target,

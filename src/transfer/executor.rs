@@ -5,9 +5,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::vfs::{Location, local::LocalFs};
+use crate::vfs::{Location, ProviderRegistry, local::LocalFs};
 
-use super::{TransferIntent, TransferMethod, TransferPlan};
+use super::s3_download;
+use super::s3_upload;
+use super::{S3TransferSpec, TransferIntent, TransferMethod, TransferPlan};
 use crate::transfer::sftp_copy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +49,7 @@ pub enum TransferExecutionError {
 pub async fn execute_transfer(
     plan: &TransferPlan,
     names: &[String],
+    registry: &ProviderRegistry,
     cancel: Arc<AtomicBool>,
     mut on_progress: impl FnMut(TransferProgress),
 ) -> Result<TransferOutcome, TransferExecutionError> {
@@ -60,10 +63,47 @@ pub async fn execute_transfer(
             method: plan.method,
             reason: "SCP executor is not implemented".into(),
         }),
-        TransferMethod::S3 => Err(TransferExecutionError::InvalidPlan {
-            method: plan.method,
-            reason: "S3 transfer executor is not enabled yet".into(),
-        }),
+        TransferMethod::S3 => {
+            let spec =
+                plan.s3_spec
+                    .as_ref()
+                    .ok_or_else(|| TransferExecutionError::InvalidPlan {
+                        method: plan.method,
+                        reason: "S3 transfer plan missing frozen spec".into(),
+                    })?;
+            let target = match spec {
+                S3TransferSpec::UploadOne { destination, .. } => &destination.target,
+                S3TransferSpec::DownloadOne { source, .. } => &source.target,
+            };
+            let provider = registry.s3_provider_for_transfer(target).map_err(|e| {
+                TransferExecutionError::InvalidPlan {
+                    method: TransferMethod::S3,
+                    reason: e.to_string(),
+                }
+            })?;
+            // ponytail: spec is the sole identity authority; names unused for S3
+            match spec {
+                S3TransferSpec::UploadOne { .. } => {
+                    s3_upload::upload_one(
+                        &provider,
+                        spec,
+                        s3_upload::S3OverwritePolicy::Forbid,
+                        cancel.clone(),
+                    )
+                    .await
+                    .map_err(TransferExecutionError::Io)?;
+                }
+                S3TransferSpec::DownloadOne { .. } => {
+                    s3_download::download_one(&provider, spec, cancel.clone())
+                        .await
+                        .map_err(TransferExecutionError::Io)?;
+                }
+            }
+            Ok(TransferOutcome {
+                completed: 1,
+                total: 1,
+            })
+        }
     }
 }
 
@@ -277,6 +317,8 @@ fn backup_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::S3TargetConfig;
+    use crate::vfs::S3ObjectRef;
     use std::fs;
     use std::path::PathBuf;
 
@@ -307,9 +349,13 @@ mod tests {
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let mut progress = Vec::new();
-        let outcome = execute_transfer(&plan, &["a.txt".into(), "b.txt".into()], cancel, |event| {
-            progress.push(event)
-        })
+        let outcome = execute_transfer(
+            &plan,
+            &["a.txt".into(), "b.txt".into()],
+            &ProviderRegistry::new(),
+            cancel,
+            |event| progress.push(event),
+        )
         .await
         .unwrap();
 
@@ -333,9 +379,15 @@ mod tests {
             s3_spec: None,
         };
         let cancel = Arc::new(AtomicBool::new(true));
-        let error = execute_transfer(&plan, &["a.txt".into()], cancel, |_| {})
-            .await
-            .unwrap_err();
+        let error = execute_transfer(
+            &plan,
+            &["a.txt".into()],
+            &ProviderRegistry::new(),
+            cancel,
+            |_| {},
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(
             error,
@@ -392,7 +444,14 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         assert!(matches!(
-            execute_transfer(&plan, &["x".into()], cancel, |_| {}).await,
+            execute_transfer(
+                &plan,
+                &["x".into()],
+                &ProviderRegistry::new(),
+                cancel,
+                |_| {}
+            )
+            .await,
             Err(TransferExecutionError::InvalidPlan { .. })
         ));
     }
@@ -409,7 +468,14 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         assert!(matches!(
-            execute_transfer(&plan, &["x".into()], cancel, |_| {}).await,
+            execute_transfer(
+                &plan,
+                &["x".into()],
+                &ProviderRegistry::new(),
+                cancel,
+                |_| {}
+            )
+            .await,
             Err(TransferExecutionError::InvalidPlan { .. })
         ));
     }
@@ -429,5 +495,112 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // ── S3-36/39: executor routing & fail-closed paths ──
+
+    fn s3_plan(method: TransferMethod, s3_spec: Option<S3TransferSpec>) -> TransferPlan {
+        TransferPlan {
+            source: local(PathBuf::from("/src")),
+            destination: local(PathBuf::from("/dst")),
+            intent: TransferIntent::Copy,
+            method,
+            s3_spec,
+        }
+    }
+
+    fn s3_upload_spec(target: &str, bucket: &str) -> S3TransferSpec {
+        S3TransferSpec::UploadOne {
+            local_source: PathBuf::from("/nonexistent/arx/upload/source.txt"),
+            destination: S3ObjectRef {
+                target: target.into(),
+                bucket: bucket.into(),
+                key: "a.txt".into(),
+            },
+        }
+    }
+
+    fn s3_target_config(id: &str, bucket: &str) -> S3TargetConfig {
+        S3TargetConfig {
+            id: id.into(),
+            name: id.into(),
+            bucket: Some(bucket.into()),
+            region: None,
+            profile: None,
+            endpoint_url: None,
+            force_path_style: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_without_frozen_spec_is_invalid_plan() {
+        let plan = s3_plan(TransferMethod::S3, None);
+        let registry = ProviderRegistry::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let err = execute_transfer(&plan, &[], &registry, cancel, |_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TransferExecutionError::InvalidPlan {
+                method: TransferMethod::S3,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn s3_unknown_target_is_invalid_plan() {
+        let plan = s3_plan(TransferMethod::S3, Some(s3_upload_spec("ghost", "bk")));
+        let registry = ProviderRegistry::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let err = execute_transfer(&plan, &[], &registry, cancel, |_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TransferExecutionError::InvalidPlan {
+                method: TransferMethod::S3,
+                ..
+            }
+        ));
+    }
+
+    // Routing proof: a registered target resolves to the S3Provider and the S3
+    // arm dispatches into upload_one, which fails locally (missing source) before
+    // any AWS network work — proving the executor reached the core.
+    #[tokio::test]
+    async fn s3_upload_arm_dispatches_to_upload_core() {
+        let registry = ProviderRegistry::new();
+        registry.register_s3_targets(&[s3_target_config("tgt", "bk")]);
+        let plan = s3_plan(TransferMethod::S3, Some(s3_upload_spec("tgt", "bk")));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let err = execute_transfer(&plan, &[], &registry, cancel, |_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TransferExecutionError::Io(_)));
+    }
+
+    // Routing proof for download: registered target resolves; the S3 arm
+    // dispatches into download_one, which fails locally (nonexistent destination
+    // parent) before any GetObject network work.
+    #[tokio::test]
+    async fn s3_download_arm_dispatches_to_download_core() {
+        let registry = ProviderRegistry::new();
+        registry.register_s3_targets(&[s3_target_config("tgt", "bk")]);
+        let spec = S3TransferSpec::DownloadOne {
+            source: S3ObjectRef {
+                target: "tgt".into(),
+                bucket: "bk".into(),
+                key: "a.txt".into(),
+            },
+            local_destination: PathBuf::from("/nonexistent-arx-dst/a.txt"),
+        };
+        let plan = s3_plan(TransferMethod::S3, Some(spec));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let err = execute_transfer(&plan, &[], &registry, cancel, |_| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TransferExecutionError::Io(_)));
     }
 }
