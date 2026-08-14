@@ -2793,6 +2793,13 @@ fn provider_identity(location: &Location) -> &'static str {
     }
 }
 
+/// S3-30R: S3 regular objects now route through the identity-aware
+/// `Effect::PreviewLocation` lane (alongside SFTP). Local/Archive fall through
+/// to their own preview paths. This is the S3 F3 dispatch decision.
+fn s3_f3_routes_to_preview(location: &Location) -> bool {
+    matches!(location.provider_id(), ProviderId::Sftp | ProviderId::S3)
+}
+
 fn diff_metric_summary(diff: &WorkspaceDiff) -> String {
     let changes = diff.entries.len();
     let bytes: u64 = diff
@@ -4964,9 +4971,9 @@ async fn dispatch_ui_action(
                 return Ok(());
             };
             let location = state.active_pane().location.clone();
-            // SFTP: dispatch preview intent, network I/O runs inside effect lane.
+            // SFTP/S3: dispatch preview intent, network I/O runs inside effect lane.
             // Forward the exact ListedEntry identity — never reduce to &entry.name.
-            if matches!(location.provider_id(), arx::vfs::ProviderId::Sftp) {
+            if s3_f3_routes_to_preview(&location) {
                 let id = effect_dispatcher.dispatch(
                     EffectLane::Preview,
                     EffectScope::Location(location.clone()),
@@ -8606,6 +8613,41 @@ mod tests {
     #[test]
     fn shift_f6_sftp_disabled() {
         assert_shift_f6_disabled(sftp_location(), listed(file("note.txt")));
+    }
+
+    #[test]
+    fn s3_30r_f3_dispatches_via_identity_preview_lane() {
+        // S3-30R: S3 regular object F3 now routes to the identity-aware
+        // PreviewLocation lane (same as SFTP), not the local-only fallthrough.
+        assert!(
+            s3_f3_routes_to_preview(&s3_location()),
+            "S3 must route F3 through the identity-aware preview lane"
+        );
+        // Local/Archive must NOT take that lane (they keep their own paths).
+        assert!(!s3_f3_routes_to_preview(&Location::Local(
+            "/tmp/work".into()
+        )));
+        assert!(!s3_f3_routes_to_preview(&archive_location()));
+
+        // The exact S3ObjectRef identity survives the dispatch intact:
+        // dispatch passes `listed.clone()` (EntryIdentity::S3Object), never
+        // entry.name. This is the behavioral agreement with S3-29.
+        let row = listed_with_identity(
+            "WRONG-DISPLAY.txt",
+            EntryKind::File,
+            EntryIdentity::S3Object(S3ObjectRef {
+                target: "prod".into(),
+                bucket: "bucket".into(),
+                key: "foo/../REAL//日本語🧙‍♂️.txt".into(),
+            }),
+        );
+        let EntryIdentity::S3Object(refr) = &row.identity else {
+            panic!("expected S3Object identity");
+        };
+        assert_eq!(refr.key, "foo/../REAL//日本語🧙‍♂️.txt");
+        assert_eq!(refr.target, "prod");
+        assert_eq!(refr.bucket, "bucket");
+        assert_ne!(row.entry.name, refr.key);
     }
 
     #[test]
