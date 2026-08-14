@@ -165,16 +165,21 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
         ActionId::BeginChmod => {
             require_active_capability(ctx, Capability::Chmod, "Permission changes")
         }
+        // ViewFile (F3) supports exactly Local, Sftp, and S3. The provider
+        // allow-list is explicit: WebDAV/Archive are never enabled merely
+        // because their capability sets happen to contain Read.
         ActionId::ViewFile
             if ctx.active_provider != ProviderId::Local
-                && ctx.active_provider != ProviderId::Sftp =>
+                && ctx.active_provider != ProviderId::Sftp
+                && ctx.active_provider != ProviderId::S3 =>
         {
             ActionAvailability::Disabled {
                 reason: "Remote viewing is not supported yet".into(),
             }
         }
         ActionId::ViewFile
-            if ctx.active_provider == ProviderId::Sftp
+            if (ctx.active_provider == ProviderId::Sftp
+                || ctx.active_provider == ProviderId::S3)
                 && !ctx.active_capabilities.supports(Capability::Read) =>
         {
             ActionAvailability::Disabled {
@@ -995,6 +1000,122 @@ mod tests {
         ctx.sync_details_ready = false;
         assert!(matches!(
             action_availability(ActionId::ShowWorkspaceSyncDetails, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    // ── S3-29: F3 ViewFile availability for S3 + exact S3Object identity ──
+
+    use crate::vfs::s3::{S3ObjectRef, S3PrefixRef};
+    use crate::vfs::{Entry, EntryIdentity, ListedEntry};
+
+    /// An S3 location that has BOTH List and Read (hypothetical, since real S3
+    /// is List-only today) — used to prove F3 gates on Read and F4 stays off.
+    fn s3_read_context() -> ActionContext {
+        let mut ctx = context(
+            ProviderId::S3,
+            CapabilitySet::NONE
+                .with(Capability::List)
+                .with(Capability::Read),
+        );
+        ctx.passive_provider = ProviderId::Local;
+        ctx
+    }
+
+    /// Build a listed S3Object row whose presentation name deliberately diverges
+    /// from the authoritative object key. This is exactly the case the S3-27R
+    /// identity seam must route through (ref.key), never the display name.
+    fn s3_object_row(key: &str, name: &str) -> ListedEntry {
+        ListedEntry {
+            entry: Entry {
+                name: name.to_string(),
+                kind: EntryKind::File,
+                size: Some(1234),
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Object(S3ObjectRef {
+                target: "s3://acct".into(),
+                bucket: "real-bucket".into(),
+                key: key.to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn s3_viewfile_available_with_read_for_s3object_identity() {
+        // Real availability resolution: derive the focused kind exactly as the
+        // TUI does (row.action_entry().map(|e| e.kind)) and ask
+        // action_availability — no debug-print string compare.
+        let row = s3_object_row("foo/../real//日本語🧙‍♂️.txt", "pretty-or-wrong.txt");
+        let mut ctx = s3_read_context();
+        ctx.focused_kind = Some(row.entry.kind);
+
+        let availability = action_availability(ActionId::ViewFile, &ctx);
+        assert_eq!(
+            availability,
+            ActionAvailability::Available,
+            "F3 must be Available for an S3Object row when S3 has Read"
+        );
+
+        // Authoritative operation target is the exact ref.key, NOT entry.name.
+        let EntryIdentity::S3Object(refr) = &row.identity else {
+            panic!("expected S3Object identity");
+        };
+        assert_eq!(refr.key, "foo/../real//日本語🧙‍♂️.txt");
+        assert_eq!(refr.bucket, "real-bucket");
+        assert_eq!(refr.target, "s3://acct");
+        // Presentation name is independent of the operation target; the
+        // routing must depend on identity, not on entry.name.
+        assert_eq!(row.entry.name, "pretty-or-wrong.txt");
+        assert_ne!(row.entry.name, refr.key);
+    }
+
+    #[test]
+    fn s3_viewfile_disabled_without_read_for_s3object_identity() {
+        // S3 with ONLY {List}: F3 must be Disabled even for a regular S3Object.
+        let row = s3_object_row("foo/bar.txt", "bar.txt");
+        let mut ctx = s3_list_context();
+        ctx.focused_kind = Some(row.entry.kind);
+        assert!(matches!(
+            action_availability(ActionId::ViewFile, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn s3_viewfile_disabled_for_s3prefix_identity() {
+        // S3Prefix is not a regular object: its focused kind is Directory, so
+        // F3 stays Disabled even with Read. Proves routing distinguishes
+        // object identity from prefix identity.
+        let row = ListedEntry {
+            entry: Entry {
+                name: "prefix/".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Prefix(S3PrefixRef {
+                target: "s3://acct".into(),
+                bucket: "real-bucket".into(),
+                prefix: "foo/bar".into(),
+            }),
+        };
+        let mut ctx = s3_read_context();
+        ctx.focused_kind = Some(row.entry.kind);
+        let availability = action_availability(ActionId::ViewFile, &ctx);
+        assert!(matches!(availability, ActionAvailability::Disabled { .. }));
+    }
+
+    // ── S3-29: F4 (EditFile) stays disabled for S3 even with hypothetical Read ──
+    // S3 has no Write capability, so the existing Read+Write gate excludes it.
+
+    #[test]
+    fn s3_edit_disabled_even_with_read() {
+        // Hypothetical S3 {List, Read}: F4 must remain Disabled because S3
+        // cannot provide Write. No RemoteEditRevision generalization for S3.
+        let ctx = s3_read_context();
+        assert!(matches!(
+            action_availability(ActionId::EditFile, &ctx),
             ActionAvailability::Disabled { .. }
         ));
     }
