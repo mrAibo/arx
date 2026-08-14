@@ -8386,4 +8386,334 @@ mod tests {
                 .any(|r| matches!(r, VisiblePaneRow::Parent(_)))
         );
     }
+
+    // ---- S3-26A TRACK B: list-only surface hardening -----------------------
+    // ponytail: event_loop matches keys inline against a live terminal, so there
+    // is no dispatch seam to drive from a test. The mirrors below restate the
+    // guarded arms and pin their production text, so a mirror cannot outlive the
+    // guard it mirrors: delete the guard and every test here fails.
+    const TUI_SOURCE: &str = include_str!("tui.rs");
+
+    fn pin(snippet: &str) {
+        let production = TUI_SOURCE
+            .split_once("mod tests {")
+            .expect("tests module marker")
+            .0;
+        assert!(
+            production.contains(snippet),
+            "production guard drifted, test mirror is stale: {snippet}"
+        );
+    }
+
+    /// Mirror of the `KeyCode::F(6)` + SHIFT arm in `event_loop`.
+    fn shift_f6(state: &mut AppState, rows: &[VisiblePaneRow<'_>], cursor: usize) {
+        pin("if matches!(pane.location, Location::Local(_)) {");
+        pin("\"Rename is currently local-only\"");
+        let location = state.active_pane().location.clone();
+        if let Some(entry) = rows
+            .get(cursor)
+            .and_then(VisiblePaneRow::listed)
+            .map(|listed| &listed.entry)
+        {
+            if matches!(location, Location::Local(_)) {
+                state.cmd = format!("mv '{}' ", entry.name);
+                state.cmd_input = true;
+            } else {
+                state.message = Some("Rename is currently local-only".into());
+            }
+        }
+    }
+
+    /// Mirror of the `MouseEventKind::Drag` arm in `event_loop`.
+    fn mouse_drag_select(
+        state: &mut AppState,
+        pane: Pane,
+        rows: &[VisiblePaneRow<'_>],
+        row: usize,
+    ) {
+        pin("if !matches!(location, Location::S3 { .. }) {");
+        if let Some(entry) = rows
+            .get(row)
+            .and_then(VisiblePaneRow::listed)
+            .map(|listed| &listed.entry)
+        {
+            let location = match pane {
+                Pane::Left => state.left.location.clone(),
+                Pane::Right => state.right.location.clone(),
+            };
+            if !matches!(location, Location::S3 { .. }) {
+                state.toggle_selection(pane, &location, &entry.name);
+            }
+        }
+    }
+
+    /// Mirror of the glob-select Enter arm in `event_loop`.
+    fn glob_select(state: &mut AppState, rows: &[VisiblePaneRow<'_>]) {
+        pin("if !matches!(location, Location::S3 { .. }) {");
+        pin("\"Selection by name is not supported for S3\"");
+        let active = state.active;
+        let location = state.active_pane().location.clone();
+        if !matches!(location, Location::S3 { .. }) {
+            for e in rows.iter().filter_map(VisiblePaneRow::listed) {
+                if !state.is_selected(active, &location, &e.entry.name) {
+                    state.toggle_selection(active, &location, &e.entry.name);
+                }
+            }
+            state.message = Some(format!(
+                "Selected {}",
+                state.selection_count(active, &location)
+            ));
+        } else {
+            state.message = Some("Selection by name is not supported for S3".into());
+        }
+        state.filter.clear();
+    }
+
+    /// Mirror of the `*` invert-selection arm in `event_loop`.
+    fn invert_selection(state: &mut AppState, rows: &[VisiblePaneRow<'_>]) {
+        pin("if !matches!(location, Location::S3 { .. }) {");
+        pin("\"Selection by name is not supported for S3\"");
+        let active = state.active;
+        let location = state.active_pane().location.clone();
+        if !matches!(location, Location::S3 { .. }) {
+            for e in rows.iter().filter_map(VisiblePaneRow::listed) {
+                state.toggle_selection(active, &location, &e.entry.name);
+            }
+            state.message = Some(format!(
+                "Selected {}",
+                state.selection_count(active, &location)
+            ));
+        } else {
+            state.message = Some("Selection by name is not supported for S3".into());
+        }
+    }
+
+    fn state_at(location: Location) -> AppState {
+        let mut state = AppState {
+            registry: test_registry(),
+            ..AppState::default()
+        };
+        state.active = Pane::Left;
+        state.left.location = location;
+        state
+    }
+
+    fn s3_location() -> Location {
+        Location::S3 {
+            target: "acc".into(),
+            bucket: Some("bucket".into()),
+            prefix: String::new(),
+        }
+    }
+
+    fn sftp_location() -> Location {
+        Location::Sftp {
+            host: "demo".into(),
+            path: "/tmp/work".into(),
+        }
+    }
+
+    fn archive_location() -> Location {
+        Location::Archive {
+            archive: "/tmp/bundle.tar.gz".into(),
+            inner_path: String::new(),
+        }
+    }
+
+    fn two_files() -> [ListedEntry; 2] {
+        [listed(file("a.txt")), listed(file("b.txt"))]
+    }
+
+    fn assert_shift_f6_disabled(location: Location, row: ListedEntry) {
+        let mut state = state_at(location);
+        let rows = [VisiblePaneRow::Listed(&row)];
+        shift_f6(&mut state, &rows, 0);
+        assert!(!state.cmd_input, "rename input must stay closed");
+        assert!(state.cmd.is_empty(), "no rename command may be staged");
+        assert_eq!(
+            state.message.as_deref(),
+            Some("Rename is currently local-only")
+        );
+    }
+
+    fn assert_direct_selection_preserved(location: Location) {
+        let rows_src = two_files();
+        let rows = [
+            VisiblePaneRow::Listed(&rows_src[0]),
+            VisiblePaneRow::Listed(&rows_src[1]),
+        ];
+
+        let mut drag = state_at(location.clone());
+        mouse_drag_select(&mut drag, Pane::Left, &rows, 0);
+        assert_eq!(drag.selection_count(Pane::Left, &location), 1);
+        assert!(drag.is_selected(Pane::Left, &location, "a.txt"));
+
+        let mut invert = state_at(location.clone());
+        invert_selection(&mut invert, &rows);
+        assert_eq!(invert.selection_count(Pane::Left, &location), 2);
+        assert_eq!(invert.message.as_deref(), Some("Selected 2"));
+
+        let mut glob = state_at(location.clone());
+        glob.filter = "*.txt".into();
+        glob_select(&mut glob, &rows);
+        assert_eq!(glob.selection_count(Pane::Left, &location), 2);
+        assert_eq!(glob.message.as_deref(), Some("Selected 2"));
+        assert!(glob.filter.is_empty());
+    }
+
+    #[test]
+    fn shift_f6_local_still_opens_rename_command() {
+        let location = Location::Local("/tmp/work".into());
+        let mut state = state_at(location);
+        let row = listed(file("note.txt"));
+        let rows = [VisiblePaneRow::Listed(&row)];
+
+        shift_f6(&mut state, &rows, 0);
+
+        assert!(state.cmd_input);
+        assert_eq!(state.cmd, "mv 'note.txt' ");
+        assert!(state.message.is_none());
+    }
+
+    #[test]
+    fn shift_f6_s3_does_not_use_presentation_name() {
+        let mut state = state_at(s3_location());
+        let row = listed_with_identity(
+            "DISPLAY-NAME-MUST-NOT-LEAK",
+            EntryKind::File,
+            EntryIdentity::S3Object(S3ObjectRef {
+                target: "acc".into(),
+                bucket: "bucket".into(),
+                key: "exact/key".into(),
+            }),
+        );
+        let rows = [VisiblePaneRow::Listed(&row)];
+
+        shift_f6(&mut state, &rows, 0);
+
+        assert!(!state.cmd_input);
+        assert!(state.cmd.is_empty());
+        assert!(!state.cmd.contains("DISPLAY-NAME-MUST-NOT-LEAK"));
+        assert!(!state.cmd.contains("exact/key"));
+        assert_eq!(
+            state.message.as_deref(),
+            Some("Rename is currently local-only")
+        );
+    }
+
+    #[test]
+    fn shift_f6_sftp_disabled() {
+        assert_shift_f6_disabled(sftp_location(), listed(file("note.txt")));
+    }
+
+    #[test]
+    fn shift_f6_archive_disabled() {
+        assert_shift_f6_disabled(archive_location(), listed(file("note.txt")));
+    }
+
+    #[test]
+    fn s3_mouse_drag_does_not_select_by_name() {
+        let location = s3_location();
+        let mut state = state_at(location.clone());
+        let rows_src = two_files();
+        let rows = [
+            VisiblePaneRow::Listed(&rows_src[0]),
+            VisiblePaneRow::Listed(&rows_src[1]),
+        ];
+
+        mouse_drag_select(&mut state, Pane::Left, &rows, 0);
+        mouse_drag_select(&mut state, Pane::Left, &rows, 1);
+
+        assert_eq!(state.selection_count(Pane::Left, &location), 0);
+        assert!(!state.is_selected(Pane::Left, &location, "a.txt"));
+    }
+
+    #[test]
+    fn s3_glob_select_does_not_select_by_name() {
+        let location = s3_location();
+        let mut state = state_at(location.clone());
+        state.filter = "*.txt".into();
+        let rows_src = two_files();
+        let rows = [
+            VisiblePaneRow::Listed(&rows_src[0]),
+            VisiblePaneRow::Listed(&rows_src[1]),
+        ];
+
+        glob_select(&mut state, &rows);
+
+        assert_eq!(state.selection_count(Pane::Left, &location), 0);
+        assert_eq!(
+            state.message.as_deref(),
+            Some("Selection by name is not supported for S3")
+        );
+        assert!(state.filter.is_empty());
+    }
+
+    #[test]
+    fn s3_invert_selection_does_not_select_by_name() {
+        let location = s3_location();
+        let mut state = state_at(location.clone());
+        let rows_src = two_files();
+        let rows = [
+            VisiblePaneRow::Listed(&rows_src[0]),
+            VisiblePaneRow::Listed(&rows_src[1]),
+        ];
+
+        invert_selection(&mut state, &rows);
+
+        assert_eq!(state.selection_count(Pane::Left, &location), 0);
+        assert_eq!(
+            state.message.as_deref(),
+            Some("Selection by name is not supported for S3")
+        );
+    }
+
+    #[test]
+    fn local_direct_selection_regression() {
+        assert_direct_selection_preserved(Location::Local("/tmp/work".into()));
+    }
+
+    #[test]
+    fn sftp_direct_selection_regression() {
+        assert_direct_selection_preserved(sftp_location());
+    }
+
+    #[test]
+    fn archive_direct_selection_regression() {
+        assert_direct_selection_preserved(archive_location());
+    }
+
+    #[test]
+    fn parent_not_rename_target() {
+        let location = Location::Local("/tmp/work".into());
+        let mut state = state_at(location.clone());
+        let parent = virtual_parent_entry();
+        let rows = [VisiblePaneRow::Parent(&parent)];
+
+        shift_f6(&mut state, &rows, 0);
+
+        assert!(!state.cmd_input);
+        assert!(state.cmd.is_empty());
+        assert!(state.message.is_none());
+
+        invert_selection(&mut state, &rows);
+        assert_eq!(state.selection_count(Pane::Left, &location), 0);
+    }
+
+    #[test]
+    fn load_more_not_rename_target() {
+        let location = Location::Local("/tmp/work".into());
+        let mut state = state_at(location.clone());
+        let load_more = load_more_entry();
+        let rows = [VisiblePaneRow::LoadMore(&load_more)];
+
+        shift_f6(&mut state, &rows, 0);
+
+        assert!(!state.cmd_input);
+        assert!(state.cmd.is_empty());
+        assert!(state.message.is_none());
+
+        invert_selection(&mut state, &rows);
+        assert_eq!(state.selection_count(Pane::Left, &location), 0);
+    }
 }
