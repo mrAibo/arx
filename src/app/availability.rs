@@ -145,15 +145,17 @@ fn require_active_capability(
 }
 
 /// Exact set of provider pairs `TransferPlanner` can actually execute for
-/// Copy. Only these three directions are implemented; every other pair
-/// (any S3 side, Archive, SFTP→SFTP, WebDAV) is disabled because the planner
-/// cannot execute it.
+/// Copy. Local↔SFTP and Local↔S3 (single-object basic transfer) are the only
+/// implemented directions; every other pair (Archive, SFTP↔SFTP, WebDAV, S3↔S3,
+/// S3↔SFTP) is disabled because the planner cannot execute it.
 fn copy_pair_supported(active: ProviderId, passive: ProviderId) -> bool {
     matches!(
         (active, passive),
         (ProviderId::Local, ProviderId::Local)
             | (ProviderId::Local, ProviderId::Sftp)
             | (ProviderId::Sftp, ProviderId::Local)
+            | (ProviderId::S3, ProviderId::Local)
+            | (ProviderId::Local, ProviderId::S3)
     )
 }
 
@@ -835,25 +837,25 @@ mod tests {
     }
 
     #[test]
-    fn copy_s3_local_disabled() {
+    fn copy_s3_local_available() {
         let ctx = s3_list_context();
-        // active = S3, passive = Local
-        assert!(matches!(
+        // active = S3, passive = Local — single-object basic transfer is enabled
+        assert_eq!(
             action_availability(ActionId::Copy, &ctx),
-            ActionAvailability::Disabled { .. }
-        ));
+            ActionAvailability::Available
+        );
     }
 
     #[test]
-    fn copy_local_s3_disabled() {
+    fn copy_local_s3_available() {
         let mut ctx = s3_list_context();
         ctx.active_provider = ProviderId::Local;
         ctx.passive_provider = ProviderId::S3;
         ctx.active_capabilities = LOCAL_CAPABILITIES;
-        assert!(matches!(
+        assert_eq!(
             action_availability(ActionId::Copy, &ctx),
-            ActionAvailability::Disabled { .. }
-        ));
+            ActionAvailability::Available
+        );
     }
 
     #[test]
