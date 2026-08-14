@@ -856,6 +856,7 @@ mod physical_acceptance {
             &up,
             S3OverwritePolicy::Forbid,
             Arc::new(AtomicBool::new(false)),
+            &mut |_| {},
         )
         .await
         .expect("upload must succeed against live endpoint");
