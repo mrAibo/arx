@@ -89,6 +89,7 @@ pub async fn execute_transfer(
                         spec,
                         s3_upload::S3OverwritePolicy::Forbid,
                         cancel.clone(),
+                        &mut on_progress,
                     )
                     .await
                     .map_err(TransferExecutionError::Io)?;
