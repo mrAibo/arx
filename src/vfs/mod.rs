@@ -262,6 +262,12 @@ pub struct RemoteEditRevision {
 }
 
 impl RemoteEditRevision {
+    /// Construct from a captured stable read. Used by tests/acceptance harness
+    /// to drive `write_file_bytes_if_unchanged_at` without a prior read roundtrip.
+    pub fn new(bytes: Vec<u8>, unix_mode: u32, unix_uid: u32, unix_gid: u32) -> Self {
+        Self { bytes, unix_mode, unix_uid, unix_gid }
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
