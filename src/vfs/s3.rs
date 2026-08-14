@@ -11,6 +11,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Builder, retry::RetryConfig};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::operation::get_object::GetObjectError;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::operation::list_buckets::ListBucketsOutput;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
 use std::borrow::Cow;
@@ -32,6 +33,38 @@ pub struct S3Provider {
     client: tokio::sync::OnceCell<aws_sdk_s3::Client>,
 }
 
+/// Outcome of the create-prefix preflight HeadObject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefixHeadState {
+    /// Object absent (modeled `NotFound`, wire code `NoSuchKey`/`NotFound`) —
+    /// PutObject may proceed.
+    Missing,
+    /// Access denied / forbidden / unauthorized — fail closed, no PutObject.
+    AccessDenied,
+    /// Any other error — fail closed (do NOT interpret as missing).
+    Unknown,
+}
+
+/// Pure classification of a HeadObject service error (S3-54R preflight).
+///
+/// In aws-sdk-s3 1.x the operation error is flattened: a missing object is the
+/// modeled `NotFound` variant, while access/forbidden/unauthorized are
+/// `Unhandled` carrying a code. Everything else is `Unknown` and fails closed.
+// ponytail: mirrors transfer::s3_upload::classify_head_error intent without a
+// vfs -> transfer dependency (VFS is lower-level).
+fn classify_prefix_head(err: &HeadObjectError) -> PrefixHeadState {
+    match err {
+        HeadObjectError::NotFound(_) => PrefixHeadState::Missing,
+        e if e.code() == Some("AccessDenied")
+            || e.code() == Some("Forbidden")
+            || e.code() == Some("Unauthorized") =>
+        {
+            PrefixHeadState::AccessDenied
+        }
+        _ => PrefixHeadState::Unknown,
+    }
+}
+
 impl S3Provider {
     pub(crate) fn new(target: S3TargetConfig) -> Self {
         Self {
@@ -49,6 +82,112 @@ impl S3Provider {
             .get_or_try_init(|| client_for_target(&self.target))
             .await
             .map_err(|e| io::Error::new(e.kind(), e.to_string()))
+    }
+
+    /// Pure marker-key construction (S3-54R).
+    ///
+    /// Unconditional separator — NEVER `Path`/`PathBuf`/`components()`/
+    /// `canonicalize`/`trim_end_matches('/')`/collapse `//`/resolve `.` or `..`.
+    /// The prefix/key is built by verbatim string join so an awkward prefix
+    /// (`foo/../bar`, `foo//`, unicode) is preserved byte-for-byte.
+    pub(crate) fn prefix_marker_key(nav_prefix: &str, child: &str) -> String {
+        if nav_prefix.is_empty() {
+            format!("{}/", child)
+        } else {
+            format!("{}/{}/", nav_prefix, child)
+        }
+    }
+
+    /// S3-native create-prefix marker (S3-54R).
+    ///
+    /// Writes an empty object at `<nav_prefix>/<child>/` — a directory-style
+    /// prefix marker — directly through this target's AWS client. It does NOT
+    /// route through the generic filesystem `mkdir_at` / `validated_child_path`
+    /// path, does NOT create a bucket, and does NOT overwrite an existing key.
+    ///
+    /// Preflights with HeadObject: an existing object (zero or non-zero) is a
+    /// hard `AlreadyExists` with no PutObject; any other error fails closed
+    /// (never interpreted as missing). On a clean preflight it issues exactly
+    /// ONE PutObject with an empty body — no ACL / metadata invention. The SDK
+    /// retry policy is already disabled by the client factory.
+    pub(crate) async fn create_prefix_marker(
+        &self,
+        bucket: &str,
+        nav_prefix: &str,
+        child: &str,
+    ) -> io::Result<S3PrefixRef> {
+        // Enforce the configured bucket binding: a bucket-bound target must
+        // never write to a different bucket (fail closed on escape).
+        let bucket_escapes = self.target.bucket.as_ref().is_some_and(|b| b != bucket);
+        if bucket_escapes {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "S3 bucket escape rejected: target bound to {}, requested {}",
+                    sanitize_diag(self.target.bucket.as_ref().unwrap()),
+                    sanitize_diag(bucket)
+                ),
+            ));
+        }
+
+        let marker = Self::prefix_marker_key(nav_prefix, child);
+        let client = self.client().await?;
+
+        // Preflight: never overwrite an existing object.
+        let head = client
+            .head_object()
+            .bucket(bucket)
+            .key(&marker)
+            .send()
+            .await;
+        match head {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("prefix marker already exists: {}", marker),
+                ));
+            }
+            Err(sdk_err) => {
+                let svc = sdk_err.into_service_error();
+                match classify_prefix_head(&svc) {
+                    PrefixHeadState::Missing => {}
+                    PrefixHeadState::AccessDenied => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "S3 prefix-marker preflight access denied",
+                        ));
+                    }
+                    PrefixHeadState::Unknown => {
+                        return Err(io::Error::other(format!(
+                            "S3 prefix-marker preflight failed: {}",
+                            sanitize_diag(&svc.to_string())
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Exactly ONE PutObject: empty body, no ACL / metadata invention.
+        let empty = aws_sdk_s3::primitives::ByteStream::from(Vec::new());
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(&marker)
+            .body(empty)
+            .send()
+            .await
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "S3 PutObject failed: {}",
+                    sanitize_diag(&e.to_string())
+                ))
+            })?;
+
+        Ok(S3PrefixRef {
+            target: self.target.id.clone(),
+            bucket: bucket.to_string(),
+            prefix: marker,
+        })
     }
 
     /// Pure decision boundary: which listing shape does this location request?
@@ -2784,5 +2923,94 @@ mod tests {
         assert!(!r.truncated);
         assert!(r.unix_mode.is_none() && r.unix_uid.is_none() && r.unix_gid.is_none());
         assert!(r.into_revision().is_err());
+    }
+
+    // ── S3-54R: create-prefix marker key + preflight classification ──
+
+    // Pure marker-key construction — no AWS, no filesystem normalization.
+    #[test]
+    fn marker_key_root_bucket() {
+        assert_eq!(S3Provider::prefix_marker_key("", "new"), "new/");
+    }
+    #[test]
+    fn marker_key_nested_prefix() {
+        assert_eq!(S3Provider::prefix_marker_key("foo", "new"), "foo/new/");
+    }
+    #[test]
+    fn marker_key_trailing_slash_prefix() {
+        assert_eq!(S3Provider::prefix_marker_key("foo/", "new"), "foo//new/");
+    }
+    #[test]
+    fn marker_key_repeated_slash_prefix() {
+        assert_eq!(S3Provider::prefix_marker_key("foo//", "new"), "foo///new/");
+    }
+    #[test]
+    fn marker_key_dotdot_prefix() {
+        assert_eq!(
+            S3Provider::prefix_marker_key("foo/../bar", "new"),
+            "foo/../bar/new/"
+        );
+    }
+    #[test]
+    fn marker_key_dot_prefix() {
+        assert_eq!(S3Provider::prefix_marker_key(".", "new"), "./new/");
+    }
+    #[test]
+    fn marker_key_unicode_prefix() {
+        assert_eq!(
+            S3Provider::prefix_marker_key("日本語/資料", "new"),
+            "日本語/資料/new/"
+        );
+    }
+
+    // Preflight classification — no AWS. Mirrors the exact match arms that gate
+    // the PutObject in `create_prefix_marker` (tests 14-17 decision logic).
+    use aws_sdk_s3::types::error::NotFound as S3NotFound;
+
+    fn head_not_found() -> HeadObjectError {
+        HeadObjectError::NotFound(S3NotFound::builder().message("missing").build())
+    }
+    fn head_unhandled(code: &str) -> HeadObjectError {
+        HeadObjectError::generic(ErrorMetadata::builder().code(code).build())
+    }
+
+    #[test]
+    fn classify_missing_is_missing() {
+        assert_eq!(
+            classify_prefix_head(&head_not_found()),
+            PrefixHeadState::Missing
+        );
+    }
+    #[test]
+    fn classify_access_denied_is_access_denied() {
+        assert_eq!(
+            classify_prefix_head(&head_unhandled("AccessDenied")),
+            PrefixHeadState::AccessDenied
+        );
+    }
+    #[test]
+    fn classify_forbidden_is_access_denied() {
+        assert_eq!(
+            classify_prefix_head(&head_unhandled("Forbidden")),
+            PrefixHeadState::AccessDenied
+        );
+    }
+    #[test]
+    fn classify_unauthorized_is_access_denied() {
+        assert_eq!(
+            classify_prefix_head(&head_unhandled("Unauthorized")),
+            PrefixHeadState::AccessDenied
+        );
+    }
+    #[test]
+    fn classify_other_is_unknown() {
+        assert_eq!(
+            classify_prefix_head(&head_unhandled("InternalError")),
+            PrefixHeadState::Unknown
+        );
+        assert_eq!(
+            classify_prefix_head(&head_unhandled("NoSuchBucket")),
+            PrefixHeadState::Unknown
+        );
     }
 }
