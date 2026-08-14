@@ -755,20 +755,17 @@ async fn event_loop(
                                     if command.is_empty() {
                                         state.message = Some(": command cancelled".into());
                                     } else if let Some(loc) = pending_mkdir {
-                                        // SFTP provider-backed mkdir
                                         let name = command;
-                                        // ponytail: validate location type early.
-                                        if !matches!(
-                                            &loc,
-                                            Location::Local(_) | Location::Sftp { .. }
-                                        ) {
-                                            state.message =
-                                                Some("mkdir: unsupported location".into());
-                                            continue;
-                                        }
                                         // Validate child name — reject empty, ".", "..", "/", NUL.
                                         if let Err(e) = arx::vfs::validate_child_name(&name) {
                                             state.message = Some(e.to_string());
+                                            continue;
+                                        }
+                                        // S3: direct-bypass guard — target root (bucket=None) MUST NOT schedule prefix creation.
+                                        if let Location::S3 { bucket: None, .. } = &loc {
+                                            state.message = Some(
+                                                "mkdir: bucket creation is not supported".into(),
+                                            );
                                             continue;
                                         }
                                         let registry = state.registry.clone();
@@ -793,37 +790,78 @@ async fn event_loop(
                                                 arx::jobs::JobEvent::Running { id: jid },
                                             );
                                         }
-                                        tokio::spawn(async move {
-                                            let result = registry.mkdir_at(&loc, &name).await;
-                                            match result {
-                                                Ok(()) => {
-                                                    let _ = jobs.publish_event(
-                                                        &tx,
-                                                        arx::jobs::JobEvent::Completed {
-                                                            id: job.id,
-                                                            result: arx::jobs::JobResult::generic(
-                                                                "created", 1,
-                                                            ),
-                                                        },
-                                                    );
-                                                    let _ = loader.load(
-                                                        pane,
-                                                        pane_location,
-                                                        PaneLoadPurpose::Refresh,
-                                                    );
+                                        // Dispatch based on location type
+                                        if let Location::S3 { .. } = &loc {
+                                            // S3: use create_s3_prefix_marker_at
+                                            tokio::spawn(async move {
+                                                let result = registry
+                                                    .create_s3_prefix_marker_at(&loc, &name)
+                                                    .await;
+                                                match result {
+                                                    Ok(_) => {
+                                                        let _ = jobs.publish_event(
+                                                            &tx,
+                                                            arx::jobs::JobEvent::Completed {
+                                                                id: job.id,
+                                                                result:
+                                                                    arx::jobs::JobResult::generic(
+                                                                        "created", 1,
+                                                                    ),
+                                                            },
+                                                        );
+                                                        let _ = loader.load(
+                                                            pane,
+                                                            pane_location,
+                                                            PaneLoadPurpose::Refresh,
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = jobs.publish_event(
+                                                            &tx,
+                                                            arx::jobs::JobEvent::Failed {
+                                                                id: job.id,
+                                                                error: e.to_string(),
+                                                                result: None,
+                                                            },
+                                                        );
+                                                    }
                                                 }
-                                                Err(e) => {
-                                                    let _ = jobs.publish_event(
-                                                        &tx,
-                                                        arx::jobs::JobEvent::Failed {
-                                                            id: job.id,
-                                                            error: e.to_string(),
-                                                            result: None,
-                                                        },
-                                                    );
+                                            });
+                                        } else {
+                                            // SFTP (and Local, if ever routed here): use mkdir_at
+                                            tokio::spawn(async move {
+                                                let result = registry.mkdir_at(&loc, &name).await;
+                                                match result {
+                                                    Ok(()) => {
+                                                        let _ = jobs.publish_event(
+                                                            &tx,
+                                                            arx::jobs::JobEvent::Completed {
+                                                                id: job.id,
+                                                                result:
+                                                                    arx::jobs::JobResult::generic(
+                                                                        "created", 1,
+                                                                    ),
+                                                            },
+                                                        );
+                                                        let _ = loader.load(
+                                                            pane,
+                                                            pane_location,
+                                                            PaneLoadPurpose::Refresh,
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = jobs.publish_event(
+                                                            &tx,
+                                                            arx::jobs::JobEvent::Failed {
+                                                                id: job.id,
+                                                                error: e.to_string(),
+                                                                result: None,
+                                                            },
+                                                        );
+                                                    }
                                                 }
-                                            }
-                                        });
+                                            });
+                                        }
                                         state.message = Some(format!("mkdir {name_for_msg}…"));
                                     } else {
                                         let id = effect_dispatcher.dispatch(
@@ -5505,8 +5543,14 @@ async fn dispatch_ui_action(
             state.clear_selection();
         }
         Action::Mkdir => {
-            // SFTP: use provider-backed mkdir via frozen location
-            if state.active_pane().location.provider_id() == arx::vfs::ProviderId::Sftp {
+            let provider_id = state.active_pane().location.provider_id();
+            if provider_id == arx::vfs::ProviderId::Sftp {
+                // SFTP: use provider-backed mkdir via frozen location
+                state.pending_mkdir_location = Some(state.active_pane().location.clone());
+                state.cmd = String::new();
+                state.cmd_input = true;
+            } else if provider_id == arx::vfs::ProviderId::S3 {
+                // S3: freeze exact Location::S3 at prompt start; provider call on Enter.
                 state.pending_mkdir_location = Some(state.active_pane().location.clone());
                 state.cmd = String::new();
                 state.cmd_input = true;
