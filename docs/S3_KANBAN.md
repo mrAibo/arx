@@ -16,11 +16,11 @@
 
 ## Column summary
 
-- **READY** (1): S3-26A
+- **READY** (0): —
 - **DOING** (0): —
-- **REVIEW** (0): —
+- **REVIEW** (1): S3-26A
 - **BLOCKED** (1): S3-26
-- **DONE** (28): S3-00..S3-25, S3-24P (PR #98 merged, merge SHA 19d4c04), S3-20R (PR #99 merged, merge SHA 2e7fe21), S3-24 (PR #100 merged, merge SHA f38273a), S3-25 (PR #101 merged, merge SHA pending)
+- **DONE** (28): S3-00..S3-25, S3-24P (PR #98 merged, merge SHA 19d4c04), S3-20R (PR #99 merged, merge SHA 2e7fe21), S3-24 (PR #100 merged, merge SHA f38273a), S3-25 (PR #101 merged, merge SHA 85afb6a)
 - **BACKLOG** (54): S3-27..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
@@ -356,7 +356,7 @@
 
 ### S3-25 — Contextual virtual S3 parent
 - **Phase:** P10
-- **Status:** DONE (PR #101 merged; merge SHA pending; independent two-axis review APPROVED 0/0/0/0, quality+msrv SUCCESS)
+- **Status:** DONE (PR #101 merged; merge SHA 85afb6a; independent two-axis review APPROVED 0/0/0/0, quality+msrv SUCCESS)
 - **Depends on:** S3-23, S3-24
 - **Allowed files:** src/vfs/mod.rs, src/app/actions.rs, src/app/mod.rs, src/tui.rs, docs/S3_KANBAN.md
 - **Acceptance:** Contextual S3 virtual-parent navigation that preserves account-style target-root and bucket-bound least-privilege semantics, awkward repeated-slash prefixes, literal `.`/`..` segments, and Local/SFTP/Archive parent behavior, using exactly ONE authoritative configured-target inventory (ProviderRegistry). Virtual `..` is UI/navigation state only — never S3ObjectRef, S3PrefixRef, object key, or provider-listed EntryIdentity.
@@ -379,7 +379,7 @@
 
 ### S3-26A — List-only action/selection surface hardening
 - **Phase:** P10
-- **Status:** READY
+- **Status:** REVIEW (PR #102 open; STOP IN REVIEW — do not merge; exact review + STOP GATE C audit required before S3-26)
 - **Depends on:** S3-25, S3-24P
 - **Allowed files:** src/app/availability.rs, src/tui.rs, docs/S3_KANBAN.md
 - **Acceptance:** Make a hypothetical S3 capability set of ONLY `{List}` expose navigation/listing only — no transfer, mutation, workspace sync, or identity-unsafe selection.
