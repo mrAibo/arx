@@ -39,6 +39,7 @@ pub struct ActionContext {
     pub sync_verification_diff_ready: bool,
     pub sync_return_preview_ready: bool,
     pub right_location: Location,
+    pub active_location: Location,
 }
 
 impl ActionContext {
@@ -113,6 +114,7 @@ impl ActionContext {
             sync_verification_diff_ready,
             sync_return_preview_ready,
             right_location: state.right.location.clone(),
+            active_location: state.active_pane().location.clone(),
         }
     }
 
@@ -265,6 +267,20 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
                 ActionAvailability::Disabled {
                     reason: "Directory creation is not supported for this location".into(),
                 }
+            } else if ctx.active_provider == ProviderId::S3 {
+                // S3: available only when bucket is Some (not target root).
+                // bucket=None => target root, bucket creation not supported.
+                // bucket=Some("") => bucket root, available.
+                // bucket=Some("...") + prefix => nested prefix, available.
+                match &ctx.active_location {
+                    Location::S3 { bucket: None, .. } => ActionAvailability::Disabled {
+                        reason: "Bucket creation is not supported".into(),
+                    },
+                    Location::S3 {
+                        bucket: Some(_), ..
+                    } => ActionAvailability::Available,
+                    _ => ActionAvailability::Available,
+                }
             } else {
                 ActionAvailability::Available
             }
@@ -396,6 +412,7 @@ mod tests {
             sync_verification_diff_ready: false,
             sync_return_preview_ready: false,
             right_location: Location::Local(std::path::PathBuf::from("/")),
+            active_location: Location::Local(std::path::PathBuf::from("/")),
         }
     }
 
