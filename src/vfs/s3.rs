@@ -2,17 +2,21 @@
 use crate::config::S3TargetConfig;
 use crate::config::sanitize_diag;
 use crate::vfs::{
-    Entry, EntryIdentity, EntryKind, ListedEntry, Location, ProviderContinuation,
+    BoundedRead, Entry, EntryIdentity, EntryKind, ListedEntry, Location, ProviderContinuation,
     ProviderListingPage, VfsOps, VfsProvider,
 };
 use aws_config::BehaviorVersion;
 use aws_config::Region;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Builder, retry::RetryConfig};
+use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::list_buckets::ListBucketsOutput;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
 use std::borrow::Cow;
 use std::io;
+use tokio::io::AsyncReadExt;
+use tokio::pin;
 
 pub struct S3Fs;
 /// Per-configured-target S3 provider.
@@ -136,6 +140,65 @@ impl S3Provider {
                 Ok(S3ListingScope::TargetRoot)
             }
         }
+    }
+    /// Fail-closed identity/location/target/bucket validation for a bounded
+    /// GetObject preview. Runs BEFORE any AWS client construction, auth, or
+    /// network. Never proves identity from `listed.entry.name` — only the exact
+    /// `S3ObjectRef` is authoritative. Returns the live `S3ObjectRef` on success.
+    // ponytail: single guard point for the read seam, mirroring
+    // classify_listing_location; no sibling path can forget the checks.
+    fn classify_read_identity<'a>(
+        &'a self,
+        location: &Location,
+        listed: &'a ListedEntry,
+    ) -> io::Result<&'a S3ObjectRef> {
+        let EntryIdentity::S3Object(refr) = &listed.identity else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "read_listed_prefix_bytes requires an S3Object identity (provider-native)",
+            ));
+        };
+        let Location::S3 { target, bucket, .. } = location else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "S3 GetObject preview requires Location::S3",
+            ));
+        };
+        // Exact target id (no normalization).
+        if target != &self.target.id {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("S3 target mismatch: {}", sanitize_diag(target)),
+            ));
+        }
+        if refr.target != self.target.id {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("S3 object target mismatch: {}", sanitize_diag(&refr.target)),
+            ));
+        }
+        // Bucket-bound configured target: never escape to another bucket.
+        if matches!(self.target.bucket.as_deref(), Some(bound) if bound != refr.bucket) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "S3 bucket escape rejected: target bound to {}, object in {}",
+                    sanitize_diag(self.target.bucket.as_deref().unwrap_or("")),
+                    sanitize_diag(&refr.bucket)
+                ),
+            ));
+        }
+        if bucket.as_deref() != Some(refr.bucket.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "S3 location bucket mismatch: location {}, object {}",
+                    sanitize_diag(bucket.as_deref().unwrap_or("")),
+                    sanitize_diag(&refr.bucket)
+                ),
+            ));
+        }
+        Ok(refr)
     }
 }
 
@@ -393,6 +456,56 @@ impl VfsProvider for S3Provider {
             }
         }
     }
+
+    /// Identity-aware bounded preview read for a listed S3 object.
+    ///
+    /// Overrides the default seam with a fail-closed, exact-identity GetObject
+    /// using a byte `Range`. Never reconstructs a key from `entry.name`; the
+    /// `S3ObjectRef` is the sole authority for bucket/key. No capability or
+    /// availability change — this is purely a narrower, identity-bound read.
+    async fn read_listed_prefix_bytes(
+        &self,
+        location: &Location,
+        listed: &ListedEntry,
+        max_bytes: usize,
+    ) -> io::Result<BoundedRead> {
+        // Fail-closed validation BEFORE any AWS client/auth/network work.
+        let refr = self.classify_read_identity(location, listed)?;
+        let params = build_get_object_params(refr, max_bytes)?;
+
+        let client = self.client().await?;
+        let out = client
+            .get_object()
+            .bucket(&params.bucket)
+            .key(&params.key)
+            .range(&params.range)
+            .send()
+            .await;
+
+        let out = match out {
+            Ok(out) => out,
+            // Diagnostics are sanitized to a static label: no key, credentials,
+            // signed query, or authorization header ever reaches the caller.
+            // A zero-byte object cannot satisfy `bytes=0-N` (N>=0), so S3
+            // returns 416 InvalidRange — the ONLY modeled condition we map to an
+            // empty preview. Every other error (NoSuchKey, AccessDenied,
+            // transport) stays a failure.
+            Err(sdk_err) => return map_get_object_error(&sdk_err.into_service_error()),
+        };
+
+        // Bounded local read: never collect an unbounded stream. `Take` enforces
+        // the cap even if the endpoint ignores the Range header.
+        let reader = out.body.into_async_read();
+        let (body, truncated) = read_bounded_body(reader, params.probe_len).await?;
+        let bytes: Vec<u8> = body.into_iter().take(max_bytes).collect();
+        Ok(BoundedRead {
+            bytes,
+            truncated,
+            unix_mode: None,
+            unix_uid: None,
+            unix_gid: None,
+        })
+    }
 }
 
 /// Bounded page size for every ListBuckets request (first and next pages).
@@ -482,6 +595,84 @@ fn map_list_buckets_page(
         entries,
         continuation: None,
     })
+}
+
+/// Exact, sanitized GetObject request parameters for one bounded preview.
+/// `probe_len` = `max_bytes + 1`: the extra byte is the truncation probe.
+#[derive(Debug)]
+struct GetObjectParams {
+    bucket: String,
+    key: String,
+    range: String,
+    probe_len: usize,
+}
+
+/// Pure request-parameter construction for a bounded S3 GetObject preview.
+///
+/// Takes ONLY the exact `S3ObjectRef` — `entry.name` is never consulted, so a
+/// wrong display name can never leak into the request. Fail-closed on a zero
+/// preview cap (no unbounded GET) and on `usize` overflow of `max_bytes + 1`.
+// ponytail: pure so the request shape is unit-testable without an AWS client.
+fn build_get_object_params(refr: &S3ObjectRef, max_bytes: usize) -> io::Result<GetObjectParams> {
+    if max_bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "S3 GetObject preview cap of 0 bytes is not supported",
+        ));
+    }
+    let probe_len = max_bytes.checked_add(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "S3 GetObject preview cap overflows usize",
+        )
+    })?;
+    Ok(GetObjectParams {
+        bucket: refr.bucket.clone(),
+        key: refr.key.clone(),
+        // S3 Range end is inclusive; `bytes=0-{max_bytes}` requests max_bytes+1 bytes.
+        range: format!("bytes=0-{max_bytes}"),
+        probe_len,
+    })
+}
+
+/// Read at most `probe_len` bytes from an `AsyncRead` and stop.
+///
+/// `Take` enforces the cap even if the endpoint ignores the Range header, so an
+/// unbounded stream is never collected. Truncation is provable from the local
+/// length: seeing the cap means more bytes exist (or the object is exactly
+/// `probe_len` > `max_bytes`), below the cap means the object fit the preview.
+// ponytail: take() is the whole bound; no Content-Length parsing needed.
+async fn read_bounded_body<R: tokio::io::AsyncRead>(
+    reader: R,
+    probe_len: usize,
+) -> io::Result<(Vec<u8>, bool)> {
+    let limited = reader.take(probe_len as u64);
+    let mut buf = Vec::with_capacity(probe_len.clamp(1, 64 * 1024));
+    pin!(limited);
+    limited.read_to_end(&mut buf).await?;
+    let truncated = buf.len() >= probe_len;
+    Ok((buf, truncated))
+}
+
+/// Sanitized mapping of a GetObject service error to a preview result.
+///
+/// Only the exact `InvalidRange` (416, from a zero-byte object that cannot
+/// satisfy `bytes=0-N`) maps to an empty, non-truncated preview. Every other
+/// error — NoSuchKey, AccessDenied, InvalidObjectState, transport — becomes a
+/// static, key-free failure. The diagnostic never contains the key, a signed
+/// query, a credential, or an authorization header.
+// ponytail: code() is the only signal inspected; the message is discarded.
+fn map_get_object_error(svc: &GetObjectError) -> io::Result<BoundedRead> {
+    match svc {
+        err if err.code() == Some("InvalidRange") => Ok(BoundedRead {
+            bytes: Vec::new(),
+            truncated: false,
+            unix_mode: None,
+            unix_uid: None,
+            unix_gid: None,
+        }),
+        _ => Err(io::Error::other("S3 GetObject preview request failed")),
+    }
 }
 
 /// Bounded page size for every ListObjectsV2 request.
@@ -1079,6 +1270,7 @@ mod tests {
 
     use aws_sdk_s3::operation::list_buckets::ListBucketsOutput;
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
+    use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::primitives::DateTime;
     use aws_sdk_s3::types::{Bucket, CommonPrefix, Object};
 
@@ -2163,5 +2355,277 @@ mod tests {
             &e.identity,
             EntryIdentity::S3Prefix(p) if p.prefix == "foo//child/"
         )));
+    }
+
+    // ── S3-27: bounded GetObject preview via identity seam (offline) ──
+
+    use aws_sdk_s3::error::ErrorMetadata;
+    use aws_sdk_s3::primitives::SdkBody;
+
+    /// Build validated request params for a listed S3 object with an exact key.
+    /// Never touches `entry.name`; the S3ObjectRef is the sole authority.
+    fn preview_params(key: &str) -> io::Result<GetObjectParams> {
+        let p = S3Provider::new(root_target());
+        let l = loc("t", Some("b"), "");
+        let listed = ListedEntry {
+            entry: Entry {
+                name: "display-name".into(),
+                kind: EntryKind::File,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                key: key.into(),
+            }),
+        };
+        let refr = p.classify_read_identity(&l, &listed)?;
+        build_get_object_params(refr, 1024)
+    }
+
+    #[test]
+    fn read_preview_preserves_exact_target_bucket_and_keys() {
+        for key in [
+            "k.txt",
+            "foo//bar.txt",
+            "foo/../bar.txt",
+            "foo/./bar.txt",
+            "a b/c d.txt",
+            "日本語/資料.txt",
+            "emoji/����‍�����.txt",
+        ] {
+            let params = preview_params(key).unwrap();
+            assert_eq!(params.bucket, "b", "bucket preserved for {key}");
+            assert_eq!(params.key, key, "key preserved byte-for-byte for {key}");
+            assert_eq!(params.range, "bytes=0-1024", "range bounded for {key}");
+        }
+        // exact target identity preserved (authority == configured target id)
+        let p = S3Provider::new(root_target());
+        let l = loc("t", Some("b"), "");
+        let listed = ListedEntry {
+            entry: Entry {
+                name: "x".into(),
+                kind: EntryKind::File,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                key: "k".into(),
+            }),
+        };
+        let refr = p.classify_read_identity(&l, &listed).unwrap();
+        assert_eq!(refr.target, "t");
+    }
+
+    #[test]
+    fn read_preview_uses_ref_key_not_display_name() {
+        let p = S3Provider::new(root_target());
+        let l = loc("t", Some("b"), "");
+        let listed = ListedEntry {
+            entry: Entry {
+                name: "WRONG-DISPLAY-NAME".into(),
+                kind: EntryKind::File,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                key: "foo/bar.txt".into(),
+            }),
+        };
+        let refr = p.classify_read_identity(&l, &listed).unwrap();
+        let params = build_get_object_params(refr, 256).unwrap();
+        assert_eq!(params.key, "foo/bar.txt");
+        assert_ne!(params.key, listed.entry.name);
+    }
+
+    #[test]
+    fn read_preview_target_mismatch_rejected_before_client() {
+        let p = S3Provider::new(root_target());
+        let l = loc("t", Some("b"), "");
+        let listed = ListedEntry {
+            entry: Entry {
+                name: "x".into(),
+                kind: EntryKind::File,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Object(S3ObjectRef {
+                target: "other".into(),
+                bucket: "b".into(),
+                key: "k".into(),
+            }),
+        };
+        assert!(p.classify_read_identity(&l, &listed).is_err());
+        assert!(p.client.get().is_none());
+    }
+
+    #[test]
+    fn read_preview_bucket_mismatch_rejected_before_client() {
+        let p = S3Provider::new(root_target());
+        let l = loc("t", Some("b"), "");
+        let listed = ListedEntry {
+            entry: Entry {
+                name: "x".into(),
+                kind: EntryKind::File,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "other".into(),
+                key: "k".into(),
+            }),
+        };
+        assert!(p.classify_read_identity(&l, &listed).is_err());
+        assert!(p.client.get().is_none());
+    }
+
+    #[test]
+    fn read_preview_bucket_bound_escape_rejected_before_client() {
+        let p = S3Provider::new(bound_target("b"));
+        let l = loc("t", Some("b"), "");
+        let listed = ListedEntry {
+            entry: Entry {
+                name: "x".into(),
+                kind: EntryKind::File,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "evil".into(),
+                key: "k".into(),
+            }),
+        };
+        assert!(p.classify_read_identity(&l, &listed).is_err());
+        assert!(p.client.get().is_none());
+    }
+
+    #[test]
+    fn read_preview_s3prefix_rejected() {
+        let p = S3Provider::new(root_target());
+        let l = loc("t", Some("b"), "");
+        let listed = ListedEntry {
+            entry: Entry {
+                name: "x".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Prefix(S3PrefixRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                prefix: "p/".into(),
+            }),
+        };
+        let err = p.classify_read_identity(&l, &listed).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(p.client.get().is_none());
+    }
+
+    #[test]
+    fn read_preview_s3bucket_rejected() {
+        let p = S3Provider::new(root_target());
+        let l = loc("t", Some("b"), "");
+        let listed = ListedEntry {
+            entry: Entry {
+                name: "x".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Bucket(S3BucketRef {
+                target: "t".into(),
+                bucket: "b".into(),
+            }),
+        };
+        let err = p.classify_read_identity(&l, &listed).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(p.client.get().is_none());
+    }
+
+    #[test]
+    fn read_preview_zero_and_overflow_cap_rejected() {
+        let refr = S3ObjectRef {
+            target: "t".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        assert_eq!(
+            build_get_object_params(&refr, 0).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            build_get_object_params(&refr, usize::MAX)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn read_preview_range_is_bounded() {
+        let refr = S3ObjectRef {
+            target: "t".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+        };
+        let params = build_get_object_params(&refr, 100).unwrap();
+        assert_eq!(params.range, "bytes=0-100");
+        assert_eq!(params.probe_len, 101);
+        let big = build_get_object_params(&refr, 1_000_000).unwrap();
+        assert_eq!(big.range, "bytes=0-1000000");
+    }
+
+    #[tokio::test]
+    async fn read_preview_body_read_caps_at_probe_len() {
+        let big = vec![b'x'; 10_000];
+        let reader = ByteStream::new(SdkBody::from(big)).into_async_read();
+        let (bytes, truncated) = read_bounded_body(reader, 5).await.unwrap();
+        assert_eq!(bytes.len(), 5, "no full-body collect");
+        assert!(truncated, "cap reached => more bytes exist");
+
+        let small = vec![b'y'; 3];
+        let reader = ByteStream::new(SdkBody::from(small)).into_async_read();
+        let (bytes, truncated) = read_bounded_body(reader, 5).await.unwrap();
+        assert_eq!(bytes.len(), 3);
+        assert!(!truncated);
+
+        let reader = ByteStream::new(SdkBody::from(Vec::<u8>::new())).into_async_read();
+        let (bytes, truncated) = read_bounded_body(reader, 5).await.unwrap();
+        assert_eq!(bytes.len(), 0);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn read_preview_error_mapping_is_sanitized() {
+        let invalid_range =
+            GetObjectError::generic(ErrorMetadata::builder().code("InvalidRange").build());
+        let empty = map_get_object_error(&invalid_range).unwrap();
+        assert_eq!(empty.bytes, Vec::<u8>::new());
+        assert!(!empty.truncated);
+
+        for code in [
+            "AccessDenied",
+            "NoSuchKey",
+            "InvalidObjectState",
+            "InternalError",
+        ] {
+            let err = GetObjectError::generic(ErrorMetadata::builder().code(code).build());
+            let io_err = map_get_object_error(&err).unwrap_err();
+            let msg = io_err.to_string();
+            assert_eq!(msg, "S3 GetObject preview request failed");
+            assert!(!msg.contains("X-Amz"), "no signed-query leak for {code}");
+            assert!(
+                !msg.contains("Authorization"),
+                "no auth-header leak for {code}"
+            );
+            assert!(!msg.contains("secret-key"), "no key leak for {code}");
+        }
     }
 }
