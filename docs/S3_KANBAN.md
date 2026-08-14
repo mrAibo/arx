@@ -16,12 +16,12 @@
 
 ## Column summary
 
-- **READY** (1): S3-26
+- **READY** (1): S3-31
 - **DOING** (0): —
 - **REVIEW** (0): —
 - **BLOCKED** (0): —
-- **DONE** (30): S3-00..S3-25, S3-24P (PR #98 merged, merge SHA 19d4c04), S3-20R (PR #99 merged, merge SHA 2e7fe21), S3-24 (PR #100 merged, merge SHA f38273a), S3-25 (PR #101 merged, merge SHA 85afb6a), S3-26A (PR #102 merged, merge SHA 6967ba2; STOP GATE C PASS), S3-27R
-- **BACKLOG** (54): S3-27..S3-80
+- **DONE** (36): S3-00..S3-25, S3-24P (PR #98 merged, merge SHA 19d4c04), S3-20R (PR #99 merged, merge SHA 2e7fe21), S3-24 (PR #100 merged, merge SHA f38273a), S3-25 (PR #101 merged, merge SHA 85afb6a), S3-26A (PR #102 merged, merge SHA 6967ba2; STOP GATE C PASS), S3-27R (PR #105 merged, merge SHA 1568e35), S3-26 (PR #104 merged, merge SHA 9c27a84), S3-27 (PR #106 merged, merge SHA a49b94b), S3-28 (PR #107 merged, merge SHA 1fd6bec), S3-29 (PR #108 merged, merge SHA 242dff6), S3-30 (PR #109 merged, merge SHA d74fb55; P11 READ/F3 GATE PASS)
+- **BACKLOG** (49): S3-32..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
 
@@ -370,7 +370,7 @@
 
 ### S3-26 — Enable List capability
 - **Phase:** P10
-- **Status:** READY (STOP GATE C PASSED on exact tree 6967ba2; not yet authorized — requires orchestrator capability-flip go-ahead)
+- **Status:** DONE (PR #104 merged; merge SHA 9c27a84; exact-head quality+msrv SUCCESS; full gates pass)
 - **Depends on:** S3-18..25, S3-24P, S3-26A
 - **Allowed files:** src/vfs/capabilities.rs, src/vfs/s3.rs
 - **Acceptance:** Only now enable S3 List capability. Preconditions: S3-18..25 complete and tested; consumer pagination complete and tested through S3-24P. Change only capability declaration/tests. No Read/Write/Delete/Mkdir yet.
@@ -396,7 +396,7 @@
 
 ### S3-27R — exact ListedEntry preview identity seam
 - **Phase:** P10
-- **Status:** DONE (after merge)
+- **Status:** DONE (PR #105 merged; merge SHA 1568e35; exact-head quality+msrv SUCCESS)
 - **Depends on:** S3-25
 - **Allowed files:** src/vfs/mod.rs, src/effects.rs, src/process/mod.rs, src/tui.rs, docs/S3_KANBAN.md
 - **Acceptance:**
@@ -411,7 +411,7 @@
 
 ### S3-27 — S3 bounded Range GET
 - **Phase:** P11
-- **Status:** BACKLOG
+- **Status:** DONE (PR #106 merged; merge SHA a49b94b; exact-head quality+msrv SUCCESS; bounded/fail-closed GetObject)
 - **Depends on:** STOP GATE C, S3-27R
 - **Allowed files:** src/vfs/s3.rs
 - **Acceptance:** read_prefix_bytes for exact S3ObjectRef via GetObject Range: bytes=0..N. Respect bounded-read semantics. No full download. No F3 availability yet.
@@ -420,7 +420,7 @@
 
 ### S3-28 — S3 bounded-read metadata
 - **Phase:** P11
-- **Status:** BACKLOG
+- **Status:** DONE (PR #107 merged; merge SHA 1fd6bec; exact-head quality+msrv SUCCESS; truthful BoundedRead, no POSIX, boundary tests)
 - **Depends on:** S3-27
 - **Allowed files:** src/vfs/s3.rs
 - **Acceptance:** Return truthful BoundedRead: bytes read, truncated/full where provable. Do NOT invent POSIX mode/uid/gid. No RemoteEditRevision.
@@ -429,7 +429,7 @@
 
 ### S3-29 — Enable S3 F3
 - **Phase:** P11
-- **Status:** BACKLOG
+- **Status:** DONE (PR #108 merged; merge SHA 242dff6; exact-head quality+msrv SUCCESS; F3 Read-gated identity-aware, F4 disabled, E2E regression)
 - **Depends on:** S3-28, S3-27R
 - **Allowed files:** src/app/availability.rs
 - **Acceptance:** Allow F3 for regular S3 object when Read implemented. Use exact S3ObjectRef. Reuse existing text/line limit, binary refusal, invalid UTF-8 handling. No F4.
@@ -438,16 +438,25 @@
 
 ### S3-30 — Enable Read capability
 - **Phase:** P11
-- **Status:** BACKLOG
+- **Status:** DONE (PR #109 merged; merge SHA d74fb55; P11 READ/F3 GATE PASS; POST-FLIP frozen-tree audit A/B/C BLOCKER 0 MAJOR 0, 1 MINOR S3 F3 handler-wiring debt)
 - **Depends on:** S3-29
 - **Allowed files:** src/vfs/capabilities.rs
 - **Acceptance:** Flip S3 Read capability only after F3 passes. No Write.
 - **Stop conditions:** Write enable.
 - **Hermes prompt:** Flip S3 Read capability ONLY after S3-29 passes. No Write.
 
+> ### ✅ STOP GATE C+ — P11 SAFE S3 READ / F3 MILESTONE PASS (frozen tree d74fb55)
+> - **Capability flip:** S3 `NONE.with(List)` → `NONE.with(List).with(Read)` (S3-30).
+> - **Surface:** Enter/Back/Refresh + F3 preview read on regular S3Object. All mutations/transfer/workspace/name-selection remain disabled.
+> - **Identity:** F3 availability routes via exact `S3ObjectRef` (S3-27R seam); S3-27 bounded/fail-closed GetObject; S3-28 truthful BoundedRead (no POSIX/F4).
+> - **POST-FLIP frozen-tree audit** (3 parallel tracks, exact tree e63e714): A PASS, B PASS (1 MINOR: S3 F3 handler not yet wired through identity seam — fail-closed no-op, safe), C PASS → **BLOCKER 0, MAJOR 0, MINOR 1, NIT 0**.
+> - **Axis safety:** LIST_SAFE ✅ · READ_SAFE ✅ · F3_EXACT_IDENTITY ✅ · BOUNDED_NETWORK ✅ · F4_DISABLED ✅ · TRANSFER_DISABLED ✅ · MUTATION_DISABLED ✅ · SELECTION_SAFE ✅ · WORKSPACE_SAFE ✅.
+> - **Exact-head CI:** quality SUCCESS, msrv SUCCESS.
+> - **Debt (recorded, not in scope):** S3 F3 preview handler wiring (tui.rs) to extend `matches!(...Sftp)` → `Sftp | S3` so F3 actually previews through the already-correct seam; currently S3 F3 is a safe fail-closed no-op. STOP GATE C NIT (Mkdir/Symlink/HardLink availability-only guard) still pending until S3 first gains a mutation capability.
+
 ### S3-31 — TransferMethod::S3
 - **Phase:** P12
-- **Status:** BACKLOG
+- **Status:** READY (S3-30 DONE; P11 READ/F3 GATE PASS on d74fb55)
 - **Depends on:** S3-30
 - **Allowed files:** src/transfer/mod.rs
 - **Acceptance:** Add S3 as explicit TransferMethod. No executor yet. Planner still returns unsupported until availability says executor exists. No shell fallback. No aws CLI.
