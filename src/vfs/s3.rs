@@ -53,15 +53,19 @@ enum PrefixHeadState {
 // ponytail: mirrors transfer::s3_upload::classify_head_error intent without a
 // vfs -> transfer dependency (VFS is lower-level).
 fn classify_prefix_head(err: &HeadObjectError) -> PrefixHeadState {
+    // ponytail: match BOTH the typed `NotFound` variant (unit tests build it
+    // directly) AND the wire `code()` (MinIO returns `Unhandled` with code
+    // "NoSuchKey", which the typed arm misses). Mirrors
+    // transfer::s3_upload::classify_head_error intent.
     match err {
         HeadObjectError::NotFound(_) => PrefixHeadState::Missing,
-        e if e.code() == Some("AccessDenied")
-            || e.code() == Some("Forbidden")
-            || e.code() == Some("Unauthorized") =>
-        {
-            PrefixHeadState::AccessDenied
-        }
-        _ => PrefixHeadState::Unknown,
+        _ => match err.code() {
+            Some("NoSuchKey") | Some("NotFound") => PrefixHeadState::Missing,
+            Some("AccessDenied") | Some("Forbidden") | Some("Unauthorized") => {
+                PrefixHeadState::AccessDenied
+            }
+            _ => PrefixHeadState::Unknown,
+        },
     }
 }
 
