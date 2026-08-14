@@ -16,12 +16,12 @@
 
 ## Column summary
 
-- **READY** (1): S3-25
+- **READY** (1): S3-26A
 - **DOING** (0): —
 - **REVIEW** (0): —
-- **BLOCKED** (0): —
-- **DONE** (27): S3-00..S3-24, S3-24P (PR #98 merged, merge SHA 19d4c04), S3-20R (PR #99 merged, merge SHA 2e7fe21), S3-24 (PR #100 merged, merge SHA pending)
-- **BACKLOG** (55): S3-26..S3-80
+- **BLOCKED** (1): S3-26
+- **DONE** (28): S3-00..S3-25, S3-24P (PR #98 merged, merge SHA 19d4c04), S3-20R (PR #99 merged, merge SHA 2e7fe21), S3-24 (PR #100 merged, merge SHA f38273a), S3-25 (PR #101 merged, merge SHA pending)
+- **BACKLOG** (54): S3-27..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
 
@@ -356,9 +356,9 @@
 
 ### S3-25 — Contextual virtual S3 parent
 - **Phase:** P10
-- **Status:** READY
+- **Status:** DONE (PR #101 merged; merge SHA pending; independent two-axis review APPROVED 0/0/0/0, quality+msrv SUCCESS)
 - **Depends on:** S3-23, S3-24
-- **Allowed files:** src/vfs/mod.rs, src/app/actions.rs, src/tui.rs, docs/S3_KANBAN.md
+- **Allowed files:** src/vfs/mod.rs, src/app/actions.rs, src/app/mod.rs, src/tui.rs, docs/S3_KANBAN.md
 - **Acceptance:** Contextual S3 virtual-parent navigation that preserves account-style target-root and bucket-bound least-privilege semantics, awkward repeated-slash prefixes, literal `.`/`..` segments, and Local/SFTP/Archive parent behavior, using exactly ONE authoritative configured-target inventory (ProviderRegistry). Virtual `..` is UI/navigation state only — never S3ObjectRef, S3PrefixRef, object key, or provider-listed EntryIdentity.
   - `Location::parent()` stays fail-closed for `Location::S3` (context-free; must not guess account-root or read S3TargetConfig). Add a contextual app-level resolver instead.
   - ProviderRegistry gains a narrow read-only accessor `s3_target_binding(target_id) -> Option<S3TargetBinding>` (AccountRoot | BucketBound(exact bucket)), reading the EXISTING `s3_targets` inventory only — no second inventory, no config/SDK exposure.
@@ -370,12 +370,29 @@
 
 ### S3-26 — Enable List capability
 - **Phase:** P10
-- **Status:** BACKLOG
-- **Depends on:** S3-18..25, S3-24P
+- **Status:** BLOCKED (on STOP GATE C — see S3-26A; independent review found capability-surface leaks: Copy provider-pair policy, direct Shift+F6 rename, workspace compare/sync, name-based selection)
+- **Depends on:** S3-18..25, S3-24P, S3-26A
 - **Allowed files:** src/vfs/capabilities.rs, src/vfs/s3.rs
 - **Acceptance:** Only now enable S3 List capability. Preconditions: S3-18..25 complete and tested; consumer pagination complete and tested through S3-24P. Change only capability declaration/tests. No Read/Write/Delete/Mkdir yet.
 - **Stop conditions:** Enabling Read/Write/Delete/Mkdir.
-- **Hermes prompt:** Flip S3 List capability ONLY after S3-18..25 and S3-24P are done and tested. No other capability. Change capability declaration/tests only.
+- **Hermes prompt:** Flip S3 List capability ONLY after S3-18..25, S3-24P, and S3-26A are done and tested, and STOP GATE C passes. No other capability. Change capability declaration/tests only.
+
+### S3-26A — List-only action/selection surface hardening
+- **Phase:** P10
+- **Status:** READY
+- **Depends on:** S3-25, S3-24P
+- **Allowed files:** src/app/availability.rs, src/tui.rs, docs/S3_KANBAN.md
+- **Acceptance:** Make a hypothetical S3 capability set of ONLY `{List}` expose navigation/listing only — no transfer, mutation, workspace sync, or identity-unsafe selection.
+  - **A1 Copy matrix:** replace `active==Local || passive==Local` with the EXACT implemented transfer matrix — `Local->Local`, `Local->SFTP`, `SFTP->Local` AVAILABLE; everything else (incl. S3<->Local, S3<->S3, S3<->SFTP, Archive<->Local) DISABLED. Private helper `copy_pair_supported(active, passive)`. Do not change TransferPlanner.
+  - **A2 S3 selection fail-closed:** while selection state is name-based, `ActionId::ToggleSelect` is Disabled when `active_provider == S3`. No selection-storage redesign.
+  - **A3 Workspace compare/sync block:** when EITHER pane provider is S3, disable `ToggleWorkspaceComparison`, `PreviewWorkspaceSync`, `ReverseWorkspaceDirection`, `ToggleWorkspaceSyncMode`, `ExecuteWorkspaceSync`, `ConfirmWorkspaceSync`. Keep lifecycle actions for existing jobs (`CancelWorkspaceSync`, `ShowWorkspaceSyncDetails`, `ShowWorkspaceVerificationDiff`, `ReturnToWorkspaceSyncPreview`) state-driven.
+  - **A4 Assert with hypothetical S3 {List}:** View/Edit/Copy/Move/Mkdir/Delete/ToggleSelect/Symlink/Chmod/Hardlink/Chown all Disabled; Enter/Back/Refresh remain available.
+  - **B1 Shift+F6 rename:** `Location::Local` preserves current rename; SFTP/Archive/S3 do NOT populate `state.cmd` / enter cmd_input — message "Rename is currently local-only". No S3/SFTP rename, no identity reconstruction from `Entry.name`.
+  - **B2 Direct S3 selection bypasses:** for active `Location::S3`, no-op mouse-drag/glob-select/`*`-invert selection (no `state.toggle_selection(... entry.name ...)`). Local/SFTP/Archive unchanged.
+  - **B3 LoadMore / virtual Parent** remain non-selectable/non-rename targets.
+  - **B4 Context menu** is static presentation with no independent dispatch lane — record as UX NIT `UI-CONTEXT-AVAILABILITY`, do not redesign.
+- **Stop conditions:** Enabling any S3 capability; S3 rename; redesigning selection storage; touching `src/vfs/*`, `src/services/*`, `src/transfer/*`, `src/app/mod.rs`, `src/app/actions.rs`, `Cargo.toml`, `Cargo.lock`, `docs/DESIGN_S3.md`.
+- **Hermes prompt:** Disjoint writers — TERRA on `src/app/availability.rs` only (Copy matrix, S3 ToggleSelect disable, workspace compare/sync block); SOL on `src/tui.rs` only (Shift+F6 Local-only, direct S3 selection no-op). No shared production files. One integration owner (SOL) cherry-picks both onto `s3/s3-26a-list-surface-hardening` after review. STOP IN REVIEW, no merge, no S3-26.
 
 ### S3-27 — S3 bounded Range GET
 - **Phase:** P11
