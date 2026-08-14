@@ -73,8 +73,9 @@ pub const WEBDAV_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::List)
     .with(Capability::Read);
 
-/// S3 is still a stub and must not advertise operations it cannot execute.
-pub const S3_CAPABILITIES: CapabilitySet = CapabilitySet::NONE;
+/// S3 currently implements listing/navigation only (ListBuckets, ListObjectsV2).
+/// Read/Write/Mkdir/Delete/Copy/Move/Rename/Symlink/Chmod/ServerSideCopy remain unimplemented.
+pub const S3_CAPABILITIES: CapabilitySet = CapabilitySet::NONE.with(Capability::List);
 
 /// Built-in capability declaration for a provider kind.
 ///
@@ -115,7 +116,8 @@ mod tests {
         assert!(ARCHIVE_CAPABILITIES.supports(Capability::List));
         assert!(WEBDAV_CAPABILITIES.supports(Capability::Read));
         assert!(!WEBDAV_CAPABILITIES.supports(Capability::Delete));
-        assert_eq!(S3_CAPABILITIES, CapabilitySet::NONE);
+        assert!(S3_CAPABILITIES.supports(Capability::List));
+        assert!(!S3_CAPABILITIES.supports(Capability::Read));
     }
 
     #[test]
@@ -136,9 +138,17 @@ mod tests {
     }
 
     #[test]
-    fn s3_no_read() {
+    fn s3_list_only_no_read() {
+        assert!(S3_CAPABILITIES.supports(Capability::List));
         assert!(!S3_CAPABILITIES.supports(Capability::Read));
-        assert!(!S3_CAPABILITIES.supports(Capability::List));
-        assert_eq!(S3_CAPABILITIES, CapabilitySet::NONE);
+        assert!(!S3_CAPABILITIES.supports(Capability::Write));
+        assert!(!S3_CAPABILITIES.supports(Capability::Mkdir));
+        assert!(!S3_CAPABILITIES.supports(Capability::Delete));
+        assert!(!S3_CAPABILITIES.supports(Capability::Copy));
+        assert!(!S3_CAPABILITIES.supports(Capability::Move));
+        assert!(!S3_CAPABILITIES.supports(Capability::Rename));
+        assert!(!S3_CAPABILITIES.supports(Capability::Symlink));
+        assert!(!S3_CAPABILITIES.supports(Capability::Chmod));
+        assert!(!S3_CAPABILITIES.supports(Capability::ServerSideCopy));
     }
 }
