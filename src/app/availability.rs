@@ -144,6 +144,19 @@ fn require_active_capability(
     }
 }
 
+/// Exact set of provider pairs `TransferPlanner` can actually execute for
+/// Copy. Only these three directions are implemented; every other pair
+/// (any S3 side, Archive, SFTP→SFTP, WebDAV) is disabled because the planner
+/// cannot execute it.
+fn copy_pair_supported(active: ProviderId, passive: ProviderId) -> bool {
+    matches!(
+        (active, passive),
+        (ProviderId::Local, ProviderId::Local)
+            | (ProviderId::Local, ProviderId::Sftp)
+            | (ProviderId::Sftp, ProviderId::Local)
+    )
+}
+
 pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailability {
     match id {
         ActionId::BeginSymlink => {
@@ -198,11 +211,11 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
                 ActionAvailability::Disabled {
                     reason: "Select a file or directory to copy".into(),
                 }
-            } else if ctx.active_provider == ProviderId::Local
-                || ctx.passive_provider == ProviderId::Local
-            {
-                // TransferPlanner supports Copy with one Local side:
-                // Local→Local, Local→SFTP, SFTP→Local.
+            } else if copy_pair_supported(ctx.active_provider, ctx.passive_provider) {
+                // TransferPlanner supports exactly Local→Local, Local→SFTP,
+                // and SFTP→Local. Every other pair (any S3 side, Archive,
+                // SFTP→SFTP, WebDAV) is disabled because the planner cannot
+                // execute it.
                 ActionAvailability::Available
             } else {
                 ActionAvailability::Disabled {
@@ -273,9 +286,47 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
                 reason: "Owner changes are currently local-only".into(),
             }
         }
+        // S3 selection is identity-unsafe while selection state is name-based:
+        // two S3 rows can share a display name. Fail closed until provider
+        // identity selection exists.
+        ActionId::ToggleSelect if ctx.active_provider == ProviderId::S3 => {
+            ActionAvailability::Disabled {
+                reason: "S3 selection not enabled until provider identity selection is available"
+                    .into(),
+            }
+        }
+        // Workspace compare/sync is identity-unsafe and not yet implemented
+        // for S3 panes (no exact-entry seam, unsafe name-based selection).
+        // Block the setup/execution actions whenever either pane is S3.
+        // Lifecycle actions for an already-existing job (Cancel, Details,
+        // VerificationDiff, ReturnToPreview) stay state-driven below.
+        ActionId::ToggleWorkspaceComparison
+        | ActionId::PreviewWorkspaceSync
+        | ActionId::ReverseWorkspaceDirection
+        | ActionId::ToggleWorkspaceSyncMode
+            if ctx.active_provider == ProviderId::S3 || ctx.passive_provider == ProviderId::S3 =>
+        {
+            ActionAvailability::Disabled {
+                reason: "Workspace compare/sync is not supported with S3 panes yet".into(),
+            }
+        }
+        ActionId::ExecuteWorkspaceSync
+            if ctx.active_provider == ProviderId::S3 || ctx.passive_provider == ProviderId::S3 =>
+        {
+            ActionAvailability::Disabled {
+                reason: "Workspace compare/sync is not supported with S3 panes yet".into(),
+            }
+        }
         ActionId::ExecuteWorkspaceSync if !ctx.sync_execute_ready => ActionAvailability::Disabled {
             reason: "Workspace sync needs a current conflict-free preview".into(),
         },
+        ActionId::ConfirmWorkspaceSync
+            if ctx.active_provider == ProviderId::S3 || ctx.passive_provider == ProviderId::S3 =>
+        {
+            ActionAvailability::Disabled {
+                reason: "Workspace compare/sync is not supported with S3 panes yet".into(),
+            }
+        }
         ActionId::ConfirmWorkspaceSync if !ctx.sync_confirmation_ready => {
             ActionAvailability::Disabled {
                 reason: "No destructive frozen sync plan is awaiting confirmation".into(),
@@ -649,5 +700,302 @@ mod tests {
         let availability = action_availability(ActionId::ViewFile, &ctx);
         assert!(matches!(availability, ActionAvailability::Disabled { .. }));
         assert!(availability.reason().unwrap().contains("regular file"));
+    }
+
+    // ── S3-26A: hypothetical S3 capability set of ONLY {List} ──
+    // S3 may list but must not expose transfer, mutation, workspace sync,
+    // or identity-unsafe selection.
+
+    /// Active provider S3 with List-only capabilities and a Local passive pane.
+    fn s3_list_context() -> ActionContext {
+        let mut ctx = context(ProviderId::S3, CapabilitySet::NONE.with(Capability::List));
+        ctx.passive_provider = ProviderId::Local;
+        ctx
+    }
+
+    #[test]
+    fn s3_list_only_view_disabled() {
+        let ctx = s3_list_context();
+        assert!(matches!(
+            action_availability(ActionId::ViewFile, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn s3_list_only_edit_disabled() {
+        let ctx = s3_list_context();
+        assert!(matches!(
+            action_availability(ActionId::EditFile, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn s3_list_only_mkdir_disabled() {
+        let ctx = s3_list_context();
+        assert!(matches!(
+            action_availability(ActionId::Mkdir, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn s3_list_only_delete_disabled() {
+        let ctx = s3_list_context();
+        assert!(matches!(
+            action_availability(ActionId::Delete, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn s3_list_only_select_disabled() {
+        let ctx = s3_list_context();
+        assert!(matches!(
+            action_availability(ActionId::ToggleSelect, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn s3_list_only_symlink_disabled() {
+        let ctx = s3_list_context();
+        assert!(matches!(
+            action_availability(ActionId::BeginSymlink, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn s3_list_only_chmod_disabled() {
+        let ctx = s3_list_context();
+        assert!(matches!(
+            action_availability(ActionId::BeginChmod, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn s3_list_only_hardlink_disabled() {
+        let ctx = s3_list_context();
+        assert!(matches!(
+            action_availability(ActionId::BeginHardLink, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn s3_list_only_chown_disabled() {
+        let ctx = s3_list_context();
+        assert!(matches!(
+            action_availability(ActionId::BeginChown, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    // ── S3-26A: Copy matrix (exact TransferPlanner-implemented pairs) ──
+
+    #[test]
+    fn copy_local_local_available() {
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        ctx.focused_kind = Some(EntryKind::File);
+        assert_eq!(
+            action_availability(ActionId::Copy, &ctx),
+            ActionAvailability::Available
+        );
+    }
+
+    #[test]
+    fn copy_local_sftp_available() {
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        ctx.passive_provider = ProviderId::Sftp;
+        ctx.focused_kind = Some(EntryKind::File);
+        assert_eq!(
+            action_availability(ActionId::Copy, &ctx),
+            ActionAvailability::Available
+        );
+    }
+
+    #[test]
+    fn copy_sftp_local_available() {
+        let mut ctx = context(ProviderId::Sftp, SFTP_CAPABILITIES);
+        ctx.passive_provider = ProviderId::Local;
+        ctx.active_capabilities = SFTP_CAPABILITIES;
+        ctx.focused_kind = Some(EntryKind::File);
+        assert_eq!(
+            action_availability(ActionId::Copy, &ctx),
+            ActionAvailability::Available
+        );
+    }
+
+    #[test]
+    fn copy_s3_local_disabled() {
+        let ctx = s3_list_context();
+        // active = S3, passive = Local
+        assert!(matches!(
+            action_availability(ActionId::Copy, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn copy_local_s3_disabled() {
+        let mut ctx = s3_list_context();
+        ctx.active_provider = ProviderId::Local;
+        ctx.passive_provider = ProviderId::S3;
+        ctx.active_capabilities = LOCAL_CAPABILITIES;
+        assert!(matches!(
+            action_availability(ActionId::Copy, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn copy_s3_s3_disabled() {
+        let mut ctx = s3_list_context();
+        ctx.active_provider = ProviderId::S3;
+        ctx.passive_provider = ProviderId::S3;
+        assert!(matches!(
+            action_availability(ActionId::Copy, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn copy_archive_local_disabled() {
+        let mut ctx = context(ProviderId::Archive, ARCHIVE_CAPABILITIES);
+        ctx.passive_provider = ProviderId::Local;
+        ctx.focused_kind = Some(EntryKind::File);
+        assert!(matches!(
+            action_availability(ActionId::Copy, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn copy_local_archive_disabled() {
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        ctx.passive_provider = ProviderId::Archive;
+        ctx.focused_kind = Some(EntryKind::File);
+        assert!(matches!(
+            action_availability(ActionId::Copy, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn move_s3_local_disabled() {
+        let ctx = s3_list_context();
+        // active = S3, passive = Local
+        assert!(matches!(
+            action_availability(ActionId::Move, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn move_local_s3_disabled() {
+        let mut ctx = s3_list_context();
+        ctx.active_provider = ProviderId::Local;
+        ctx.passive_provider = ProviderId::S3;
+        ctx.active_capabilities = LOCAL_CAPABILITIES;
+        assert!(matches!(
+            action_availability(ActionId::Move, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    // ── S3-26A: workspace compare/sync blocked with S3 panes ──
+
+    #[test]
+    fn workspace_compare_disabled_with_active_s3() {
+        let ctx = s3_list_context();
+        assert!(matches!(
+            action_availability(ActionId::ToggleWorkspaceComparison, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn workspace_compare_disabled_with_passive_s3() {
+        let mut ctx = s3_list_context();
+        ctx.active_provider = ProviderId::Local;
+        ctx.passive_provider = ProviderId::S3;
+        ctx.active_capabilities = LOCAL_CAPABILITIES;
+        assert!(matches!(
+            action_availability(ActionId::ToggleWorkspaceComparison, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn workspace_preview_disabled_with_s3() {
+        let ctx = s3_list_context();
+        assert!(matches!(
+            action_availability(ActionId::PreviewWorkspaceSync, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+        assert!(matches!(
+            action_availability(ActionId::ReverseWorkspaceDirection, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+        assert!(matches!(
+            action_availability(ActionId::ToggleWorkspaceSyncMode, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn workspace_execute_disabled_with_s3() {
+        let mut ctx = s3_list_context();
+        // Even with a ready preview, S3 panes block execution.
+        ctx.sync_execute_ready = true;
+        assert!(matches!(
+            action_availability(ActionId::ExecuteWorkspaceSync, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn workspace_confirm_disabled_with_s3() {
+        let mut ctx = s3_list_context();
+        ctx.sync_confirmation_ready = true;
+        assert!(matches!(
+            action_availability(ActionId::ConfirmWorkspaceSync, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn workspace_cancel_existing_job_still_state_driven() {
+        // S3 active but an already-running job must keep Cancel Available.
+        let mut ctx = s3_list_context();
+        ctx.sync_cancel_ready = true;
+        assert_eq!(
+            action_availability(ActionId::CancelWorkspaceSync, &ctx),
+            ActionAvailability::Available
+        );
+        ctx.sync_cancel_ready = false;
+        assert!(matches!(
+            action_availability(ActionId::CancelWorkspaceSync, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+    }
+
+    #[test]
+    fn workspace_details_existing_job_still_state_driven() {
+        // S3 active but an existing job must keep Details Available.
+        let mut ctx = s3_list_context();
+        ctx.sync_details_ready = true;
+        assert_eq!(
+            action_availability(ActionId::ShowWorkspaceSyncDetails, &ctx),
+            ActionAvailability::Available
+        );
+        ctx.sync_details_ready = false;
+        assert!(matches!(
+            action_availability(ActionId::ShowWorkspaceSyncDetails, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
     }
 }
