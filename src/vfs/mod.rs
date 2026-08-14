@@ -898,6 +898,71 @@ impl ProviderRegistry {
         Ok(Arc::clone(&registered.provider))
     }
 
+    /// Typed sibling of `resolve_s3_provider`: returns the concrete
+    /// `Arc<S3Provider>` (the same allocation stored in `registered.s3`).
+    /// Keeps `resolve_s3_provider` unchanged — this reuses its registration so
+    /// the AWS client is shared with the listing/transfer paths.
+    fn resolve_s3_provider_typed(&self, target_id: &str) -> std::io::Result<Arc<s3::S3Provider>> {
+        // Ensure the instance is registered (populates `registered.s3`).
+        self.resolve_s3_provider(target_id)?;
+        let key = ProviderInstanceKey::S3Target(target_id.to_string());
+        let registered = self
+            .providers
+            .read()
+            .expect("provider registry poisoned")
+            .get(&key)
+            .cloned();
+        registered.and_then(|r| r.s3).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "unknown S3 target: {}",
+                    crate::config::sanitize_diag(target_id)
+                ),
+            )
+        })
+    }
+
+    /// S3-native create-prefix typed seam (S3-54R).
+    ///
+    /// Creates an empty marker object `<nav_prefix>/<child>/` directly through
+    /// the target's AWS client — NO generic filesystem `mkdir_at` /
+    /// `validated_child_path` routing, NO bucket creation, NO overwrite of an
+    /// existing object. Fails closed on any preflight error that is not an
+    /// explicit missing-object result.
+    // ponytail: seam takes target from the Location and resolves THAT target's
+    // provider, so a Location cannot reach another target's provider.
+    pub async fn create_s3_prefix_marker_at(
+        &self,
+        location: &Location,
+        child_name: &str,
+    ) -> std::io::Result<S3PrefixRef> {
+        let Location::S3 {
+            target,
+            bucket,
+            prefix,
+        } = location
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "create_s3_prefix_marker_at requires Location::S3",
+            ));
+        };
+        // bucket == None => target root. Creating a bucket is out of scope;
+        // this guard proves no bucket-creation path exists.
+        let bucket = bucket.clone().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "bucket creation is not supported",
+            )
+        })?;
+        validate_child_name(child_name)?;
+        let provider = self.resolve_s3_provider_typed(target)?;
+        provider
+            .create_prefix_marker(&bucket, prefix, child_name)
+            .await
+    }
+
     /// Resolve the concrete `S3Target(id)` provider for a transfer operation.
     ///
     /// Returns the SAME `Arc<S3Provider>` already registered under
@@ -3207,5 +3272,133 @@ mod s3_list_page_tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unknown S3 target"));
+    }
+}
+
+#[cfg(test)]
+mod s3_54r_tests {
+    use super::*;
+    use crate::config::S3TargetConfig;
+
+    fn bound_registry() -> ProviderRegistry {
+        let r = ProviderRegistry::new();
+        r.register_s3_targets(&[S3TargetConfig {
+            id: "bkt".into(),
+            name: "bkt".into(),
+            bucket: Some("company-artifacts".into()),
+            region: None,
+            profile: None,
+            endpoint_url: None,
+            force_path_style: false,
+        }]);
+        r
+    }
+
+    // 1. target root (bucket None) rejected before any client/provider work.
+    #[tokio::test]
+    async fn target_root_bucket_none_rejected() {
+        let registry = ProviderRegistry::new();
+        let loc = Location::S3 {
+            target: "x".into(),
+            bucket: None,
+            prefix: String::new(),
+        };
+        let err = registry
+            .create_s3_prefix_marker_at(&loc, "new")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("bucket creation is not supported"));
+    }
+
+    // 9/10/11. invalid child name rejected before resolving the provider.
+    #[tokio::test]
+    async fn invalid_child_dot_rejected() {
+        let registry = ProviderRegistry::new();
+        let loc = Location::S3 {
+            target: "x".into(),
+            bucket: Some("b".into()),
+            prefix: String::new(),
+        };
+        let err = registry
+            .create_s3_prefix_marker_at(&loc, ".")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+    #[tokio::test]
+    async fn invalid_child_dotdot_rejected() {
+        let registry = ProviderRegistry::new();
+        let loc = Location::S3 {
+            target: "x".into(),
+            bucket: Some("b".into()),
+            prefix: String::new(),
+        };
+        let err = registry
+            .create_s3_prefix_marker_at(&loc, "..")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+    #[tokio::test]
+    async fn invalid_child_slash_rejected() {
+        let registry = ProviderRegistry::new();
+        let loc = Location::S3 {
+            target: "x".into(),
+            bucket: Some("b".into()),
+            prefix: String::new(),
+        };
+        let err = registry
+            .create_s3_prefix_marker_at(&loc, "a/b")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    // 12. unknown target => Err (no provider constructed).
+    #[tokio::test]
+    async fn unknown_target_rejected() {
+        let registry = ProviderRegistry::new();
+        let loc = Location::S3 {
+            target: "nope".into(),
+            bucket: Some("b".into()),
+            prefix: String::new(),
+        };
+        let err = registry
+            .create_s3_prefix_marker_at(&loc, "new")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("unknown S3 target"));
+    }
+
+    // 13. bucket-bound escape rejected: Location bucket differs from the bound
+    // target's bucket. The provider for the target refuses the write.
+    #[tokio::test]
+    async fn bucket_bound_escape_rejected() {
+        let registry = bound_registry();
+        let loc = Location::S3 {
+            target: "bkt".into(),
+            bucket: Some("evil".into()),
+            prefix: String::new(),
+        };
+        let err = registry
+            .create_s3_prefix_marker_at(&loc, "new")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("bucket escape rejected"));
+    }
+
+    // non-S3 location rejected (typed seam only).
+    #[tokio::test]
+    async fn non_s3_location_rejected() {
+        let registry = ProviderRegistry::new();
+        let loc = Location::Local(std::path::PathBuf::from("/tmp"));
+        let err = registry
+            .create_s3_prefix_marker_at(&loc, "new")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
 }
