@@ -9,7 +9,7 @@ pub mod sftp;
 pub mod webdav;
 
 pub use capabilities::{Capability, CapabilitySet};
-pub use s3::{S3ObjectRef, S3BucketRef, S3PrefixRef};
+pub use s3::{S3BucketRef, S3ObjectRef, S3PrefixRef};
 
 // ── Provider Registry (new architecture — phased migration) ──
 // ponytail: add ProviderId + VfsProvider + Registry alongside old Location enum.
