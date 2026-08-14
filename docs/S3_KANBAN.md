@@ -24,7 +24,31 @@
 - **BACKLOG** (49): S3-32..S3-80
 - **PARKED** (13): S3-81, S3-82, S3-83, S3-84, S3-85, S3-90, S3-91, S3-92, S3-93, S3-94, S3-95, S3-96, S3-97
 
+---
 
+## P11R CORRECTION PACK — CLOSE-OUT (P12–P15 basic Local↔S3 transfer)
+
+**Baseline:** `ab7558a` (P11 docs-close). **Stop Gate D HEAD:** `755f438`.
+
+All P11R cards merged; STOP GATE D frozen-tree audit = BLOCKER 0 / MAJOR 0 (3 parallel read-only tracks: capability/availability, TUI bypass/identity, provider/transfer/runtime). Physical acceptance run against live MinIO (real PutObject+GetObject roundtrip, byte-exact) — S3-42 Write flip is genuinely verified, no fabricated pass.
+
+| Card | PR | Merge SHA | Note |
+|------|----|-----------|------|
+| S3-30R | #111 | `5c2f409` | S3 F3 preview dispatch via identity lane (S3-30 follow-up) |
+| S3-31R | #112 | `51e6ec3` | S3TransferSpec + frozen-identity seam (transfer layer) |
+| S3-31/32/33 | #113 | `c0e2001` | planner selects `TransferMethod::S3` for Local↔S3 Copy |
+| S3-31R/33 seam | #114 | `ef8f0e4` | s3_upload.rs + s3_download.rs module seam |
+| S3-37/38 | #115 | `c176634` | download core (GetObject stream + staging + fsync + atomic rename) |
+| S3-34/35 | #116 | `f949ff0` | upload core (single PutObject + HeadObject overwrite preflight) |
+| S3-36/39 | #117 | `5ebbd1c` | executor integration (registry provider resolve + dispatch) |
+| S3-40/41 | #118 | `c03e4ac` | F5 availability + Copy wiring (frozen S3ObjectRef, Move stays unavailable) |
+| S3-42 | #119 | `755f438` | Write capability flip + MinIO physical acceptance (`NotFound` classifier fix) |
+
+**Capability surface after pack:** S3 = `List + Read + Write`. Mkdir/Delete/Copy/Move/Rename/Symlink remain unimplemented. Copy available Local↔S3 (single object); Move/Sync unavailable for S3.
+
+**Next:** S3-43 (MVP READY) — open when Gate D audit is recorded BLOCKER 0 / MAJOR 0.
+
+---
 
 ---
 
