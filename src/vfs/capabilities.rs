@@ -73,9 +73,12 @@ pub const WEBDAV_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::List)
     .with(Capability::Read);
 
-/// S3 currently implements listing/navigation only (ListBuckets, ListObjectsV2).
-/// Read/Write/Mkdir/Delete/Copy/Move/Rename/Symlink/Chmod/ServerSideCopy remain unimplemented.
-pub const S3_CAPABILITIES: CapabilitySet = CapabilitySet::NONE.with(Capability::List);
+/// S3 implements listing/navigation (ListBuckets, ListObjectsV2) and bounded
+/// preview reads (GetObject Range). Write/Mkdir/Delete/Copy/Move/Rename/
+/// Symlink/Chmod/ServerSideCopy remain unimplemented.
+pub const S3_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
+    .with(Capability::List)
+    .with(Capability::Read);
 
 /// Built-in capability declaration for a provider kind.
 ///
@@ -117,7 +120,16 @@ mod tests {
         assert!(WEBDAV_CAPABILITIES.supports(Capability::Read));
         assert!(!WEBDAV_CAPABILITIES.supports(Capability::Delete));
         assert!(S3_CAPABILITIES.supports(Capability::List));
-        assert!(!S3_CAPABILITIES.supports(Capability::Read));
+        assert!(S3_CAPABILITIES.supports(Capability::Read));
+        assert!(!S3_CAPABILITIES.supports(Capability::Write));
+        assert!(!S3_CAPABILITIES.supports(Capability::Mkdir));
+        assert!(!S3_CAPABILITIES.supports(Capability::Delete));
+        assert!(!S3_CAPABILITIES.supports(Capability::Copy));
+        assert!(!S3_CAPABILITIES.supports(Capability::Move));
+        assert!(!S3_CAPABILITIES.supports(Capability::Rename));
+        assert!(!S3_CAPABILITIES.supports(Capability::Symlink));
+        assert!(!S3_CAPABILITIES.supports(Capability::Chmod));
+        assert!(!S3_CAPABILITIES.supports(Capability::ServerSideCopy));
     }
 
     #[test]
@@ -138,9 +150,9 @@ mod tests {
     }
 
     #[test]
-    fn s3_list_only_no_read() {
+    fn s3_list_and_read_only() {
         assert!(S3_CAPABILITIES.supports(Capability::List));
-        assert!(!S3_CAPABILITIES.supports(Capability::Read));
+        assert!(S3_CAPABILITIES.supports(Capability::Read));
         assert!(!S3_CAPABILITIES.supports(Capability::Write));
         assert!(!S3_CAPABILITIES.supports(Capability::Mkdir));
         assert!(!S3_CAPABILITIES.supports(Capability::Delete));
