@@ -5193,14 +5193,19 @@ async fn dispatch_ui_action(
             let names2 = names.clone();
             let plan2 = plan.clone();
             let job_id = id.clone();
+            let registry2 = state.registry.clone();
             tokio::spawn(async move {
                 if !jobs.publish_event(&tx, arx::jobs::JobEvent::Running { id: job_id.clone() }) {
                     return;
                 }
                 let tx2 = tx.clone();
                 let jid = job_id.clone();
-                let result =
-                    arx::transfer::executor::execute_transfer(&plan2, &names2, cancel, |p| {
+                let result = arx::transfer::executor::execute_transfer(
+                    &plan2,
+                    &names2,
+                    &registry2,
+                    cancel,
+                    |p| {
                         let pct = p.completed.saturating_mul(100) / p.total.max(1);
                         let _ = jobs.publish_event(
                             &tx2,
@@ -5209,8 +5214,9 @@ async fn dispatch_ui_action(
                                 progress: arx::jobs::Progress::Percent(pct as u8).into(),
                             },
                         );
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 match result {
                     Ok(outcome) => {
                         let _ = jobs.publish_event(
@@ -5311,14 +5317,19 @@ async fn dispatch_ui_action(
             let names2 = names.clone();
             let plan2 = plan.clone();
             let job_id = id.clone();
+            let registry2 = state.registry.clone();
             tokio::spawn(async move {
                 if !jobs.publish_event(&tx, arx::jobs::JobEvent::Running { id: job_id.clone() }) {
                     return;
                 }
                 let tx2 = tx.clone();
                 let jid = job_id.clone();
-                let result =
-                    arx::transfer::executor::execute_transfer(&plan2, &names2, cancel, |p| {
+                let result = arx::transfer::executor::execute_transfer(
+                    &plan2,
+                    &names2,
+                    &registry2,
+                    cancel,
+                    |p| {
                         let pct = p.completed.saturating_mul(100) / p.total.max(1);
                         let _ = jobs.publish_event(
                             &tx2,
@@ -5327,8 +5338,9 @@ async fn dispatch_ui_action(
                                 progress: arx::jobs::Progress::Percent(pct as u8).into(),
                             },
                         );
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 match result {
                     Ok(outcome) => {
                         let _ = jobs.publish_event(
