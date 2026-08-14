@@ -4,7 +4,7 @@
 /// such as `ProcessService` is allowed to perform the external operation.
 use std::path::PathBuf;
 
-use crate::vfs::{Location, RemoteEditSession};
+use crate::vfs::{ListedEntry, Location, RemoteEditSession};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -38,8 +38,7 @@ pub enum Effect {
     },
     PreviewLocation {
         location: Location,
-        name: String,
-        total_size: Option<u64>,
+        listed: ListedEntry,
     },
     /// Download a remote file to a secure temp directory for editing.
     DownloadRemoteFile {
@@ -115,4 +114,91 @@ pub enum EffectEvent {
         label: String,
         error: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vfs::s3::S3ObjectRef;
+    use crate::vfs::{Entry, EntryIdentity, EntryKind, ListedEntry, Location};
+
+    // S3-27R A: identity survives the UI/effect boundary verbatim. A wrong
+    // presentation name must never overwrite the exact provider-native key.
+    #[test]
+    fn preview_location_carries_exact_s3_identity() {
+        let listed = ListedEntry {
+            entry: Entry {
+                name: "DISPLAY-WRONG.txt".into(),
+                kind: EntryKind::File,
+                size: Some(42),
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Object(S3ObjectRef {
+                target: "Prod".into(),
+                bucket: "Bucket".into(),
+                key: "foo/../REAL//����‍�����.txt".into(),
+            }),
+        };
+        let effect = Effect::PreviewLocation {
+            location: Location::S3 {
+                target: "Prod".into(),
+                bucket: Some("Bucket".into()),
+                prefix: String::new(),
+            },
+            listed,
+        };
+        match effect {
+            Effect::PreviewLocation { listed, .. } => {
+                match listed.identity {
+                    EntryIdentity::S3Object(ref r) => {
+                        assert_eq!(r.key, "foo/../REAL//����‍�����.txt")
+                    }
+                    other => panic!("expected S3Object identity, got {other:?}"),
+                }
+                assert_eq!(listed.entry.name, "DISPLAY-WRONG.txt");
+            }
+            _ => panic!("expected PreviewLocation"),
+        }
+    }
+
+    // S3-27R H: duplicate presentation names with distinct S3 identities stay distinct.
+    #[test]
+    fn preview_location_distinct_identities_same_name() {
+        let mk = |key: &str| ListedEntry {
+            entry: Entry {
+                name: "dup.txt".into(),
+                kind: EntryKind::File,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Object(S3ObjectRef {
+                target: "Prod".into(),
+                bucket: "Bucket".into(),
+                key: key.into(),
+            }),
+        };
+        let loc = Location::S3 {
+            target: "Prod".into(),
+            bucket: Some("Bucket".into()),
+            prefix: String::new(),
+        };
+        let a = Effect::PreviewLocation {
+            location: loc.clone(),
+            listed: mk("a/one.txt"),
+        };
+        let b = Effect::PreviewLocation {
+            location: loc,
+            listed: mk("b/two.txt"),
+        };
+        let listed_a = match a {
+            Effect::PreviewLocation { listed, .. } => listed,
+            _ => panic!("expected PreviewLocation"),
+        };
+        let listed_b = match b {
+            Effect::PreviewLocation { listed, .. } => listed,
+            _ => panic!("expected PreviewLocation"),
+        };
+        assert_ne!(listed_a.identity, listed_b.identity);
+        assert_eq!(listed_a.entry.name, listed_b.entry.name);
+    }
 }

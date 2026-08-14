@@ -164,14 +164,15 @@ impl ProcessService {
             | Effect::PreviewFile { .. }
             | Effect::OpenPath { .. }) => Self::execute(e).await,
 
-            Effect::PreviewLocation {
-                location,
-                name,
-                total_size,
-            } => {
+            Effect::PreviewLocation { location, listed } => {
+                let name = &listed.entry.name;
                 let label = format!("remote preview: {name}");
                 let bounded = match registry
-                    .read_prefix_bytes_at(&location, &name, preview::MAX_TEXT_PREVIEW_BYTES)
+                    .read_listed_prefix_bytes_at(
+                        &location,
+                        &listed,
+                        preview::MAX_TEXT_PREVIEW_BYTES,
+                    )
                     .await
                 {
                     Ok(b) => b,
@@ -184,9 +185,9 @@ impl ProcessService {
                 };
                 let lines = preview::format_bounded_preview(
                     &bounded.bytes,
-                    total_size,
+                    listed.entry.size,
                     bounded.truncated,
-                    &name,
+                    name,
                     preview::MAX_TEXT_PREVIEW_LINES,
                 )
                 .unwrap_or_else(|e| vec![format!("Error: {e}")]);
@@ -545,7 +546,9 @@ mod tests {
     use super::*;
     use crate::effect_dispatcher::{EffectDispatcher, EffectLane, EffectScope};
     use crate::vfs::capabilities;
-    use crate::vfs::{BoundedRead, Entry, Location, VfsProvider};
+    use crate::vfs::{
+        BoundedRead, Entry, EntryIdentity, EntryKind, ListedEntry, Location, VfsProvider,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1221,8 +1224,7 @@ mod tests {
                     host: "test-host".into(),
                     path: "/missing.txt".into(),
                 },
-                name: "missing.txt".into(),
-                total_size: None,
+                listed: listed_file("missing.txt", None),
             },
             &registry,
         )
@@ -1249,8 +1251,7 @@ mod tests {
                     host: "test-host".into(),
                     path: "/secret.txt".into(),
                 },
-                name: "secret.txt".into(),
-                total_size: None,
+                listed: listed_file("secret.txt", None),
             },
             &registry,
         )
@@ -1277,8 +1278,7 @@ mod tests {
                     host: "test-host".into(),
                     path: "/data.txt".into(),
                 },
-                name: "data.txt".into(),
-                total_size: None,
+                listed: listed_file("data.txt", None),
             },
             &registry,
         )
@@ -1310,8 +1310,7 @@ mod tests {
                     host: "test-host".into(),
                     path: "/greeting.txt".into(),
                 },
-                name: "greeting.txt".into(),
-                total_size: Some(20),
+                listed: listed_file("greeting.txt", Some(20)),
             },
             &registry,
         )
@@ -1329,11 +1328,22 @@ mod tests {
 
     // ── FIX-05: Concurrency ──
 
+    fn listed_file(name: &str, size: Option<u64>) -> ListedEntry {
+        ListedEntry {
+            entry: Entry {
+                name: name.into(),
+                kind: EntryKind::File,
+                size,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::Other,
+        }
+    }
+
     fn preview_effect(loc: &Location, name: &str) -> Effect {
         Effect::PreviewLocation {
             location: loc.clone(),
-            name: name.into(),
-            total_size: None,
+            listed: listed_file(name, None),
         }
     }
 
