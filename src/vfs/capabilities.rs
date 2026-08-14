@@ -74,13 +74,15 @@ pub const WEBDAV_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::Read);
 
 /// S3 implements listing/navigation (ListBuckets, ListObjectsV2), bounded
-/// preview reads (GetObject Range), and single-object basic transfers
-/// (upload = PutObject via `Write`; download = GetObject via `Read`).
-/// Mkdir/Delete/Copy/Move/Rename/Symlink/Chmod/ServerSideCopy remain unimplemented.
+/// preview reads (GetObject Range), single-object basic transfers
+/// (upload = PutObject via `Write`; download = GetObject via `Read`), and
+/// prefix creation (Mkdir = empty-object marker via `create_s3_prefix_marker_at`).
+/// Delete/Copy/Move/Rename/Symlink/Chmod/ServerSideCopy remain unimplemented.
 pub const S3_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::List)
     .with(Capability::Read)
-    .with(Capability::Write);
+    .with(Capability::Write)
+    .with(Capability::Mkdir);
 
 /// Built-in capability declaration for a provider kind.
 ///
