@@ -16,12 +16,12 @@
 
 ## Column summary
 
-- **READY** (1): S3-54
+- **READY** (0): —
 - **DOING** (0): —
 - **REVIEW** (0): —
 - **BLOCKED** (0): —
-- **DONE** (59): S3-00..S3-30, S3-31, S3-31R, S3-32..S3-42 (P11R), S3-42S, S3-43, S3-44..S3-50, S3-51, S3-52, S3-53
-- **BACKLOG** (24): S3-55..S3-80
+- **DONE** (67): S3-00..S3-30, S3-31, S3-31R, S3-32..S3-42 (P11R), S3-42S, S3-43, S3-44..S3-50, S3-51, S3-52, S3-53, S3-54(R), S3-55(R/F7/Ph4/Ph8), S3-57, S3-58, S3·58P, S3-61
+- **BACKLOG** (16): S3-62..S3-80
 - **PARKED** (14): S3-81..S3-97
 
 ---
@@ -70,7 +70,38 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 **Out-of-scope debt (recorded, not blocking this pack):** two `unreachable!()` in `src/vfs/sftp.rs` pre-exist the S3 work and are outside the S3 transfer runtime — flagged as separate follow-up, must not block the S3 capability flip.
 
-**Next:** S3-54 (prefix-marker primitive) is now READY.
+---
+
+## HERMES BIG PACK — CLOSE-OUT (S3-54 → S3-61: CREATE PREFIX + SAFE SINGLE DELETE)
+
+**Baseline:** `2f0588a` (prior docs-close). **Final HEAD:** `4aeb863`.
+
+Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, fmt, clippy, tests, 1.88, quality, msrv, frozen-tree review B0/M0, clean tree). All criteria met on every merged card.
+
+| Card | PR | Merge SHA | Note |
+|------|----|-----------|------|
+| Phase 0 kanban repair | — | `f157b26` | kanban backfill (S3-54 already DONE) |
+| S3-54R | #132 | `58d8036` | S3-native create-prefix typed seam `create_s3_prefix_marker_at` (Location::S3 only, bucket=None→Unsupported, validate_child_name, no overwrite) |
+| Phase 2 physical | #133 | `107bf68` | MinIO physical acceptance: marker PutObject accepted, dup→AlreadyExists, target-root rejected, repeated-slash honestly rejected; classify_prefix_head fixed (typed NotFound + wire code for MinIO Unhandled) |
+| S3-55 F7 | #135 | `ee8df0e` | F7 (Mkdir) execution lane + availability correction for S3 (bucket=None→Disabled) |
+| S3-57/58/58P | #134 | `fca5da6` | bucket versioning probe + exact delete primitive `delete_object_exact` + bounded empty-marker proof `prove_empty_prefix_marker` |
+| S3-55 Phase4 | #136 | `5066820` | Mkdir capability flip true (physical create verified in Phase 2) |
+| S3-55 Phase8 | #137 | `4dca1e6` | frozen S3 delete confirmation: `delete_s3_at` + `prove_empty_s3_prefix_at` seams, `ConfirmRemoteDelete` S3 branch (preflight prove_empty, ONE DeleteObject) |
+| S3-61 Phase9 | — | (verified) | physical delete against MinIO (`tests/s3_delete_minio.rs`): create→prove_empty true→delete→prove_empty false (marker gone) |
+| S3-61 | #138 | `4aeb863` | Delete capability flip true; S3 `Action::Delete` TUI entry branch (frozen RemoteDeletePlan, key from prefix+name) |
+
+**Capability surface after pack:** S3 = `List + Read + Write + Mkdir + Delete`. Copy/Move/Rename/Symlink/Chmod/ServerSideCopy remain unimplemented (false).
+
+**Stop Gate F (frozen SHA `4aeb863`) = BLOCKER 0 / MAJOR 0 / MINOR 0 / NIT 0 (3 parallel read-only tracks):**
+- Track A (capability/availability): M0 — contract consistent, no over-promise.
+- Track B (TUI/operational-identity): M0 — S3 routes only through seams, no shell escape, no recursive prefix delete, no bucket delete, key verbatim.
+- Track C (provider/runtime): M0 — all 5 mutating `.send()` single-shot, no retry re-enable; create/delete/prove/versioning logic exact; seams derive target/bucket from Location (no cross-target reach).
+
+**Physical acceptance (live MinIO, `arx-minio-test`):** create empty marker → `prove_empty` true → exact `DeleteObject` → `prove_empty` false (marker gone from bucket). No fabricated pass; env-gated `ARX_MINIO_TEST=1`.
+
+**SDK retry invariant:** unchanged — every mutating request = exactly ONE logical AWS send, retry disabled.
+
+**Next:** S3-62+ (Copy/Move/Rename or versioning-aware delete UI) — backlog.
 
 ---
 
