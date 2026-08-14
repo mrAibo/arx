@@ -793,3 +793,95 @@ mod tests {
         assert!(s3_spec_for_objects(&[one.clone(), one.clone()]).is_err());
     }
 }
+
+/// Real physical acceptance test for S3 basic transfer (S3-42 gate).
+///
+/// Runs ONLY when `ARX_TEST_S3_ENDPOINT` is set (e.g. a local MinIO instance).
+/// It exercises the actual `upload_one`/`download_one` arx code paths against a
+/// live S3-compatible endpoint — no aws-cli, no shell fallback. This is the
+/// physical acceptance evidence required to flip `S3_CAPABILITIES::Write`.
+#[cfg(test)]
+mod physical_acceptance {
+    use super::*;
+    use crate::config::S3TargetConfig;
+    use crate::transfer::s3_upload::S3OverwritePolicy;
+    use crate::vfs::s3::S3Provider;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::tempdir;
+
+    fn minio_target() -> Option<S3TargetConfig> {
+        let endpoint = std::env::var("ARX_TEST_S3_ENDPOINT").ok()?;
+        let bucket = std::env::var("ARX_TEST_S3_BUCKET").unwrap_or_else(|_| "arxtest".into());
+        Some(S3TargetConfig {
+            id: "phys-accept".into(),
+            name: "phys-accept".into(),
+            bucket: Some(bucket),
+            region: Some("us-east-1".into()),
+            profile: None,
+            endpoint_url: Some(endpoint),
+            force_path_style: true,
+        })
+    }
+
+    #[tokio::test]
+    async fn s3_upload_download_roundtrip_against_live_endpoint() {
+        let Some(target) = minio_target() else {
+            eprintln!("skipping physical acceptance: ARX_TEST_S3_ENDPOINT not set");
+            return;
+        };
+        // Credentials come from the default AWS SDK chain (AWS_ACCESS_KEY_ID /
+        // AWS_SECRET_ACCESS_KEY); set them to the MinIO root keys before running.
+        let provider = S3Provider::new(target);
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("upload.bin");
+        let payload: Vec<u8> = (0u8..=255).cycle().take(100_000).collect();
+        std::fs::write(&src, &payload).unwrap();
+
+        let key = format!("arx-phys-accept/{}.bin", uuid_like());
+        let object = S3ObjectRef {
+            target: "phys-accept".into(),
+            bucket: "arxtest".into(),
+            key: key.clone(),
+        };
+
+        // Upload through the real arx core (exactly one PutObject).
+        let up = S3TransferSpec::UploadOne {
+            local_source: src.clone(),
+            destination: object.clone(),
+        };
+        let written = s3_upload::upload_one(
+            &provider,
+            &up,
+            S3OverwritePolicy::Forbid,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("upload must succeed against live endpoint");
+        assert_eq!(written as usize, payload.len());
+
+        // Download back through the real arx core (full GetObject + staging + fsync).
+        let dst = dir.path().join("download.bin");
+        let down = S3TransferSpec::DownloadOne {
+            source: object.clone(),
+            local_destination: dst.clone(),
+        };
+        let got = s3_download::download_one(&provider, &down, Arc::new(AtomicBool::new(false)))
+            .await
+            .expect("download must succeed against live endpoint");
+        assert_eq!(got as usize, payload.len());
+
+        let back = std::fs::read(&dst).unwrap();
+        assert_eq!(back, payload, "roundtrip bytes must match exactly");
+    }
+
+    fn uuid_like() -> String {
+        // ponytail: monotonic-ish token for unique keys; no crate needed
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{n}")
+    }
+}

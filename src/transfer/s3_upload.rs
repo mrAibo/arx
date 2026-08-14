@@ -247,13 +247,13 @@ pub(crate) fn check_single_put_size(size: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Pure: map a HeadObject service error into a `HeadState`. Only the error
-/// `code()` is inspected; the message is discarded so no credential or signed
-/// query leaks. A missing object is `NoSuchKey`; `AccessDenied` is NEVER
-/// inferred as missing; everything else is `Unknown` (factual failure).
+/// Pure: map a HeadObject service error into a `HeadState`. The object-absent
+/// code is `NoSuchKey` on AWS; MinIO (S3-compatible) returns `NotFound`. Both
+/// mean the object is missing. `AccessDenied` is NEVER inferred as missing;
+/// everything else is `Unknown` (factual failure).
 pub(crate) fn classify_head_error(svc: &HeadObjectError) -> HeadState {
     match svc.code() {
-        Some("NoSuchKey") => HeadState::Missing,
+        Some("NoSuchKey") | Some("NotFound") => HeadState::Missing,
         Some("AccessDenied") => HeadState::AccessDenied,
         _ => HeadState::Unknown,
     }
