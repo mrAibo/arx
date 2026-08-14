@@ -473,7 +473,9 @@ async fn event_loop(
                                 } else {
                                     state.right.location.clone()
                                 };
-                                state.toggle_selection(pane, &location, &entry.name);
+                                if !matches!(location, Location::S3 { .. }) {
+                                    state.toggle_selection(pane, &location, &entry.name);
+                                }
                             }
                         }
                         MouseEventKind::Down(_) => {
@@ -681,24 +683,28 @@ async fn event_loop(
                                 if state.glob_input && !state.filter.is_empty() {
                                     let active = state.active;
                                     let location = state.active_pane().location.clone();
-                                    let rows = if state.active == Pane::Left {
-                                        &left_visible
-                                    } else {
-                                        &right_visible
-                                    };
-                                    for e in rows.iter().filter_map(VisiblePaneRow::listed) {
-                                        if !state.is_selected(active, &location, &e.entry.name) {
-                                            state.toggle_selection(
-                                                active,
-                                                &location,
-                                                &e.entry.name,
-                                            );
+                                    if !matches!(location, Location::S3 { .. }) {
+                                        let rows = if state.active == Pane::Left {
+                                            &left_visible
+                                        } else {
+                                            &right_visible
+                                        };
+                                        for e in rows.iter().filter_map(VisiblePaneRow::listed) {
+                                            if !state.is_selected(active, &location, &e.entry.name) {
+                                                state.toggle_selection(
+                                                    active,
+                                                    &location,
+                                                    &e.entry.name,
+                                                );
+                                            }
                                         }
+                                        state.message = Some(format!(
+                                            "Selected {}",
+                                            state.selection_count(active, &location)
+                                        ));
+                                    } else {
+                                        state.message = Some("Selection by name is not supported for S3".into());
                                     }
-                                    state.message = Some(format!(
-                                        "Selected {}",
-                                        state.selection_count(active, &location)
-                                    ));
                                     state.filter.clear();
                                 } else if state.go_input && !state.filter.is_empty() {
                                     // Navigate to typed path
@@ -1322,15 +1328,19 @@ async fn event_loop(
                             state.message = Some("Swapped".into());
                             schedule_both_pane_loads(&pane_loader, &mut state);
                         }
-                        // Shift+F6: rename file under cursor
+                        // Shift+F6: rename file under cursor (local-only)
                         KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => {
                             if let Some(entry) = visible_rows
                                 .get(cursor)
                                 .and_then(VisiblePaneRow::listed)
                                 .map(|listed| &listed.entry)
                             {
-                                state.cmd = format!("mv '{}' ", entry.name);
-                                state.cmd_input = true;
+                                if matches!(pane.location, Location::Local(_)) {
+                                    state.cmd = format!("mv '{}' ", entry.name);
+                                    state.cmd_input = true;
+                                } else {
+                                    state.message = Some("Rename is currently local-only".into());
+                                }
                             }
                         }
                         // Ctrl+A: file attributes (permissions/owner)
@@ -1488,22 +1498,26 @@ async fn event_loop(
                             });
                             schedule_both_pane_loads(&pane_loader, &mut state);
                         }
-                        // *: invert selection on visible entries
+                        // *: invert selection on visible entries (local/SFTP/archive only)
                         KeyCode::Char('*') => {
-                            let rows = if state.active == Pane::Left {
-                                &left_visible
-                            } else {
-                                &right_visible
-                            };
                             let active = state.active;
                             let location = state.active_pane().location.clone();
-                            for e in rows.iter().filter_map(VisiblePaneRow::listed) {
-                                state.toggle_selection(active, &location, &e.entry.name);
+                            if !matches!(location, Location::S3 { .. }) {
+                                let rows = if state.active == Pane::Left {
+                                    &left_visible
+                                } else {
+                                    &right_visible
+                                };
+                                for e in rows.iter().filter_map(VisiblePaneRow::listed) {
+                                    state.toggle_selection(active, &location, &e.entry.name);
+                                }
+                                state.message = Some(format!(
+                                    "Selected {}",
+                                    state.selection_count(active, &location)
+                                ));
+                            } else {
+                                state.message = Some("Selection by name is not supported for S3".into());
                             }
-                            state.message = Some(format!(
-                                "Selected {}",
-                                state.selection_count(active, &location)
-                            ));
                         }
                         // +: enter glob-select mode (uses filter buffer)
                         KeyCode::Char('+') => {
@@ -3148,7 +3162,7 @@ fn render(
     }
 
     // Command Center overlay (Ctrl+P)
-    // Context menu (right-click)
+    // Context menu (right-click) — ponytail: UI-CONTEXT-AVAILABILITY — static presentation, no dispatch lane; later capability-aware rendering
     if state.show_context_menu {
         let popup = centered_rect(18, 7, area);
         frame.render_widget(Clear, popup);
