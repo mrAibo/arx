@@ -1,4 +1,5 @@
 pub mod executor;
+pub mod integrity;
 pub mod probe;
 #[allow(dead_code)]
 pub mod sftp_copy;
