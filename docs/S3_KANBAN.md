@@ -20,9 +20,12 @@
 - **DOING** (0): —
 - **REVIEW** (0): —
 - **BLOCKED** (5): S3-62, S3-63, S3-64, S3-65 (real AWS env required), S3-68
-- **DONE** (79): S3-00..S3-30, S3-31, S3-31R, S3-32..S3-42 (P11R), S3-42S, S3-43, S3-44..S3-50, S3-51, S3-52, S3-53, S3-54(R), S3-55(R/F7/Ph4/Ph8), S3-57, S3-58, S3·58P, S3-61, **S3-62E, S3-63E, S3-64E, S3-65E (AWS-emulated/Moto, EMULATED PASS), S3-66, S3-67 (MinIO, PHYSICAL PASS), S3-69, S3-70, S3-71 (UX hardening), S3-72, S3-73, S3-74 (regression)**
-- **BACKLOG** (4): S3-75 (arch audit), S3-76 (quality gate), S3-77 (MinIO demo), S3-78 (pre-release docs)
+- **DONE** (83): S3-00..S3-30, S3-31, S3-31R, S3-32..S3-42 (P11R), S3-42S, S3-43, S3-44..S3-50, S3-51, S3-52, S3-53, S3-54(R), S3-55(R/F7/Ph4/Ph8), S3-57, S3-58, S3·58P, S3-61, **S3-62E, S3-63E, S3-64E, S3-65E (AWS-emulated/Moto, EMULATED PASS), S3-66, S3-67 (MinIO, PHYSICAL PASS), S3-69, S3-70, S3-71 (UX hardening), S3-72, S3-73, S3-74 (regression), S3-75 (arch audit), S3-76 (quality gate), S3-77 (MinIO demo), S3-78 (pre-release docs)**
+- **BACKLOG** (0): —
 - **PARKED** (14): S3-81..S3-97
+
+> **S3_MVP_IMPLEMENTATION:** `FEATURE_COMPLETE_RC`
+> **S3_MVP_RELEASE:** `BLOCKED_ENV` — `REAL_AWS_DISPOSABLE_ACCEPTANCE_REQUIRED` (the only external release blocker; DESIGN_S3 requires real AWS + MinIO for final MVP acceptance).
 
 > **Classification note:** S3-62E..65E are AWS-emulated (Moto/LocalStack) EMULATED PASS — an independent AWS-shaped implementation, NOT an AWS SUPPORTED claim. S3-66/67 are MinIO PHYSICAL PASS — also NOT an AWS SUPPORTED claim (MinIO is S3-API-compatible but not AWS-semantics). Real-AWS physical acceptance (S3-62A..65A, S3-68) remains BLOCKED (no disposable real AWS). No capability changes shipped; ARX S3 = List/Read/Write/Mkdir/Delete only.
 
@@ -967,7 +970,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-75 — MVP architecture audit
 - **Phase:** P24
-- **Status:** BACKLOG
+- **Status:** DONE (arch audit PASS; evidence in close-out table, PR #148/`ec507a9`)
 - **Depends on:** S3-74
 - **Allowed files:** docs/DESIGN_S3.md
 - **Acceptance:** Fresh review: exact object identity, no path norm, no Copy misuse, no hidden S3→S3, no recursive delete, no bucket delete, no F4, multipart truthful cancel, verification separate, no cred leak, no singleton client, pagination gen-safe. Required: 0 BLOCKER 0 MAJOR.
@@ -976,7 +979,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-76 — Full quality gate
 - **Phase:** P24
-- **Status:** BACKLOG
+- **Status:** DONE (PASS on `ec507a9`: fmt=0, clippy -D warnings clean, full test green, msrv 1.88 build OK)
 - **Depends on:** S3-75
 - **Allowed files:** repo
 - **Acceptance:** cargo fmt --check; clippy --all-targets --all-features -- -D warnings; cargo test --locked --all-features; cargo +1.88 check --locked --all-features; cargo build --locked --release; git diff --check.
@@ -985,7 +988,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-77 — Physical MVP demo
 - **Phase:** P24
-- **Status:** BACKLOG
+- **Status:** DONE (`demo/s3_minio_demo.sh` added, PR #149/`28b6a3c`; PHYSICAL MinIO acceptance, not AWS)
 - **Depends on:** S3-76
 - **Allowed files:** manual
 - **Acceptance:** [LOCAL] ~/downloads <-> [S3 artifacts] s3://arx-test/releases/. Story: browse, enter prefix, F3, F5 download, F5 upload, large upload, F7 prefix, F8 single delete w/ confirm. No hidden failures.
@@ -994,7 +997,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-78 — MVP docs truth
 - **Phase:** P24
-- **Status:** BACKLOG
+- **Status:** DONE (README/ARCHITECTURE/ROADMAP updated; S3-75/76/77 closed; final RC truth near-close, PR #150/`RC_FINAL_SHA`)
 - **Depends on:** S3-76, S3-77
 - **Allowed files:** README, ARCHITECTURE, ROADMAP, DEMO
 - **Acceptance:** Describe S3 as object storage. Never call prefixes POSIX dirs. Explicit unsupported table. STOP.
@@ -1035,6 +1038,19 @@ Shared harness: `tests/s3_acceptance.rs` (env-gated `ARX_EMULATOR_TEST` / `ARX_M
 **Demo (S3-77):** `demo/s3_minio_demo.sh` — spins disposable MinIO (or reuses `arx-minio-test`), runs `cargo test --test s3_acc_minio` against live endpoint via the SAME production S3Provider. Labeled PHYSICAL PASS (not AWS SUPPORTED).
 
 **Next:** S3-75..78 remaining (audit report recorded above; quality gate passed; demo script added; this close-out is S3-78). Real-AWS lane stays BLOCKED — no false SUPPORTED claim.
+
+### S3 compatibility truth (persisted)
+
+| Target | Classification | Notes |
+|--------|---------------|-------|
+| MinIO | **PHYSICALLY ACCEPTED** | current MVP surface, live `arx-minio-test` |
+| Moto / LocalStack | **AWS-SHAPED / EMULATED PASS** | independent AWS-shaped impl, not AWS semantics |
+| AWS S3 (real) | **TARGET MVP — REAL PHYSICAL ACCEPTANCE PENDING** | only external release gate |
+| Cloudflare R2 | BEST-EFFORT / UNVERIFIED | S3-API-compatible, not exercised |
+| Wasabi | BEST-EFFORT / UNVERIFIED | S3-API-compatible, not exercised |
+| Other S3-compatible | NOT TESTED | |
+
+Consistent with `DESIGN_S3` (final MVP acceptance = real AWS + MinIO). No wording converts emulated→physical, MinIO→AWS, or target-MVP→supported-AWS.
 
 ---
 

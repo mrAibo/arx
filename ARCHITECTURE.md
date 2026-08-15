@@ -58,7 +58,7 @@ Remote preview and remote edit use Effect lanes. Transfers, syncs, and job-orien
 
 ### Provider layer
 
-`VfsProvider` trait + `ProviderRegistry`. Providers implement: listing, metadata, bounded reads, exact-length reads, write-back via immutable revision. Capability sets declare what a provider supports. F4 only shows when both `Read` and `Write` are present. F3 shows when `Read` is present.
+`VfsProvider` trait + `ProviderRegistry`. Providers implement: listing, metadata, bounded reads, exact-length reads, write-back via immutable revision. Capability sets declare what a provider supports. F3 shows when `Read` is present; F4 shows when `Read` **and** `Write` are present **and** the provider policy allows editing — S3 has Read+Write but F4 stays intentionally disabled, so availability is capability **and** provider-policy gated, not capability-only.
 
 ### Transfer planners
 
@@ -87,6 +87,32 @@ The workspace flow is deliberately split into independent truths:
 
 SFTP connections are pooled per host. Ambiguous transport failures invalidate the session. Definitive protocol-level errors (status codes) don't trigger invalidation.
 
+### S3 (object storage, AWS-shaped)
+
+Implemented provider, physically accepted against MinIO and AWS-shaped-emulated
+against Moto. Exact architectural distinctions:
+
+- **Identity:** `S3BucketRef` / `S3PrefixRef` / `S3ObjectRef` are provider-native
+  strings stored verbatim; `Entry.name` is presentation only and never an
+  operational identity.
+- **Prefixes are not POSIX directories:** `foo/bar` is an object-key namespace,
+  not a filesystem path — no normalization, `//` collapse, `.`/`..` resolution, or
+  canonicalization.
+- **Transfer:** `TransferPlanner` builds a frozen `S3TransferSpec` with exact refs;
+  no plan mutates after dispatch.
+- **Runtime:** target-scoped `S3Provider` + lazy per-target client; bucket-bound
+  targets can never reach `ListAllMyBuckets`.
+- **Multipart:** sequential part PUT/GET, SDK retries disabled, cancellation truth
+  (pre-create → clean interrupt; post-create → Abort attempted, outcome classified
+  truthfully).
+- **Verification:** physical outcome is separate from verification evidence; `ETag`
+  is not a universal content hash.
+
+S3 capability surface (current MVP): `List`, `Read`, `Write`, `Mkdir`, `Delete`.
+`Copy`/`Move`/`Rename`/`Symlink`/`Chmod`/`ServerSideCopy` remain off. F4 edit is
+intentionally disabled despite Read+Write (provider-policy gated, not
+capability-only). No recursive prefix delete, no bucket create/delete.
+
 ## File tree (current runtime)
 
 ```
@@ -101,7 +127,7 @@ src/
 │   ├── local.rs
 │   ├── sftp.rs         # full SFTP provider incl. atomic write
 │   ├── archive.rs
-│   ├── s3.rs (stub)
+│   ├── s3.rs          # implemented S3 object-storage provider (AWS-shaped; MinIO + Moto-emulated acceptance)
 │   └── webdav.rs (stub)
 ├── transfer/           # TransferPlanner, executors, transactional SFTP copy
 ├── remote/             # HostConfig, OpenSSH transport, ssh_config
