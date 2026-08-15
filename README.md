@@ -108,12 +108,12 @@ of truth.
 
 | Key | Action |
 |-----|--------|
-| **F3** | View — Local: full preview; SFTP: bounded text (1 MiB / 500 lines) |
-| **F4** | Edit — Local: configured editor; SFTP: conflict-safe UTF-8 text edit, full-file only, binary/NUL refused |
-| **F5** | Copy — Local↔Local, Local↔SFTP (SFTP→SFTP unsupported) |
-| **F6** | Move — Local↔Local only |
-| **F7** | Create directory — Local + SFTP |
-| **F8** | Delete — Local: trash; SFTP: permanent confirmed delete (no recursive remote delete) |
+| **F3** | View — Local: full preview; SFTP: bounded text (1 MiB / 500 lines); **S3: bounded object preview (where supported)** |
+| **F4** | Edit — Local: configured editor; SFTP: conflict-safe UTF-8 text edit, full-file only, binary/NUL refused; **S3: disabled** |
+| **F5** | Copy — Local↔Local, Local↔SFTP (SFTP→SFTP unsupported); **S3: Local↔S3 and S3→Local single-object copy (no S3→S3, no SFTP↔S3)** |
+| **F6** | Move — Local↔Local only; **S3: disabled** |
+| **F7** | Create directory — Local + SFTP; **S3: creates a prefix marker (not a POSIX directory / bucket)** |
+| **F8** | Delete — Local: trash; SFTP: permanent confirmed delete (no recursive remote delete); **S3: exact single-object or proven-empty marker delete (no recursive prefix delete, no bucket delete)** |
 | Shift+F6 | Rename |
 | Ctrl+U | Swap panes |
 | Ctrl+X C / L / O / S | chmod / hardlink / chown / symlink |
@@ -216,7 +216,8 @@ Menu entries appear in Command Center (Ctrl+P).
 | User menu with custom scripts | ✅ |
 | Host Center (F9) | ✅ |
 | Extension colors, heatmap, git status bar | ✅ |
-| S3/MinIO + WebDAV backends | stubs |
+| S3 object-storage backend (AWS-shaped, MinIO + Moto-emulated acceptance) | ✅ RC (not yet AWS-physically released) |
+| WebDAV backend | stub |
 
 ## Architecture
 
@@ -266,7 +267,10 @@ arx/
 **VFS:** `VfsProvider` trait + `Location` + `CapabilitySet`. Backends
 implement listing, metadata, bounded reads, exact-length reads, and
 write-back via immutable revision. Capability sets gate action
-availability — F4 only shows when both Read and Write are present.
+availability — F4 only shows when both Read and Write are present **and** the
+provider policy allows editing. S3 has Read+Write but F4 stays intentionally
+disabled (no generic edit path yet), so availability is capability **and**
+provider-policy gated, not capability-only.
 
 **Transfer Stack:** `TransferPlanner` builds a frozen plan from a
 `TransferRequest`. The planner picks native, rsync, or SFTP streaming.

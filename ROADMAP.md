@@ -30,7 +30,7 @@ Issues #47–#53 track deferred engineering work:
 
 ## FUTURE
 
-- S3/MinIO backend — implementation in progress; not released as supported until physical acceptance gates pass.
+- S3 object-storage backend — feature-complete release candidate. Physically accepted against MinIO; AWS-shaped emulated acceptance against Moto. **Real AWS physical acceptance remains the only external release gate (AWS_S3_PHYSICAL_ACCEPTANCE_REQUIRED).** Not released as fully-supported AWS S3 until that gate passes.
 - Cross-backend Move
 - SFTP → SFTP workspace sync
 - Recursive remote delete
