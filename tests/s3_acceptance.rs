@@ -56,6 +56,120 @@ pub fn maybe_skip_minio() -> Option<ProviderRegistry> {
     Some(registry)
 }
 
+pub fn maybe_skip_aws() -> Option<ProviderRegistry> {
+    match std::env::var("ARX_AWS_ACCEPTANCE") {
+        Ok(v) if !v.trim().is_empty() => {}
+        _ => {
+            eprintln!("ARX_AWS_ACCEPTANCE not set; skipping real AWS S3 acceptance");
+            return None;
+        }
+    }
+    // Real AWS: NO endpoint override, virtual-hosted style (no force_path_style).
+    // Fail closed: bucket + region + full profile MUST be explicitly set. No defaults.
+    let bucket = match std::env::var("ARX_AWS_BUCKET") {
+        Ok(b) if b.starts_with("arx-acceptance-") => b,
+        Ok(b) => {
+            eprintln!(
+                "ARX_AWS_BUCKET '{b}' fails acceptance naming rule (must be arx-acceptance-*); skipping"
+            );
+            return None;
+        }
+        Err(_) => {
+            eprintln!("ARX_AWS_BUCKET required for real AWS acceptance; skipping");
+            return None;
+        }
+    };
+    let region = match std::env::var("ARX_AWS_REGION") {
+        Ok(r) if !r.trim().is_empty() => r,
+        _ => {
+            eprintln!(
+                "ARX_AWS_REGION required for real AWS acceptance (no implicit us-east-1); skipping"
+            );
+            return None;
+        }
+    };
+    let full_profile = match std::env::var("ARX_AWS_FULL_PROFILE") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => {
+            eprintln!("ARX_AWS_FULL_PROFILE required for real AWS acceptance; skipping");
+            return None;
+        }
+    };
+    let registry = ProviderRegistry::new();
+    // Account-style target (bucket=None) for ListBuckets / account-root acceptance.
+    registry.register_s3_targets(&[
+        S3TargetConfig {
+            id: "aws".to_string(),
+            name: "aws".to_string(),
+            bucket: None,
+            region: Some(region.clone()),
+            profile: Some(full_profile.clone()),
+            endpoint_url: None,
+            force_path_style: false,
+        },
+        // Bucket-bound full target for object-level acceptance (upload/download/etc).
+        S3TargetConfig {
+            id: "aws-bucket".to_string(),
+            name: "aws-bucket".to_string(),
+            bucket: Some(bucket),
+            region: Some(region),
+            profile: Some(full_profile),
+            endpoint_url: None,
+            force_path_style: false,
+        },
+    ]);
+    Some(registry)
+}
+
+/// AWS target with a specific profile (used for STS AssumeRole / restricted roles).
+/// Caller MUST pass an explicit profile; no ambient fallback.
+pub fn aws_target_with_profile(id: &str, profile: &str) -> arx::config::S3TargetConfig {
+    let bucket =
+        std::env::var("ARX_AWS_BUCKET").expect("ARX_AWS_BUCKET must be set for AWS acceptance");
+    let region =
+        std::env::var("ARX_AWS_REGION").expect("ARX_AWS_REGION must be set for AWS acceptance");
+    S3TargetConfig {
+        id: id.to_string(),
+        name: id.to_string(),
+        bucket: Some(bucket),
+        region: Some(region),
+        profile: Some(profile.to_string()),
+        endpoint_url: None,
+        force_path_style: false,
+    }
+}
+
+/// AWS target pinned to an intentionally WRONG region (F test).
+/// Deterministically picks a region DIFFERENT from the configured one so the
+/// test is always actually-wrong (never accidentally correct).
+pub fn aws_target_wrong_region() -> arx::config::S3TargetConfig {
+    let bucket =
+        std::env::var("ARX_AWS_BUCKET").expect("ARX_AWS_BUCKET must be set for AWS acceptance");
+    let configured =
+        std::env::var("ARX_AWS_REGION").expect("ARX_AWS_REGION must be set for AWS acceptance");
+    let wrong = if configured.trim() == "eu-west-1" {
+        "us-east-1".to_string()
+    } else {
+        "eu-west-1".to_string()
+    };
+    assert_ne!(
+        wrong,
+        configured.trim(),
+        "wrong region must differ from configured"
+    );
+    let full_profile = std::env::var("ARX_AWS_FULL_PROFILE")
+        .expect("ARX_AWS_FULL_PROFILE must be set for AWS acceptance");
+    S3TargetConfig {
+        id: "aws-wrong-region".to_string(),
+        name: "aws-wrong-region".to_string(),
+        bucket: Some(bucket),
+        region: Some(wrong),
+        profile: Some(full_profile),
+        endpoint_url: None,
+        force_path_style: false,
+    }
+}
+
 /// Bucket-root location for the configured target.
 pub fn bucket_root(target: &str, bucket: &str) -> Location {
     Location::S3 {

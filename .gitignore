@@ -5,3 +5,6 @@
 .vscode/
 .DS_Store
 dist/
+
+# ARX AWS acceptance — disposable temp credentials (Punkt 3)
+.aws-acceptance/
