@@ -16,13 +16,15 @@
 
 ## Column summary
 
-- **READY** (7): S3-62E, S3-63E, S3-64E, S3-65E, S3-66, S3-67, S3-69
+- **READY** (0): —
 - **DOING** (0): —
 - **REVIEW** (0): —
 - **BLOCKED** (5): S3-62, S3-63, S3-64, S3-65 (real AWS env required), S3-68
-- **DONE** (67): S3-00..S3-30, S3-31, S3-31R, S3-32..S3-42 (P11R), S3-42S, S3-43, S3-44..S3-50, S3-51, S3-52, S3-53, S3-54(R), S3-55(R/F7/Ph4/Ph8), S3-57, S3-58, S3·58P, S3-61
-- **BACKLOG** (12): S3-70..S3-80
+- **DONE** (79): S3-00..S3-30, S3-31, S3-31R, S3-32..S3-42 (P11R), S3-42S, S3-43, S3-44..S3-50, S3-51, S3-52, S3-53, S3-54(R), S3-55(R/F7/Ph4/Ph8), S3-57, S3-58, S3·58P, S3-61, **S3-62E, S3-63E, S3-64E, S3-65E (AWS-emulated/Moto, EMULATED PASS), S3-66, S3-67 (MinIO, PHYSICAL PASS), S3-69, S3-70, S3-71 (UX hardening), S3-72, S3-73, S3-74 (regression)**
+- **BACKLOG** (4): S3-75 (arch audit), S3-76 (quality gate), S3-77 (MinIO demo), S3-78 (pre-release docs)
 - **PARKED** (14): S3-81..S3-97
+
+> **Classification note:** S3-62E..65E are AWS-emulated (Moto/LocalStack) EMULATED PASS — an independent AWS-shaped implementation, NOT an AWS SUPPORTED claim. S3-66/67 are MinIO PHYSICAL PASS — also NOT an AWS SUPPORTED claim (MinIO is S3-API-compatible but not AWS-semantics). Real-AWS physical acceptance (S3-62A..65A, S3-68) remains BLOCKED (no disposable real AWS). No capability changes shipped; ARX S3 = List/Read/Write/Mkdir/Delete only.
 
 ---
 
@@ -998,6 +1000,43 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 - **Acceptance:** Describe S3 as object storage. Never call prefixes POSIX dirs. Explicit unsupported table. STOP.
 - **Stop conditions:** Calling prefixes POSIX dirs.
 - **Hermes prompt:** Update README/ARCH/ROADMAP/DEMO: S3=object storage, no POSIX-dir claim, unsupported table.
+
+
+## HERMES BIG PACK — CLOSE-OUT (S3-62E..65E emulator, S3-66/67 MinIO, S3-69..71 UX, S3-72..74 regression)
+
+**Baseline:** `cd9d4b8` (Phase 0 kanban repair). **Final HEAD:** `ec507a9`.
+
+AWS real-physical lane (S3-62A..65A, S3-68) remained BLOCKED (no disposable real AWS; only MinIO + Moto available). The emulator lane (S3-62E..65E) uses **Moto/LocalStack** — independent AWS-shaped implementations, a legitimate substitute for the *emulated* claim (distinct from the real-AWS lane). MinIO lane (S3-66/67) is S3-API-compatible but explicitly NOT an AWS SUPPORTED claim.
+
+Shared harness: `tests/s3_acceptance.rs` (env-gated `ARX_EMULATOR_TEST` / `ARX_MINIO_TEST`; normalized diagnostics; factual PASS/FAIL/NOT_RUN).
+
+| Card | PR | Merge SHA | Result |
+|------|----|-----------|--------|
+| Shared acceptance harness | #141 | `dd6a912` | env-gated helpers |
+| S3-66/67 MinIO target+transfer | #142 | `b283666` | PHYSICAL PASS (6/6: connect/prefix/unicode/zero+marker/pagination>1000/transfer) |
+| S3-62E emulator basic (Moto) | #143 | `1299d7d` | EMULATED PASS (6/6) |
+| S3-63E pagination continuation | #144 | `3735568` | PASS (2/2: emulator+MinIO, bounded page1 + truthful continuation + no dup/missing) |
+| S3-64E multipart + cancel/abort | #145 | `28dcb0d` | PASS (2/2: 65 MiB roundtrip byte-exact + cancel-before leaves no object) |
+| S3-65E permission fail-closed | #146 | `64b0216` | EMULATED PASS (bucket-escape + ListBuckets rejection; full IAM matrix NOT_RUN — Moto IAM ≠ AWS) |
+| S3-69/70/71 UX capability contract | #147 | `6d4b7d3` | PASS (1/1: S3={List,Read,Write,Mkdir,Delete}; Copy/Move/Rename/Symlink/Chmod/ServerSideCopy off) |
+| S3-72/73/74 regression | #148 | `ec507a9` | PASS (1/1: S3 flip did not regress Local/Sftp; S3 not widened) |
+
+**Capability surface:** unchanged — S3 = `List + Read + Write + Mkdir + Delete`. No capability changes shipped.
+
+**Architecture invariants verified (S3-75 read-only audit):**
+- SDK retry disabled: `builder.retry_config(RetryConfig::disabled())` (s3.rs:677) + unit test `retry_policy_disabled_synthetic_sdk_config` (max_attempts==1).
+- No path normalization: verbatim string join (s3.rs:107-110, 1049); never `Path`/`canonicalize`/`trim_end_matches('/')`/collapse `//`.
+- No recursive delete: `delete_s3_at` removes exactly one object by exact key; no prefix delete.
+- No bucket create/delete: `create_s3_prefix_marker_at` rejects `bucket=None` (Unsupported).
+- Exact identity: `prefix_marker_key` / `list_objects_wire_prefix` verbatim; `classify_listing_location` fail-closed (bucket-bound cannot reach ListAllMyBuckets).
+
+**Quality gate (S3-76) on `ec507a9`:** fmt=0, clippy `-D warnings` clean (all-targets/all-features), msrv 1.88 build OK, full `cargo test --locked` green.
+
+**Demo (S3-77):** `demo/s3_minio_demo.sh` — spins disposable MinIO (or reuses `arx-minio-test`), runs `cargo test --test s3_acc_minio` against live endpoint via the SAME production S3Provider. Labeled PHYSICAL PASS (not AWS SUPPORTED).
+
+**Next:** S3-75..78 remaining (audit report recorded above; quality gate passed; demo script added; this close-out is S3-78). Real-AWS lane stays BLOCKED — no false SUPPORTED claim.
+
+---
 
 
 ## PARKED
