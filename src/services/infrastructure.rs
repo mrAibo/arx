@@ -6,7 +6,7 @@ pub struct InfrastructureService;
 
 impl InfrastructureService {
     pub async fn snapshot() -> Vec<String> {
-        let hosts = crate::remote::ssh_config::parse_ssh_config();
+        let hosts = crate::remote::ssh_config::parse_ssh_config().unwrap_or_default();
         let mut tasks = JoinSet::new();
 
         for (alias, entry) in hosts.into_iter().take(30) {

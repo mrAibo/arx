@@ -4,6 +4,8 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::app::AppState;
+    use crate::remote::ssh_config::parse_ssh_config;
     use crate::remote::ssh_config_manager::{
         ManagedHost, add_managed_host, delete_managed_host, ensure_arx_include,
         generate_ed25519_key, list_managed_hosts, managed_config_path, open_config,
@@ -378,6 +380,234 @@ mod tests {
             assert!(!content.contains("PRIVATE KEY"));
             // The managed host is present by alias (discovery path-independent).
             assert!(content.contains("Host secret"));
+
+            // Error messages from a collision must not echo secret material either.
+            // Plant an unmanaged host whose HostName looks like a secret, then collide.
+            let ssh = std::env::var("HOME").unwrap();
+            let cfg = PathBuf::from(&ssh).join(".ssh").join("config");
+            let mut f = std::fs::File::create(&cfg).unwrap();
+            writeln!(f, "Host secret").unwrap();
+            writeln!(f, "    HostName AKIA-SECRET-ACCESS-KEY-VALUE").unwrap();
+            let res = add_managed_host(&sample_host("secret"));
+            let msg = res.err().unwrap_or_default();
+            assert!(
+                !msg.contains("AKIA"),
+                "error log must not leak secret: {msg}"
+            );
+        });
+    }
+
+    // ---- Include / discovery matrix (requirement #6/#7) ----
+
+    #[test]
+    fn keyword_equals_directive_is_parsed() {
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let cfg = PathBuf::from(&ssh).join(".ssh").join("config");
+            let mut f = std::fs::File::create(&cfg).unwrap();
+            // Keyword=value form that the old whitespace-only parser ignored.
+            writeln!(f, "Host=equalsform").unwrap();
+            writeln!(f, "    HostName=10.0.0.42").unwrap();
+            let map = parse_ssh_config().expect("discovery must succeed");
+            assert!(
+                map.contains_key("equalsform"),
+                "Host=alias must be discovered"
+            );
+            assert_eq!(map["equalsform"].hostname.as_deref(), Some("10.0.0.42"));
+        });
+    }
+
+    #[test]
+    fn include_equals_recognized_as_installed() {
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            let abs = ssh_dir.join("arx_hosts.conf").display().to_string();
+            let mut f = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            // `Include=...` must be recognized, not silently ignored (old bug).
+            writeln!(f, "Include={abs}").unwrap();
+            assert!(
+                crate::remote::ssh_config_manager::is_arx_include_installed(),
+                "Include= form must be recognized"
+            );
+            ensure_arx_include().unwrap();
+            let live = std::fs::read_to_string(ssh_dir.join("config")).unwrap();
+            assert_eq!(
+                live.lines()
+                    .filter(|l| l.trim_start().to_lowercase().starts_with("include"))
+                    .count(),
+                1,
+                "must stay exactly one include"
+            );
+        });
+    }
+
+    #[test]
+    fn question_mark_glob_is_matched() {
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            std::fs::create_dir_all(ssh_dir.join("d")).unwrap();
+            let mut main = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            writeln!(main, "Include ~/.ssh/d/host?.conf").unwrap();
+            let mut inc = std::fs::File::create(ssh_dir.join("d").join("hosta.conf")).unwrap();
+            writeln!(inc, "Host qmark").unwrap();
+            writeln!(inc, "    HostName 10.0.0.51").unwrap();
+            // A non-matching file (two chars) must NOT be discovered.
+            let mut inc2 = std::fs::File::create(ssh_dir.join("d").join("hostbb.conf")).unwrap();
+            writeln!(inc2, "Host notqmark").unwrap();
+            let map = parse_ssh_config().expect("discovery must succeed");
+            assert!(map.contains_key("qmark"), "? glob must match hosta.conf");
+            assert!(
+                !map.contains_key("notqmark"),
+                "? glob must not match hostbb.conf"
+            );
+        });
+    }
+
+    #[test]
+    fn multi_level_glob_discovers_unmanaged() {
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            std::fs::create_dir_all(ssh_dir.join("config.d")).unwrap();
+            let mut main = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            writeln!(main, "Include ~/.ssh/config.d/*.conf").unwrap();
+            let mut inc = std::fs::File::create(ssh_dir.join("config.d").join("b.conf")).unwrap();
+            writeln!(inc, "Host deep").unwrap();
+            writeln!(inc, "    HostName 10.0.0.61").unwrap();
+            // collision discovery must see the globbed host.
+            assert!(
+                matches!(
+                    crate::remote::ssh_config_manager::alias_collision("deep"),
+                    Ok(true)
+                ),
+                "globbed host must be discovered for collision"
+            );
+        });
+    }
+
+    #[test]
+    fn relative_include_resolved_against_ssh_dir() {
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            std::fs::create_dir_all(ssh_dir.join("inc")).unwrap();
+            let mut main = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            // OpenSSH resolves a relative Include in user config against ~/.ssh.
+            writeln!(main, "Include inc/rel.conf").unwrap();
+            let mut inc = std::fs::File::create(ssh_dir.join("inc").join("rel.conf")).unwrap();
+            writeln!(inc, "Host relative").unwrap();
+            writeln!(inc, "    HostName 10.0.0.71").unwrap();
+            let map = parse_ssh_config().expect("discovery must succeed");
+            assert!(
+                map.contains_key("relative"),
+                "relative Include must resolve against ~/.ssh"
+            );
+        });
+    }
+
+    #[test]
+    fn unreadable_include_fails_closed() {
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            std::fs::create_dir_all(&ssh_dir).unwrap();
+            // An Include pointing at a DIRECTORY cannot be read -> discovery errors.
+            let mut main = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            writeln!(main, "Include ~/.ssh").unwrap();
+            // Discovery must surface the error (fail closed), not silently empty.
+            assert!(
+                parse_ssh_config().is_err(),
+                "unreadable Include must fail closed"
+            );
+            // Consequently, add_managed_host must be refused rather than assume no collision.
+            let h = sample_host("anything");
+            assert!(
+                add_managed_host(&h).is_err(),
+                "write must be refused when discovery is unsafe"
+            );
+        });
+    }
+
+    #[test]
+    fn collision_discovery_error_propagates_as_failure() {
+        with_temp_ssh(|| {
+            // Build an unreadable include so discovery errors, then prove the
+            // collision check refuses instead of returning false (fail closed).
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            std::fs::create_dir_all(&ssh_dir).unwrap();
+            let mut main = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            writeln!(main, "Include ~/.ssh").unwrap();
+            assert!(
+                crate::remote::ssh_config_manager::alias_collision("probe").is_err(),
+                "collision check must error on unsafe discovery"
+            );
+        });
+    }
+
+    // ---- Behavioral: list-mode keygen confirmation (no bypass) ----
+
+    #[test]
+    fn list_mode_ctrl_k_sets_pending_without_writing() {
+        // Ctrl+K must set a pending flag and NOT generate a key until confirmed.
+        with_temp_ssh(|| {
+            let mut host = sample_host("srv");
+            host.identity_file = None;
+            host.identities_only = false;
+            add_managed_host(&host).unwrap();
+
+            let mut hosts = list_managed_hosts().into_values().collect::<Vec<_>>();
+            let cursor = hosts.iter().position(|h| h.alias == "srv").unwrap();
+            let mut state = AppState {
+                ssh_hosts: std::mem::take(&mut hosts),
+                ssh_pending_keygen: Some("srv".into()),
+                ssh_host_cursor: cursor,
+                ..AppState::default()
+            };
+
+            // Before confirm: no identity, pending is set, key file absent.
+            assert!(state.ssh_pending_keygen.is_some());
+            let before = list_managed_hosts();
+            assert!(before.get("srv").unwrap().identity_file.is_none());
+
+            // Confirm via the app-level handler (what y triggers).
+            crate::app::confirm_pending_keygen(&mut state);
+
+            assert!(
+                state.ssh_pending_keygen.is_none(),
+                "pending clears after confirm"
+            );
+            let after = list_managed_hosts();
+            let got = after.get("srv").expect("host still present");
+            assert!(
+                got.identity_file.is_some(),
+                "identity attached after confirm"
+            );
+            assert!(got.identities_only, "identities_only set");
+            assert!(
+                got.identity_file.clone().unwrap().exists(),
+                "generated key file exists"
+            );
+        });
+    }
+
+    #[test]
+    fn cancel_pending_keygen_clears_and_writes_nothing() {
+        with_temp_ssh(|| {
+            let mut state = AppState {
+                ssh_pending_keygen: Some("srv".into()),
+                ..AppState::default()
+            };
+            crate::app::cancel_pending_keygen(&mut state);
+            assert!(state.ssh_pending_keygen.is_none());
+            assert!(state.ssh_host_status.is_some());
+            // No managed host was created/modified by cancellation.
+            assert!(
+                !list_managed_hosts().contains_key("srv"),
+                "cancel must not create or modify a host"
+            );
         });
     }
 }

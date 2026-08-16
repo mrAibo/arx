@@ -11,7 +11,9 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::remote::ssh_config::{SshHostEntry, home_dir, managed_include_path, parse_ssh_config};
+use crate::remote::ssh_config::{
+    DiscoveryResult, SshHostEntry, home_dir, managed_include_path, parse_ssh_config,
+};
 
 /// Managed-file model written by ARX. Only literal aliases are allowed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,14 +94,11 @@ pub fn is_arx_include_installed() -> bool {
     let target_rel = "~/.ssh/arx_hosts.conf"; // ponytail: preferred readable form
     content.lines().any(|l| {
         let t = l.trim_start();
-        let (kw, val) = match t.split_once(char::is_whitespace) {
-            Some((k, v)) => (k.to_lowercase(), v.trim().to_string()),
-            None => return false,
-        };
-        if kw != "include" {
+        // Support both `Include x y` and `Include=x y`.
+        let (kw, val) = crate::remote::ssh_config::parse_directive(t);
+        if kw.to_lowercase() != "include" {
             return false;
         }
-        // Each include value (space-separated) compared canonically.
         val.split_whitespace().any(|tok| {
             let expanded = expand_include_token(tok, &dir);
             expanded == target_display || tok == target_rel
@@ -126,7 +125,9 @@ fn expand_include_token(tok: &str, base_dir: &Path) -> String {
     } else {
         base_dir.join(&p)
     };
-    abs.display().to_string()
+    abs.canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| abs.display().to_string())
 }
 
 /// Ensure ~/.ssh exists. Only sets 0700 when ARX creates it; an existing dir
@@ -225,25 +226,31 @@ pub fn list_managed_hosts() -> BTreeMap<String, ManagedHost> {
 }
 
 /// Does an alias already exist anywhere ARX can see (managed or user config)?
-/// Uses the full discovery parser (glob/nested includes) — collision fail-closed (B5).
-pub fn alias_collision(alias: &str) -> bool {
+/// Uses the full discovery parser (glob/nested includes). Returns `Err` when a
+/// referenced config/include cannot be safely resolved — callers must then fail
+/// closed rather than assume "no collision" (requirement #8).
+pub fn alias_collision(alias: &str) -> Result<bool, String> {
     let lower = alias.to_lowercase();
-    parse_ssh_config().keys().any(|k| k.to_lowercase() == lower)
+    let map = crate::remote::ssh_config::parse_ssh_config()
+        .map_err(|e| format!("SSH config discovery failed; refusing to write: {e}"))?;
+    Ok(map.keys().any(|k| k.to_lowercase() == lower))
 }
 
 /// True when the alias collides with an *unmanaged* (user-owned) entry.
-/// Used so a rename/add fails closed against real discovered hosts.
-pub fn alias_collides_unmanaged(alias: &str) -> bool {
+/// Returns `Err` on any discovery failure so a rename/add fails closed.
+pub fn alias_collides_unmanaged(alias: &str) -> Result<bool, String> {
     let lower = alias.to_lowercase();
-    parse_ssh_config()
+    let map = crate::remote::ssh_config::parse_ssh_config()
+        .map_err(|e| format!("SSH config discovery failed; refusing to write: {e}"))?;
+    Ok(map
         .iter()
-        .any(|(k, e)| k.to_lowercase() == lower && !e.managed)
+        .any(|(k, e)| k.to_lowercase() == lower && !e.managed))
 }
 
-/// Add a managed host. Fails closed on invalid alias or collision.
+/// Add a managed host. Fails closed on invalid alias or collision (incl. discovery errors).
 pub fn add_managed_host(host: &ManagedHost) -> Result<(), String> {
     host.validate()?;
-    if alias_collision(&host.alias) {
+    if alias_collision(&host.alias)? {
         return Err(format!(
             "Host alias '{}' already exists in your SSH configuration.",
             host.alias
@@ -269,7 +276,7 @@ pub fn update_managed_host(original_alias: &str, updated: &ManagedHost) -> Resul
     }
     let alias_changed = original_alias != updated.alias;
     if alias_changed {
-        if alias_collides_unmanaged(&updated.alias) {
+        if alias_collides_unmanaged(&updated.alias)? {
             return Err(format!(
                 "Host alias '{}' collides with an unmanaged SSH configuration.",
                 updated.alias
@@ -510,24 +517,33 @@ fn classify_ssh_stderr(stderr: &str) -> TestConnectionResult {
 
 /// B6 — Test reachability of an alias using ssh -G (truth) then a batch-mode
 /// connection probe. The alias is validated to prevent option injection.
-/// Returns a classified result; the caller (TUI) must run this off the event loop.
+/// Bounded: each ssh subprocess is spawned and polled with a deadline; on
+/// timeout the child is killed so the operation always terminates. The caller
+/// (TUI) must run this off the event loop (see spawn_ssh_test).
 pub fn test_connection(alias: &str) -> TestConnectionResult {
     if super::validate_ssh_alias(alias).is_err() {
         return TestConnectionResult::SshConfigError;
     }
-    // Preflight: ssh -G must succeed (config resolves).
-    let probe = std::process::Command::new("ssh")
-        .args(["-G", "-o", "BatchMode=yes", alias])
-        .output();
-    let probe = match probe {
-        Ok(p) => p,
+    // Preflight: ssh -G must succeed (config resolves). Bounded by a deadline.
+    let mut preflight = match std::process::Command::new("ssh")
+        .args(["-G", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", alias])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
         Err(_) => return TestConnectionResult::SshConfigError,
     };
-    if !probe.status.success() {
+    if !wait_bounded(&mut preflight, std::time::Duration::from_secs(8)) {
+        let _ = preflight.kill();
+        let _ = preflight.wait();
+        return TestConnectionResult::SshConfigError;
+    }
+    if !preflight.wait().map(|s| s.success()).unwrap_or(false) {
         return TestConnectionResult::SshConfigError;
     }
     // Actual connection probe (no PTY, no command execution beyond true).
-    let conn = std::process::Command::new("ssh")
+    let mut probe = match std::process::Command::new("ssh")
         .args([
             "-o",
             "BatchMode=yes",
@@ -538,11 +554,44 @@ pub fn test_connection(alias: &str) -> TestConnectionResult {
             alias,
             "true",
         ])
-        .output();
-    match conn {
-        Ok(c) if c.status.success() => TestConnectionResult::Connected,
-        Ok(c) => classify_ssh_stderr(&String::from_utf8_lossy(&c.stderr)),
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return TestConnectionResult::HostUnreachable,
+    };
+    if !wait_bounded(&mut probe, std::time::Duration::from_secs(8)) {
+        let _ = probe.kill();
+        let _ = probe.wait();
+        return TestConnectionResult::HostUnreachable;
+    }
+    // Capture stderr before consuming the child via wait().
+    let mut buf = Vec::new();
+    if let Some(mut s) = probe.stderr.take() {
+        let _ = std::io::Read::read_to_end(&mut s, &mut buf);
+    }
+    match probe.wait() {
+        Ok(c) if c.success() => TestConnectionResult::Connected,
+        Ok(_) => classify_ssh_stderr(&String::from_utf8_lossy(&buf)),
         Err(_) => TestConnectionResult::HostUnreachable,
+    }
+}
+
+/// Poll a child until it exits or `deadline` elapses. Returns true if it exited
+/// within the deadline, false if it had to be considered timed out (caller kills).
+fn wait_bounded(child: &mut std::process::Child, deadline: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                if start.elapsed() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => return false,
+        }
     }
 }
 
@@ -596,7 +645,8 @@ pub fn user_config_path() -> PathBuf {
 }
 
 /// B10 — Reload: re-read the effective SSH config. Parsing is lazy, so this
-/// simply re-parses. Returns the merged alias → entry map (incl. managed).
-pub fn reload() -> BTreeMap<String, SshHostEntry> {
+/// simply re-parses. Returns the merged alias → entry map (incl. managed), or a
+/// discovery error so callers can fail closed.
+pub fn reload() -> DiscoveryResult {
     parse_ssh_config()
 }
