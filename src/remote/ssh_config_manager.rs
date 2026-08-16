@@ -102,7 +102,7 @@ pub fn is_arx_include_installed() -> bool {
         // Each include value (space-separated) compared canonically.
         val.split_whitespace().any(|tok| {
             let expanded = expand_include_token(tok, &dir);
-            expanded == target_display || tok == target_rel || expanded == target_display
+            expanded == target_display || tok == target_rel
         })
     })
 }
