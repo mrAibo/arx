@@ -396,6 +396,7 @@ fn wildcard_match_chars(text: &[char], pattern: &[char]) -> bool {
 /// Recursive glob matcher: does `pattern[pi..]` match a suffix of `text[ti..]`?
 fn glob_match(text: &[char], ti: usize, pattern: &[char], pi: usize) -> bool {
     let mut si = pi;
+    let mut ti = ti;
     while si < pattern.len() {
         let pc = pattern[si];
         if pc == '*' {
@@ -415,7 +416,9 @@ fn glob_match(text: &[char], ti: usize, pattern: &[char], pi: usize) -> bool {
             if ti >= text.len() {
                 return false;
             }
-            return glob_match(text, ti + 1, pattern, si + 1);
+            ti += 1;
+            si += 1;
+            continue;
         } else if pc == '[' {
             let end = match pattern[si..].iter().position(|c| *c == ']') {
                 Some(e) => si + e,
@@ -425,13 +428,14 @@ fn glob_match(text: &[char], ti: usize, pattern: &[char], pi: usize) -> bool {
             if ti >= text.len() || !match_bracket(text[ti], body) {
                 return false;
             }
-            return glob_match(text, ti + 1, pattern, end + 1);
+            ti += 1;
+            si = end + 1;
+            continue;
         } else if ti >= text.len() || text[ti] != pc {
             return false;
         }
-        // literal char consumed one text char
+        ti += 1;
         si += 1;
-        return glob_match(text, ti + 1, pattern, si);
     }
     ti == text.len()
 }
