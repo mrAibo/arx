@@ -37,7 +37,7 @@ DENY_DEL_ROLE="arx-deny-del-role"
 echo "== Cleaning bucket: $BUCKET =="
 
 # 1. permanently delete all versions + delete markers
-aws s3api list-object-versions --bucket "$BUCKET" --profile "$BOOTSTRAP_PROFILE" --output json > /tmp/arx_versions.json 2>/dev/null || echo "[]" > /tmp/arx_versions.json
+aws s3api list-object-versions --bucket "$BUCKET" --profile "$BOOTSTRAP_PROFILE" --output json > /tmp/arx_versions.json 2>/dev/null || echo '{}' > /tmp/arx_versions.json
 python3 - "$BUCKET" "$BOOTSTRAP_PROFILE" <<'PY'
 import json, subprocess, sys
 bucket, profile = sys.argv[1], sys.argv[2]

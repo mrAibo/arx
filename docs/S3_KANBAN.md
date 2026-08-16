@@ -19,15 +19,15 @@
 - **READY** (0): —
 - **DOING** (0): —
 - **REVIEW** (0): —
-- **BLOCKED** (5): S3-62, S3-63, S3-64, S3-65 (real AWS env required), S3-68
-- **DONE** (83): S3-00..S3-30, S3-31, S3-31R, S3-32..S3-42 (P11R), S3-42S, S3-43, S3-44..S3-50, S3-51, S3-52, S3-53, S3-54(R), S3-55(R/F7/Ph4/Ph8), S3-57, S3-58, S3·58P, S3-61, **S3-62E, S3-63E, S3-64E, S3-65E (AWS-emulated/Moto, EMULATED PASS), S3-66, S3-67 (MinIO, PHYSICAL PASS), S3-69, S3-70, S3-71 (UX hardening), S3-72, S3-73, S3-74 (regression), S3-75 (arch audit), S3-76 (quality gate), S3-77 (MinIO demo), S3-78 (pre-release docs)**
+- **BLOCKED** (0): —
+- **DONE** (88): S3-00..S3-30, S3-31, S3-31R, S3-32..S3-42 (P11R), S3-42S, S3-43, S3-44..S3-50, S3-51, S3-52, S3-53, S3-54(R), S3-55(R/F7/Ph4/Ph8), S3-57, S3-58, S3·58P, S3-61, **S3-62, S3-63, S3-64, S3-65 (real AWS physical PASS on immutable SHA b5f0ee6), S3-66, S3-67 (MinIO, PHYSICAL PASS), S3-68 (compatibility close), S3-69, S3-70, S3-71 (UX hardening), S3-72, S3-73, S3-74 (regression), S3-75 (arch audit), S3-76 (quality gate), S3-77 (MinIO demo), S3-78 (pre-release docs)**
 - **BACKLOG** (0): —
 - **PARKED** (14): S3-81..S3-97
 
 > **S3_MVP_IMPLEMENTATION:** `FEATURE_COMPLETE_RC`
-> **S3_MVP_RELEASE:** `BLOCKED_ENV` — `REAL_AWS_DISPOSABLE_ACCEPTANCE_REQUIRED` (the only external release blocker; DESIGN_S3 requires real AWS + MinIO for final MVP acceptance).
+> **S3_MVP_RELEASE:** `READY` — real AWS physical acceptance PASSED on immutable SHA `b5f0ee6845a624ae0fb2a8cf8cc6b769e003ab0a` (20/20 physical tests, account `715844024414`, disposable bucket `arx-acceptance-715844024414-*` deleted post-run). MinIO physical PASS. Moto emulated PASS.
 
-> **Classification note:** S3-62E..65E are AWS-emulated (Moto/LocalStack) EMULATED PASS — an independent AWS-shaped implementation, NOT an AWS SUPPORTED claim. S3-66/67 are MinIO PHYSICAL PASS — also NOT an AWS SUPPORTED claim (MinIO is S3-API-compatible but not AWS-semantics). Real-AWS physical acceptance (S3-62A..65A, S3-68) remains BLOCKED (no disposable real AWS). No capability changes shipped; ARX S3 = List/Read/Write/Mkdir/Delete only.
+> **Classification note:** S3-62..65 are now **AWS SUPPORTED MVP / PHYSICAL PASS** (real AWS account `715844024414`, not Moto/LocalStack/MinIO). S3-67 is MinIO PHYSICAL PASS (S3-API-compatible, not AWS-semantics). R2/Wasabi = UNVERIFIED / BEST-EFFORT. No capability changes shipped; ARX S3 = List/Read/Write/Mkdir/Delete only. Compatibility truth recorded in `docs/releases/v0.16.0.md`.
 
 ---
 
