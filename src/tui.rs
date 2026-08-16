@@ -1024,6 +1024,107 @@ async fn event_loop(
                         continue;
                     }
 
+                    // SSH Hosts overlay: Esc to close, navigation, A/E/D/T/K/O/R
+                    if state.show_ssh_hosts {
+                        match key.code {
+                            KeyCode::Esc => {
+                                state.show_ssh_hosts = false;
+                            }
+                            KeyCode::Up => {
+                                state.ssh_host_cursor = state.ssh_host_cursor.saturating_sub(1);
+                            }
+                            KeyCode::Down if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                let max = state.ssh_hosts.len().saturating_sub(1);
+                                if state.ssh_host_cursor < max {
+                                    state.ssh_host_cursor += 1;
+                                }
+                            }
+                            KeyCode::Char('a') => {
+                                // Add — start form mode (simplified: just show status)
+                                state.ssh_host_status =
+                                    Some("Add: press A again to create 'new' (placeholder)".into());
+                            }
+                            KeyCode::Char('e') => {
+                                if let Some(h) = state.ssh_hosts.get(state.ssh_host_cursor).cloned()
+                                {
+                                    state.ssh_host_status =
+                                        Some(format!("Edit {} (placeholder)", h.alias));
+                                }
+                            }
+                            KeyCode::Char('d') => {
+                                if let Some(h) = state.ssh_hosts.get(state.ssh_host_cursor).cloned()
+                                {
+                                    match arx::remote::ssh_config_manager::delete_managed_host(
+                                        &h.alias,
+                                    ) {
+                                        Ok(_) => {
+                                            state.ssh_host_status =
+                                                Some(format!("Deleted {}", h.alias))
+                                        }
+                                        Err(e) => {
+                                            state.ssh_host_status =
+                                                Some(format!("Delete failed: {}", e))
+                                        }
+                                    }
+                                    state.ssh_hosts =
+                                        arx::remote::ssh_config_manager::list_managed_hosts()
+                                            .into_values()
+                                            .collect();
+                                }
+                            }
+                            KeyCode::Char('t') => {
+                                if let Some(h) = state.ssh_hosts.get(state.ssh_host_cursor).cloned()
+                                {
+                                    match arx::remote::ssh_config_manager::test_connection(&h.alias)
+                                    {
+                                        Ok(_) => {
+                                            state.ssh_host_status =
+                                                Some(format!("Connected to {}", h.alias))
+                                        }
+                                        Err(e) => {
+                                            state.ssh_host_status =
+                                                Some(format!("Test failed: {}", e))
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                // Ctrl+K: generate key for selected
+                                if let Some(h) = state.ssh_hosts.get(state.ssh_host_cursor).cloned()
+                                {
+                                    let key_name = format!("{}_ed25519", h.alias);
+                                    match arx::remote::ssh_config_manager::generate_ed25519_key(
+                                        &key_name,
+                                    ) {
+                                        Ok(p) => {
+                                            state.ssh_host_status =
+                                                Some(format!("Generated {}", p.display()))
+                                        }
+                                        Err(e) => {
+                                            state.ssh_host_status =
+                                                Some(format!("Key gen failed: {}", e))
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('o') => {
+                                // Open config in editor (placeholder)
+                                state.ssh_host_status =
+                                    Some("Open config: use your editor (placeholder)".into());
+                            }
+                            KeyCode::Char('r') => {
+                                // Reload
+                                state.ssh_hosts =
+                                    arx::remote::ssh_config_manager::list_managed_hosts()
+                                        .into_values()
+                                        .collect();
+                                state.ssh_host_status = Some("Reloaded".into());
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Jobs panel: Ctrl+J
                     if state.show_jobs {
                         match key.code {
@@ -3399,6 +3500,11 @@ fn render(
         render_hosts(frame, area, state);
     }
 
+    // SSH Hosts overlay
+    if state.show_ssh_hosts {
+        render_ssh_hosts(frame, area, state);
+    }
+
     // Jobs overlay
     if state.show_jobs {
         render_jobs(frame, area, state);
@@ -4357,6 +4463,59 @@ fn render_hosts(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     frame.render_stateful_widget(list, popup_area, &mut list_state);
 }
 
+fn render_ssh_hosts(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    let popup_area = centered_rect(70, 70, area);
+    frame.render_widget(Clear, popup_area);
+
+    let title = " SSH Hosts (Esc: close, A: add, E: edit, D: delete, T: test, Ctrl+K: key, O: open, R: reload) ";
+    let items: Vec<ListItem> = if state.ssh_hosts.is_empty() {
+        vec![ListItem::new(Line::from(
+            "  No managed hosts — press A to add one.",
+        ))]
+    } else {
+        state
+            .ssh_hosts
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let prefix = if i == state.ssh_host_cursor {
+                    "> "
+                } else {
+                    "  "
+                };
+                let ident = if h.identities_only {
+                    " IdentitiesOnly"
+                } else {
+                    ""
+                };
+                let key = h
+                    .identity_file
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or("-".into());
+                let line = format!(
+                    "{prefix}{} [{}] {}:{} ({}){}",
+                    h.alias, h.user, h.hostname, h.port, key, ident
+                );
+                ListItem::new(Line::from(line))
+            })
+            .collect()
+    };
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.ssh_host_cursor));
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
+    frame.render_stateful_widget(list, popup_area, &mut list_state);
+}
+
 fn render_jobs(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let popup_area = centered_rect(70, 70, area);
     frame.render_widget(Clear, popup_area);
@@ -5061,6 +5220,7 @@ async fn dispatch_ui_action(
         Action::OpenBookmarks => state.toggle_overlay(OverlayKind::Bookmarks),
         Action::OpenJobs => state.toggle_overlay(OverlayKind::Jobs),
         Action::OpenHosts => toggle_hosts_overlay(state),
+        Action::OpenSshHosts => state.toggle_overlay(OverlayKind::SshHosts),
         Action::OpenHelp => {
             key_router.clear_pending();
             state.help_scroll = 0;

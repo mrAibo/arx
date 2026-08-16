@@ -21,6 +21,7 @@ pub enum OverlayKind {
     Infrastructure,
     ContextMenu,
     SyncPreview,
+    SshHosts,
 }
 
 impl AppState {
@@ -52,6 +53,8 @@ impl AppState {
             Some(OverlayKind::SyncPreview)
         } else if self.show_context_menu {
             Some(OverlayKind::ContextMenu)
+        } else if self.show_ssh_hosts {
+            Some(OverlayKind::SshHosts)
         } else {
             None
         }
@@ -70,6 +73,7 @@ impl AppState {
         self.show_tree = false;
         self.show_infra = false;
         self.show_context_menu = false;
+        self.show_ssh_hosts = false;
     }
 
     pub fn open_overlay(&mut self, overlay: OverlayKind) {
@@ -108,6 +112,15 @@ impl AppState {
             OverlayKind::Tree => self.show_tree = true,
             OverlayKind::Infrastructure => self.show_infra = true,
             OverlayKind::ContextMenu => self.show_context_menu = true,
+            OverlayKind::SshHosts => {
+                self.show_ssh_hosts = true;
+                self.ssh_host_cursor = 0;
+                // Reload managed hosts on open
+                self.ssh_hosts = crate::remote::ssh_config_manager::list_managed_hosts()
+                    .into_values()
+                    .collect();
+                self.ssh_host_status = None;
+            }
             // SyncPreview uses `active_overlay()` as an exclusive semantic
             // owner, but its visible state is the presence of a workspace
             // plan. No second mutable boolean is introduced.

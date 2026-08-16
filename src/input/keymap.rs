@@ -188,6 +188,11 @@ impl Default for Keymap {
             ),
             KeyBinding::new(
                 Browser,
+                vec![KeyStroke::new(F(12), KeyModifiers::NONE)],
+                Action::OpenSshHosts,
+            ),
+            KeyBinding::new(
+                Browser,
                 vec![KeyStroke::new(F(10), KeyModifiers::NONE)],
                 Action::Quit,
             ),

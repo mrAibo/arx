@@ -110,6 +110,7 @@ fn empty_query_action_bias(id: ActionId, state: &AppState) -> i64 {
             ActionId::PreviewWorkspaceSync => 500,
             ActionId::ToggleWorkspaceComparison => 400,
             ActionId::OpenHosts => 300,
+            ActionId::OpenSshHosts => 250,
             ActionId::OpenHelp => 200,
             ActionId::OpenJobs => 100,
             _ => 0,
@@ -118,6 +119,7 @@ fn empty_query_action_bias(id: ActionId, state: &AppState) -> i64 {
         match id {
             ActionId::ToggleWorkspaceComparison => 500,
             ActionId::OpenHosts => 400,
+            ActionId::OpenSshHosts => 350,
             ActionId::OpenHelp => 300,
             ActionId::OpenJobs => 200,
             ActionId::OpenBookmarks => 100,

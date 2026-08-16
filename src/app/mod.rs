@@ -247,6 +247,11 @@ pub struct AppState {
     pub hosts: Vec<Host>,
     pub show_hosts: bool,
     pub host_cursor: usize,
+    // PACK B: managed SSH host manager overlay
+    pub show_ssh_hosts: bool,
+    pub ssh_host_cursor: usize,
+    pub ssh_hosts: Vec<crate::remote::ssh_config_manager::ManagedHost>,
+    pub ssh_host_status: Option<String>,
     // B4: render-only snapshot; JobManager owns runtime lifecycle.
     pub jobs: Vec<Job>,
     pub show_jobs: bool,
@@ -370,6 +375,10 @@ impl Default for AppState {
             hosts: Vec::new(),
             show_hosts: false,
             host_cursor: 0,
+            show_ssh_hosts: false,
+            ssh_host_cursor: 0,
+            ssh_hosts: Vec::new(),
+            ssh_host_status: None,
             jobs: Vec::new(),
             show_jobs: false,
             job_cursor: 0,
