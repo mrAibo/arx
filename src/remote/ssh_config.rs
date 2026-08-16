@@ -377,83 +377,46 @@ pub(crate) fn wildcard_match(text: &str, pattern: &str) -> bool {
 /// Match `text` against `pattern` where `*` matches any run, `?` any single char
 /// and `[...]` a bracket class (char list or `a-z` range). Mirrors glob(3)
 /// pathname semantics as used by OpenSSH for Include pathnames:
-/// - the literal segment before the first `*` is anchored at the start,
-/// - the segment after the last `*` at the end,
-/// - internal segments are matched in order with no overlap (suffix start
-///   must be >= the position consumed by prior segments),
-/// - a leading `.` in `text` is only matched by an explicit `.` at the start of
-///   the pattern (no implicit `*`/`.` matching), per POSIX pathname glob.
+/// - the whole component must match (both ends anchored, like the system glob),
+/// - a leading `.` in `text` is only matched by an explicit `.` (no implicit
+///   `*`/`.` matching), per POSIX pathname glob.
+///
+/// Implemented as a single recursive matcher over the whole component, so a
+/// bracket `[ab]` consumes one filename char (not its 4 pattern chars) and `*`
+/// consumes a variable run — mixing `*` with brackets works correctly.
 fn wildcard_match_chars(text: &[char], pattern: &[char]) -> bool {
     // Leading-dot rule (POSIX pathname glob): a leading `.` is NOT matched by an
     // implicit wildcard — only by an explicit `.` at pattern position 0.
     if text.first() == Some(&'.') && pattern.first() != Some(&'.') {
         return false;
     }
-    let stars: Vec<usize> = pattern
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| **c == '*')
-        .map(|(i, _)| i)
-        .collect();
-    if stars.is_empty() {
-        // No '*': the whole text must equal the pattern (with ?/[...] inside).
-        return match_glob(text, pattern);
-    }
-    // Split into literal segments (each may contain ?/[...]) between the '*'s.
-    let mut segs: Vec<&[char]> = Vec::new();
-    let mut prev = 0usize;
-    for s in &stars {
-        segs.push(&pattern[prev..*s]);
-        prev = *s + 1;
-    }
-    segs.push(&pattern[prev..]);
-
-    let mut ti = 0usize;
-    // First segment anchored at start.
-    if !segs[0].is_empty() {
-        if text.len() < segs[0].len() {
-            return false;
-        }
-        if !match_glob(&text[..segs[0].len()], segs[0]) {
-            return false;
-        }
-        ti = segs[0].len();
-    }
-    // Internal segments in order, non-overlapping.
-    for seg in &segs[1..segs.len() - 1] {
-        if seg.is_empty() {
-            continue;
-        }
-        match find_segment(text, ti, seg) {
-            Some(idx) => ti = idx + seg.len(),
-            None => return false,
-        }
-    }
-    // Last segment anchored at end, and must not reuse consumed characters.
-    let last = segs[segs.len() - 1];
-    if !last.is_empty() {
-        if text.len() < last.len() || text.len() - last.len() < ti {
-            return false;
-        }
-        return match_glob(&text[text.len() - last.len()..], last);
-    }
-    true
+    glob_match(text, 0, pattern, 0)
 }
 
-/// Match `pattern` against the ENTIRE `text` slice: literal chars match exactly,
-/// `?` matches any char, `[...]` a bracket class. Used for whole segments (which
-/// are matched against an exactly-sized window of the filename).
-fn match_glob(text: &[char], pattern: &[char]) -> bool {
-    let mut ti = 0;
-    let mut si = 0;
+/// Recursive glob matcher: does `pattern[pi..]` match a suffix of `text[ti..]`?
+fn glob_match(text: &[char], ti: usize, pattern: &[char], pi: usize) -> bool {
+    let mut si = pi;
     while si < pattern.len() {
         let pc = pattern[si];
-        if pc == '?' {
+        if pc == '*' {
+            // Try every run length for this '*', then match the rest.
+            let mut rest = ti;
+            loop {
+                if glob_match(text, rest, pattern, si + 1) {
+                    return true;
+                }
+                if rest >= text.len() {
+                    break;
+                }
+                rest += 1;
+            }
+            return false;
+        } else if pc == '?' {
             if ti >= text.len() {
                 return false;
             }
+            return glob_match(text, ti + 1, pattern, si + 1);
         } else if pc == '[' {
-            // Bracket expression up to the matching ']'.
             let end = match pattern[si..].iter().position(|c| *c == ']') {
                 Some(e) => si + e,
                 None => return false,
@@ -462,14 +425,13 @@ fn match_glob(text: &[char], pattern: &[char]) -> bool {
             if ti >= text.len() || !match_bracket(text[ti], body) {
                 return false;
             }
-            si = end + 1;
-            ti += 1;
-            continue;
+            return glob_match(text, ti + 1, pattern, end + 1);
         } else if ti >= text.len() || text[ti] != pc {
             return false;
         }
-        ti += 1;
+        // literal char consumed one text char
         si += 1;
+        return glob_match(text, ti + 1, pattern, si);
     }
     ti == text.len()
 }
@@ -499,23 +461,6 @@ fn match_bracket(c: char, pat: &[char]) -> bool {
         }
     }
     matched != negate
-}
-
-/// Find `seg` in `text[from..]`, returning the start index. `seg` may contain
-/// `?` (any char) and `[...]` bracket expressions.
-fn find_segment(text: &[char], from: usize, seg: &[char]) -> Option<usize> {
-    if seg.is_empty() {
-        return Some(from);
-    }
-    if text.len() < from + seg.len() {
-        return None;
-    }
-    for start in from..=(text.len() - seg.len()) {
-        if match_glob(&text[start..start + seg.len()], seg) {
-            return Some(start);
-        }
-    }
-    None
 }
 
 /// Resolve effective SSH config via `ssh -G` (handles all OpenSSH features).
