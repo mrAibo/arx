@@ -1129,4 +1129,59 @@ mod tests {
             assert!(sentinel.exists(), "sentinel prod.pub must survive rollback");
         });
     }
+
+    // ---- Glob matcher: brackets combined with '*' (MAJOR #1, correction #6) ----
+
+    #[test]
+    fn glob_bracket_and_star_combine_correctly() {
+        let m = crate::remote::ssh_config::wildcard_match;
+        // Bracket consumes one filename char; '*' consumes a variable run.
+        assert!(m("env-afoo", "env-[ab]*"), "env-[ab]* must match env-afoo");
+        assert!(
+            m("foo3.conf", "*[0-9].conf"),
+            "*[0-9].conf must match foo3.conf"
+        );
+        assert!(m("a3b", "a*[1-9]*b"), "a*[1-9]*b must match a3b");
+        // Negative controls: bracket class not satisfied.
+        assert!(
+            !m("env-cfoo", "env-[ab]*"),
+            "env-[ab]* must NOT match env-cfoo"
+        );
+        assert!(
+            !m("fooX.conf", "*[0-9].conf"),
+            "*[0-9].conf must NOT match fooX.conf"
+        );
+    }
+
+    #[test]
+    fn bracket_star_component_is_discovered_end_to_end() {
+        // Include with a bracket+star in one component must be discovered as a
+        // glob (OpenSSH passes the whole pathname to glob()).
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            std::fs::create_dir_all(ssh_dir.join("env-aprod")).unwrap();
+            std::fs::create_dir_all(ssh_dir.join("env-cdev")).unwrap();
+            let mut main = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            writeln!(main, "Include ~/.ssh/env-[ab]*/hosts.conf").unwrap();
+            let mut inc =
+                std::fs::File::create(ssh_dir.join("env-aprod").join("hosts.conf")).unwrap();
+            writeln!(inc, "Host bracketstar").unwrap();
+            writeln!(inc, "    HostName 10.0.0.97").unwrap();
+            // env-cdev is NOT in class [ab], so must not be discovered.
+            let mut bad =
+                std::fs::File::create(ssh_dir.join("env-cdev").join("hosts.conf")).unwrap();
+            writeln!(bad, "Host bracketstar_trap").unwrap();
+            writeln!(bad, "    HostName 10.0.0.98").unwrap();
+            let map = parse_ssh_config().expect("discovery must succeed");
+            assert!(
+                map.contains_key("bracketstar"),
+                "env-[ab]* must discover env-aprod"
+            );
+            assert!(
+                !map.contains_key("bracketstar_trap"),
+                "env-[ab]* must NOT discover env-cdev"
+            );
+        });
+    }
 }
