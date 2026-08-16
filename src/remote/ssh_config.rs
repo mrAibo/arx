@@ -368,51 +368,69 @@ fn resolve_components(
 
 /// `*` (any run) / `?` (exactly one char) matcher, anchored at both ends.
 /// Operates on `&str` via char vectors so UTF-8 is handled correctly.
-fn wildcard_match(text: &str, pattern: &str) -> bool {
+pub(crate) fn wildcard_match(text: &str, pattern: &str) -> bool {
     let t: Vec<char> = text.chars().collect();
     let p: Vec<char> = pattern.chars().collect();
     wildcard_match_chars(&t, &p)
 }
 
 /// Match `text` against `pattern` where `*` matches any run and `?` any single char.
+/// Mirrors glob(3) component semantics: the segment before the first `*` is
+/// anchored at the start, the segment after the last `*` at the end, and
+/// internal segments are matched left-to-right in order. (OpenSSH passes the
+/// whole Include pathname to the system glob; a component like `env-*` must
+/// match a name *beginning* with `env-`, not one merely containing it.)
 fn wildcard_match_chars(text: &[char], pattern: &[char]) -> bool {
-    // Split pattern on `*` into literal segments; match left-to-right with gaps.
-    let mut seg_start = 0usize;
-    let mut ti = 0usize;
-    let mut pi = 0usize;
-    while pi < pattern.len() {
-        if pattern[pi] == '*' {
-            // segment [seg_start, pi) must be found starting at ti
-            if pi == seg_start {
-                // leading `*`: skip, next segment begins after
-                seg_start = pi + 1;
-                pi += 1;
-                continue;
-            }
-            let seg = &pattern[seg_start..pi];
-            match find_segment(text, ti, seg) {
-                Some(idx) => {
-                    ti = idx + seg.len();
-                    seg_start = pi + 1;
-                    pi += 1;
-                }
-                None => return false,
-            }
-        } else {
-            pi += 1;
-        }
-    }
-    // trailing segment must match suffix
-    if seg_start <= pattern.len() {
-        let seg = &pattern[seg_start..];
-        if seg.is_empty() {
-            return true; // pattern ended with `*` or was all `*`
-        }
-        if text.len() < seg.len() {
+    let stars: Vec<usize> = pattern
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c == '*')
+        .map(|(i, _)| i)
+        .collect();
+    if stars.is_empty() {
+        // No `*`: match the whole text (with `?`), both ends anchored.
+        if text.len() != pattern.len() {
             return false;
         }
-        let suffix = &text[text.len() - seg.len()..];
-        return match_segment(suffix, seg);
+        return match_segment(text, pattern);
+    }
+    // Split into literal segments between the `*`s.
+    let mut segs: Vec<&[char]> = Vec::new();
+    let mut prev = 0usize;
+    for s in &stars {
+        segs.push(&pattern[prev..*s]);
+        prev = *s + 1;
+    }
+    segs.push(&pattern[prev..]);
+
+    let mut ti = 0usize;
+    // First segment anchored at start.
+    if !segs[0].is_empty() {
+        if text.len() < segs[0].len() {
+            return false;
+        }
+        if !match_segment(&text[..segs[0].len()], segs[0]) {
+            return false;
+        }
+        ti = segs[0].len();
+    }
+    // Internal segments matched in order, anywhere after the previous match.
+    for seg in &segs[1..segs.len() - 1] {
+        if seg.is_empty() {
+            continue;
+        }
+        match find_segment(text, ti, seg) {
+            Some(idx) => ti = idx + seg.len(),
+            None => return false,
+        }
+    }
+    // Last segment anchored at end.
+    let last = segs[segs.len() - 1];
+    if !last.is_empty() {
+        if text.len() < last.len() {
+            return false;
+        }
+        return match_segment(&text[text.len() - last.len()..], last);
     }
     true
 }
