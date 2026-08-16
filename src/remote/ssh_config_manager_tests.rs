@@ -755,4 +755,191 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn multi_wildcard_component_is_discovered() {
+        // OpenSSH passes the whole Include pathname to glob(), so multiple
+        // wildcard segments are supported (e.g. ~/.ssh/env-*/host?/conf*.ssh).
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            std::fs::create_dir_all(ssh_dir.join("env-prod").join("host1")).unwrap();
+            let mut main = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            writeln!(main, "Include ~/.ssh/env-*/host?/conf*.ssh").unwrap();
+            let mut inc =
+                std::fs::File::create(ssh_dir.join("env-prod").join("host1").join("conf1.ssh"))
+                    .unwrap();
+            writeln!(inc, "Host multiwild").unwrap();
+            writeln!(inc, "    HostName 10.0.0.91").unwrap();
+            let map = parse_ssh_config().expect("discovery must succeed");
+            assert!(
+                map.contains_key("multiwild"),
+                "multiple wildcard segments must be discovered"
+            );
+        });
+    }
+
+    #[test]
+    fn matched_metadata_error_after_wildcard_fails_closed() {
+        // A wildcard matches a path, but stat'ing it fails (e.g. broken symlink
+        // target), must surface as an error, not "no match". Uses a 2-segment
+        // include so the descent (metadata) branch is exercised.
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            std::fs::create_dir_all(&ssh_dir).unwrap();
+            let dir = ssh_dir.join("broken.d");
+            std::fs::create_dir_all(&dir).unwrap();
+            // A genuine matchable directory that would otherwise be descended.
+            std::fs::create_dir_all(dir.join("real")).unwrap();
+            let mut ok = std::fs::File::create(dir.join("real").join("hosts.conf")).unwrap();
+            writeln!(ok, "Host okhost").unwrap();
+            // Dangling symlink: read_dir lists it, but stat fails -> descent errors.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                symlink("/nonexistent-arx-target-xyz", dir.join("link")).unwrap();
+            }
+            #[cfg(not(unix))]
+            {
+                // Non-unix: a regular file matched by the wildcard cannot be
+                // descended (not a dir) but must still surface as fail-closed
+                // because the metadata probe errors.
+                std::fs::File::create(dir.join("link")).unwrap();
+            }
+            let mut main = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            writeln!(main, "Include ~/.ssh/broken.d/*/hosts.conf").unwrap();
+            assert!(
+                parse_ssh_config().is_err(),
+                "wildcard match with unstatable entry must fail closed"
+            );
+        });
+    }
+
+    // ---- Pending-confirmation gate: the helper is the production dispatcher ----
+
+    #[test]
+    fn pending_ctrl_k_then_d_does_not_delete() {
+        with_temp_ssh(|| {
+            let mut host = sample_host("srv");
+            host.identity_file = None;
+            add_managed_host(&host).unwrap();
+            let mut state = AppState {
+                ssh_hosts: list_managed_hosts().into_values().collect(),
+                ssh_host_cursor: 0,
+                ..AppState::default()
+            };
+            // Ctrl+K sets pending.
+            crate::app::handle_ssh_host_keypress(
+                &mut state,
+                key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            );
+            assert!(state.ssh_pending_keygen.is_some());
+            // D must be swallowed while pending -> no delete.
+            crate::app::handle_ssh_host_keypress(
+                &mut state,
+                key(KeyCode::Char('d'), KeyModifiers::NONE),
+            );
+            assert!(
+                list_managed_hosts().contains_key("srv"),
+                "D must not delete a host while keygen is pending"
+            );
+            assert!(state.ssh_pending_keygen.is_some(), "pending survives D");
+        });
+    }
+
+    #[test]
+    fn pending_ctrl_k_then_a_does_not_open_form() {
+        with_temp_ssh(|| {
+            let mut host = sample_host("srv");
+            host.identity_file = None;
+            add_managed_host(&host).unwrap();
+            let mut state = AppState {
+                ssh_hosts: list_managed_hosts().into_values().collect(),
+                ssh_host_cursor: 0,
+                ..AppState::default()
+            };
+            crate::app::handle_ssh_host_keypress(
+                &mut state,
+                key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            );
+            crate::app::handle_ssh_host_keypress(
+                &mut state,
+                key(KeyCode::Char('a'), KeyModifiers::NONE),
+            );
+            assert!(
+                state.ssh_form.is_none(),
+                "A must not open the form while pending"
+            );
+            assert!(state.ssh_pending_keygen.is_some());
+        });
+    }
+
+    #[test]
+    fn pending_ctrl_k_then_esc_cancels() {
+        with_temp_ssh(|| {
+            let mut host = sample_host("srv");
+            host.identity_file = None;
+            add_managed_host(&host).unwrap();
+            let mut state = AppState {
+                ssh_hosts: list_managed_hosts().into_values().collect(),
+                ssh_host_cursor: 0,
+                ..AppState::default()
+            };
+            crate::app::handle_ssh_host_keypress(
+                &mut state,
+                key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            );
+            let consumed = crate::app::handle_ssh_host_keypress(
+                &mut state,
+                key(KeyCode::Esc, KeyModifiers::NONE),
+            );
+            assert!(consumed, "Esc must be consumed while pending");
+            assert!(state.ssh_pending_keygen.is_none(), "Esc cancels pending");
+        });
+    }
+
+    #[test]
+    fn pending_ctrl_k_then_arbitrary_key_unchanged() {
+        with_temp_ssh(|| {
+            let mut host = sample_host("srv");
+            host.identity_file = None;
+            add_managed_host(&host).unwrap();
+            let mut state = AppState {
+                ssh_hosts: list_managed_hosts().into_values().collect(),
+                ssh_host_cursor: 0,
+                ..AppState::default()
+            };
+            crate::app::handle_ssh_host_keypress(
+                &mut state,
+                key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            );
+            crate::app::handle_ssh_host_keypress(
+                &mut state,
+                key(KeyCode::Char('x'), KeyModifiers::NONE),
+            );
+            assert!(state.ssh_pending_keygen.is_some(), "arbitrary key ignored");
+        });
+    }
+
+    #[test]
+    fn confirm_without_existing_host_does_not_orphan_key() {
+        with_temp_ssh(|| {
+            // Pending alias whose host was deleted between request and confirm.
+            let mut state = AppState {
+                ssh_hosts: vec![],
+                ssh_pending_keygen: Some("ghost".into()),
+                ..AppState::default()
+            };
+            crate::app::confirm_pending_keygen(&mut state);
+            assert!(state.ssh_pending_keygen.is_none());
+            // No key file should have been written for a non-existent host.
+            let ssh = std::env::var("HOME").unwrap();
+            let key_path = PathBuf::from(&ssh)
+                .join(".ssh")
+                .join("arx")
+                .join("ghost_ed25519");
+            assert!(!key_path.exists(), "no orphan key for missing host");
+        });
+    }
 }

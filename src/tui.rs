@@ -1143,7 +1143,15 @@ async fn event_loop(
                             continue;
                         }
 
-                        // List-mode handling
+                        // List-mode handling.
+                        // PACK B: the confirmation gate runs FIRST. While a key
+                        // generation is pending, handle_ssh_host_keypress swallows
+                        // every key (y/n/Esc confirm or cancel; all others are
+                        // ignored) so D/A/E etc. cannot mutate state mid-pending.
+                        if arx::app::handle_ssh_host_keypress(&mut state, key) {
+                            continue;
+                        }
+
                         match key.code {
                             KeyCode::Esc => {
                                 state.show_ssh_hosts = false;
@@ -1197,12 +1205,8 @@ async fn event_loop(
                                 }
                             }
                             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                arx::app::handle_ssh_host_keypress(&mut state, key);
-                            }
-                            KeyCode::Char('y') => {
-                                arx::app::handle_ssh_host_keypress(&mut state, key);
-                            }
-                            KeyCode::Char('n') => {
+                                // handle_ssh_host_keypress already ran above and
+                                // returned false (no pending), so this sets pending.
                                 arx::app::handle_ssh_host_keypress(&mut state, key);
                             }
                             KeyCode::Char('o') => {
