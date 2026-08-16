@@ -874,8 +874,9 @@ pub fn confirm_pending_keygen(state: &mut AppState) {
                     }
                     Err(e) => {
                         state.ssh_host_status = Some(format!("Key attached failed: {e}"));
-                        // Roll back the just-generated key so no orphan remains.
-                        let _ = std::fs::remove_file(&p);
+                        // Roll back the just-generated key + its .pub so no
+                        // orphan remains (ssh-keygen writes both).
+                        crate::app::remove_generated_key_pair(&p);
                     }
                 }
                 state.ssh_hosts = crate::remote::ssh_config_manager::list_managed_hosts()
@@ -883,7 +884,7 @@ pub fn confirm_pending_keygen(state: &mut AppState) {
                     .collect();
             } else {
                 // Host vanished between the check above and the find; drop key.
-                let _ = std::fs::remove_file(&p);
+                crate::app::remove_generated_key_pair(&p);
             }
         }
         Err(e) => state.ssh_host_status = Some(format!("Key gen failed: {e}")),
@@ -897,6 +898,13 @@ pub fn cancel_pending_keygen(state: &mut AppState) {
         state.ssh_pending_keygen = None;
         state.ssh_host_status = Some("Key generation cancelled".into());
     }
+}
+
+/// PACK B — Remove a generated key pair (private + `.pub`). Used to roll back a
+/// key after a failed attach so no orphan files remain. `ssh-keygen` writes both.
+pub fn remove_generated_key_pair(private: &std::path::Path) {
+    let _ = std::fs::remove_file(private);
+    let _ = std::fs::remove_file(private.with_extension("pub"));
 }
 
 /// PACK B — Drive the managed-SSH-host list-mode key transition from a real

@@ -942,4 +942,72 @@ mod tests {
             assert!(!key_path.exists(), "no orphan key for missing host");
         });
     }
+
+    #[test]
+    fn wildcard_anchors_prefix_at_start() {
+        // env-* must match names BEGINNING with env-, not those merely
+        // containing it (glob component semantics).
+        assert!(crate::remote::ssh_config::wildcard_match(
+            "env-prod", "env-*"
+        ));
+        assert!(
+            !crate::remote::ssh_config::wildcard_match("xenv-prod", "env-*"),
+            "env-* must not match xenv-prod"
+        );
+        assert!(
+            !crate::remote::ssh_config::wildcard_match("myenv-x", "env-*"),
+            "env-* must not match a name where env- is not at the start"
+        );
+    }
+
+    #[test]
+    fn wildcard_anchors_suffix_at_end() {
+        // *.conf must match names ENDING with .conf.
+        assert!(crate::remote::ssh_config::wildcard_match(
+            "hosts.conf",
+            "*.conf"
+        ));
+        assert!(
+            !crate::remote::ssh_config::wildcard_match("conf.hosts", "*.conf"),
+            "*.conf must not match conf.hosts"
+        );
+        assert!(crate::remote::ssh_config::wildcard_match("a*b", "a*b"));
+        assert!(
+            !crate::remote::ssh_config::wildcard_match("xaXXb", "a*b"),
+            "a*b must not match xaXXb (suffix not at end)"
+        );
+    }
+
+    #[test]
+    fn env_include_rejects_unanchored_substring_dir() {
+        // The discovery path must not descend into xenv-prod for Include env-*.
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            std::fs::create_dir_all(ssh_dir.join("env-prod")).unwrap();
+            std::fs::create_dir_all(ssh_dir.join("xenv-prod")).unwrap();
+            let mut main = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            writeln!(main, "Include ~/.ssh/env-*/hosts.conf").unwrap();
+            let mut good =
+                std::fs::File::create(ssh_dir.join("env-prod").join("hosts.conf")).unwrap();
+            writeln!(good, "Host envok").unwrap();
+            writeln!(good, "    HostName 10.0.0.91").unwrap();
+            let mut bad =
+                std::fs::File::create(ssh_dir.join("xenv-prod").join("hosts.conf")).unwrap();
+            writeln!(bad, "Host envtrap").unwrap();
+            writeln!(bad, "    HostName 10.0.0.92").unwrap();
+            let map = match parse_ssh_config() {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("DEBUG DISCOVERY ERR: {e:?}");
+                    panic!("discovery errored");
+                }
+            };
+            assert!(map.contains_key("envok"), "env-prod must be discovered");
+            assert!(
+                !map.contains_key("envtrap"),
+                "xenv-prod must NOT be matched by env-* (prefix anchor)"
+            );
+        });
+    }
 }
