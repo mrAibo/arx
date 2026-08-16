@@ -997,7 +997,7 @@ Single internal PR auto-merge discipline (10 criteria: scope exact, diff-check, 
 
 ### S3-78 — MVP docs truth
 - **Phase:** P24
-- **Status:** DONE (README/ARCHITECTURE/ROADMAP updated; S3-75/76/77 closed; final RC truth near-close, PR #150/`RC_FINAL_SHA`)
+- **Status:** DONE (README/ARCHITECTURE/ROADMAP updated; S3-75/76/77 closed; final RC truth near-close, PR #150/`ffa5002`)
 - **Depends on:** S3-76, S3-77
 - **Allowed files:** README, ARCHITECTURE, ROADMAP, DEMO
 - **Acceptance:** Describe S3 as object storage. Never call prefixes POSIX dirs. Explicit unsupported table. STOP.
@@ -1037,7 +1037,7 @@ Shared harness: `tests/s3_acceptance.rs` (env-gated `ARX_EMULATOR_TEST` / `ARX_M
 
 **Demo (S3-77):** `demo/s3_minio_demo.sh` — spins disposable MinIO (or reuses `arx-minio-test`), runs `cargo test --test s3_acc_minio` against live endpoint via the SAME production S3Provider. Labeled PHYSICAL PASS (not AWS SUPPORTED).
 
-**Next:** S3-75..78 remaining (audit report recorded above; quality gate passed; demo script added; this close-out is S3-78). Real-AWS lane stays BLOCKED — no false SUPPORTED claim.
+**Next:** S3-75..78 are DONE (audit report recorded above; quality gate passed; demo script added; S3-78 close-out complete). Real-AWS lane stays BLOCKED — no false SUPPORTED claim.
 
 ### S3 compatibility truth (persisted)
 
