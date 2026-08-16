@@ -1,9 +1,10 @@
 //! Parse ~/.ssh/config for host aliases, ProxyJump chains, and IdentityFile directives.
 //! ponytail: line-by-line parser, no crate dependency. Supports Host/HostName/User/Port/IdentityFile/ProxyJump.
+//! Include directives are resolved so ARX-managed entries (e.g. ~/.ssh/arx_hosts.conf) are discovered.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default)]
 pub struct SshHostEntry {
@@ -12,22 +13,54 @@ pub struct SshHostEntry {
     pub port: Option<u16>,
     pub identity_file: Option<PathBuf>,
     pub proxy_jump: Option<String>,
+    /// True when this entry was declared in an ARX-managed include file.
+    pub managed: bool,
+}
+
+/// Resolve `~` to the user's home directory.
+pub(crate) fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/root"))
+}
+
+/// Managed include path ARX installs into ~/.ssh/config.
+pub fn managed_include_path() -> PathBuf {
+    home_dir().join(".ssh").join("arx_hosts.conf")
 }
 
 /// Parse ~/.ssh/config and return alias → resolved host details.
+/// Include directives are followed (bounded recursion, no shell expansion).
 pub fn parse_ssh_config() -> BTreeMap<String, SshHostEntry> {
-    let config_path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/root"))
-        .join(".ssh")
-        .join("config");
-    let content = match std::fs::read_to_string(&config_path) {
+    let config_path = home_dir().join(".ssh").join("config");
+    parse_config_file(&config_path, &mut BTreeSet::new())
+}
+
+/// Internal: parse one config file, following Include directives.
+/// `seen` guards against include cycles.
+fn parse_config_file(path: &Path, seen: &mut BTreeSet<PathBuf>) -> BTreeMap<String, SshHostEntry> {
+    let mut hosts = BTreeMap::new();
+    let canon = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return hosts,
+    };
+    if !seen.insert(canon.clone()) {
+        return hosts; // cycle guard
+    }
+    let content = match std::fs::read_to_string(&canon) {
         Ok(c) => c,
-        Err(_) => return BTreeMap::new(),
+        Err(_) => return hosts,
     };
 
-    let mut hosts = BTreeMap::new();
+    let managed = canon.ends_with("arx_hosts.conf");
+
     let mut current_aliases: Vec<String> = Vec::new();
-    let mut current_entry = SshHostEntry::default();
+    let mut current_entry = SshHostEntry {
+        managed,
+        ..Default::default()
+    };
+    let base_dir = canon
+        .parent()
+        .unwrap_or_else(|| Path::new("/"))
+        .to_path_buf();
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -47,7 +80,10 @@ pub fn parse_ssh_config() -> BTreeMap<String, SshHostEntry> {
                     .filter(|a| !a.contains('*') && !a.contains('?'))
                     .map(|a| a.to_lowercase())
                     .collect();
-                current_entry = SshHostEntry::default();
+                current_entry = SshHostEntry {
+                    managed,
+                    ..Default::default()
+                };
             }
             "hostname" => current_entry.hostname = Some(value),
             "user" => current_entry.user = Some(value),
@@ -57,15 +93,44 @@ pub fn parse_ssh_config() -> BTreeMap<String, SshHostEntry> {
                 }
             }
             "identityfile" => {
-                let expanded = value.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1);
+                let expanded = expand_home(&value);
                 current_entry.identity_file = Some(PathBuf::from(expanded));
             }
             "proxyjump" => current_entry.proxy_jump = Some(value),
+            "include" => {
+                // B3: safe Include resolution. Expand ~, follow relative paths
+                // against the current file's directory, bounded by `seen`.
+                for inc in value.split_whitespace() {
+                    let inc_path = resolve_include_path(inc, &base_dir);
+                    let included = parse_config_file(&inc_path, seen);
+                    for (a, e) in included {
+                        hosts.entry(a).or_insert(e);
+                    }
+                }
+            }
             _ => {}
         }
     }
     flush_entry(&mut hosts, &current_aliases, &current_entry);
     hosts
+}
+
+/// Expand a leading `~` to $HOME. No glob/shell expansion (read-only parse).
+fn expand_home(value: &str) -> String {
+    if let Some(rest) = value.strip_prefix("~/") {
+        format!("{}/{}", home_dir().display(), rest)
+    } else if value == "~" {
+        home_dir().display().to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// Resolve an Include path: ~ expansion, relative-to-base resolution.
+fn resolve_include_path(inc: &str, base_dir: &Path) -> PathBuf {
+    let expanded = expand_home(inc);
+    let p = PathBuf::from(expanded);
+    if p.is_absolute() { p } else { base_dir.join(p) }
 }
 
 fn flush_entry(
