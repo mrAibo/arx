@@ -333,7 +333,7 @@ mod tests {
         with_temp_ssh(|| {
             let path = generate_ed25519_key("gentest").expect("generate");
             assert!(path.exists(), "key file must exist");
-            let pub_path = path.with_extension("pub");
+            let pub_path = crate::app::pub_path_for(&path);
             assert!(pub_path.exists(), "public key must exist");
             // The managed file must never contain key bytes.
             let mut h = sample_host("genhost");
@@ -1008,6 +1008,125 @@ mod tests {
                 !map.contains_key("envtrap"),
                 "xenv-prod must NOT be matched by env-* (prefix anchor)"
             );
+        });
+    }
+
+    // ---- Glob matcher: overlap, brackets, leading-dot (MAJOR #1) ----
+
+    #[test]
+    fn glob_suffix_must_not_reuse_consumed_chars() {
+        let m = crate::remote::ssh_config::wildcard_match;
+        // No overlap: 'a' cannot be both the prefix and the suffix.
+        assert!(!m("a", "a*a"), "a*a must NOT match 'a' (overlap)");
+        // 'a' + '*' + 'b' + '*' + 'b' cannot fit into "ab" without overlap.
+        assert!(!m("ab", "a*b*b"), "a*b*b must NOT match 'ab' (overlap)");
+        // Positive controls that DO fit.
+        assert!(m("aba", "a*a"));
+        assert!(m("ab", "a*b"));
+        assert!(!m("ab", "a*b*b"), "still not enough chars");
+        assert!(m("abcb", "a*b*b"));
+    }
+
+    #[test]
+    fn glob_bracket_classes_and_ranges() {
+        let m = crate::remote::ssh_config::wildcard_match;
+        // POSIX bracket class in a directory component.
+        assert!(m("env-a", "env-[ab]"));
+        assert!(m("env-b", "env-[ab]"));
+        assert!(!m("env-c", "env-[ab]"), "env-[ab] must not match env-c");
+        // Range.
+        assert!(m("env-3", "env-[1-9]"));
+        assert!(!m("env-x", "env-[1-9]"));
+        // Negation.
+        assert!(m("env-c", "env-[!ab]"));
+        // End-to-end: Include with a bracket component is discovered as a glob.
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            std::fs::create_dir_all(ssh_dir.join("env-a")).unwrap();
+            std::fs::create_dir_all(ssh_dir.join("env-c")).unwrap();
+            let mut main = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            writeln!(main, "Include ~/.ssh/env-[ab]/hosts.conf").unwrap();
+            let mut a = std::fs::File::create(ssh_dir.join("env-a").join("hosts.conf")).unwrap();
+            writeln!(a, "Host bracketok").unwrap();
+            writeln!(a, "    HostName 10.0.0.93").unwrap();
+            let mut c = std::fs::File::create(ssh_dir.join("env-c").join("hosts.conf")).unwrap();
+            writeln!(c, "Host brackettrap").unwrap();
+            writeln!(c, "    HostName 10.0.0.94").unwrap();
+            let map = parse_ssh_config().expect("discovery must succeed");
+            assert!(
+                map.contains_key("bracketok"),
+                "env-[ab] must discover env-a"
+            );
+            assert!(
+                !map.contains_key("brackettrap"),
+                "env-[ab] must NOT discover env-c"
+            );
+        });
+    }
+
+    #[test]
+    fn glob_does_not_implicitly_match_leading_dot() {
+        let m = crate::remote::ssh_config::wildcard_match;
+        // '*.conf' must not match a hidden file unless the dot is explicit.
+        assert!(
+            !m(".hidden.conf", "*.conf"),
+            "*.conf must not match .hidden.conf"
+        );
+        assert!(
+            m(".hidden.conf", ".*.conf"),
+            ".*.conf must match .hidden.conf"
+        );
+        // End-to-end: a hidden directory component is not glob-matched implicitly.
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            std::fs::create_dir_all(ssh_dir.join(".secret.d")).unwrap();
+            std::fs::create_dir_all(ssh_dir.join("public.d")).unwrap();
+            let mut main = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            writeln!(main, "Include ~/.ssh/*.d/hosts.conf").unwrap();
+            let mut pubf =
+                std::fs::File::create(ssh_dir.join("public.d").join("hosts.conf")).unwrap();
+            writeln!(pubf, "Host dotpub").unwrap();
+            writeln!(pubf, "    HostName 10.0.0.95").unwrap();
+            let mut sec =
+                std::fs::File::create(ssh_dir.join(".secret.d").join("hosts.conf")).unwrap();
+            writeln!(sec, "Host dotsecret").unwrap();
+            writeln!(sec, "    HostName 10.0.0.96").unwrap();
+            let map = parse_ssh_config().expect("discovery must succeed");
+            assert!(map.contains_key("dotpub"), "public.d must be discovered");
+            assert!(
+                !map.contains_key("dotsecret"),
+                "*.d must NOT match .secret.d (leading dot)"
+            );
+        });
+    }
+
+    // ---- .pub rollback appends, does not replace extension (MAJOR #2) ----
+
+    #[test]
+    fn dotted_alias_pub_rollback_keeps_sentinel() {
+        with_temp_ssh(|| {
+            let arx_dir = std::path::PathBuf::from(&std::env::var("HOME").unwrap())
+                .join(".ssh")
+                .join("arx");
+            std::fs::create_dir_all(&arx_dir).unwrap();
+            let private = arx_dir.join("prod.eu_ed25519");
+            std::fs::write(&private, "PRIV").unwrap();
+            // ssh-keygen appends .pub to the FULL filename.
+            let real_pub = arx_dir.join("prod.eu_ed25519.pub");
+            std::fs::write(&real_pub, "PUB").unwrap();
+            // An unrelated file that `with_extension("pub")` would have wrongly hit.
+            let sentinel = arx_dir.join("prod.pub");
+            std::fs::write(&sentinel, "SENTINEL").unwrap();
+
+            crate::app::remove_generated_key_pair(&private);
+
+            // Real key + its .pub removed.
+            assert!(!private.exists(), "private key removed");
+            assert!(!real_pub.exists(), "real .pub removed");
+            // Unrelated sentinel survives.
+            assert!(sentinel.exists(), "sentinel prod.pub must survive rollback");
         });
     }
 }
