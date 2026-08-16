@@ -1199,34 +1199,20 @@ async fn event_loop(
                             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 if let Some(h) = state.ssh_hosts.get(state.ssh_host_cursor).cloned()
                                 {
-                                    let key_name = format!("{}_ed25519", h.alias);
-                                    match arx::remote::ssh_config_manager::generate_ed25519_key(
-                                        &key_name,
-                                    ) {
-                                        Ok(p) => {
-                                            let mut updated = h.clone();
-                                            updated.identity_file = Some(p.clone());
-                                            updated.identities_only = true;
-                                            match arx::remote::ssh_config_manager::update_managed_host(&h.alias, &updated) {
-                                                Ok(_) => state.ssh_host_status = Some(format!(
-                                                    "Generated {} and attached to {}",
-                                                    p.display(),
-                                                    h.alias
-                                                )),
-                                                Err(e) => state.ssh_host_status = Some(format!(
-                                                    "Key attached failed: {e}"
-                                                )),
-                                            }
-                                            state.ssh_hosts = arx::remote::ssh_config_manager::list_managed_hosts()
-                                                .into_values()
-                                                .collect();
-                                        }
-                                        Err(e) => {
-                                            state.ssh_host_status =
-                                                Some(format!("Key gen failed: {e}"))
-                                        }
-                                    }
+                                    // Route through the same confirmation as the form: show the
+                                    // unencrypted-key fact, require y/n before any key is written.
+                                    state.ssh_pending_keygen = Some(h.alias.clone());
+                                    state.ssh_host_status = Some(format!(
+                                        "Generate UNENCRYPTED Ed25519 key for '{}'? (y/n)",
+                                        h.alias
+                                    ));
                                 }
+                            }
+                            KeyCode::Char('y') => {
+                                arx::app::confirm_pending_keygen(&mut state);
+                            }
+                            KeyCode::Char('n') => {
+                                arx::app::cancel_pending_keygen(&mut state);
                             }
                             KeyCode::Char('o') => {
                                 let path = arx::remote::ssh_config_manager::user_ssh_config_path();
@@ -4723,7 +4709,8 @@ fn save_ssh_form(state: &mut AppState) -> Result<String, String> {
     }
 }
 
-/// F7 — Run the bounded ssh connection test off the event loop via tokio::spawn.
+/// F7 — Run the bounded ssh connection test off the event loop via
+/// spawn_blocking (the test runs blocking subprocess polls; never on a tokio worker).
 fn spawn_ssh_test(state: &mut AppState, alias: String) {
     if alias.trim().is_empty() {
         state.ssh_host_status = Some("Cannot test: alias is empty".into());
@@ -4734,7 +4721,7 @@ fn spawn_ssh_test(state: &mut AppState, alias: String) {
     }
     let slot = state.ssh_test_result.clone();
     let alias_for_spawn = alias.clone();
-    tokio::spawn(async move {
+    tokio::task::spawn_blocking(move || {
         let result = arx::remote::ssh_config_manager::test_connection(&alias_for_spawn);
         if let Ok(mut g) = slot.lock() {
             *g = Some(result.message(&alias_for_spawn));

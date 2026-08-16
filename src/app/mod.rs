@@ -324,6 +324,8 @@ pub struct AppState {
     pub ssh_host_status: Option<String>,
     /// Active Add/Edit form (F1/F2). None when the list is shown.
     pub ssh_form: Option<SshHostForm>,
+    /// Pending unconfirmed Ed25519 key generation (list-mode Ctrl+K waits for y/n).
+    pub ssh_pending_keygen: Option<String>,
     /// Shared result slot for async (non-blocking) connection tests (F7).
     pub ssh_test_result: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     // B4: render-only snapshot; JobManager owns runtime lifecycle.
@@ -454,6 +456,7 @@ impl Default for AppState {
             ssh_hosts: Vec::new(),
             ssh_host_status: None,
             ssh_form: None,
+            ssh_pending_keygen: None,
             ssh_test_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             jobs: Vec::new(),
             show_jobs: false,
@@ -832,6 +835,54 @@ fn dirs_fallback() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/"))
+}
+
+/// PACK B — Confirm a pending unencrypted key generation (list-mode Ctrl+K → y).
+/// Generates the Ed25519 key, attaches it to the selected managed host, and
+/// clears the pending state. Business logic lives here (in `app`), not in the
+/// TUI binary module, so it stays unit-testable without exposing `tui` as API.
+pub fn confirm_pending_keygen(state: &mut AppState) {
+    let alias = match state.ssh_pending_keygen.clone() {
+        Some(a) => a,
+        None => return,
+    };
+    let key_name = format!("{alias}_ed25519");
+    match crate::remote::ssh_config_manager::generate_ed25519_key(&key_name) {
+        Ok(p) => {
+            if let Some(h) = state.ssh_hosts.iter().find(|x| x.alias == alias).cloned() {
+                let mut updated = h;
+                updated.identity_file = Some(p.clone());
+                updated.identities_only = true;
+                match crate::remote::ssh_config_manager::update_managed_host(
+                    &updated.alias,
+                    &updated,
+                ) {
+                    Ok(_) => {
+                        state.ssh_host_status = Some(format!(
+                            "Generated {} and attached to {}",
+                            p.display(),
+                            alias
+                        ))
+                    }
+                    Err(e) => state.ssh_host_status = Some(format!("Key attached failed: {e}")),
+                }
+                state.ssh_hosts = crate::remote::ssh_config_manager::list_managed_hosts()
+                    .into_values()
+                    .collect();
+            }
+        }
+        Err(e) => state.ssh_host_status = Some(format!("Key gen failed: {e}")),
+    }
+    state.ssh_pending_keygen = None;
+}
+
+/// PACK B — Cancel a pending key generation (list-mode n). Clears pending state,
+/// writes nothing.
+pub fn cancel_pending_keygen(state: &mut AppState) {
+    if state.ssh_pending_keygen.is_some() {
+        state.ssh_pending_keygen = None;
+        state.ssh_host_status = Some("Key generation cancelled".into());
+    }
 }
 
 #[cfg(test)]
