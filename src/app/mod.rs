@@ -330,6 +330,10 @@ pub struct AppState {
     pub ssh_test_result: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     // B4: render-only snapshot; JobManager owns runtime lifecycle.
     pub jobs: Vec<Job>,
+    // PACK C #51: runtime JobManager + event sink so TUI observers (remote edit)
+    // can publish job events without threading the manager through every caller.
+    pub job_manager: crate::jobs::JobManager,
+    pub job_events: tokio::sync::mpsc::UnboundedSender<crate::jobs::JobEvent>,
     pub show_jobs: bool,
     pub job_cursor: usize,
     // C1: directory compare
@@ -349,6 +353,8 @@ pub struct AppState {
     pub pending_remote_edit_origin: Option<(Pane, Location)>,
     /// Defer editor launch until after queued terminal input is drained.
     pub pending_editor: bool,
+    /// JobManager job id for the in-flight remote edit (survives all phases).
+    pub pending_remote_edit_job_id: Option<String>,
     // C3: user menu
     pub menu: Vec<MenuEntry>,
     pub show_menu: bool,
@@ -459,6 +465,8 @@ impl Default for AppState {
             ssh_pending_keygen: None,
             ssh_test_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             jobs: Vec::new(),
+            job_manager: crate::jobs::JobManager::new(),
+            job_events: tokio::sync::mpsc::unbounded_channel().0,
             show_jobs: false,
             job_cursor: 0,
             show_diff: false,
@@ -470,6 +478,7 @@ impl Default for AppState {
             pending_remote_edit_session: None,
             pending_remote_edit_origin: None,
             pending_editor: false,
+            pending_remote_edit_job_id: None,
             menu: Vec::new(),
             show_menu: false,
             menu_cursor: 0,

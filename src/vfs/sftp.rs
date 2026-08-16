@@ -798,7 +798,8 @@ impl SftpProvider {
     }
 
     async fn list_pooled(&self, path: &str) -> std::io::Result<Vec<Entry>> {
-        let mut guard = self.connection.lock().await;
+        // Probe the pooled session (transport break → fresh replace) before reuse.
+        let mut guard = self.connect_for_mutation().await?;
 
         // One reconnect attempt handles servers closing an idle subsystem
         // between directory reads while avoiding a reconnect per directory.
@@ -822,7 +823,10 @@ impl SftpProvider {
             match result {
                 Ok(entries) => return Ok(entries_from_read_dir(entries.collect())),
                 Err(error) => {
-                    if let Some(mut broken) = guard.take() {
+                    // Transport-only invalidation: keep pool on application/Status error.
+                    if classify_russh_error(&error).should_invalidate()
+                        && let Some(mut broken) = guard.take()
+                    {
                         broken.abort().await;
                     }
                     if attempt == 1 {
@@ -874,7 +878,10 @@ impl SftpProvider {
         match conn.session.create_dir(path.to_string()).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                if let Some(mut broken) = guard.take() {
+                // Transport-only invalidation: keep pool on application/Status error.
+                if classify_russh_error(&e).should_invalidate()
+                    && let Some(mut broken) = guard.take()
+                {
                     broken.abort().await;
                 }
                 Err(std::io::Error::other(format!("SFTP mkdir {path}: {e}")))
@@ -890,7 +897,10 @@ impl SftpProvider {
         match conn.session.remove_file(path.to_string()).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                if let Some(mut broken) = guard.take() {
+                // Transport-only invalidation: keep pool on application/Status error.
+                if classify_russh_error(&e).should_invalidate()
+                    && let Some(mut broken) = guard.take()
+                {
                     broken.abort().await;
                 }
                 Err(std::io::Error::other(format!(
@@ -908,7 +918,10 @@ impl SftpProvider {
         match conn.session.remove_dir(path.to_string()).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                if let Some(mut broken) = guard.take() {
+                // Transport-only invalidation: keep pool on application/Status error.
+                if classify_russh_error(&e).should_invalidate()
+                    && let Some(mut broken) = guard.take()
+                {
                     broken.abort().await;
                 }
                 Err(std::io::Error::other(format!(
@@ -1029,7 +1042,8 @@ impl SftpProvider {
     async fn read_prefix(&self, path: &str, max_bytes: usize) -> std::io::Result<BoundedRead> {
         use tokio::io::AsyncReadExt;
 
-        let mut guard = self.connection.lock().await;
+        // Probe the pooled session (transport break → fresh replace) before reuse.
+        let mut guard = self.connect_for_mutation().await?;
 
         for attempt in 0..2 {
             if guard.is_none() {
@@ -1070,7 +1084,10 @@ impl SftpProvider {
                     });
                 }
                 Err(error) => {
-                    if let Some(mut broken) = guard.take() {
+                    // Transport-only invalidation: keep pool on application/Status error.
+                    if classify_russh_error(&error).should_invalidate()
+                        && let Some(mut broken) = guard.take()
+                    {
                         broken.abort().await;
                     }
                     if attempt == 1 {
@@ -1104,10 +1121,13 @@ impl SftpProvider {
             self.pause_after_pin(),
         )
         .await;
-        if result.is_err()
-            && let Some(mut broken) = guard.take()
-        {
-            broken.abort().await;
+        if let Err(error) = &result {
+            // Transport-only invalidation: keep pool on application/Status error.
+            if classify_io_error(error).should_invalidate()
+                && let Some(mut broken) = guard.take()
+            {
+                broken.abort().await;
+            }
         }
         result
     }

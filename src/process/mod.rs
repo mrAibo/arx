@@ -302,6 +302,7 @@ impl ProcessService {
                         revision,
                         temp_dir: std::sync::Arc::new(temp_dir),
                         state: RemoteEditState::ReadyToEdit,
+                        job_id: None,
                     },
                 }
             }
@@ -1127,6 +1128,7 @@ mod tests {
             .unwrap(),
             temp_dir,
             state: RemoteEditState::WritingBack,
+            job_id: None,
         };
         (registry, session, current, writes, expected_seen)
     }

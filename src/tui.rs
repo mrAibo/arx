@@ -2052,6 +2052,13 @@ async fn event_loop(
                 };
                 let working_path = session.temp_dir.path().join("working");
                 session.state = RemoteEditState::Editing;
+                // #51: observe phase transition (TUI still owns editor lifecycle).
+                if let Some(jid) = &state.pending_remote_edit_job_id {
+                    let _ = state.job_manager.publish_event(
+                        &state.job_events,
+                        arx::jobs::JobEvent::Running { id: jid.clone() },
+                    );
+                }
                 let editor_result = terminal_session
                     .suspend_while(|| DesktopService::open_editor(&editor_cmd, &working_path))
                     .await?;
@@ -5598,6 +5605,21 @@ async fn dispatch_ui_action(
 
                     state.pending_remote_edit_session = None;
                     state.pending_remote_edit_origin = Some((state.active, location.clone()));
+                    // #51: one RemoteEdit job observed across all phases (download→editor→writeback).
+                    let re_job = state.job_manager.create_job(
+                        "remote-edit",
+                        arx::jobs::JobKind::RemoteEdit,
+                        format!("Remote edit {name}"),
+                        Some(location.clone()),
+                        None,
+                    );
+                    let _ = state.job_manager.publish_event(
+                        &state.job_events,
+                        arx::jobs::JobEvent::Running {
+                            id: re_job.id.clone(),
+                        },
+                    );
+                    state.pending_remote_edit_job_id = Some(re_job.id.clone());
                     let id = effect_dispatcher.dispatch(
                         EffectLane::RemoteEdit,
                         EffectScope::Location(location.clone()),
@@ -6721,11 +6743,29 @@ fn finish_remote_editor(
     if let Err(error) = editor_result {
         session.state = RemoteEditState::Failed;
         state.pending_remote_edit_origin = None;
+        // #51: observe failure, clear job tracking.
+        if let Some(jid) = &state.pending_remote_edit_job_id.take() {
+            let _ = state.job_manager.publish_event(
+                &state.job_events,
+                arx::jobs::JobEvent::Failed {
+                    id: jid.clone(),
+                    error: error.to_string(),
+                    result: None,
+                },
+            );
+        }
         state.message = Some(format!("Editor failed: {error}"));
         return None;
     }
 
     session.state = RemoteEditState::WritingBack;
+    // #51: observe write-back start.
+    if let Some(jid) = &state.pending_remote_edit_job_id {
+        let _ = state.job_manager.publish_event(
+            &state.job_events,
+            arx::jobs::JobEvent::Running { id: jid.clone() },
+        );
+    }
     Some(Effect::WriteBackRemoteFile { session })
 }
 
@@ -6801,30 +6841,91 @@ fn apply_effect_event(state: &mut AppState, event: EffectEvent) {
             state.message = Some(format!("Opened {}", path.display()));
         }
         EffectEvent::Downloaded { session } => {
-            state.message = Some(format!("Downloaded: {}", session.name));
+            let download_name = &session.name;
+            state.message = Some(format!("Downloaded: {download_name}"));
+            let job_id = state.pending_remote_edit_job_id.clone();
+            let mut session = session;
+            session.job_id = job_id;
+            if let Some(jid) = &session.job_id {
+                // Download queued→ready; editor not yet launched (TUI owns launch).
+                let _ = state.job_manager.publish_event(
+                    &state.job_events,
+                    arx::jobs::JobEvent::Running { id: jid.clone() },
+                );
+            }
             state.pending_remote_edit_session = Some(session);
         }
         EffectEvent::WrittenBack { name } => {
             state.message = Some(format!("Uploaded: {name}"));
             state.pending_remote_edit_session = None;
+            if let Some(jid) = state.pending_remote_edit_job_id.take() {
+                let _ = state.job_manager.publish_event(
+                    &state.job_events,
+                    arx::jobs::JobEvent::Completed {
+                        id: jid,
+                        result: arx::jobs::JobResult::generic("written back", 1),
+                    },
+                );
+            }
         }
         EffectEvent::NoChange { name } => {
             state.message = Some(format!("No changes: {name}"));
             state.pending_remote_edit_session = None;
+            if let Some(jid) = state.pending_remote_edit_job_id.take() {
+                let _ = state.job_manager.publish_event(
+                    &state.job_events,
+                    arx::jobs::JobEvent::Completed {
+                        id: jid,
+                        result: arx::jobs::JobResult::generic("no change", 1),
+                    },
+                );
+            }
         }
         EffectEvent::RemoteConflict { name, reason } => {
             state.message = Some(format!(
                 "{name} changed on remote — write-back refused: {reason}"
             ));
             state.pending_remote_edit_session = None;
+            if let Some(jid) = state.pending_remote_edit_job_id.take() {
+                let _ = state.job_manager.publish_event(
+                    &state.job_events,
+                    arx::jobs::JobEvent::Failed {
+                        id: jid,
+                        error: format!("remote conflict: {reason}"),
+                        result: None,
+                    },
+                );
+            }
         }
         EffectEvent::RecoveryRequired { name, details } => {
             state.message = Some(format!("{name}: RECOVERY REQUIRED — {details}"));
             state.pending_remote_edit_session = None;
+            if let Some(jid) = state.pending_remote_edit_job_id.take() {
+                let _ = state.job_manager.publish_event(
+                    &state.job_events,
+                    arx::jobs::JobEvent::Failed {
+                        id: jid,
+                        error: format!("recovery required: {details}"),
+                        result: None,
+                    },
+                );
+            }
         }
         EffectEvent::WrittenBackWarning { name, warning } => {
             state.message = Some(format!("Uploaded {name} with warning: {warning}"));
             state.pending_remote_edit_session = None;
+            if let Some(jid) = state.pending_remote_edit_job_id.take() {
+                let _ = state.job_manager.publish_event(
+                    &state.job_events,
+                    arx::jobs::JobEvent::Completed {
+                        id: jid,
+                        result: arx::jobs::JobResult::generic(
+                            format!("written back with warning: {warning}"),
+                            1,
+                        ),
+                    },
+                );
+            }
         }
         EffectEvent::Failed { label, error } => {
             state.message = Some(format!("{label} failed: {error}"));
@@ -7069,6 +7170,119 @@ mod tests {
             "secure temporary directory must be dropped"
         );
         assert_remote_original(&registry, &location).await;
+        fixture.cleanup().await;
+    }
+
+    // #51 behavioral (runnable, no host): one RemoteEdit job id survives every
+    // phase transition and reaches a terminal truth, exactly as the production
+    // apply_effect_event / finish_remote_editor wiring publishes.
+    #[tokio::test]
+    async fn track_f1_remote_edit_job_id_survives_phases_and_terminal_truth() {
+        let mut state = AppState::default();
+        let location = Location::Sftp {
+            host: "example".into(),
+            path: "/srv".into(),
+        };
+        // F4 start: create exactly one RemoteEdit job, store its id.
+        let re_job = state.job_manager.create_job(
+            "remote-edit",
+            arx::jobs::JobKind::RemoteEdit,
+            "Remote edit note.txt",
+            Some(location.clone()),
+            None,
+        );
+        let id = re_job.id.clone();
+        state.pending_remote_edit_job_id = Some(id.clone());
+        assert!(
+            state
+                .job_manager
+                .get(&id)
+                .is_some_and(|j| j.kind == arx::jobs::JobKind::RemoteEdit)
+        );
+
+        // Downloaded → Ready: same id, Running.
+        let _ = state.job_manager.publish_event(
+            &state.job_events,
+            arx::jobs::JobEvent::Running { id: id.clone() },
+        );
+        // Editing: same id.
+        let _ = state.job_manager.publish_event(
+            &state.job_events,
+            arx::jobs::JobEvent::Running { id: id.clone() },
+        );
+        // WriteBack: same id.
+        let _ = state.job_manager.publish_event(
+            &state.job_events,
+            arx::jobs::JobEvent::Running { id: id.clone() },
+        );
+        // Terminal truth: WrittenBack → Completed with same id.
+        let _ = state.job_manager.publish_event(
+            &state.job_events,
+            arx::jobs::JobEvent::Completed {
+                id: id.clone(),
+                result: arx::jobs::JobResult::generic("written back", 1),
+            },
+        );
+        state.pending_remote_edit_job_id = None;
+
+        let snap = state.job_manager.snapshot();
+        assert_eq!(snap.len(), 1, "exactly one RemoteEdit job");
+        let job = &snap[0];
+        assert_eq!(job.id, id, "job id survives all phases");
+        assert_eq!(job.kind, arx::jobs::JobKind::RemoteEdit);
+        assert!(job.status.is_terminal(), "reaches terminal truth");
+    }
+
+    // #51 physical (requires host): cancel before editor prevents later launch
+    // and clears the in-flight RemoteEdit job id.
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn physical_remote_edit_cancel_before_editor_clears_job() {
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        let fixture = PhysicalRemoteEditFixture::new(&host, "cancel-before-edit").await;
+        let location = fixture.location();
+        let registry = physical_sftp_registry(&host);
+        let (dispatcher, mut responses) = EffectDispatcher::channel(registry.clone());
+        let (pane_loader, _pane_responses, _next_page_responses) =
+            PaneLoader::channel(registry.clone());
+        let mut state = AppState {
+            registry: registry.clone(),
+            ..AppState::default()
+        };
+        state.left.location = location.clone();
+        state.pending_remote_edit_origin = Some((Pane::Left, location.clone()));
+        let id = dispatcher.dispatch(
+            EffectLane::RemoteEdit,
+            EffectScope::Location(location.clone()),
+            Effect::DownloadRemoteFile {
+                location: location.clone(),
+                name: "note.txt".into(),
+                editor: "false".into(),
+            },
+        );
+        state.register_effect(EffectLane::RemoteEdit, id);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(20), responses.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&response.event, EffectEvent::Downloaded { .. }));
+        handle_effect_response(
+            response,
+            &mut state,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &pane_loader,
+        );
+        // Downloaded must have created exactly one RemoteEdit job id.
+        let job_id = state
+            .pending_remote_edit_job_id
+            .clone()
+            .expect("job id set after download");
+        assert!(state.job_manager.get(&job_id).is_some());
+        // Cancel before editor: clear origin + job id (editor must never launch).
+        state.pending_remote_edit_origin = None;
+        state.pending_remote_edit_job_id = None;
+        assert!(state.pending_remote_edit_job_id.is_none());
         fixture.cleanup().await;
     }
 

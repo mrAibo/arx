@@ -1555,6 +1555,8 @@ pub struct RemoteEditSession {
     /// Contains `working` (editable copy) and `original` (immutable snapshot).
     pub temp_dir: std::sync::Arc<tempfile::TempDir>,
     pub state: RemoteEditState,
+    /// JobManager job id tracking this edit across all phases (download→editor→writeback).
+    pub job_id: Option<String>,
 }
 
 impl std::fmt::Debug for RemoteEditSession {

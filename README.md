@@ -233,7 +233,7 @@ Wasabi are **unverified — best-effort only, not claimed supported.**
 | Moto (emulator) | ✅ EMULATED PASS |
 | Cloudflare R2 / Wasabi | ⚠️ UNVERIFIED — best-effort only |
 
-Capabilities: List / Read / Write / F3 (mkdir as a zero-byte prefix marker). Local↔S3
+Capabilities: List / Read / Write / F3 (bounded object preview). Local↔S3
 single-object copy only — no S3→S3, no SFTP↔S3. F7 creates a zero-byte prefix marker (not
 a POSIX directory / bucket). F8 deletes an exact single object or a proven-empty marker (no
 recursive prefix delete, no bucket delete). F4 and F6 are disabled. No S3 rename, no
