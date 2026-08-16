@@ -901,10 +901,21 @@ pub fn cancel_pending_keygen(state: &mut AppState) {
 }
 
 /// PACK B — Remove a generated key pair (private + `.pub`). Used to roll back a
-/// key after a failed attach so no orphan files remain. `ssh-keygen` writes both.
+/// key after a failed attach so no orphan files remain. `ssh-keygen` writes the
+/// public key as the private path with `.pub` APPENDED (not as a replaced
+/// extension), so we do the same — a dotted alias (e.g. `prod.eu` ->
+/// `prod.eu_ed25519.pub`) must not delete an unrelated `prod.pub`.
 pub fn remove_generated_key_pair(private: &std::path::Path) {
     let _ = std::fs::remove_file(private);
-    let _ = std::fs::remove_file(private.with_extension("pub"));
+    let _ = std::fs::remove_file(pub_path_for(private));
+}
+
+/// Companion `.pub` path for a private key: appends `.pub` to the full filename
+/// (matches ssh-keygen), rather than replacing the extension.
+pub fn pub_path_for(private: &std::path::Path) -> std::path::PathBuf {
+    let mut name = private.file_name().unwrap_or_default().to_os_string();
+    name.push(".pub");
+    private.with_file_name(name)
 }
 
 /// PACK B — Drive the managed-SSH-host list-mode key transition from a real

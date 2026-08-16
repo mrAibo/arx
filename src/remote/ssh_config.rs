@@ -249,7 +249,7 @@ fn resolve_include_paths(inc: &str) -> Result<Vec<PathBuf>, DiscoveryError> {
         match comp {
             Component::Normal(c) => {
                 let s = c.to_string_lossy().into_owned();
-                if s.contains('*') || s.contains('?') {
+                if s.contains('*') || s.contains('?') || s.contains('[') {
                     parts.push(GlobPart {
                         literal: None,
                         pattern: Some(s),
@@ -374,13 +374,21 @@ pub(crate) fn wildcard_match(text: &str, pattern: &str) -> bool {
     wildcard_match_chars(&t, &p)
 }
 
-/// Match `text` against `pattern` where `*` matches any run and `?` any single char.
-/// Mirrors glob(3) component semantics: the segment before the first `*` is
-/// anchored at the start, the segment after the last `*` at the end, and
-/// internal segments are matched left-to-right in order. (OpenSSH passes the
-/// whole Include pathname to the system glob; a component like `env-*` must
-/// match a name *beginning* with `env-`, not one merely containing it.)
+/// Match `text` against `pattern` where `*` matches any run, `?` any single char
+/// and `[...]` a bracket class (char list or `a-z` range). Mirrors glob(3)
+/// pathname semantics as used by OpenSSH for Include pathnames:
+/// - the literal segment before the first `*` is anchored at the start,
+/// - the segment after the last `*` at the end,
+/// - internal segments are matched in order with no overlap (suffix start
+///   must be >= the position consumed by prior segments),
+/// - a leading `.` in `text` is only matched by an explicit `.` at the start of
+///   the pattern (no implicit `*`/`.` matching), per POSIX pathname glob.
 fn wildcard_match_chars(text: &[char], pattern: &[char]) -> bool {
+    // Leading-dot rule (POSIX pathname glob): a leading `.` is NOT matched by an
+    // implicit wildcard — only by an explicit `.` at pattern position 0.
+    if text.first() == Some(&'.') && pattern.first() != Some(&'.') {
+        return false;
+    }
     let stars: Vec<usize> = pattern
         .iter()
         .enumerate()
@@ -388,13 +396,10 @@ fn wildcard_match_chars(text: &[char], pattern: &[char]) -> bool {
         .map(|(i, _)| i)
         .collect();
     if stars.is_empty() {
-        // No `*`: match the whole text (with `?`), both ends anchored.
-        if text.len() != pattern.len() {
-            return false;
-        }
-        return match_segment(text, pattern);
+        // No '*': the whole text must equal the pattern (with ?/[...] inside).
+        return match_glob(text, pattern);
     }
-    // Split into literal segments between the `*`s.
+    // Split into literal segments (each may contain ?/[...]) between the '*'s.
     let mut segs: Vec<&[char]> = Vec::new();
     let mut prev = 0usize;
     for s in &stars {
@@ -409,12 +414,12 @@ fn wildcard_match_chars(text: &[char], pattern: &[char]) -> bool {
         if text.len() < segs[0].len() {
             return false;
         }
-        if !match_segment(&text[..segs[0].len()], segs[0]) {
+        if !match_glob(&text[..segs[0].len()], segs[0]) {
             return false;
         }
         ti = segs[0].len();
     }
-    // Internal segments matched in order, anywhere after the previous match.
+    // Internal segments in order, non-overlapping.
     for seg in &segs[1..segs.len() - 1] {
         if seg.is_empty() {
             continue;
@@ -424,37 +429,93 @@ fn wildcard_match_chars(text: &[char], pattern: &[char]) -> bool {
             None => return false,
         }
     }
-    // Last segment anchored at end.
+    // Last segment anchored at end, and must not reuse consumed characters.
     let last = segs[segs.len() - 1];
     if !last.is_empty() {
-        if text.len() < last.len() {
+        if text.len() < last.len() || text.len() - last.len() < ti {
             return false;
         }
-        return match_segment(&text[text.len() - last.len()..], last);
+        return match_glob(&text[text.len() - last.len()..], last);
     }
     true
 }
 
-/// Find `seg` in `text[from..]` allowing `?` wildcards in `seg`, return start index.
+/// Match `pattern` against the ENTIRE `text` slice: literal chars match exactly,
+/// `?` matches any char, `[...]` a bracket class. Used for whole segments (which
+/// are matched against an exactly-sized window of the filename).
+fn match_glob(text: &[char], pattern: &[char]) -> bool {
+    let mut ti = 0;
+    let mut si = 0;
+    while si < pattern.len() {
+        let pc = pattern[si];
+        if pc == '?' {
+            if ti >= text.len() {
+                return false;
+            }
+        } else if pc == '[' {
+            // Bracket expression up to the matching ']'.
+            let end = match pattern[si..].iter().position(|c| *c == ']') {
+                Some(e) => si + e,
+                None => return false,
+            };
+            let body = &pattern[si + 1..end];
+            if ti >= text.len() || !match_bracket(text[ti], body) {
+                return false;
+            }
+            si = end + 1;
+            ti += 1;
+            continue;
+        } else if ti >= text.len() || text[ti] != pc {
+            return false;
+        }
+        ti += 1;
+        si += 1;
+    }
+    ti == text.len()
+}
+
+/// Does `c` match the bracket body `pat` (WITHOUT the outer brackets)? Supports a
+/// char list and `x-y` ranges; `!`/`^` as first char negates.
+fn match_bracket(c: char, pat: &[char]) -> bool {
+    let (negate, body) = match pat.first() {
+        Some(&'!' | &'^') => (true, &pat[1..]),
+        _ => (false, pat),
+    };
+    let mut i = 0;
+    let mut matched = false;
+    while i < body.len() {
+        if i + 2 < body.len() && body[i + 1] == '-' && body[i + 2] != ']' {
+            let lo = body[i];
+            let hi = body[i + 2];
+            if lo <= c && c <= hi {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if body[i] == c {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+    matched != negate
+}
+
+/// Find `seg` in `text[from..]`, returning the start index. `seg` may contain
+/// `?` (any char) and `[...]` bracket expressions.
 fn find_segment(text: &[char], from: usize, seg: &[char]) -> Option<usize> {
     if seg.is_empty() {
         return Some(from);
     }
-    if text.len() < seg.len() {
+    if text.len() < from + seg.len() {
         return None;
     }
     for start in from..=(text.len() - seg.len()) {
-        if match_segment(&text[start..start + seg.len()], seg) {
+        if match_glob(&text[start..start + seg.len()], seg) {
             return Some(start);
         }
     }
     None
-}
-
-/// Match two equal-length char slices, with `?` = any single char.
-fn match_segment(text: &[char], seg: &[char]) -> bool {
-    debug_assert_eq!(text.len(), seg.len());
-    text.iter().zip(seg).all(|(c, p)| *p == '?' || *p == *c)
 }
 
 /// Resolve effective SSH config via `ssh -G` (handles all OpenSSH features).
