@@ -250,11 +250,6 @@ fn resolve_include_paths(inc: &str) -> Result<Vec<PathBuf>, DiscoveryError> {
             Component::Normal(c) => {
                 let s = c.to_string_lossy().into_owned();
                 if s.contains('*') || s.contains('?') {
-                    if parts.iter().any(|p| p.pattern.is_some()) {
-                        return Err(DiscoveryError::UnresolvableInclude(format!(
-                            "multiple wildcard segments in {inc}"
-                        )));
-                    }
                     parts.push(GlobPart {
                         literal: None,
                         pattern: Some(s),
@@ -353,11 +348,16 @@ fn resolve_components(
             let matched = entry.path();
             if tail.is_empty() {
                 out.push(matched);
-            } else if std::fs::metadata(&matched)
-                .map(|m| m.is_dir())
-                .unwrap_or(false)
-            {
-                resolve_components(&matched, tail, out)?;
+            } else {
+                // Error here means we cannot safely determine/traverse the
+                // matched path — fail closed (requirement #8), do NOT treat as
+                // "no match". A non-directory match simply cannot be descended.
+                let meta = std::fs::metadata(&matched).map_err(|e| {
+                    DiscoveryError::Unreadable(format!("include path {}: {e}", matched.display()))
+                })?;
+                if meta.is_dir() {
+                    resolve_components(&matched, tail, out)?;
+                }
             }
         }
         Ok(())

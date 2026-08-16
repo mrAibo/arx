@@ -842,10 +842,18 @@ fn dirs_fallback() -> PathBuf {
 /// clears the pending state. Business logic lives here (in `app`), not in the
 /// TUI binary module, so it stays unit-testable without exposing `tui` as API.
 pub fn confirm_pending_keygen(state: &mut AppState) {
-    let alias = match state.ssh_pending_keygen.clone() {
+    // Snapshot the pending alias, then clear intent immediately so concurrent
+    // edits/deletes between the request and the confirm cannot leave an orphan
+    // generated key behind.
+    let alias = match state.ssh_pending_keygen.take() {
         Some(a) => a,
         None => return,
     };
+    // Re-check the host still exists in the list before touching the filesystem.
+    if !state.ssh_hosts.iter().any(|h| h.alias == alias) {
+        state.ssh_host_status = Some(format!("Key gen cancelled: '{alias}' no longer listed"));
+        return;
+    }
     let key_name = format!("{alias}_ed25519");
     match crate::remote::ssh_config_manager::generate_ed25519_key(&key_name) {
         Ok(p) => {
@@ -864,16 +872,22 @@ pub fn confirm_pending_keygen(state: &mut AppState) {
                             alias
                         ))
                     }
-                    Err(e) => state.ssh_host_status = Some(format!("Key attached failed: {e}")),
+                    Err(e) => {
+                        state.ssh_host_status = Some(format!("Key attached failed: {e}"));
+                        // Roll back the just-generated key so no orphan remains.
+                        let _ = std::fs::remove_file(&p);
+                    }
                 }
                 state.ssh_hosts = crate::remote::ssh_config_manager::list_managed_hosts()
                     .into_values()
                     .collect();
+            } else {
+                // Host vanished between the check above and the find; drop key.
+                let _ = std::fs::remove_file(&p);
             }
         }
         Err(e) => state.ssh_host_status = Some(format!("Key gen failed: {e}")),
     }
-    state.ssh_pending_keygen = None;
 }
 
 /// PACK B — Cancel a pending key generation (list-mode n). Clears pending state,
@@ -897,6 +911,10 @@ pub fn handle_ssh_host_keypress(state: &mut AppState, key: crossterm::event::Key
     use crossterm::event::{KeyCode, KeyModifiers};
     if state.ssh_pending_keygen.is_some() {
         match key.code {
+            KeyCode::Esc => {
+                cancel_pending_keygen(state);
+                true
+            }
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 confirm_pending_keygen(state);
                 true
