@@ -4,6 +4,9 @@ use std::io;
 pub mod hosts_config;
 pub mod openssh_sftp;
 pub mod ssh_config;
+pub mod ssh_config_manager;
+#[cfg(test)]
+mod ssh_config_manager_tests;
 #[cfg(target_os = "linux")]
 pub mod watch;
 

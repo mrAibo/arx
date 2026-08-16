@@ -962,13 +962,20 @@ async fn aws_invalid_credentials_no_fallback() {
             return;
         }
     }
+    // Genuinely reach the invalid-credential SDK path: use the registered
+    // `aws-invalid` target (not aws_root()/aws-bucket).
     let cfg = s3_acceptance::aws_target_with_profile(
         "aws-invalid",
         &std::env::var("ARX_AWS_INVALID_PROFILE").unwrap_or_else(|_| "invalid".to_string()),
     );
     let registry = ProviderRegistry::new();
     registry.register_s3_targets(&[cfg]);
-    let res = registry.list_page(&aws_root(), None).await;
+    let invalid_loc = Location::S3 {
+        target: "aws-invalid".to_string(),
+        bucket: Some(aws_bucket()),
+        prefix: "arx-acceptance/invalid".to_string(),
+    };
+    let res = registry.list_page(&invalid_loc, None).await;
     assert!(
         res.is_err(),
         "invalid creds must fail, no fallback to ambient identity"
