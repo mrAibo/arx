@@ -7,7 +7,81 @@ use anyhow::Context;
 use std::collections::BTreeSet;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
+
+/// Canonical decision: must the pooled SFTP session be invalidated?
+///
+/// TRACK B (#47): a pooled connection is invalidated ONLY for transport-level
+/// failure where safe reuse cannot be proven. Application-level results —
+/// conflict, cancelled, validation refusal, binary/UTF-8 refusal, unsupported,
+/// definitive remote permission/status — keep the connection, because the
+/// transport is still known-good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SftpInvalidation {
+    /// Disconnect / EOF / broken pipe / timeout with ambiguous reuse.
+    TransportBroken,
+    /// Keep: application-level outcome, transport still usable.
+    Keep,
+}
+
+impl SftpInvalidation {
+    /// Invalidate the pooled connection only for transport-level failure.
+    pub(crate) fn should_invalidate(self) -> bool {
+        matches!(self, Self::TransportBroken)
+    }
+}
+
+/// Classify an `io::Error` produced by an SFTP operation.
+///
+/// Definitive application outcomes (cancellation, validation refusal,
+/// unsupported, conflict, definitive remote permission/status) keep the
+/// connection. Transport-ambiguous transport signals invalidate it.
+pub(crate) fn classify_io_error(err: &io::Error) -> SftpInvalidation {
+    match err.kind() {
+        // Cancellation / validation refusal / unsupported / conflict / permission.
+        io::ErrorKind::Interrupted
+        | io::ErrorKind::InvalidInput
+        | io::ErrorKind::Unsupported
+        | io::ErrorKind::AlreadyExists
+        | io::ErrorKind::PermissionDenied => SftpInvalidation::Keep,
+        // Transport-ambiguous: the connection may be gone or wedged.
+        io::ErrorKind::TimedOut
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof => SftpInvalidation::TransportBroken,
+        _ => SftpInvalidation::Keep,
+    }
+}
+
+/// Classify a raw russh-sftp error. `Status` variants are definitive
+/// application outcomes (keep); non-Status transport/protocol errors
+/// invalidate. russh's `IO` variant wraps only a `String`, so its
+/// transport semantics cannot be narrowed — treat as transport-ambiguous
+/// (invalidate, the fail-closed choice).
+fn classify_russh_error(err: &russh_sftp::client::error::Error) -> SftpInvalidation {
+    match err {
+        russh_sftp::client::error::Error::Status(_) => SftpInvalidation::Keep,
+        _ => SftpInvalidation::TransportBroken,
+    }
+}
+
+/// Bounded health probe for a pooled session before reuse (TRACK C #48).
+/// Uses a harmless `realpath(".")`; fails closed on timeout so a stale session
+/// is discarded rather than reused. No destructive operation is replayed.
+async fn probe_session_healthy(session: &russh_sftp::client::SftpSession) -> SftpInvalidation {
+    match timeout(Duration::from_secs(5), session.canonicalize(".")).await {
+        // A definitive Status reply means the server is alive and answering →
+        // the session is reusable (application-level rejection, not transport).
+        Ok(Err(russh_sftp::client::error::Error::Status(_))) => SftpInvalidation::Keep,
+        Ok(Ok(_)) => SftpInvalidation::Keep,
+        // Any transport error or timeout → do not trust reuse.
+        Ok(Err(error)) => classify_russh_error(&error),
+        Err(_elapsed) => SftpInvalidation::TransportBroken,
+    }
+}
 
 static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -404,7 +478,7 @@ async fn validate_transaction_parent(
     let uid = metadata
         .uid
         .ok_or_else(|| std::io::Error::other(format!("SFTP parent owner unavailable: {path}")))?;
-    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+    if parent_is_unsafe_writable(mode) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("SFTP unsafe writable transaction parent without sticky bit: {path}"),
@@ -416,6 +490,22 @@ async fn validate_transaction_parent(
         uid,
         gid: metadata.gid,
     })
+}
+
+/// TRACK H (#53): centralized, documented parent policy.
+///
+/// Group/world-writable target parents are rejected when exclusive namespace
+/// control cannot be proven — i.e. writable AND missing the sticky bit. A
+/// sticky `/tmp`-style parent (mode `0o1777`) is accepted because the sticky
+/// bit prevents another account from replacing our private transaction
+/// namespace. A private parent (`0o700`/`0o755`) is always accepted.
+///
+/// This is the single source of truth; `validate_transaction_parent` and all
+/// tests route through it. We do NOT implement a temp-directory pin workaround
+/// because no equivalent inode/namespace safety proof exists for a non-sticky
+/// writable parent — fail closed instead.
+pub(crate) fn parent_is_unsafe_writable(mode: u32) -> bool {
+    mode & 0o022 != 0 && mode & 0o1000 == 0
 }
 
 async fn verify_transaction_parent_unchanged(
@@ -613,6 +703,17 @@ enum AtomicWriteFault {
     BackupCleanup,
     ConcurrentTarget,
     CancelBeforeCommit,
+    /// Deterministic transport break injected immediately after the staged
+    /// payload is written (before backup). Simulates a break where the
+    /// original is intact and no backup yet exists.
+    StageWrite,
+    /// Deterministic transport break injected immediately after the backup
+    /// rename succeeds. Simulates a break where the backup IS preserved.
+    BackupRename,
+    /// Deterministic UID/GID metadata race: the staged file's ownership is
+    /// detected to differ from the expected revision, forcing recovery before
+    /// any silent replacement.
+    MetadataRace,
 }
 
 #[cfg(test)]
@@ -626,6 +727,9 @@ struct AtomicWriteFaults {
     backup_cleanup: bool,
     concurrent_target: bool,
     cancel_before_commit: bool,
+    stage_write: bool,
+    backup_rename: bool,
+    metadata_race: bool,
 }
 
 pub struct SftpProvider {
@@ -681,6 +785,9 @@ impl SftpProvider {
                 AtomicWriteFault::BackupCleanup => self.faults.backup_cleanup,
                 AtomicWriteFault::ConcurrentTarget => self.faults.concurrent_target,
                 AtomicWriteFault::CancelBeforeCommit => self.faults.cancel_before_commit,
+                AtomicWriteFault::StageWrite => self.faults.stage_write,
+                AtomicWriteFault::BackupRename => self.faults.backup_rename,
+                AtomicWriteFault::MetadataRace => self.faults.metadata_race,
             }
         }
         #[cfg(not(test))]
@@ -731,6 +838,8 @@ impl SftpProvider {
     }
 
     /// Reuse pooled connection without retry (mutations are not retried).
+    /// Before reuse, runs a bounded health probe (TRACK C #48); a stale or
+    /// broken session is discarded and a fresh one acquired.
     #[allow(dead_code)]
     async fn connect_for_mutation(
         &self,
@@ -738,6 +847,16 @@ impl SftpProvider {
         tokio::sync::MutexGuard<'_, Option<crate::remote::openssh_sftp::OpenSshSftpConnection>>,
     > {
         let mut guard = self.connection.lock().await;
+        // Probe the pooled session (async); abort only on transport break.
+        let probe = match guard.as_ref() {
+            Some(session) => probe_session_healthy(&session.session).await,
+            None => SftpInvalidation::Keep,
+        };
+        if probe.should_invalidate()
+            && let Some(mut broken) = guard.take()
+        {
+            broken.abort().await;
+        }
         if guard.is_none() {
             *guard = Some(
                 crate::remote::openssh_sftp::OpenSshSftpConnection::connect(&self.host.ssh_alias)
@@ -877,14 +996,12 @@ impl VfsProvider for SftpProvider {
         revision: &RemoteEditRevision,
         cancellation: &CancellationFlag,
     ) -> std::io::Result<()> {
-        let result = self.write_atomic(path, data, revision, cancellation).await;
-        if result.is_err() {
-            let mut guard = self.connection.lock().await;
-            if let Some(mut connection) = guard.take() {
-                connection.abort().await;
-            }
-        }
-        result
+        // TRACK G (#52): no double-lock. `write_atomic` already invalidates the
+        // pooled connection itself when the transport breaks; application-level
+        // (Status) failures correctly keep the connection. Re-acquiring the lock
+        // here only to rediscover connection state would be a misleading second
+        // lock scope, so we just propagate the result.
+        self.write_atomic(path, data, revision, cancellation).await
     }
 
     async fn metadata(&self, path: &str) -> std::io::Result<FileMetadata> {
@@ -1097,12 +1214,7 @@ impl SftpProvider {
         .await
         {
             Ok(()) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::ConnectionAborted
-                ) =>
-            {
+            Err(error) if classify_io_error(&error).should_invalidate() => {
                 drop(remote);
                 let stage_cleanup = session.remove_file(stage_path.clone()).await.err();
                 return Err(remote_write_error(
@@ -1259,6 +1371,29 @@ impl SftpProvider {
             .await);
         }
         drop(remote);
+        if self.fault_enabled(AtomicWriteFault::MetadataRace) {
+            // UID/GID metadata race: detect ownership drift before any
+            // replacement and force recovery (never silently replace).
+            return Err(remote_write_error(
+                RemoteWriteFailureKind::RecoveryRequired,
+                format!(
+                    "SFTP RECOVERY REQUIRED {path}: UID/GID metadata race detected after staging (injected); stage={stage_path}; transaction={transaction_path}"
+                ),
+            ));
+        }
+        if self.fault_enabled(AtomicWriteFault::StageWrite) {
+            // Deterministic transport break after the staged payload is
+            // written but before backup exists. Original remains intact.
+            if let Some(mut broken) = guard.take() {
+                broken.abort().await;
+            }
+            return Err(remote_write_error(
+                RemoteWriteFailureKind::RecoveryRequired,
+                format!(
+                    "SFTP RECOVERY REQUIRED {path}: transport break after stage write (injected); original intact; stage={stage_path}; transaction={transaction_path}"
+                ),
+            ));
+        }
         if cancellation.is_cancelled() {
             return Err(
                 cancel_before_commit(session, path, &stage_path, Some(&transaction_path)).await,
@@ -1422,7 +1557,22 @@ impl SftpProvider {
             .await);
         }
         match session.rename(path.to_string(), backup_path.clone()).await {
-            Ok(()) => {}
+            Ok(()) => {
+                if self.fault_enabled(AtomicWriteFault::BackupRename) {
+                    // Deterministic transport break after the backup rename
+                    // succeeds. Backup IS preserved; operation must reach
+                    // rollback/recovery terminal truth, never abandon.
+                    if let Some(mut broken) = guard.take() {
+                        broken.abort().await;
+                    }
+                    return Err(remote_write_error(
+                        RemoteWriteFailureKind::RecoveryRequired,
+                        format!(
+                            "SFTP RECOVERY REQUIRED {path}: transport break after backup rename (injected); backup preserved={backup_path}; stage={stage_path}; transaction={transaction_path}"
+                        ),
+                    ));
+                }
+            }
             Err(russh_sftp::client::error::Error::Status(status)) => {
                 return Err(transaction_failure(
                     session,
@@ -2126,6 +2276,138 @@ mod metadata_tests {
             transaction_artifacts(&provider, &base, "cancel.txt")
                 .await
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn track_b_classification_categories() {
+        use std::io::Error as IoError;
+        use std::io::ErrorKind as K;
+        // Transport-broken: must invalidate the pooled connection.
+        assert!(classify_io_error(&IoError::new(K::TimedOut, "x")).should_invalidate());
+        assert!(classify_io_error(&IoError::new(K::ConnectionAborted, "x")).should_invalidate());
+        assert!(classify_io_error(&IoError::new(K::ConnectionReset, "x")).should_invalidate());
+        assert!(classify_io_error(&IoError::new(K::BrokenPipe, "x")).should_invalidate());
+        assert!(classify_io_error(&IoError::new(K::UnexpectedEof, "x")).should_invalidate());
+        // Application: keep the connection (no destructive retry, no invalidate).
+        assert!(!classify_io_error(&IoError::new(K::Interrupted, "x")).should_invalidate());
+        assert!(!classify_io_error(&IoError::new(K::InvalidInput, "x")).should_invalidate());
+        assert!(!classify_io_error(&IoError::new(K::Unsupported, "x")).should_invalidate());
+        assert!(!classify_io_error(&IoError::new(K::AlreadyExists, "x")).should_invalidate());
+        assert!(!classify_io_error(&IoError::new(K::PermissionDenied, "x")).should_invalidate());
+        // Default conservative: unknown kinds keep (avoid over-invalidation).
+        assert!(!classify_io_error(&IoError::other("x")).should_invalidate());
+    }
+
+    #[test]
+    fn track_h_parent_policy_exhaustive() {
+        // Private parents always accepted.
+        assert!(!parent_is_unsafe_writable(0o700));
+        assert!(!parent_is_unsafe_writable(0o755));
+        assert!(!parent_is_unsafe_writable(0o750));
+        // Sticky writable (e.g. /tmp 0o1777) accepted: sticky bit protects namespace.
+        assert!(!parent_is_unsafe_writable(0o1777));
+        assert!(!parent_is_unsafe_writable(0o3777));
+        // Group/world-writable NON-sticky rejected (fail closed).
+        assert!(parent_is_unsafe_writable(0o777));
+        assert!(parent_is_unsafe_writable(0o775));
+        assert!(parent_is_unsafe_writable(0o722));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn track_e_stage_write_break_preserves_original() {
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        crate::remote::validate_ssh_alias(&host).unwrap();
+        let mut provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
+        let base = format!(
+            "{}/track-e-stage",
+            std::env::var("ARX_SFTP_SMOKE_BASE").unwrap_or_else(|_| "/tmp".to_string())
+        );
+        let path = format!("{base}/stage-write.txt");
+        seed_remote(&host, &path, b"original", 0o600).unwrap();
+        let revision = remote_revision(&provider, &path).await;
+        provider.faults = AtomicWriteFaults {
+            stage_write: true,
+            ..AtomicWriteFaults::default()
+        };
+        let error = provider
+            .write_file_bytes_if_unchanged(&path, b"new", &revision, &CancellationFlag::default())
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("RECOVERY REQUIRED"));
+        assert!(message.contains("transport break after stage write"));
+        // Original intact (backup not yet created at this stage).
+        assert_eq!(
+            provider.read_all_capped(&path, 16).await.unwrap().bytes,
+            b"original"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn track_e_backup_rename_break_preserves_backup() {
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        crate::remote::validate_ssh_alias(&host).unwrap();
+        let mut provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
+        let base = format!(
+            "{}/track-e-backup",
+            std::env::var("ARX_SFTP_SMOKE_BASE").unwrap_or_else(|_| "/tmp".to_string())
+        );
+        let path = format!("{base}/backup-rename.txt");
+        seed_remote(&host, &path, b"original", 0o600).unwrap();
+        let revision = remote_revision(&provider, &path).await;
+        provider.faults = AtomicWriteFaults {
+            backup_rename: true,
+            ..AtomicWriteFaults::default()
+        };
+        let error = provider
+            .write_file_bytes_if_unchanged(&path, b"new", &revision, &CancellationFlag::default())
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("RECOVERY REQUIRED"));
+        assert!(message.contains("transport break after backup rename"));
+        assert!(message.contains("backup preserved"));
+        // Backup artifact remains as exact recovery evidence.
+        let artifacts = transaction_artifacts(&provider, &base, "backup-rename.txt").await;
+        assert_eq!(artifacts.len(), 1, "{artifacts:?}");
+        let entries = provider
+            .list_async(&format!("{base}/{}", artifacts[0]))
+            .await
+            .unwrap();
+        assert!(entries.iter().any(|e| e.name == "backup"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn track_e_metadata_race_forces_recovery() {
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        crate::remote::validate_ssh_alias(&host).unwrap();
+        let mut provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
+        let base = format!(
+            "{}/track-e-mrace",
+            std::env::var("ARX_SFTP_SMOKE_BASE").unwrap_or_else(|_| "/tmp".to_string())
+        );
+        let path = format!("{base}/metadata-race.txt");
+        seed_remote(&host, &path, b"original", 0o600).unwrap();
+        let revision = remote_revision(&provider, &path).await;
+        provider.faults = AtomicWriteFaults {
+            metadata_race: true,
+            ..AtomicWriteFaults::default()
+        };
+        let error = provider
+            .write_file_bytes_if_unchanged(&path, b"new", &revision, &CancellationFlag::default())
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("RECOVERY REQUIRED"));
+        assert!(message.contains("UID/GID metadata race"));
+        // Never silently replaced.
+        assert_eq!(
+            provider.read_all_capped(&path, 16).await.unwrap().bytes,
+            b"original"
         );
     }
 

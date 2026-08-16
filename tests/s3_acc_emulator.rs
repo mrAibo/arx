@@ -2,8 +2,9 @@
 //!
 //! Gated behind ARX_EMULATOR_TEST=1 (Moto server at ARX_EMULATOR_ENDPOINT,
 //! default http://localhost:5000). Exercises the SAME production S3Provider
-//! as AWS. Classify results EMULATED PASS — this is an AWS-shaped emulator,
-//! NOT a substitute for real-AWS physical acceptance (S3-62A remains PARKED).
+//! Classify results EMULATED PASS — this is an AWS-shaped emulator,
+//! NOT a substitute for real-AWS physical acceptance (AWS S3-62A passed
+//! physical acceptance in v0.17.0; S3-62E remains emulator-scoped).
 
 mod s3_acceptance;
 

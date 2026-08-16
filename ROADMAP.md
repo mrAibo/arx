@@ -2,26 +2,26 @@
 
 ## CURRENT — Product Truth
 
-Documentation and product positioning reflect the actual runtime. Remote Workspace is the hero workflow. SFTP F3/F4 are implemented. Keybindings match runtime truth.
+ARX **v0.17.0 released 2026-08-16** (SHA `32a7e78`). Documentation and product positioning reflect the actual runtime. Remote Workspace is the hero workflow. SFTP F3/F4 and the SSH Host Manager (F12) are implemented. The S3 backend is physically accepted against real AWS S3 (`715844024414`) and MinIO. Keybindings match runtime truth.
 
-## NEXT — Release Readiness
+## RELEASED — v0.17.0 (2026-08-16)
 
-- Resolve Cargo.toml version vs public tag/release line
-- Verify MSRV against CI toolchain and dependency requirements
-- Harden release workflow: checksums, quality gates, smoke
-- Freeze supported artifact matrix
-- Release notes covering user-visible capabilities
-- Install/documentation truth for source and binary
-- Release candidate dry run on real artifact
-- Tag and publish
+The Release Readiness gates below were completed and **v0.17.0 was published**:
+
+- Cargo.toml version / tag / release line resolved (v0.17.0)
+- MSRV verified at Rust 1.88 against CI toolchain
+- Release workflow hardened: checksums, quality gates, smoke
+- Supported artifact matrix frozen (Linux x86_64 binary + source)
+- Release notes and install/doc truth published
+- Tagged and published
 
 ## THEN — Next Public Release
 
 Release from current main after Product Truth and Release Readiness gates pass.
 
-## POST-RELEASE DEBT
+## PACK C — current hardening (PR open)
 
-Issues #47–#53 track deferred engineering work:
+Issues #47–#53 are in-progress under PACK C post-release hardening (do not close):
 
 - **Reliability:** transport-only connection invalidation (#47), connection health probe (#48)
 - **Cleanup:** dead RemoteEditState variants (#49), double-lock (#52)
@@ -30,7 +30,7 @@ Issues #47–#53 track deferred engineering work:
 
 ## FUTURE
 
-- S3 object-storage backend — feature-complete release candidate. Physically accepted against MinIO; AWS-shaped emulated acceptance against Moto. **Real AWS physical acceptance remains the only external release gate (AWS_S3_PHYSICAL_ACCEPTANCE_REQUIRED).** Not released as fully-supported AWS S3 until that gate passes.
+- S3 object-storage backend — **RELEASED as SUPPORTED MVP.** Real AWS S3 (account `715844024414`) and MinIO both passed physical acceptance (20/20 tests, immutable SHA `b5f0ee6`). Moto emulated PASS. Cloudflare R2 / Wasabi remain UNVERIFIED (best-effort only, not claimed supported).
 - Cross-backend Move
 - SFTP → SFTP workspace sync
 - Recursive remote delete

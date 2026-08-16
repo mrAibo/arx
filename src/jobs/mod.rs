@@ -353,6 +353,9 @@ pub enum JobKind {
     RemoteCommand,
     Transfer,
     Synchronize,
+    /// First-class remote-edit session job (SFTP atomic write-back).
+    /// Carries typed terminal outcome via `JobResult`, never string-encoded.
+    RemoteEdit,
     Custom(String),
 }
 

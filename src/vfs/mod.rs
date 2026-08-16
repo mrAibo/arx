@@ -1584,13 +1584,11 @@ impl Eq for RemoteEditSession {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteEditState {
-    Downloading,
     ReadyToEdit,
     Editing,
     NoChange,
     WritingBack,
     Conflict,
-    Done,
     Failed,
 }
 
