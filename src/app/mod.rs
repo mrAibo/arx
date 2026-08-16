@@ -885,6 +885,45 @@ pub fn cancel_pending_keygen(state: &mut AppState) {
     }
 }
 
+/// PACK B — Drive the managed-SSH-host list-mode key transition from a real
+/// `KeyEvent`. Powers Ctrl+K (request unencrypted-key generation, awaiting y/n),
+/// `y` (confirm → generates + attaches), and `n` (cancel). Kept in `app` (not
+/// the `tui` binary module) so it is unit-testable via real KeyEvents without
+/// exposing `tui` as public API.
+///
+/// Returns true if the event was consumed (caller should not also run default
+/// list navigation for it).
+pub fn handle_ssh_host_keypress(state: &mut AppState, key: crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if state.ssh_pending_keygen.is_some() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                confirm_pending_keygen(state);
+                true
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                cancel_pending_keygen(state);
+                true
+            }
+            _ => true, // swallow other keys while awaiting confirmation
+        }
+    } else {
+        match key.code {
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(h) = state.ssh_hosts.get(state.ssh_host_cursor).cloned() {
+                    state.ssh_pending_keygen = Some(h.alias.clone());
+                    state.ssh_host_status = Some(format!(
+                        "Generate UNENCRYPTED Ed25519 key for '{}'? (y/n)",
+                        h.alias
+                    ));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,23 +1,25 @@
 //! Parse ~/.ssh/config for host aliases, ProxyJump chains, and IdentityFile directives.
 //! ponytail: line-by-line parser, no crate dependency. Supports Host/HostName/User/Port/IdentityFile/ProxyJump.
 //! Include directives are resolved so ARX-managed entries are discovered. OpenSSH Include
-//! supports `~` expansion, multiple space-separated paths, glob patterns (`*`/`?`), nested
-//! includes, `Keyword=value` or whitespace separation, and relative paths resolved against the
-//! including file's directory (bounded, cycle-safe).
+//! supports `~` expansion, multiple space-separated paths, glob patterns (`*`/`?`) in ANY path
+//! component, nested includes, `Keyword=value` or whitespace separation, and relative paths
+//! anchored to ~/.ssh for user configuration.
 //!
-//! Safety: discovery is fail-closed. If any referenced included file cannot be read or a
-//! directive cannot be resolved, the whole parse returns an error so callers refuse to write
-//! rather than silently miss an unmanaged host (requirement #8).
+//! Safety: discovery is fail-closed. If any referenced included file or directory cannot be
+//! resolved/read (permission denied, broken symlink, unreadable glob directory), the whole parse
+//! returns an error so callers refuse to write rather than silently miss an unmanaged host
+//! (requirement #8). Only a genuinely MISSING file (NotFound) is treated as "nothing to include",
+//! matching OpenSSH which ignores absent Include targets.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Discovery error: a referenced config/include could not be safely resolved/read.
 /// Callers must fail closed when this is returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoveryError {
-    /// The entry file itself could not be canonicalized or read.
+    /// The entry file/directory itself could not be accessed (read/permission/canonicalize).
     Unreadable(String),
     /// An Include token could not be resolved to a path.
     UnresolvableInclude(String),
@@ -53,9 +55,15 @@ pub(crate) fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/root"))
 }
 
+/// User SSH directory (~/.ssh). OpenSSH anchors every relative Include in user
+/// configuration here, including nested includes.
+pub(crate) fn ssh_dir() -> PathBuf {
+    home_dir().join(".ssh")
+}
+
 /// Managed include path ARX installs into ~/.ssh/config.
 pub fn managed_include_path() -> PathBuf {
-    home_dir().join(".ssh").join("arx_hosts.conf")
+    ssh_dir().join("arx_hosts.conf")
 }
 
 /// Canonical form of the ARX-managed file (symlink-resolved), used for
@@ -70,7 +78,7 @@ pub fn canonical_managed_path() -> PathBuf {
 /// Parse ~/.ssh/config and return alias → resolved host details.
 /// Fail-closed: any unreadable/unsupported included file yields an error.
 pub fn parse_ssh_config() -> DiscoveryResult {
-    let config_path = home_dir().join(".ssh").join("config");
+    let config_path = ssh_dir().join("config");
     let mut seen = BTreeSet::new();
     parse_config_file(&config_path, &mut seen)
 }
@@ -81,9 +89,10 @@ pub fn parse_ssh_config() -> DiscoveryResult {
 /// Fail-closed: a referenced file that EXISTS but cannot be read (permission
 /// denied, broken symlink) yields an error so callers refuse to write rather than
 /// silently miss an unmanaged host. A MISSING file (including the root config) is
-/// treated as "nothing to include" — OpenSSH ignores absent Include targets.
+/// treated as "nothing to include" — distinguished from access errors via
+/// `try_exists`, not the error-folding `Path::exists`.
 fn parse_config_file(path: &Path, seen: &mut BTreeSet<PathBuf>) -> DiscoveryResult {
-    if !path.exists() {
+    if !is_present(path)? {
         return Ok(BTreeMap::new());
     }
     let canon = path
@@ -104,10 +113,6 @@ fn parse_config_file(path: &Path, seen: &mut BTreeSet<PathBuf>) -> DiscoveryResu
         managed,
         ..Default::default()
     };
-    let base_dir = canon
-        .parent()
-        .unwrap_or_else(|| Path::new("/"))
-        .to_path_buf();
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -143,13 +148,13 @@ fn parse_config_file(path: &Path, seen: &mut BTreeSet<PathBuf>) -> DiscoveryResu
             }
             "proxyjump" => current_entry.proxy_jump = Some(value),
             "include" => {
-                // B3: safe Include resolution. Expand ~, follow relative paths, glob-expand
-                // patterns, and recurse with cycle guard. A referenced-but-unreadable file
-                // fails closed.
+                // B3: safe Include resolution. Expand ~, follow relative paths
+                // (anchored to ~/.ssh for user config, including nested includes),
+                // glob-expand patterns in any component, and recurse with cycle
+                // guard. A referenced-but-unreadable file fails closed.
                 for inc in value.split_whitespace() {
-                    let paths = resolve_include_paths(inc, &base_dir)?;
-                    // OpenSSH treats a glob with no matches as "nothing to include" (ignored).
-                    // But an explicit path that exists and can't be read must fail closed.
+                    let paths = resolve_include_paths(inc)?;
+                    // An explicit path that exists and can't be read must fail closed.
                     for inc_path in paths {
                         let included = parse_config_file(&inc_path, seen)?;
                         for (a, e) in included {
@@ -163,6 +168,30 @@ fn parse_config_file(path: &Path, seen: &mut BTreeSet<PathBuf>) -> DiscoveryResu
     }
     flush_entry(&mut hosts, &current_aliases, &current_entry);
     Ok(hosts)
+}
+
+/// `try_exists` distinguishes NotFound (→ Ok(false)) from access errors
+/// (→ Err), unlike `Path::exists` which folds every error into `false`.
+fn is_present(path: &Path) -> Result<bool, DiscoveryError> {
+    match path.try_exists() {
+        Ok(true) => Ok(true),
+        Ok(false) => Ok(false),
+        Err(e) if is_not_found(&e) => Ok(false),
+        Err(e) => Err(DiscoveryError::Unreadable(format!(
+            "{}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn is_not_found(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(2) // ENOENT
+}
+
+#[cfg(not(unix))]
+fn is_not_found(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
 }
 
 /// Split a directive line into (keyword, value), supporting both
@@ -194,44 +223,147 @@ fn expand_home(value: &str) -> String {
 }
 
 /// Resolve one Include argument to zero or more absolute paths.
-/// Handles: `~` expansion, absolute paths, relative-to-base resolution, and glob patterns.
-/// ponytail: no shell execution; glob uses std::fs dir walk.
-fn resolve_include_paths(inc: &str, base_dir: &Path) -> Result<Vec<PathBuf>, DiscoveryError> {
+///
+/// OpenSSH semantics (user configuration):
+/// - `~` expands to $HOME.
+/// - Relative paths anchor to ~/.ssh, INCLUDING nested includes (not the
+///   including file's directory).
+/// - `*`/`?` wildcards are supported in ANY path component and expanded
+///   recursively; a directory that cannot be read is an error (fail-closed),
+///   not an empty result.
+///
+/// Returns an error when resolution or glob traversal fails, so a missing
+/// unmanaged host inside an unreadable glob cannot be hidden.
+fn resolve_include_paths(inc: &str) -> Result<Vec<PathBuf>, DiscoveryError> {
     let expanded = expand_home(inc);
     let p = PathBuf::from(expanded);
     let absolute = if p.is_absolute() {
         p
     } else {
-        base_dir.join(&p)
+        // Anchor relative includes to ~/.ssh (OpenSSH user-config rule).
+        ssh_dir().join(&p)
     };
 
-    // Glob support: OpenSSH expands `*`/`?` in include patterns.
-    if inc.contains('*') || inc.contains('?') {
-        return Ok(glob_paths(&absolute));
-    }
-    Ok(vec![absolute])
-}
-
-/// Minimal glob expansion over a single directory level for `*`/`?` wildcards.
-/// ponytail: only the final path component may contain wildcards; no `**`.
-fn glob_paths(pattern: &Path) -> Vec<PathBuf> {
-    let parent = pattern.parent().unwrap_or_else(|| Path::new("."));
-    let file_pattern = match pattern.file_name().and_then(|f| f.to_str()) {
-        Some(s) => s,
-        None => return Vec::new(),
-    };
-    let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(parent) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if wildcard_match(&name, file_pattern) {
-                out.push(entry.path());
+    let mut parts: Vec<GlobPart> = Vec::new();
+    for comp in absolute.components() {
+        match comp {
+            Component::Normal(c) => {
+                let s = c.to_string_lossy().into_owned();
+                if s.contains('*') || s.contains('?') {
+                    if parts.iter().any(|p| p.pattern.is_some()) {
+                        return Err(DiscoveryError::UnresolvableInclude(format!(
+                            "multiple wildcard segments in {inc}"
+                        )));
+                    }
+                    parts.push(GlobPart {
+                        literal: None,
+                        pattern: Some(s),
+                    });
+                } else {
+                    parts.push(GlobPart {
+                        literal: Some(s),
+                        pattern: None,
+                    });
+                }
+            }
+            other => {
+                parts.push(GlobPart {
+                    literal: Some(other.as_os_str().to_string_lossy().into_owned()),
+                    pattern: None,
+                });
             }
         }
     }
+
+    if !parts.iter().any(|p| p.pattern.is_some()) {
+        return Ok(vec![absolute]);
+    }
+    // Build the literal base directory from the ORIGINAL absolute path's leading
+    // literal components (preserving the real root/home prefix), then resolve the
+    // remaining wildcard components against it.
+    let prefix_len = parts.iter().take_while(|p| p.literal.is_some()).count();
+    let mut base = PathBuf::new();
+    for c in absolute.components().take(prefix_len) {
+        base.push(c.as_os_str());
+    }
+    let mut out = Vec::new();
+    resolve_components(&base, &parts[prefix_len..], &mut out)?;
     out.sort();
-    out
+    Ok(out)
+}
+
+/// One path-component of an Include pattern.
+struct GlobPart {
+    /// Literal directory/file name (no wildcard).
+    literal: Option<String>,
+    /// Wildcard pattern (single wildcard segment), matched in full.
+    pattern: Option<String>,
+}
+
+/// Recursively resolve `parts` starting from `base`, collecting concrete files.
+/// A literal part must exist as a (sub)directory; an unreadable directory is an
+/// error. A wildcard part is expanded against the current directory and descent
+/// continues through each match (so `env-*/hosts.conf` works).
+fn resolve_components(
+    base: &Path,
+    parts: &[GlobPart],
+    out: &mut Vec<PathBuf>,
+) -> Result<(), DiscoveryError> {
+    let (head, tail) = match parts.split_first() {
+        Some(x) => x,
+        None => return Ok(()),
+    };
+
+    if let Some(lit) = &head.literal {
+        let next = base.join(lit);
+        if tail.is_empty() {
+            if is_present(&next)? {
+                out.push(next);
+            }
+            return Ok(());
+        }
+        let meta = std::fs::metadata(&next).map_err(|e| {
+            if is_not_found(&e) {
+                DiscoveryError::Unreadable(format!("include path {}: missing", next.display()))
+            } else {
+                DiscoveryError::Unreadable(format!("include dir {}: {e}", next.display()))
+            }
+        })?;
+        if !meta.is_dir() {
+            return Err(DiscoveryError::Unreadable(format!(
+                "include path {} is not a directory",
+                next.display()
+            )));
+        }
+        resolve_components(&next, tail, out)
+    } else if let Some(pat) = &head.pattern {
+        let entries = std::fs::read_dir(base).map_err(|e| {
+            DiscoveryError::Unreadable(format!("include dir {}: {e}", base.display()))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                DiscoveryError::Unreadable(format!("include dir {}: {e}", base.display()))
+            })?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Match the whole segment (e.g. `host?.conf`), so the literal suffix
+            // after the wildcard is part of the match for the final component.
+            if !wildcard_match(&name, pat) {
+                continue;
+            }
+            let matched = entry.path();
+            if tail.is_empty() {
+                out.push(matched);
+            } else if std::fs::metadata(&matched)
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
+                resolve_components(&matched, tail, out)?;
+            }
+        }
+        Ok(())
+    } else {
+        Ok(())
+    }
 }
 
 /// `*` (any run) / `?` (exactly one char) matcher, anchored at both ends.

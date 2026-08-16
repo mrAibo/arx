@@ -547,66 +547,211 @@ mod tests {
         });
     }
 
-    // ---- Behavioral: list-mode keygen confirmation (no bypass) ----
+    // ---- Behavioral: real KeyEvent transition, no bypass ----
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
 
     #[test]
-    fn list_mode_ctrl_k_sets_pending_without_writing() {
-        // Ctrl+K must set a pending flag and NOT generate a key until confirmed.
+    fn ctrl_k_event_sets_pending_without_writing() {
         with_temp_ssh(|| {
             let mut host = sample_host("srv");
             host.identity_file = None;
             host.identities_only = false;
             add_managed_host(&host).unwrap();
 
-            let mut hosts = list_managed_hosts().into_values().collect::<Vec<_>>();
-            let cursor = hosts.iter().position(|h| h.alias == "srv").unwrap();
             let mut state = AppState {
-                ssh_hosts: std::mem::take(&mut hosts),
-                ssh_pending_keygen: Some("srv".into()),
-                ssh_host_cursor: cursor,
+                ssh_hosts: list_managed_hosts().into_values().collect(),
+                ssh_host_cursor: 0,
                 ..AppState::default()
             };
-
-            // Before confirm: no identity, pending is set, key file absent.
-            assert!(state.ssh_pending_keygen.is_some());
-            let before = list_managed_hosts();
-            assert!(before.get("srv").unwrap().identity_file.is_none());
-
-            // Confirm via the app-level handler (what y triggers).
-            crate::app::confirm_pending_keygen(&mut state);
-
-            assert!(
-                state.ssh_pending_keygen.is_none(),
-                "pending clears after confirm"
+            // No pending yet.
+            assert!(state.ssh_pending_keygen.is_none());
+            // Drive the REAL Ctrl+K key event (not a pre-seeded field).
+            let consumed = crate::app::handle_ssh_host_keypress(
+                &mut state,
+                key(KeyCode::Char('k'), KeyModifiers::CONTROL),
             );
-            let after = list_managed_hosts();
-            let got = after.get("srv").expect("host still present");
+            assert!(consumed, "Ctrl+K must be consumed");
             assert!(
-                got.identity_file.is_some(),
-                "identity attached after confirm"
+                state.ssh_pending_keygen.is_some(),
+                "Ctrl+K must set pending keygen state"
             );
-            assert!(got.identities_only, "identities_only set");
+            // Still nothing written: host has no identity.
             assert!(
-                got.identity_file.clone().unwrap().exists(),
-                "generated key file exists"
+                list_managed_hosts()
+                    .get("srv")
+                    .unwrap()
+                    .identity_file
+                    .is_none()
             );
         });
     }
 
     #[test]
-    fn cancel_pending_keygen_clears_and_writes_nothing() {
+    fn y_event_confirms_pending_generates_key() {
         with_temp_ssh(|| {
+            let mut host = sample_host("srv");
+            host.identity_file = None;
+            host.identities_only = false;
+            add_managed_host(&host).unwrap();
             let mut state = AppState {
-                ssh_pending_keygen: Some("srv".into()),
+                ssh_hosts: list_managed_hosts().into_values().collect(),
+                ssh_host_cursor: 0,
                 ..AppState::default()
             };
-            crate::app::cancel_pending_keygen(&mut state);
-            assert!(state.ssh_pending_keygen.is_none());
-            assert!(state.ssh_host_status.is_some());
-            // No managed host was created/modified by cancellation.
+            crate::app::handle_ssh_host_keypress(
+                &mut state,
+                key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            );
+            // Now drive the real y key event.
+            crate::app::handle_ssh_host_keypress(
+                &mut state,
+                key(KeyCode::Char('y'), KeyModifiers::NONE),
+            );
             assert!(
-                !list_managed_hosts().contains_key("srv"),
-                "cancel must not create or modify a host"
+                state.ssh_pending_keygen.is_none(),
+                "pending cleared after y"
+            );
+            let after = list_managed_hosts();
+            let got = after.get("srv").expect("host present");
+            assert!(got.identity_file.is_some(), "y attached identity");
+            assert!(got.identities_only);
+            assert!(
+                got.identity_file.clone().unwrap().exists(),
+                "key file written"
+            );
+        });
+    }
+
+    #[test]
+    fn n_event_cancels_pending_writes_nothing() {
+        with_temp_ssh(|| {
+            let mut host = sample_host("srv");
+            host.identity_file = None;
+            add_managed_host(&host).unwrap();
+            let mut state = AppState {
+                ssh_hosts: list_managed_hosts().into_values().collect(),
+                ssh_host_cursor: 0,
+                ..AppState::default()
+            };
+            crate::app::handle_ssh_host_keypress(
+                &mut state,
+                key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            );
+            // Drive the real n key event.
+            crate::app::handle_ssh_host_keypress(
+                &mut state,
+                key(KeyCode::Char('n'), KeyModifiers::NONE),
+            );
+            assert!(
+                state.ssh_pending_keygen.is_none(),
+                "pending cleared after n"
+            );
+            assert!(
+                !list_managed_hosts().contains_key("srv")
+                    || list_managed_hosts()
+                        .get("srv")
+                        .unwrap()
+                        .identity_file
+                        .is_none(),
+                "cancel must not attach an identity"
+            );
+        });
+    }
+
+    #[test]
+    fn plain_k_event_does_not_set_pending() {
+        with_temp_ssh(|| {
+            let mut state = AppState::default();
+            let consumed = crate::app::handle_ssh_host_keypress(
+                &mut state,
+                key(KeyCode::Char('k'), KeyModifiers::NONE),
+            );
+            assert!(!consumed, "plain k must not be consumed");
+            assert!(state.ssh_pending_keygen.is_none());
+        });
+    }
+
+    // ---- Discovery regression: fail-closed paths ----
+
+    #[test]
+    fn unreadable_glob_directory_fails_closed() {
+        // A glob whose parent is a FILE (not a directory) makes read_dir error
+        // regardless of user/permissions — proving the resolver surfaces the error
+        // instead of yielding an empty result.
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            std::fs::create_dir_all(&ssh_dir).unwrap();
+            // config exists as a regular file; `~/.ssh/config/*` cannot be read as a dir.
+            let mut main = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            writeln!(main, "Include ~/.ssh/config/*").unwrap();
+            assert!(
+                parse_ssh_config().is_err(),
+                "glob over a non-directory parent must fail closed"
+            );
+        });
+    }
+
+    #[test]
+    fn wildcard_in_directory_component_is_discovered() {
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            std::fs::create_dir_all(ssh_dir.join("env-prod")).unwrap();
+            let mut main = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            writeln!(main, "Include ~/.ssh/env-*/hosts.conf").unwrap();
+            let mut inc =
+                std::fs::File::create(ssh_dir.join("env-prod").join("hosts.conf")).unwrap();
+            writeln!(inc, "Host dirwild").unwrap();
+            writeln!(inc, "    HostName 10.0.0.81").unwrap();
+            let map = parse_ssh_config().expect("discovery must succeed");
+            assert!(
+                map.contains_key("dirwild"),
+                "wildcard in directory component must be discovered"
+            );
+        });
+    }
+
+    #[test]
+    fn nested_relative_include_anchors_to_ssh_dir() {
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            std::fs::create_dir_all(ssh_dir.join("sub")).unwrap();
+            let mut root = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            writeln!(root, "Include sub/outer.conf").unwrap();
+            let mut outer = std::fs::File::create(ssh_dir.join("sub").join("outer.conf")).unwrap();
+            writeln!(outer, "Include inner.conf").unwrap();
+            let mut inner = std::fs::File::create(ssh_dir.join("inner.conf")).unwrap();
+            writeln!(inner, "Host nested").unwrap();
+            writeln!(inner, "    HostName 10.0.0.91").unwrap();
+            let map = parse_ssh_config().expect("discovery must succeed");
+            assert!(
+                map.contains_key("nested"),
+                "nested relative include must anchor to ~/.ssh, not sub/"
+            );
+        });
+    }
+
+    #[test]
+    fn failed_discovery_refuses_add() {
+        with_temp_ssh(|| {
+            let ssh = std::env::var("HOME").unwrap();
+            let ssh_dir = PathBuf::from(&ssh).join(".ssh");
+            std::fs::create_dir_all(&ssh_dir).unwrap();
+            // Glob over a regular file makes discovery error reliably (cross-user).
+            let mut main = std::fs::File::create(ssh_dir.join("config")).unwrap();
+            writeln!(main, "Include ~/.ssh/config/*").unwrap();
+            // Discovery error must propagate to a refused write.
+            let h = sample_host("anything");
+            assert!(
+                add_managed_host(&h).is_err(),
+                "write must be refused when discovery is unsafe"
             );
         });
     }

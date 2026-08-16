@@ -1197,22 +1197,13 @@ async fn event_loop(
                                 }
                             }
                             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if let Some(h) = state.ssh_hosts.get(state.ssh_host_cursor).cloned()
-                                {
-                                    // Route through the same confirmation as the form: show the
-                                    // unencrypted-key fact, require y/n before any key is written.
-                                    state.ssh_pending_keygen = Some(h.alias.clone());
-                                    state.ssh_host_status = Some(format!(
-                                        "Generate UNENCRYPTED Ed25519 key for '{}'? (y/n)",
-                                        h.alias
-                                    ));
-                                }
+                                arx::app::handle_ssh_host_keypress(&mut state, key);
                             }
                             KeyCode::Char('y') => {
-                                arx::app::confirm_pending_keygen(&mut state);
+                                arx::app::handle_ssh_host_keypress(&mut state, key);
                             }
                             KeyCode::Char('n') => {
-                                arx::app::cancel_pending_keygen(&mut state);
+                                arx::app::handle_ssh_host_keypress(&mut state, key);
                             }
                             KeyCode::Char('o') => {
                                 let path = arx::remote::ssh_config_manager::user_ssh_config_path();
