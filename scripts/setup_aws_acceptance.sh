@@ -127,8 +127,9 @@ EOF
 
 cat > /tmp/arx_dl.json <<EOF
 {"Version":"2012-10-17","Statement":[
- {"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":"$ARN"},
- {"Effect":"Allow","Action":["s3:GetObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],"Resource":"$ARN_OBJ"}
+ {"Effect":"Allow","Action":["s3:GetBucketLocation","s3:GetBucketVersioning","s3:ListBucketMultipartUploads"],"Resource":"$ARN"},
+ {"Effect":"Deny","Action":["s3:ListBucket"],"Resource":"$ARN"},
+ {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],"Resource":"$ARN_OBJ"}
 ]}
 EOF
 

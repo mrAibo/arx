@@ -496,8 +496,12 @@ async fn aws_multipart_cancel_after_first_part_aborts() {
     );
     // S3-64 physical orphan query: full role has s3:ListBucketMultipartUploads.
     // Verify NO active multipart upload remains for the exact key.
+    // Must use the explicit temporary arx-full profile (no ambient/default fallback).
     use aws_sdk_s3::Client as S3Client;
+    let full_profile = std::env::var("ARX_AWS_FULL_PROFILE")
+        .expect("ARX_AWS_FULL_PROFILE required for orphan verifier");
     let shared = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .profile_name(full_profile)
         .region(Region::new(region_for_test()))
         .load()
         .await;
