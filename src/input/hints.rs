@@ -146,6 +146,7 @@ fn candidate_actions(state: &AppState) -> Vec<(ActionId, HintPriority)> {
             (OpenCommandCenter, Secondary),
             (ToggleEmbeddedTerminal, Discovery),
             (OpenHosts, Discovery),
+            (OpenSshHosts, Discovery),
             (OpenJobs, Discovery),
             (OpenBookmarks, Discovery),
             (OpenHelp, Discovery),
@@ -186,7 +187,7 @@ mod tests {
         let hints = contextual_hints(&state, &Keymap::default());
 
         // Hint count includes all candidate actions, including ones with available=false
-        assert_eq!(hints.len(), 14);
+        assert_eq!(hints.len(), 15);
         // Verify actions with known bindings are present
         let mkdir = hints.iter().find(|h| h.action == ActionId::Mkdir).unwrap();
         assert_eq!(mkdir.binding, "F7");
