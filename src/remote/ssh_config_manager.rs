@@ -46,16 +46,23 @@ pub fn validate_alias(alias: &str) -> Result<(), String> {
     if alias.is_empty() {
         return Err("alias must not be empty".into());
     }
-    for ch in alias.chars() {
-        if ch == '\0' || ch.is_control() {
-            return Err("alias must not contain NUL or control characters".into());
-        }
+    if alias.chars().any(|c| c.is_whitespace()) {
+        return Err("alias must not contain whitespace".into());
     }
     if alias.starts_with('-') {
         return Err("alias must not start with '-'".into());
     }
     if alias.contains('*') || alias.contains('?') {
         return Err("wildcard aliases are not allowed".into());
+    }
+    if alias.contains('/') || alias == ".." || alias.starts_with("../") || alias.starts_with("..\\")
+    {
+        return Err("alias must not contain a path separator".into());
+    }
+    for ch in alias.chars() {
+        if ch == '\0' || ch.is_control() {
+            return Err("alias must not contain NUL or control characters".into());
+        }
     }
     Ok(())
 }
@@ -67,11 +74,69 @@ fn ssh_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/root/.ssh"))
 }
 
-/// Ensure ~/.ssh exists with 0700 and return its path.
+/// True when the ARX-managed include is already installed in `config`.
+/// Recognizes tilde, absolute, relative-to-~/.ssh, and glob forms as equivalent,
+/// so ARX never appends a second Include for an already-included managed file.
+pub fn is_arx_include_installed() -> bool {
+    let dir = ssh_dir();
+    let cfg = dir.join("config");
+    if !cfg.exists() {
+        return false;
+    }
+    let content = match std::fs::read_to_string(&cfg) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let target = crate::remote::ssh_config::canonical_managed_path();
+    let target_display = target.display().to_string();
+    let target_rel = "~/.ssh/arx_hosts.conf"; // ponytail: preferred readable form
+    content.lines().any(|l| {
+        let t = l.trim_start();
+        let (kw, val) = match t.split_once(char::is_whitespace) {
+            Some((k, v)) => (k.to_lowercase(), v.trim().to_string()),
+            None => return false,
+        };
+        if kw != "include" {
+            return false;
+        }
+        // Each include value (space-separated) compared canonically.
+        val.split_whitespace().any(|tok| {
+            let expanded = expand_include_token(tok, &dir);
+            expanded == target_display || tok == target_rel || expanded == target_display
+        })
+    })
+}
+
+/// Expand one Include token: ~, absolute, or relative-to-~/.ssh base.
+fn expand_include_token(tok: &str, base_dir: &Path) -> String {
+    let expanded = if let Some(rest) = tok.strip_prefix("~/") {
+        format!(
+            "{}/{}",
+            crate::remote::ssh_config::home_dir().display(),
+            rest
+        )
+    } else if tok == "~" {
+        crate::remote::ssh_config::home_dir().display().to_string()
+    } else {
+        tok.to_string()
+    };
+    let p = PathBuf::from(&expanded);
+    let abs = if p.is_absolute() {
+        p
+    } else {
+        base_dir.join(&p)
+    };
+    abs.display().to_string()
+}
+
+/// Ensure ~/.ssh exists. Only sets 0700 when ARX creates it; an existing dir
+/// keeps its permissions (F9: respect user ownership).
 fn ensure_ssh_dir() -> std::io::Result<PathBuf> {
     let dir = ssh_dir();
+    if dir.exists() {
+        return Ok(dir);
+    }
     std::fs::create_dir_all(&dir)?;
-    // 0700 where ARX creates it.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -82,33 +147,24 @@ fn ensure_ssh_dir() -> std::io::Result<PathBuf> {
 
 /// Install the ARX Include directive into ~/.ssh/config if missing.
 /// Safe: never rewrites existing blocks, never duplicates the Include,
-/// backs up the config before the first mutation, preserves all bytes/comments.
+/// backs up the config before the first mutation (and never overwrites an
+/// existing backup), preserves all bytes/comments.
 pub fn ensure_arx_include() -> std::io::Result<()> {
     let dir = ensure_ssh_dir()?;
     let cfg = dir.join("config");
     let include_value = managed_include_path();
     let include_value_str = include_value.display().to_string();
 
-    // Already present? (match `Include <path>` ignoring case/indent)
-    if cfg.exists() {
-        let content = std::fs::read_to_string(&cfg)?;
-        let present = content.lines().any(|l| {
-            let t = l.trim_start();
-            let (kw, val) = match t.split_once(char::is_whitespace) {
-                Some((k, v)) => (k.to_lowercase(), v.trim().to_string()),
-                None => return false,
-            };
-            kw == "include" && Path::new(val.as_str()) == include_value.as_path()
-        });
-        if present {
-            return Ok(());
-        }
+    if is_arx_include_installed() {
+        return Ok(());
     }
 
-    // Backup before first mutation.
+    // Backup before first mutation (preserve any pre-existing backup).
     if cfg.exists() {
         let backup = dir.join("config.arx-backup");
-        std::fs::copy(&cfg, &backup)?;
+        if !backup.exists() {
+            std::fs::copy(&cfg, &backup)?;
+        }
     }
 
     let mut content = if cfg.exists() {
@@ -118,15 +174,44 @@ pub fn ensure_arx_include() -> std::io::Result<()> {
         }
         c
     } else {
+        // ARX creates the user config with 0600 when it did not exist.
         String::new()
     };
     content.push_str(&format!("Include {}\n", include_value_str));
-    atomic_write(&cfg, content.as_bytes())
+    atomic_write(&cfg, content.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// Path to the ARX-managed hosts file.
 pub fn managed_config_path() -> PathBuf {
     managed_include_path()
+}
+
+/// Path to the user-owned ~/.ssh/config (ARX never writes to it except the
+/// single Include directive installed by `ensure_arx_include`).
+pub fn user_ssh_config_path() -> PathBuf {
+    ssh_dir().join("config")
+}
+
+/// Resolve the config file to open: `false` -> user `~/.ssh/config`,
+/// `true` -> ARX-managed `~/.ssh/arx_hosts.conf`. Returns `None` only if the
+/// ssh dir cannot be resolved.
+pub fn open_config(managed: bool) -> Option<PathBuf> {
+    if managed {
+        Some(managed_config_path())
+    } else {
+        Some(user_ssh_config_path())
+    }
+}
+
+/// Reload the managed-host snapshot from disk (sees external edits).
+pub fn reload_managed_hosts() -> BTreeMap<String, ManagedHost> {
+    list_managed_hosts()
 }
 
 /// List currently managed hosts (parsed from the managed file only).
@@ -140,10 +225,19 @@ pub fn list_managed_hosts() -> BTreeMap<String, ManagedHost> {
 }
 
 /// Does an alias already exist anywhere ARX can see (managed or user config)?
-/// Used for collision fail-closed (B5).
+/// Uses the full discovery parser (glob/nested includes) — collision fail-closed (B5).
 pub fn alias_collision(alias: &str) -> bool {
     let lower = alias.to_lowercase();
     parse_ssh_config().keys().any(|k| k.to_lowercase() == lower)
+}
+
+/// True when the alias collides with an *unmanaged* (user-owned) entry.
+/// Used so a rename/add fails closed against real discovered hosts.
+pub fn alias_collides_unmanaged(alias: &str) -> bool {
+    let lower = alias.to_lowercase();
+    parse_ssh_config()
+        .iter()
+        .any(|(k, e)| k.to_lowercase() == lower && !e.managed)
 }
 
 /// Add a managed host. Fails closed on invalid alias or collision.
@@ -161,27 +255,33 @@ pub fn add_managed_host(host: &ManagedHost) -> Result<(), String> {
     write_managed(&hosts)
 }
 
-/// Edit an existing managed host. Only ARX-owned entries may be modified.
-pub fn update_managed_host(host: &ManagedHost) -> Result<(), String> {
-    host.validate()?;
+/// Edit an existing managed host.
+/// `original_alias` must be an ARX-managed entry. If the alias changed, the
+/// new alias is validated and collision-checked against unmanaged + other managed
+/// entries; the old block is removed and the new block added in ONE atomic write.
+/// On failure the old entry remains intact.
+pub fn update_managed_host(original_alias: &str, updated: &ManagedHost) -> Result<(), String> {
+    validate_alias(original_alias)?;
+    updated.validate()?;
     let mut hosts = list_managed_hosts();
-    if !hosts.contains_key(&host.alias) {
-        return Err(format!("managed host '{}' does not exist", host.alias));
+    if !hosts.contains_key(original_alias) {
+        return Err(format!("managed host '{}' does not exist", original_alias));
     }
-    // Collision check only when the alias changed.
-    if alias_collision(&host.alias) {
-        let existing = parse_ssh_config()
-            .get(&host.alias.to_lowercase())
-            .map(|e| e.managed)
-            .unwrap_or(false);
-        if !existing {
+    let alias_changed = original_alias != updated.alias;
+    if alias_changed {
+        if alias_collides_unmanaged(&updated.alias) {
             return Err(format!(
                 "Host alias '{}' collides with an unmanaged SSH configuration.",
-                host.alias
+                updated.alias
             ));
         }
+        if hosts.contains_key(&updated.alias) && updated.alias != original_alias {
+            return Err(format!("managed host '{}' already exists", updated.alias));
+        }
+        // Atomic rename: drop old, insert new in the same map write.
+        hosts.remove(original_alias);
     }
-    hosts.insert(host.alias.clone(), host.clone());
+    hosts.insert(updated.alias.clone(), updated.clone());
     write_managed(&hosts)
 }
 
@@ -361,19 +461,70 @@ pub fn display_entry(e: &SshHostEntry) -> String {
     )
 }
 
+/// B6 — Classified result of a connection test (user-facing, factual).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestConnectionResult {
+    ConfigValid,
+    Connected,
+    HostUnreachable,
+    AuthenticationFailed,
+    HostKeyTrustFailure,
+    SshConfigError,
+}
+
+impl TestConnectionResult {
+    pub fn message(&self, alias: &str) -> String {
+        match self {
+            TestConnectionResult::ConfigValid => {
+                format!("Config valid for {alias} (no live probe)")
+            }
+            TestConnectionResult::Connected => format!("Connected to {alias}"),
+            TestConnectionResult::HostUnreachable => format!("Host {alias} unreachable"),
+            TestConnectionResult::AuthenticationFailed => {
+                format!("Authentication failed for {alias}")
+            }
+            TestConnectionResult::HostKeyTrustFailure => {
+                format!("Host key/trust failure for {alias}")
+            }
+            TestConnectionResult::SshConfigError => format!("SSH config error for {alias}"),
+        }
+    }
+}
+
+/// Classify an ssh stderr tail into a factual result bucket (no secret leakage).
+fn classify_ssh_stderr(stderr: &str) -> TestConnectionResult {
+    let tail = stderr.lines().last().unwrap_or("").to_lowercase();
+    if tail.contains("permission denied") || tail.contains("authentication") {
+        TestConnectionResult::AuthenticationFailed
+    } else if tail.contains("host key")
+        || tail.contains("hostkey")
+        || tail.contains("verify")
+        || tail.contains("fingerprint")
+    {
+        TestConnectionResult::HostKeyTrustFailure
+    } else {
+        // ponytail: any other stderr tail is conservatively treated as unreachable.
+        TestConnectionResult::HostUnreachable
+    }
+}
+
 /// B6 — Test reachability of an alias using ssh -G (truth) then a batch-mode
 /// connection probe. The alias is validated to prevent option injection.
-pub fn test_connection(alias: &str) -> io::Result<()> {
-    super::validate_ssh_alias(alias)?;
+/// Returns a classified result; the caller (TUI) must run this off the event loop.
+pub fn test_connection(alias: &str) -> TestConnectionResult {
+    if super::validate_ssh_alias(alias).is_err() {
+        return TestConnectionResult::SshConfigError;
+    }
     // Preflight: ssh -G must succeed (config resolves).
     let probe = std::process::Command::new("ssh")
         .args(["-G", "-o", "BatchMode=yes", alias])
-        .output()
-        .map_err(|e| io::Error::other(format!("ssh -G {alias}: {e}")))?;
+        .output();
+    let probe = match probe {
+        Ok(p) => p,
+        Err(_) => return TestConnectionResult::SshConfigError,
+    };
     if !probe.status.success() {
-        return Err(io::Error::other(format!(
-            "ssh -G {alias} failed (config does not resolve)"
-        )));
+        return TestConnectionResult::SshConfigError;
     }
     // Actual connection probe (no PTY, no command execution beyond true).
     let conn = std::process::Command::new("ssh")
@@ -387,16 +538,11 @@ pub fn test_connection(alias: &str) -> io::Result<()> {
             alias,
             "true",
         ])
-        .output()
-        .map_err(|e| io::Error::other(format!("ssh {alias}: {e}")))?;
-    if conn.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&conn.stderr);
-        Err(io::Error::other(format!(
-            "ssh connection to {alias} failed: {}",
-            stderr.lines().last().unwrap_or("unknown error")
-        )))
+        .output();
+    match conn {
+        Ok(c) if c.status.success() => TestConnectionResult::Connected,
+        Ok(c) => classify_ssh_stderr(&String::from_utf8_lossy(&c.stderr)),
+        Err(_) => TestConnectionResult::HostUnreachable,
     }
 }
 

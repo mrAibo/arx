@@ -43,7 +43,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
@@ -1026,6 +1026,124 @@ async fn event_loop(
 
                     // SSH Hosts overlay: Esc to close, navigation, A/E/D/T/K/O/R
                     if state.show_ssh_hosts {
+                        // When a form is open, route to form editing.
+                        if state.ssh_form.is_some() {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    if let Some(form) = state.ssh_form.as_mut() {
+                                        if form.confirm_generate {
+                                            form.confirm_generate = false;
+                                        } else {
+                                            state.ssh_form = None;
+                                        }
+                                    }
+                                }
+                                KeyCode::Up | KeyCode::Char('k')
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    if let Some(form) = state.ssh_form.as_mut() {
+                                        form.focus = form.focus.saturating_sub(1);
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Char('j')
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    if let Some(form) = state.ssh_form.as_mut() {
+                                        if form.focus < form.fields.len() - 1 {
+                                            form.focus += 1;
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('s') | KeyCode::Enter => {
+                                    match save_ssh_form(&mut state) {
+                                        Ok(msg) => {
+                                            state.ssh_host_status = Some(msg);
+                                            state.ssh_form = None;
+                                        }
+                                        Err(e) => {
+                                            if let Some(form) = state.ssh_form.as_mut() {
+                                                form.error = Some(e);
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('c') => {
+                                    state.ssh_form = None;
+                                }
+                                KeyCode::Char('t') => {
+                                    let alias = state
+                                        .ssh_form
+                                        .as_ref()
+                                        .map(|f| f.fields[0].trim().to_string())
+                                        .unwrap_or_default();
+                                    spawn_ssh_test(&mut state, alias);
+                                }
+                                KeyCode::Char('k')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    if let Some(form) = state.ssh_form.as_mut() {
+                                        form.confirm_generate = true;
+                                    }
+                                }
+                                KeyCode::Char('y') => {
+                                    let generated = {
+                                        let form = state.ssh_form.as_mut().unwrap();
+                                        if !form.confirm_generate {
+                                            None
+                                        } else {
+                                            match generate_and_attach(form) {
+                                                Ok(p) => Some(p),
+                                                Err(e) => {
+                                                    form.error = Some(e);
+                                                    form.confirm_generate = false;
+                                                    None
+                                                }
+                                            }
+                                        }
+                                    };
+                                    if let Some(path) = generated {
+                                        if let Some(form) = state.ssh_form.as_mut() {
+                                            form.fields[4] = path.display().to_string();
+                                            form.fields[6] = "yes".into();
+                                            form.confirm_generate = false;
+                                            form.error = None;
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('n') => {
+                                    if let Some(form) = state.ssh_form.as_mut() {
+                                        form.confirm_generate = false;
+                                    }
+                                }
+                                KeyCode::Tab => {
+                                    if let Some(form) = state.ssh_form.as_mut() {
+                                        let next = (form.focus + 1) % form.fields.len();
+                                        form.focus = next;
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    if let Some(form) = state.ssh_form.as_mut() {
+                                        form.fields[form.focus].pop();
+                                    }
+                                }
+                                KeyCode::Char(c)
+                                    if !c.is_control()
+                                        && state
+                                            .ssh_form
+                                            .as_ref()
+                                            .map(|f| !f.confirm_generate)
+                                            .unwrap_or(false) =>
+                                {
+                                    if let Some(form) = state.ssh_form.as_mut() {
+                                        form.fields[form.focus].push(c);
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
+                        // List-mode handling
                         match key.code {
                             KeyCode::Esc => {
                                 state.show_ssh_hosts = false;
@@ -1040,15 +1158,15 @@ async fn event_loop(
                                 }
                             }
                             KeyCode::Char('a') => {
-                                // Add — start form mode (simplified: just show status)
-                                state.ssh_host_status =
-                                    Some("Add: press A again to create 'new' (placeholder)".into());
+                                state.ssh_form = Some(arx::app::SshHostForm::new_add());
+                                if let Some(form) = &mut state.ssh_form {
+                                    form.error = None;
+                                }
                             }
                             KeyCode::Char('e') => {
                                 if let Some(h) = state.ssh_hosts.get(state.ssh_host_cursor).cloned()
                                 {
-                                    state.ssh_host_status =
-                                        Some(format!("Edit {} (placeholder)", h.alias));
+                                    state.ssh_form = Some(arx::app::SshHostForm::new_edit(&h));
                                 }
                             }
                             KeyCode::Char('d') => {
@@ -1063,7 +1181,7 @@ async fn event_loop(
                                         }
                                         Err(e) => {
                                             state.ssh_host_status =
-                                                Some(format!("Delete failed: {}", e))
+                                                Some(format!("Delete failed: {e}"))
                                         }
                                     }
                                     state.ssh_hosts =
@@ -1075,21 +1193,10 @@ async fn event_loop(
                             KeyCode::Char('t') => {
                                 if let Some(h) = state.ssh_hosts.get(state.ssh_host_cursor).cloned()
                                 {
-                                    match arx::remote::ssh_config_manager::test_connection(&h.alias)
-                                    {
-                                        Ok(_) => {
-                                            state.ssh_host_status =
-                                                Some(format!("Connected to {}", h.alias))
-                                        }
-                                        Err(e) => {
-                                            state.ssh_host_status =
-                                                Some(format!("Test failed: {}", e))
-                                        }
-                                    }
+                                    spawn_ssh_test(&mut state, h.alias);
                                 }
                             }
                             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                // Ctrl+K: generate key for selected
                                 if let Some(h) = state.ssh_hosts.get(state.ssh_host_cursor).cloned()
                                 {
                                     let key_name = format!("{}_ed25519", h.alias);
@@ -1097,23 +1204,39 @@ async fn event_loop(
                                         &key_name,
                                     ) {
                                         Ok(p) => {
-                                            state.ssh_host_status =
-                                                Some(format!("Generated {}", p.display()))
+                                            let mut updated = h.clone();
+                                            updated.identity_file = Some(p.clone());
+                                            updated.identities_only = true;
+                                            match arx::remote::ssh_config_manager::update_managed_host(&h.alias, &updated) {
+                                                Ok(_) => state.ssh_host_status = Some(format!(
+                                                    "Generated {} and attached to {}",
+                                                    p.display(),
+                                                    h.alias
+                                                )),
+                                                Err(e) => state.ssh_host_status = Some(format!(
+                                                    "Key attached failed: {e}"
+                                                )),
+                                            }
+                                            state.ssh_hosts = arx::remote::ssh_config_manager::list_managed_hosts()
+                                                .into_values()
+                                                .collect();
                                         }
                                         Err(e) => {
                                             state.ssh_host_status =
-                                                Some(format!("Key gen failed: {}", e))
+                                                Some(format!("Key gen failed: {e}"))
                                         }
                                     }
                                 }
                             }
                             KeyCode::Char('o') => {
-                                // Open config in editor (placeholder)
-                                state.ssh_host_status =
-                                    Some("Open config: use your editor (placeholder)".into());
+                                let path = arx::remote::ssh_config_manager::user_ssh_config_path();
+                                open_ssh_config_file(&mut state, &path);
+                            }
+                            KeyCode::Char('O') => {
+                                let path = arx::remote::ssh_config_manager::managed_config_path();
+                                open_ssh_config_file(&mut state, &path);
                             }
                             KeyCode::Char('r') => {
-                                // Reload
                                 state.ssh_hosts =
                                     arx::remote::ssh_config_manager::list_managed_hosts()
                                         .into_values()
@@ -4463,7 +4586,199 @@ fn render_hosts(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     frame.render_stateful_widget(list, popup_area, &mut list_state);
 }
 
+const SSH_FORM_LABELS: [&str; 7] = [
+    "Alias",
+    "HostName",
+    "User",
+    "Port",
+    "IdentityFile",
+    "ProxyJump",
+    "IdentitiesOnly (yes/no)",
+];
+
+fn render_ssh_host_form(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    form: &arx::app::SshHostForm,
+    state: &AppState,
+) {
+    use ratatui::layout::Constraint;
+    let popup_area = centered_rect(70, 80, area);
+    frame.render_widget(Clear, popup_area);
+
+    let mode = match form.mode {
+        arx::app::SshHostFormMode::Add => "Add SSH Host",
+        arx::app::SshHostFormMode::Edit => "Edit SSH Host",
+    };
+    let title =
+        format!(" {mode} (S: save | C: cancel | T: test | Ctrl+K: generate key | Esc: close) ");
+
+    let mut lines: Vec<Line> = Vec::with_capacity(SSH_FORM_LABELS.len() + 4);
+    for (i, label) in SSH_FORM_LABELS.iter().enumerate() {
+        let cursor = if i == form.focus { ">" } else { " " };
+        let val = &form.fields[i];
+        let val = if val.is_empty() { "<empty>" } else { val };
+        let style = if i == form.focus {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{cursor} {label:<22}: "), style),
+            Span::styled(val.to_string(), style),
+        ]));
+    }
+
+    if let Some(err) = &form.error {
+        lines.push(Line::from(Span::styled(
+            format!("  ERROR: {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    if form.confirm_generate {
+        lines.push(Line::from(Span::styled(
+            "  Generate UNENCRYPTED Ed25519 key? (y/n) — private key has NO passphrase and stays on disk only.",
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    // ponytail: single if-let (edition 2021 has no let-chains); .cloned() lifts out of the guard.
+    let test_result = state
+        .ssh_test_result
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().cloned());
+    if let Some(r) = test_result {
+        lines.push(Line::from(Span::styled(
+            format!("  Test: {r}"),
+            Style::default().fg(Color::Green),
+        )));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    let _ = Constraint::Min(0);
+    frame.render_widget(paragraph, popup_area);
+}
+
+/// Build a ManagedHost from the form and persist it (add or atomic rename).
+fn save_ssh_form(state: &mut AppState) -> Result<String, String> {
+    let form = state
+        .ssh_form
+        .as_ref()
+        .ok_or_else(|| "no form active".to_string())?;
+    let alias = form.fields[0].trim().to_string();
+    let hostname = form.fields[1].trim().to_string();
+    let user = form.fields[2].trim().to_string();
+    let port_str = form.fields[3].trim();
+    let identity_file = form.fields[4].trim();
+    let proxy_jump = form.fields[5].trim();
+    let ident_only = form.fields[6].trim().eq_ignore_ascii_case("yes");
+
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| format!("Port must be a number 1-65535, got '{port_str}'"))?;
+
+    let host = arx::remote::ssh_config_manager::ManagedHost {
+        alias: alias.clone(),
+        hostname,
+        user,
+        port,
+        identity_file: if identity_file.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(identity_file))
+        },
+        proxy_jump: if proxy_jump.is_empty() {
+            None
+        } else {
+            Some(proxy_jump.to_string())
+        },
+        identities_only: ident_only,
+    };
+
+    match form.mode {
+        arx::app::SshHostFormMode::Add => {
+            arx::remote::ssh_config_manager::add_managed_host(&host)?;
+            state.ssh_hosts = arx::remote::ssh_config_manager::list_managed_hosts()
+                .into_values()
+                .collect();
+            Ok(format!("Added managed host {alias}"))
+        }
+        arx::app::SshHostFormMode::Edit => {
+            let original = form
+                .original_alias
+                .clone()
+                .ok_or_else(|| "missing original alias".to_string())?;
+            arx::remote::ssh_config_manager::update_managed_host(&original, &host)?;
+            state.ssh_hosts = arx::remote::ssh_config_manager::list_managed_hosts()
+                .into_values()
+                .collect();
+            Ok(format!("Updated managed host {alias}"))
+        }
+    }
+}
+
+/// F7 — Run the bounded ssh connection test off the event loop via tokio::spawn.
+fn spawn_ssh_test(state: &mut AppState, alias: String) {
+    if alias.trim().is_empty() {
+        state.ssh_host_status = Some("Cannot test: alias is empty".into());
+        return;
+    }
+    if let Ok(mut g) = state.ssh_test_result.lock() {
+        *g = None;
+    }
+    let slot = state.ssh_test_result.clone();
+    let alias_for_spawn = alias.clone();
+    tokio::spawn(async move {
+        let result = arx::remote::ssh_config_manager::test_connection(&alias_for_spawn);
+        if let Ok(mut g) = slot.lock() {
+            *g = Some(result.message(&alias_for_spawn));
+        }
+    });
+    state.ssh_host_status = Some(format!("Testing {alias}…"));
+}
+
+/// Generate an Ed25519 key for the current form alias and attach it.
+fn generate_and_attach(form: &mut arx::app::SshHostForm) -> Result<PathBuf, String> {
+    let alias = form.fields[0].trim().to_string();
+    if alias.is_empty() {
+        return Err("Alias required before generating a key".into());
+    }
+    let key_name = format!("{alias}_ed25519");
+    let path = arx::remote::ssh_config_manager::generate_ed25519_key(&key_name)
+        .map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+/// Open a config file in the user's editor (O / Shift+O). Argument-safe
+/// launcher (DesktopService::open_editor) — no shell interpolation.
+fn open_ssh_config_file(state: &mut AppState, path: &Path) {
+    let editor = DesktopService::resolve_editor(None);
+    match editor {
+        Some(editor) => {
+            let owned = path.to_path_buf();
+            let display = owned.display().to_string();
+            tokio::spawn(async move {
+                let _ = DesktopService::open_editor(&editor, &owned).await;
+            });
+            state.ssh_host_status = Some(format!("Opening {display} in editor"));
+        }
+        None => {
+            state.ssh_host_status = Some("No $EDITOR/$VISUAL set; cannot open file".into());
+        }
+    }
+}
+
 fn render_ssh_hosts(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    if let Some(form) = &state.ssh_form {
+        render_ssh_host_form(frame, area, form, state);
+        return;
+    }
     let popup_area = centered_rect(70, 70, area);
     frame.render_widget(Clear, popup_area);
 

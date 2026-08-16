@@ -189,6 +189,76 @@ pub enum PanelMode {
     Brief, // filenames in columns
 }
 
+/// PACK B: Add/Edit form for the managed SSH host manager (F1/F2).
+/// Fields are edited as plain strings; conversion/validation happens on Save.
+#[derive(Debug)]
+pub struct SshHostForm {
+    pub mode: SshHostFormMode,
+    /// [0]=Alias [1]=HostName [2]=User [3]=Port [4]=IdentityFile [5]=ProxyJump [6]=IdentitiesOnly(yes/no)
+    pub fields: [String; 7],
+    /// Index into `fields` currently being edited.
+    pub focus: usize,
+    /// Original alias when editing (for atomic rename).
+    pub original_alias: Option<String>,
+    /// Transient error shown after a failed Save.
+    pub error: Option<String>,
+    /// True while awaiting explicit confirmation to generate an unencrypted key.
+    pub confirm_generate: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SshHostFormMode {
+    Add,
+    Edit,
+}
+
+impl SshHostForm {
+    pub fn new_add() -> Self {
+        Self {
+            mode: SshHostFormMode::Add,
+            fields: [
+                String::new(),
+                String::new(),
+                whoami_user(),
+                "22".into(),
+                String::new(),
+                String::new(),
+                "no".into(),
+            ],
+            focus: 0,
+            original_alias: None,
+            error: None,
+            confirm_generate: false,
+        }
+    }
+
+    pub fn new_edit(h: &crate::remote::ssh_config_manager::ManagedHost) -> Self {
+        Self {
+            mode: SshHostFormMode::Edit,
+            fields: [
+                h.alias.clone(),
+                h.hostname.clone(),
+                h.user.clone(),
+                h.port.to_string(),
+                h.identity_file
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                h.proxy_jump.clone().unwrap_or_default(),
+                if h.identities_only { "yes" } else { "no" }.into(),
+            ],
+            focus: 0,
+            original_alias: Some(h.alias.clone()),
+            error: None,
+            confirm_generate: false,
+        }
+    }
+}
+
+fn whoami_user() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "root".into())
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub should_quit: bool,
@@ -252,6 +322,10 @@ pub struct AppState {
     pub ssh_host_cursor: usize,
     pub ssh_hosts: Vec<crate::remote::ssh_config_manager::ManagedHost>,
     pub ssh_host_status: Option<String>,
+    /// Active Add/Edit form (F1/F2). None when the list is shown.
+    pub ssh_form: Option<SshHostForm>,
+    /// Shared result slot for async (non-blocking) connection tests (F7).
+    pub ssh_test_result: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     // B4: render-only snapshot; JobManager owns runtime lifecycle.
     pub jobs: Vec<Job>,
     pub show_jobs: bool,
@@ -379,6 +453,8 @@ impl Default for AppState {
             ssh_host_cursor: 0,
             ssh_hosts: Vec::new(),
             ssh_host_status: None,
+            ssh_form: None,
+            ssh_test_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             jobs: Vec::new(),
             show_jobs: false,
             job_cursor: 0,

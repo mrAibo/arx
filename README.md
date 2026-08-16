@@ -203,6 +203,7 @@ Menu entries appear in Command Center (Ctrl+P).
 | SFTP F3 bounded text preview | ✅ |
 | SFTP F4 conflict-safe text editing | ✅ |
 | ~/.ssh/config parsing (aliases, ProxyJump, keys) | ✅ |
+| Managed SSH Host Manager (F12: add/edit/delete/test/identity/open) | ✅ |
 | Command Center (Ctrl+P) — fuzzy search | ✅ |
 | Quick Actions — compress, chmod, touch, mkdir, symlink, sha256 | ✅ |
 | Preview engine — chafa, pdftotext, ffprobe, 7z, bat | ✅ |
