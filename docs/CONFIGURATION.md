@@ -66,6 +66,31 @@ stores or displays them. To generate a key, ARX shells out to `ssh-keygen`
 
 ## Editing
 
-Use the in-app **SSH Hosts** manager (Commander → SSH Hosts) for add / edit /
-delete / test / identity / open-config / reload. Manual edits to
-`~/.ssh/config` or `~/.ssh/arx_hosts.conf` are also respected.
+Use the in-app **SSH Hosts** manager (press **F12**, or Commander → SSH Hosts)
+for add / edit / delete / test / identity / open-config / reload. Manual edits
+to `~/.ssh/config` or `~/.ssh/arx_hosts.conf` are also respected (reload to
+resync).
+
+### SSH Hosts actions
+
+| Key | Action |
+|-----|--------|
+| `A` | Add a host (form: Alias, HostName, User, Port, IdentityFile, ProxyJump, IdentitiesOnly) |
+| `E` | Edit the selected host (same form, pre-filled) |
+| `D` | Delete the selected ARX-managed host only |
+| `T` | Test the alias (config truth via `ssh -G`, then a bounded real probe) — runs off the TUI loop |
+| `K` | Identity: in the form, `Ctrl+K` generates a new Ed25519 key and attaches it; typing a path stores that path |
+| `O` | Open `~/.ssh/config` in `$EDITOR`/`$VISUAL` (argument-safe, no shell interpolation) |
+| `Shift+O` | Open `~/.ssh/arx_hosts.conf` |
+| `R` | Reload from disk (sees external edits) |
+
+### Generated keys — honest notes
+
+- Keys are **Ed25519**, generated via `ssh-keygen`.
+- Default path is `~/.ssh/arx/<alias>_ed25519`.
+- ARX-generated keys are currently created **without a passphrase**; the form
+  shows this fact and asks for confirmation before generating.
+- The private key remains filesystem-only (ARX never stores or displays the
+  key bytes or passphrase).
+- When a generated key is attached, ARX sets `IdentitiesOnly yes` unless you
+  disable it.
