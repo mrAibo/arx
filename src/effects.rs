@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use crate::vfs::{ListedEntry, Location, RemoteEditSession};
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -49,11 +50,32 @@ pub enum Effect {
     /// Write edited content back to a remote file (atomic staging).
     WriteBackRemoteFile {
         session: RemoteEditSession,
+        /// Narrow typed progress callback (Verifying / RollbackOrRecovery) emitted
+        /// by the provider at the real transaction boundary. TUI supplies the
+        /// closure that publishes to JobManager; the executor just forwards it.
+        progress: ProgressSlot,
     },
     OpenPath {
         path: PathBuf,
     },
 }
+
+/// ponytail: closure can't be Debug/Eq/Clone-trivially; wrap so Effect keeps its
+/// derives. Two effects are compared ignoring the progress sender (it's a
+/// behavior seam, not observable data).
+#[derive(Clone)]
+pub struct ProgressSlot(pub Option<mpsc::UnboundedSender<crate::jobs::RemoteEditPhase>>);
+impl std::fmt::Debug for ProgressSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProgressSlot(..)")
+    }
+}
+impl PartialEq for ProgressSlot {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for ProgressSlot {}
 
 /// Typed result sent back across the effect boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]

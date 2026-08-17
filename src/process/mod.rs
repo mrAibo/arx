@@ -9,7 +9,7 @@ use std::process::Output;
 
 use tokio::process::Command;
 
-use crate::effects::{Effect, EffectEvent};
+use crate::effects::{Effect, EffectEvent, ProgressSlot};
 use crate::services::{
     DesktopService, DiffService, FileInfoService, InfrastructureService, PreviewService,
     TreeService, preview,
@@ -307,9 +307,13 @@ impl ProcessService {
                 }
             }
 
-            Effect::WriteBackRemoteFile { mut session } => {
+            Effect::WriteBackRemoteFile {
+                mut session,
+                progress,
+            } => {
                 let name = session.name.clone();
                 let label = format!("remote write-back: {name}");
+                let ProgressSlot(progress) = progress;
                 if cancellation.is_cancelled() {
                     return EffectEvent::Failed {
                         label,
@@ -371,6 +375,7 @@ impl ProcessService {
                         &data,
                         &session.revision,
                         cancellation,
+                        progress,
                     )
                     .await;
                 match result {
@@ -1072,6 +1077,7 @@ mod tests {
             data: &[u8],
             revision: &crate::vfs::RemoteEditRevision,
             _cancellation: &crate::vfs::CancellationFlag,
+            _progress: Option<crate::vfs::RemoteEditProgressFn>,
         ) -> std::io::Result<()> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             *self.expected_seen.lock().unwrap() = Some(revision.bytes().to_vec());
@@ -1138,7 +1144,10 @@ mod tests {
         let (registry, session, _, writes, _) =
             writeback_fixture(b"same", b"same", 0o600, b"same", 0o600);
         let event = ProcessService::execute_with_registry(
-            Effect::WriteBackRemoteFile { session },
+            Effect::WriteBackRemoteFile {
+                session,
+                progress: ProgressSlot(None),
+            },
             &registry,
         )
         .await;
@@ -1152,7 +1161,10 @@ mod tests {
         let (registry, session, _, writes, _) =
             writeback_fixture(b"old", &edited, 0o600, b"old", 0o600);
         let event = ProcessService::execute_with_registry(
-            Effect::WriteBackRemoteFile { session },
+            Effect::WriteBackRemoteFile {
+                session,
+                progress: ProgressSlot(None),
+            },
             &registry,
         )
         .await;
@@ -1167,7 +1179,10 @@ mod tests {
         let (registry, session, current, writes, _) =
             writeback_fixture(b"hello", b"local", 0o600, b"other", 0o600);
         let event = ProcessService::execute_with_registry(
-            Effect::WriteBackRemoteFile { session },
+            Effect::WriteBackRemoteFile {
+                session,
+                progress: ProgressSlot(None),
+            },
             &registry,
         )
         .await;
@@ -1181,7 +1196,10 @@ mod tests {
         let (registry, session, _, writes, _) =
             writeback_fixture(b"", b"local", 0o600, b"x", 0o600);
         let event = ProcessService::execute_with_registry(
-            Effect::WriteBackRemoteFile { session },
+            Effect::WriteBackRemoteFile {
+                session,
+                progress: ProgressSlot(None),
+            },
             &registry,
         )
         .await;
@@ -1191,7 +1209,10 @@ mod tests {
         let (registry, session, _, writes, _) =
             writeback_fixture(b"same", b"local", 0o600, b"same", 0o644);
         let event = ProcessService::execute_with_registry(
-            Effect::WriteBackRemoteFile { session },
+            Effect::WriteBackRemoteFile {
+                session,
+                progress: ProgressSlot(None),
+            },
             &registry,
         )
         .await;
@@ -1204,7 +1225,10 @@ mod tests {
         let (registry, session, current, writes, expected_seen) =
             writeback_fixture(b"old", b"new", 0o600, b"old", 0o600);
         let event = ProcessService::execute_with_registry(
-            Effect::WriteBackRemoteFile { session },
+            Effect::WriteBackRemoteFile {
+                session,
+                progress: ProgressSlot(None),
+            },
             &registry,
         )
         .await;

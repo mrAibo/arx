@@ -363,6 +363,12 @@ impl CancellationFlag {
 /// Files larger than this are refused before editor launch.
 pub const MAX_REMOTE_EDIT_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
+/// ponytail: narrow typed progress callback from a remote-write transaction to
+/// JobManager. The provider never knows about JobManager; it just emits the
+/// phase at the real boundary (Verifying before verify, RollbackOrRecovery at
+/// the real recovery transition). TUI supplies the sender.
+pub type RemoteEditProgressFn = tokio::sync::mpsc::UnboundedSender<crate::jobs::RemoteEditPhase>;
+
 /// Backend trait — each provider implements this. async deferred to F2.
 /// ponytail: sync list() kept for backward compat; list_async() is the new path.
 #[async_trait::async_trait]
@@ -447,6 +453,7 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
         _data: &[u8],
         _revision: &RemoteEditRevision,
         _cancellation: &CancellationFlag,
+        _progress: Option<crate::vfs::RemoteEditProgressFn>,
     ) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -1154,13 +1161,14 @@ impl ProviderRegistry {
         data: &[u8],
         revision: &RemoteEditRevision,
         cancellation: &CancellationFlag,
+        progress: Option<crate::vfs::RemoteEditProgressFn>,
     ) -> std::io::Result<()> {
         self.require(&location.provider_id(), Capability::Write)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::Unsupported, error))?;
         let (provider, parent_path) = self.provider_for_location(location)?;
         let path = validated_child_path(&parent_path, name)?;
         provider
-            .write_file_bytes_if_unchanged(&path, data, revision, cancellation)
+            .write_file_bytes_if_unchanged(&path, data, revision, cancellation, progress)
             .await
     }
 
@@ -2349,6 +2357,19 @@ mod tests {
     struct RoutingMockProvider {
         host_label: String,
         read_result: Mutex<Option<std::io::Result<BoundedRead>>>,
+        // #51/MAJOR#1: capture the progress phases the provider emits so the
+        // ordering contract (Verifying before terminal; RollbackOrRecovery at
+        // the real recovery transition; no Verifying on pre-verify failure) is
+        // asserted without a real SFTP host. Captured via the closure the test
+        // passes in `write_file_bytes_if_unchanged` (see below) — no host.
+        write_mode: Mutex<WriteMode>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum WriteMode {
+        Success,
+        PreVerifyFailure,
+        RecoveryRequired,
     }
 
     impl std::fmt::Debug for RoutingMockProvider {
@@ -2394,9 +2415,118 @@ mod tests {
             _data: &[u8],
             _revision: &RemoteEditRevision,
             _cancellation: &CancellationFlag,
+            progress: Option<RemoteEditProgressFn>,
         ) -> std::io::Result<()> {
-            panic!("mock: write must be rejected at registry boundary")
+            // #51/MAJOR#1: drive the real writeback progress contract through the
+            // mock so ordering is asserted without a live SFTP host.
+            let mode = *self.write_mode.lock().unwrap();
+            match mode {
+                WriteMode::Success => {
+                    // Verifying is emitted at the real verification boundary,
+                    // BEFORE the terminal result — not post-hoc by the TUI.
+                    if let Some(p) = &progress {
+                        let _ = p.send(crate::jobs::RemoteEditPhase::Verifying);
+                    }
+                    Ok(())
+                }
+                WriteMode::PreVerifyFailure => {
+                    // Failure before verification: must NOT fabricate Verifying.
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "pre-verify failure",
+                    ))
+                }
+                WriteMode::RecoveryRequired => {
+                    // Real recovery transition: RollbackOrRecovery emitted at the
+                    // genuine boundary before the terminal recovery error.
+                    if let Some(p) = &progress {
+                        let _ = p.send(crate::jobs::RemoteEditPhase::RollbackOrRecovery);
+                    }
+                    Err(std::io::Error::other("recovery required"))
+                }
+            }
         }
+    }
+
+    fn make_mock(
+        host_label: &str,
+    ) -> (
+        RoutingMockProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<crate::jobs::RemoteEditPhase>>>,
+    ) {
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            RoutingMockProvider {
+                host_label: host_label.to_string(),
+                read_result: Mutex::new(None),
+                write_mode: Mutex::new(WriteMode::Success),
+            },
+            capture,
+        )
+    }
+
+    // ponytail: drive writeback progress through a channel and drain buffered
+    // sends into the shared capture vec, so ordering is asserted without a host.
+    async fn mock_write(
+        provider: &RoutingMockProvider,
+        cap: &std::sync::Arc<std::sync::Mutex<Vec<crate::jobs::RemoteEditPhase>>>,
+        rev: &RemoteEditRevision,
+    ) -> std::io::Result<()> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let r = provider
+            .write_file_bytes_if_unchanged(
+                "file.txt",
+                b"data",
+                rev,
+                &CancellationFlag::default(),
+                Some(tx),
+            )
+            .await;
+        while let Ok(p) = rx.try_recv() {
+            cap.lock().unwrap().push(p);
+        }
+        r
+    }
+
+    #[tokio::test]
+    async fn remote_write_progress_verifying_before_terminal_and_never_on_pre_verify_failure() {
+        use crate::jobs::RemoteEditPhase;
+        // Success path: Verifying emitted, then terminal Ok.
+        let (provider, cap) = make_mock("mock-host");
+        let rev = RemoteEditRevision::new(b"abc123".to_vec(), 0o600, 1000, 1000);
+        let result = mock_write(&provider, &cap, &rev).await;
+        assert!(result.is_ok(), "success write should succeed");
+        let seen = cap.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![RemoteEditPhase::Verifying],
+            "Verifying before terminal on success"
+        );
+
+        // Pre-verify failure: NO Verifying emitted.
+        *provider.write_mode.lock().unwrap() = WriteMode::PreVerifyFailure;
+        cap.lock().unwrap().clear();
+        let result = mock_write(&provider, &cap, &rev).await;
+        assert!(result.is_err(), "pre-verify failure should fail");
+        assert!(
+            cap.lock().unwrap().is_empty(),
+            "Verifying must NOT be fabricated on pre-verify failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_write_progress_recovery_transition_is_rollback_or_recovery() {
+        use crate::jobs::RemoteEditPhase;
+        let (provider, cap) = make_mock("mock-host");
+        *provider.write_mode.lock().unwrap() = WriteMode::RecoveryRequired;
+        let rev = RemoteEditRevision::new(b"abc123".to_vec(), 0o600, 1000, 1000);
+        let result = mock_write(&provider, &cap, &rev).await;
+        assert!(result.is_err(), "recovery path should fail");
+        assert_eq!(
+            cap.lock().unwrap().clone(),
+            vec![RemoteEditPhase::RollbackOrRecovery],
+            "RollbackOrRecovery emitted at the real recovery transition"
+        );
     }
 
     #[test]
@@ -2413,6 +2543,7 @@ mod tests {
                     unix_uid: None,
                     unix_gid: None,
                 }))),
+                write_mode: Mutex::new(WriteMode::Success),
             }),
             capabilities::SFTP_CAPABILITIES,
         );
@@ -2427,6 +2558,7 @@ mod tests {
                     unix_uid: None,
                     unix_gid: None,
                 }))),
+                write_mode: Mutex::new(WriteMode::Success),
             }),
             capabilities::SFTP_CAPABILITIES,
         );
@@ -2486,6 +2618,7 @@ mod tests {
             Box::new(RoutingMockProvider {
                 host_label: "read-only".into(),
                 read_result: Mutex::new(None),
+                write_mode: Mutex::new(WriteMode::Success),
             }),
             CapabilitySet::NONE.with(Capability::Read),
         );
@@ -2507,6 +2640,7 @@ mod tests {
                 b"new",
                 &revision,
                 &CancellationFlag::default(),
+                None,
             )
             .await
             .unwrap_err();
@@ -2522,6 +2656,7 @@ mod tests {
             Box::new(RoutingMockProvider {
                 host_label: "host-a".into(),
                 read_result: Mutex::new(None),
+                write_mode: Mutex::new(WriteMode::Success),
             }),
             capabilities::SFTP_CAPABILITIES,
         );
@@ -2543,6 +2678,7 @@ mod tests {
                 b"new",
                 &revision,
                 &CancellationFlag::default(),
+                None,
             )
             .await
             .unwrap_err();

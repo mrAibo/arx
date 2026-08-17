@@ -60,7 +60,14 @@ async fn production_writeback(
     registry: &ProviderRegistry,
     session: RemoteEditSession,
 ) -> EffectEvent {
-    ProcessService::execute_with_registry(Effect::WriteBackRemoteFile { session }, registry).await
+    ProcessService::execute_with_registry(
+        Effect::WriteBackRemoteFile {
+            session,
+            progress: arx::effects::ProgressSlot(None),
+        },
+        registry,
+    )
+    .await
 }
 
 fn ssh_write(host: &str, path: &str, bytes: &[u8], mode: u32) -> std::io::Result<()> {
@@ -135,7 +142,7 @@ async fn remote_edit_sftp_smoke() -> Result<(), Box<dyn std::error::Error>> {
         .into_revision()?;
     assert_eq!(small_revision.bytes(), b"old\n");
     provider
-        .write_file_bytes_if_unchanged(&small_path, b"new\n", &small_revision, &cancellation)
+        .write_file_bytes_if_unchanged(&small_path, b"new\n", &small_revision, &cancellation, None)
         .await?;
     assert_eq!(
         provider.read_all_capped(&small_path, 1024).await?.bytes,
@@ -165,7 +172,13 @@ async fn remote_edit_sftp_smoke() -> Result<(), Box<dyn std::error::Error>> {
         .into_revision()?;
     assert_ne!(group_revision.unix_gid(), original_gid);
     provider
-        .write_file_bytes_if_unchanged(&group_path, b"group new\n", &group_revision, &cancellation)
+        .write_file_bytes_if_unchanged(
+            &group_path,
+            b"group new\n",
+            &group_revision,
+            &cancellation,
+            None,
+        )
         .await?;
     let group_metadata = provider.metadata(&group_path).await?;
     assert_eq!(group_metadata.unix_uid, Some(original_uid));
@@ -184,6 +197,7 @@ async fn remote_edit_sftp_smoke() -> Result<(), Box<dyn std::error::Error>> {
             b"#!/bin/sh\nprintf ok\n",
             &executable_revision,
             &cancellation,
+            None,
         )
         .await?;
     assert_eq!(
@@ -205,7 +219,13 @@ async fn remote_edit_sftp_smoke() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .into_revision()?;
     provider
-        .write_file_bytes_if_unchanged(&large_path, &large_edited, &large_revision, &cancellation)
+        .write_file_bytes_if_unchanged(
+            &large_path,
+            &large_edited,
+            &large_revision,
+            &cancellation,
+            None,
+        )
         .await?;
     let large_read = provider.read_all_capped(&large_path, 2_000_000).await?;
     assert!(!large_read.truncated);
@@ -241,7 +261,13 @@ async fn remote_edit_sftp_smoke() -> Result<(), Box<dyn std::error::Error>> {
         .into_revision()?;
     ssh_write(&host_alias, &conflict_path, b"BBBB", 0o600)?;
     let conflict = provider
-        .write_file_bytes_if_unchanged(&conflict_path, b"LOCAL", &conflict_revision, &cancellation)
+        .write_file_bytes_if_unchanged(
+            &conflict_path,
+            b"LOCAL",
+            &conflict_revision,
+            &cancellation,
+            None,
+        )
         .await
         .expect_err("same-size remote mutation must conflict");
     assert_eq!(conflict.kind(), std::io::ErrorKind::AlreadyExists);
@@ -258,7 +284,7 @@ async fn remote_edit_sftp_smoke() -> Result<(), Box<dyn std::error::Error>> {
         .into_revision()?;
     ssh_write(&host_alias, &zero_path, b"x", 0o600)?;
     let zero_conflict = provider
-        .write_file_bytes_if_unchanged(&zero_path, b"local", &zero_revision, &cancellation)
+        .write_file_bytes_if_unchanged(&zero_path, b"local", &zero_revision, &cancellation, None)
         .await
         .expect_err("zero-byte frozen revision must not be a sentinel");
     assert_eq!(zero_conflict.kind(), std::io::ErrorKind::AlreadyExists);
@@ -275,7 +301,7 @@ async fn remote_edit_sftp_smoke() -> Result<(), Box<dyn std::error::Error>> {
         &format!("chmod 644 -- {}", sh_quote(&mode_path)),
     )?;
     let mode_conflict = provider
-        .write_file_bytes_if_unchanged(&mode_path, b"local", &mode_revision, &cancellation)
+        .write_file_bytes_if_unchanged(&mode_path, b"local", &mode_revision, &cancellation, None)
         .await
         .expect_err("concurrent chmod must conflict");
     assert_eq!(mode_conflict.kind(), std::io::ErrorKind::AlreadyExists);

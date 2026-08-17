@@ -120,15 +120,28 @@ fn stream_read_error(error: io::Error, ctx: &str) -> io::Error {
 /// Bounded health probe for a pooled session before reuse (TRACK C #48).
 /// Uses a harmless `realpath(".")`; fails closed on timeout so a stale session
 /// is discarded rather than reused. No destructive operation is replayed.
-async fn probe_session_healthy(session: &russh_sftp::client::SftpSession) -> SftpInvalidation {
-    match timeout(Duration::from_secs(5), session.canonicalize(".")).await {
-        // A definitive Status reply means the server is alive and answering →
-        // the session is reusable (application-level rejection, not transport).
-        Ok(Err(russh_sftp::client::error::Error::Status(_))) => SftpInvalidation::Keep,
-        Ok(Ok(_)) => SftpInvalidation::Keep,
-        // Any transport error or timeout → do not trust reuse.
-        Ok(Err(error)) => classify_russh_error(&error),
+/// Run a health probe with a bounded timeout. The probe future itself is
+/// unbounded (a hang would otherwise wedge the pool); the bound lives HERE so
+/// production and the deterministic #48 matrix share one timeout path. A
+/// timeout classifies the session as `TransportBroken` → the pool discards it
+/// and reconnects exactly once.
+async fn bounded_health_probe<F>(duration: Duration, probe: F) -> SftpInvalidation
+where
+    F: std::future::Future<Output = SftpInvalidation>,
+{
+    match timeout(duration, probe).await {
+        Ok(v) => v,
         Err(_elapsed) => SftpInvalidation::TransportBroken,
+    }
+}
+
+async fn probe_session_healthy(session: &russh_sftp::client::SftpSession) -> SftpInvalidation {
+    // ponytail: no internal timeout here — bounded_health_probe owns the bound.
+    // A definitive Status reply means the server is alive and answering →
+    // the session is reusable (application-level rejection, not transport).
+    match session.canonicalize(".").await {
+        Ok(_) => SftpInvalidation::Keep,
+        Err(error) => classify_russh_error(&error),
     }
 }
 
@@ -788,6 +801,10 @@ pub struct SftpProvider {
     faults: AtomicWriteFaults,
     #[cfg(test)]
     pause_after_pin: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Bound for the pooled-session health probe before reuse. Production: 5s.
+    /// Tests inject a near-zero value to exercise the SAME internal timeout
+    /// path (discard stale + reconnect once) without an outer tokio::time::timeout.
+    probe_timeout: Duration,
     /// Test-only injectable seam for the pooled acquire/probe/reconnect
     /// algorithm (TRACK C #48 deterministic matrix). When set,
     /// `connect_for_mutation` uses these instead of a real SSH session, so the
@@ -840,6 +857,7 @@ impl SftpProvider {
             faults: AtomicWriteFaults::default(),
             #[cfg(test)]
             pause_after_pin: None,
+            probe_timeout: Duration::from_secs(5),
             test_probe: None,
             test_connect: None,
         }
@@ -936,14 +954,21 @@ impl SftpProvider {
         let mut guard = self.connection.lock().await;
         // Probe the pooled session (async); abort only on transport break.
         // Test seam: if `test_probe` is injected, it stands in for the real
-        // `realpath(".")` health probe so the matrix runs without a network.
+        // `canonicalize(".")` health probe so the matrix runs without a network.
+        // Both paths run through `bounded_health_probe` — the SAME internal
+        // timeout (self.probe_timeout) that production uses, so the #48 matrix
+        // exercises the real discard-stale + reconnect-once semantics, not an
+        // outer tokio::time::timeout.
         let probe = match guard.as_ref() {
             Some(session) => {
-                if let Some(probe_fn) = &self.test_probe {
-                    probe_fn(session).await
+                let future: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = SftpInvalidation> + Send + Sync>,
+                > = if let Some(probe_fn) = &self.test_probe {
+                    probe_fn(session)
                 } else {
-                    probe_session_healthy(session.session()).await
-                }
+                    Box::pin(probe_session_healthy(session.session()))
+                };
+                bounded_health_probe(self.probe_timeout, future).await
             }
             None => SftpInvalidation::Keep,
         };
@@ -1009,11 +1034,13 @@ impl SftpProvider {
         self
     }
 
-    /// Test-only: inject a probe that never resolves (pending forever) so the
-    /// bounded-timeout acquire path can be proven deterministically under a
-    /// bounded `tokio::time::timeout` (no real `sleep`, no `test-util` feature).
-    /// Also injects the stub connect so the first acquire succeeds immediately
-    /// and only the second (pooled) acquire hits the pending probe.
+    /// Test-only: inject a probe that never resolves (pending forever) and a
+    /// short internal `probe_timeout` so the SAME bounded path production uses
+    /// fires the internal timeout deterministically (discard stale + reconnect
+    /// once). No outer `tokio::time::timeout` — the test exercises the real
+    /// internal path. Also injects the stub connect so the first acquire
+    /// succeeds immediately and only the second (pooled) acquire hits the
+    /// pending probe.
     #[cfg(test)]
     fn with_test_pool_pending_probe(
         mut self,
@@ -1036,6 +1063,7 @@ impl SftpProvider {
                 })
             },
         );
+        self.probe_timeout = Duration::from_millis(50);
         self.test_connect = Some(connect);
         self.test_probe = Some(probe);
         self
@@ -1197,13 +1225,15 @@ impl VfsProvider for SftpProvider {
         data: &[u8],
         revision: &RemoteEditRevision,
         cancellation: &CancellationFlag,
+        progress: Option<crate::vfs::RemoteEditProgressFn>,
     ) -> std::io::Result<()> {
         // TRACK G (#52): no double-lock. `write_atomic` already invalidates the
         // pooled connection itself when the transport breaks; application-level
         // (Status) failures correctly keep the connection. Re-acquiring the lock
         // here only to rediscover connection state would be a misleading second
         // lock scope, so we just propagate the result.
-        self.write_atomic(path, data, revision, cancellation).await
+        self.write_atomic(path, data, revision, cancellation, progress)
+            .await
     }
 
     async fn metadata(&self, path: &str) -> std::io::Result<FileMetadata> {
@@ -1334,6 +1364,7 @@ impl SftpProvider {
         data: &[u8],
         revision: &RemoteEditRevision,
         cancellation: &CancellationFlag,
+        progress: Option<crate::vfs::RemoteEditProgressFn>,
     ) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt;
 
@@ -1361,6 +1392,15 @@ impl SftpProvider {
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?
             .session();
         let transaction_parent = validate_transaction_parent(session, path).await?;
+
+        // #51/MAJOR#1: narrow progress callback. RollbackOrRecovery is emitted at
+        // every real recovery transition (RecoveryRequired decision below); the
+        // provider never knows about JobManager.
+        let recovery = || {
+            if let Some(p) = &progress {
+                let _ = p.send(crate::jobs::RemoteEditPhase::RollbackOrRecovery);
+            }
+        };
 
         // Create an empty 0600 stage first. Its owner proves which account the
         // separate atomic mkdir command must create the private namespace for.
@@ -1647,6 +1687,12 @@ impl SftpProvider {
         }
 
         // ── Verify staged content and metadata ──
+        // #51/MAJOR#1: truthful telemetry. Verifying is emitted at the real
+        // verification boundary (before verify_remote_matches), not post-hoc in
+        // the TUI after WrittenBack has already returned.
+        if let Some(progress) = &progress {
+            let _ = progress.send(crate::jobs::RemoteEditPhase::Verifying);
+        }
         match self
             .verify_remote_matches(
                 session,
@@ -1670,6 +1716,7 @@ impl SftpProvider {
                 .await);
             }
             Err(error) => {
+                recovery();
                 return Err(transaction_failure(
                     session,
                     path,
@@ -1801,6 +1848,7 @@ impl SftpProvider {
                 let message = format!(
                     "SFTP RECOVERY REQUIRED {path}: backup rename transport outcome is uncertain ({error}); backup={backup_path}; stage={stage_path}"
                 );
+                recovery();
                 if let Some(mut broken) = guard.take() {
                     broken.abort().await;
                 }
@@ -2248,19 +2296,25 @@ mod metadata_tests {
         let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
             .with_test_pool_pending_probe(connects.clone());
         // First connect has no pooled session, so the probe is skipped and the
-        // connect runs immediately.
-        let _ = provider.connect_for_mutation().await;
+        // connect runs immediately (count == 1). This is the NEW live session.
+        // Drop the guard so the connection Mutex is released before reuse.
+        let _g1 = provider.connect_for_mutation().await;
+        drop(_g1);
         assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
         // Second acquire probes the now-pooled session with a never-resolving
-        // probe; the outer timeout must fire instead of hanging.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            let _ = provider.connect_for_mutation().await;
-        })
-        .await;
+        // probe. The INTERNAL bounded_health_probe (probe_timeout = 50ms, set by
+        // the seam) must time out, classify TransportBroken, DISCARD the old
+        // pooled session, and RECONNECT exactly once — all WITHOUT an outer
+        // tokio::time::timeout. acquire returns successfully (no hang).
+        let result = provider.connect_for_mutation().await;
         assert!(
-            result.is_err(),
-            "acquire must be bounded by a timeout, not hang on a pending probe"
+            result.is_ok(),
+            "internal probe timeout must not hang acquire"
         );
+        drop(result);
+        // total fresh connects == 2: the initial one + exactly one replacement
+        // after the stale session was discarded. Never an unbounded spin.
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     // ── #47 stream-read transport truth seam ──
@@ -2547,7 +2601,7 @@ mod metadata_tests {
         let mode_revision = remote_revision(&provider, &mode_path).await;
         provider.faults.preserve_mode = true;
         let mode_error = provider
-            .write_file_bytes_if_unchanged(&mode_path, b"new", &mode_revision, &cancellation)
+            .write_file_bytes_if_unchanged(&mode_path, b"new", &mode_revision, &cancellation, None)
             .await
             .unwrap_err();
         assert!(mode_error.to_string().contains("preserve metadata"));
@@ -2573,7 +2627,13 @@ mod metadata_tests {
             ..AtomicWriteFaults::default()
         };
         let commit_error = provider
-            .write_file_bytes_if_unchanged(&commit_path, b"new", &commit_revision, &cancellation)
+            .write_file_bytes_if_unchanged(
+                &commit_path,
+                b"new",
+                &commit_revision,
+                &cancellation,
+                None,
+            )
             .await
             .unwrap_err();
         assert!(!commit_error.to_string().contains("RECOVERY REQUIRED"));
@@ -2605,6 +2665,7 @@ mod metadata_tests {
                 b"new",
                 &recovery_revision,
                 &cancellation,
+                None,
             )
             .await
             .unwrap_err();
@@ -2629,7 +2690,13 @@ mod metadata_tests {
             ..AtomicWriteFaults::default()
         };
         let visible_error = provider
-            .write_file_bytes_if_unchanged(&visible_path, b"new", &visible_revision, &cancellation)
+            .write_file_bytes_if_unchanged(
+                &visible_path,
+                b"new",
+                &visible_revision,
+                &cancellation,
+                None,
+            )
             .await
             .unwrap_err();
         assert!(visible_error.to_string().contains("RECOVERY REQUIRED"));
@@ -2658,7 +2725,7 @@ mod metadata_tests {
             ..AtomicWriteFaults::default()
         };
         let race_error = provider
-            .write_file_bytes_if_unchanged(&race_path, b"new", &race_revision, &cancellation)
+            .write_file_bytes_if_unchanged(&race_path, b"new", &race_revision, &cancellation, None)
             .await
             .unwrap_err();
         assert!(race_error.to_string().contains("RECOVERY REQUIRED"));
@@ -2681,7 +2748,13 @@ mod metadata_tests {
             ..AtomicWriteFaults::default()
         };
         let warning_error = provider
-            .write_file_bytes_if_unchanged(&warning_path, b"new", &warning_revision, &cancellation)
+            .write_file_bytes_if_unchanged(
+                &warning_path,
+                b"new",
+                &warning_revision,
+                &cancellation,
+                None,
+            )
             .await
             .unwrap_err();
         assert!(warning_error.to_string().contains("COMMITTED WITH WARNING"));
@@ -2705,7 +2778,7 @@ mod metadata_tests {
         };
         let cancel = CancellationFlag::default();
         let cancel_error = provider
-            .write_file_bytes_if_unchanged(&cancel_path, b"new", &cancel_revision, &cancel)
+            .write_file_bytes_if_unchanged(&cancel_path, b"new", &cancel_revision, &cancel, None)
             .await
             .unwrap_err();
         assert_eq!(cancel_error.kind(), std::io::ErrorKind::Interrupted);
@@ -2777,7 +2850,13 @@ mod metadata_tests {
             ..AtomicWriteFaults::default()
         };
         let error = provider
-            .write_file_bytes_if_unchanged(&path, b"new", &revision, &CancellationFlag::default())
+            .write_file_bytes_if_unchanged(
+                &path,
+                b"new",
+                &revision,
+                &CancellationFlag::default(),
+                None,
+            )
             .await
             .unwrap_err();
         let message = error.to_string();
@@ -2808,7 +2887,13 @@ mod metadata_tests {
             ..AtomicWriteFaults::default()
         };
         let error = provider
-            .write_file_bytes_if_unchanged(&path, b"new", &revision, &CancellationFlag::default())
+            .write_file_bytes_if_unchanged(
+                &path,
+                b"new",
+                &revision,
+                &CancellationFlag::default(),
+                None,
+            )
             .await
             .unwrap_err();
         let message = error.to_string();
@@ -2843,7 +2928,13 @@ mod metadata_tests {
             ..AtomicWriteFaults::default()
         };
         let error = provider
-            .write_file_bytes_if_unchanged(&path, b"new", &revision, &CancellationFlag::default())
+            .write_file_bytes_if_unchanged(
+                &path,
+                b"new",
+                &revision,
+                &CancellationFlag::default(),
+                None,
+            )
             .await
             .unwrap_err();
         let message = error.to_string();

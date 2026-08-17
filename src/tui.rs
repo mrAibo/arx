@@ -8,7 +8,7 @@ use arx::app::{
     navigation_parent_target,
 };
 use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectResponse, EffectScope};
-use arx::effects::{Effect, EffectEvent};
+use arx::effects::{Effect, EffectEvent, ProgressSlot};
 #[cfg(test)]
 use arx::input::contextual_hints_with_file_context;
 use arx::input::{ContextHint, KeyResolution, KeyRouter, command_bar_rows, contextual_hints};
@@ -2049,7 +2049,10 @@ async fn event_loop(
                     .await?;
                 if let Some(effect) = finish_remote_editor(session, editor_result, &mut state) {
                     let location = match &effect {
-                        Effect::WriteBackRemoteFile { session } => session.location.clone(),
+                        Effect::WriteBackRemoteFile {
+                            session,
+                            progress: _,
+                        } => session.location.clone(),
                         _ => unreachable!("remote editor can only schedule write-back"),
                     };
                     let id = effect_dispatcher.dispatch(
@@ -6756,13 +6759,29 @@ fn finish_remote_editor(
     }
 
     session.state = RemoteEditState::WritingBack;
-    // #51: observable phases, but only truthful ones. The real remote
-    // transaction (stage/commit/verification) runs later inside the SFTP write
-    // effect, so Verifying is published at the actual verification boundary in
-    // apply_effect_event (WrittenBack), NOT here before dispatch.
+    // #51/MAJOR#1: supply a narrow progress sender so Verifying is emitted at
+    // the real verification boundary inside the provider, not post-hoc here.
     publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::ValidatingWorkingCopy);
     publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::WriteBack);
-    Some(Effect::WriteBackRemoteFile { session })
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<arx::jobs::RemoteEditPhase>();
+    // ponytail: receive on a worker task. Capture only the Send+Sync handles
+    // (job_manager + event sink + id), never &AppState — AppState is not Sync.
+    let job_manager = state.job_manager.clone();
+    let job_events = state.job_events.clone();
+    let job_id = session.job_id.clone();
+    if let (Some(jm), Some(events)) = (job_manager, job_events) {
+        tokio::spawn(async move {
+            while let Some(phase) = rx.recv().await {
+                if let Some(ref id) = job_id {
+                    jm.publish_remote_edit_phase(&events, id, phase);
+                }
+            }
+        });
+    }
+    Some(Effect::WriteBackRemoteFile {
+        session,
+        progress: ProgressSlot(Some(tx)),
+    })
 }
 
 fn apply_effect_event(state: &mut AppState, event: EffectEvent) {
@@ -6850,10 +6869,9 @@ fn apply_effect_event(state: &mut AppState, event: EffectEvent) {
         }
         EffectEvent::WrittenBack { name } => {
             state.message = Some(format!("Uploaded: {name}"));
-            // #51/MAJOR#2: Verifying is published at the real verification
-            // boundary — the remote transaction committed and verified — not
-            // before the writeback effect ran.
-            publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::Verifying);
+            // #51/MAJOR#1: Verifying is NOT invented here — it was already
+            // published at the real verification boundary by the provider
+            // progress closure (before verify_remote_matches). Only terminate.
             terminate_remote_edit_job(state, arx::jobs::RemoteEditOutcome::Completed, None);
         }
         EffectEvent::NoChange { name } => {
