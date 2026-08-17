@@ -15,7 +15,7 @@ use tokio::time::timeout;
 /// known_hosts and host-key policy. russh-sftp only speaks the SFTP protocol
 /// over the already-authenticated subsystem stream.
 pub struct OpenSshSftpConnection {
-    pub session: SftpSession,
+    pub session: Option<SftpSession>,
     child: Child,
 }
 
@@ -57,7 +57,10 @@ impl OpenSshSftpConnection {
             .map_err(|error| io::Error::other(format!("SFTP handshake failed: {error}")))?;
         session.set_timeout(30);
 
-        Ok(Self { session, child })
+        Ok(Self {
+            session: Some(session),
+            child,
+        })
     }
 
     /// Create a transaction directory with mode 0700 in the creating syscall.
@@ -110,7 +113,9 @@ impl OpenSshSftpConnection {
     }
 
     pub async fn close(mut self) -> io::Result<()> {
-        let _ = self.session.close().await;
+        if let Some(session) = self.session.take() {
+            let _ = session.close().await;
+        }
         match timeout(Duration::from_secs(2), self.child.wait()).await {
             Ok(result) => {
                 let _ = result?;
@@ -123,15 +128,21 @@ impl OpenSshSftpConnection {
         Ok(())
     }
 
+    pub fn session(&self) -> &SftpSession {
+        self.session.as_ref().expect("connected session")
+    }
+
     pub async fn abort(&mut self) {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
     }
 
     /// Test-only connection that owns a local `sftp-server` pipe instead of a
-    /// real SSH subsystem. This runs the real SFTP handshake over stdio against
-    /// the system `sftp-server` (no SSH, no network), so the pooled
-    /// acquire/probe/reconnect algorithm can be exercised deterministically.
+    /// real SSH subsystem, and performs the real SFTP handshake over stdio.
+    /// No SSH, no remote network — deterministic on the ambient test runtime
+    /// (the handshake runs on the runtime, not a nested block_on, so it is
+    /// flake-free). Exercises the exact production acquire/probe/reconnect
+    /// algorithm including real session ops.
     #[cfg(test)]
     pub(crate) async fn test_stub() -> Self {
         use tokio::process::Command;
@@ -153,14 +164,15 @@ impl OpenSshSftpConnection {
             .ok_or_else(|| io::Error::other("sftp-server stdout unavailable"))
             .expect("test_stub");
         let stream = SshSubsystemStream { stdin, stdout };
-        // ponytail: build the real SFTP session on the ambient test runtime
-        // (no nested block_on — that deadlocks inside #[tokio::test]).
         let session = SftpSession::new(stream)
             .await
             .map_err(|error| io::Error::other(format!("sftp-server handshake: {error}")))
             .expect("test_stub handshake");
         session.set_timeout(30);
-        Self { session, child }
+        Self {
+            session: Some(session),
+            child,
+        }
     }
 }
 

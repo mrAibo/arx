@@ -200,7 +200,7 @@ async fn list_sftp(host: &Host, remote_path: &str) -> anyhow::Result<Vec<Entry>>
         .with_context(|| format!("OpenSSH SFTP connect to {}", host.ssh_alias))?;
 
     let read_dir = connection
-        .session
+        .session()
         .read_dir(remote_path.to_string())
         .await
         .with_context(|| format!("SFTP read_dir {remote_path}"))?;
@@ -892,7 +892,7 @@ impl SftpProvider {
             let result = guard
                 .as_ref()
                 .expect("connection initialized")
-                .session
+                .session()
                 .read_dir(path.to_string())
                 .await;
 
@@ -935,7 +935,7 @@ impl SftpProvider {
                 if let Some(probe_fn) = &self.test_probe {
                     probe_fn(session)
                 } else {
-                    probe_session_healthy(&session.session).await
+                    probe_session_healthy(session.session()).await
                 }
             }
             None => SftpInvalidation::Keep,
@@ -997,7 +997,13 @@ impl SftpProvider {
         let conn = guard
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
-        match conn.session.create_dir(path.to_string()).await {
+        match conn
+            .session
+            .as_ref()
+            .expect("connected session")
+            .create_dir(path.to_string())
+            .await
+        {
             Ok(()) => Ok(()),
             Err(e) => {
                 // Transport-only invalidation: keep pool on application/Status error.
@@ -1016,7 +1022,13 @@ impl SftpProvider {
         let conn = guard
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
-        match conn.session.remove_file(path.to_string()).await {
+        match conn
+            .session
+            .as_ref()
+            .expect("connected session")
+            .remove_file(path.to_string())
+            .await
+        {
             Ok(()) => Ok(()),
             Err(e) => {
                 // Transport-only invalidation: keep pool on application/Status error.
@@ -1037,7 +1049,13 @@ impl SftpProvider {
         let conn = guard
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
-        match conn.session.remove_dir(path.to_string()).await {
+        match conn
+            .session
+            .as_ref()
+            .expect("connected session")
+            .remove_dir(path.to_string())
+            .await
+        {
             Ok(()) => Ok(()),
             Err(e) => {
                 // Transport-only invalidation: keep pool on application/Status error.
@@ -1181,7 +1199,12 @@ impl SftpProvider {
                 .as_ref()
                 .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
 
-            let open_result = conn.session.open(path.to_string()).await;
+            let open_result = conn
+                .session
+                .as_ref()
+                .expect("connected session")
+                .open(path.to_string())
+                .await;
 
             match open_result {
                 Ok(mut file) => {
@@ -1234,7 +1257,7 @@ impl SftpProvider {
         let session = &guard
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?
-            .session;
+            .session();
         let result = read_pinned_snapshot(
             session,
             path,
@@ -1287,7 +1310,7 @@ impl SftpProvider {
         let session = &guard
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?
-            .session;
+            .session();
         let transaction_parent = validate_transaction_parent(session, path).await?;
 
         // Create an empty 0600 stage first. Its owner proves which account the
@@ -1976,7 +1999,7 @@ impl SftpProvider {
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
         let meta = conn
-            .session
+            .session()
             .symlink_metadata(path.to_string())
             .await
             .map_err(|error| russh_to_io(error, &format!("SFTP metadata {path}")))?;

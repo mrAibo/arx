@@ -107,77 +107,77 @@ async fn upload_file(
 
     let mut local = tokio::fs::File::open(&local_path).await?;
     let mut remote = connection
-        .session
+        .session()
         .create(temp.clone())
         .await
         .map_err(|error| sftp_failure(name, error))?;
 
     if let Err(error) = copy_stream(&mut local, &mut remote, cancel, completed).await {
-        let _ = connection.session.remove_file(temp.clone()).await;
+        let _ = connection.session().remove_file(temp.clone()).await;
         return Err(error);
     }
     if let Err(error) = remote.flush().await {
-        let _ = connection.session.remove_file(temp.clone()).await;
+        let _ = connection.session().remove_file(temp.clone()).await;
         return Err(error.into());
     }
     if let Err(error) = remote.shutdown().await {
-        let _ = connection.session.remove_file(temp.clone()).await;
+        let _ = connection.session().remove_file(temp.clone()).await;
         return Err(error.into());
     }
 
-    let staged = match connection.session.metadata(temp.clone()).await {
+    let staged = match connection.session().metadata(temp.clone()).await {
         Ok(staged) => staged,
         Err(error) => {
-            let _ = connection.session.remove_file(temp.clone()).await;
+            let _ = connection.session().remove_file(temp.clone()).await;
             return Err(sftp_failure(name, error));
         }
     };
     if staged.len() != local_meta.len() {
-        let _ = connection.session.remove_file(temp.clone()).await;
+        let _ = connection.session().remove_file(temp.clone()).await;
         return Err(invalid(
             "SFTP upload verification failed: staged size differs",
         ));
     }
     if let Err(cancelled) = check_cancelled(cancel, completed) {
-        let _ = connection.session.remove_file(temp.clone()).await;
+        let _ = connection.session().remove_file(temp.clone()).await;
         return Err(cancelled);
     }
-    let had_target = match remote_exists(&connection.session, &target).await {
+    let had_target = match remote_exists(connection.session(), &target).await {
         Ok(exists) => exists,
         Err(error) => {
-            let _ = connection.session.remove_file(temp.clone()).await;
+            let _ = connection.session().remove_file(temp.clone()).await;
             return Err(error);
         }
     };
     if had_target
         && let Err(error) = connection
-            .session
+            .session()
             .rename(target.clone(), backup.clone())
             .await
     {
-        let _ = connection.session.remove_file(temp.clone()).await;
+        let _ = connection.session().remove_file(temp.clone()).await;
         return Err(sftp_failure(name, error));
     }
     // Cancellation after target→backup must roll the original target back
     // instead of committing the staged replacement.
     if let Err(cancelled) = check_cancelled(cancel, completed) {
-        let _ = connection.session.remove_file(temp.clone()).await;
+        let _ = connection.session().remove_file(temp.clone()).await;
         if had_target {
             let _ = connection
-                .session
+                .session()
                 .rename(backup.clone(), target.clone())
                 .await;
         }
         return Err(cancelled);
     }
     if let Err(error) = connection
-        .session
+        .session()
         .rename(temp.clone(), target.clone())
         .await
     {
-        let _ = connection.session.remove_file(temp).await;
+        let _ = connection.session().remove_file(temp).await;
         if had_target {
-            let _ = connection.session.rename(backup, target).await;
+            let _ = connection.session().rename(backup, target).await;
         }
         return Err(sftp_failure(name, error));
     }
@@ -195,7 +195,7 @@ async fn download_file(
 ) -> Result<(), TransferExecutionError> {
     let source = remote_join(remote_dir, name);
     let remote_meta = connection
-        .session
+        .session()
         .metadata(source.clone())
         .await
         .map_err(|error| sftp_failure(name, error))?;
@@ -211,7 +211,7 @@ async fn download_file(
     let backup = path_with_suffix(&target, &format!(".arx-bak-{token}"));
 
     let mut remote = connection
-        .session
+        .session()
         .open(source)
         .await
         .map_err(|error| sftp_failure(name, error))?;
