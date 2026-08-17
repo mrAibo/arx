@@ -1398,7 +1398,7 @@ impl SftpProvider {
         // provider never knows about JobManager.
         let recovery = || {
             if let Some(p) = &progress {
-                let _ = p.send(crate::jobs::RemoteEditPhase::RollbackOrRecovery);
+                p(crate::jobs::RemoteEditPhase::RollbackOrRecovery);
             }
         };
 
@@ -1691,7 +1691,7 @@ impl SftpProvider {
         // verification boundary (before verify_remote_matches), not post-hoc in
         // the TUI after WrittenBack has already returned.
         if let Some(progress) = &progress {
-            let _ = progress.send(crate::jobs::RemoteEditPhase::Verifying);
+            progress(crate::jobs::RemoteEditPhase::Verifying);
         }
         match self
             .verify_remote_matches(

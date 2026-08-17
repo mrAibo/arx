@@ -363,11 +363,14 @@ impl CancellationFlag {
 /// Files larger than this are refused before editor launch.
 pub const MAX_REMOTE_EDIT_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
-/// ponytail: narrow typed progress callback from a remote-write transaction to
-/// JobManager. The provider never knows about JobManager; it just emits the
-/// phase at the real boundary (Verifying before verify, RollbackOrRecovery at
-/// the real recovery transition). TUI supplies the sender.
-pub type RemoteEditProgressFn = tokio::sync::mpsc::UnboundedSender<crate::jobs::RemoteEditPhase>;
+/// ponytail: narrow synchronous Send+Sync progress callback from a remote-write
+/// transaction to JobManager. The provider never knows about JobManager; it just
+/// emits the phase at the real boundary (Verifying before verify,
+/// RollbackOrRecovery at the real recovery transition). The TUI supplies a
+/// closure that synchronously forwards to JobManager, so progress is published
+/// in program order before the terminal event — no detached relay, no scheduler
+/// races, deterministic Verifying -> Completed ordering.
+pub type RemoteEditProgressFn = std::sync::Arc<dyn Fn(crate::jobs::RemoteEditPhase) + Send + Sync>;
 
 /// Backend trait — each provider implements this. async deferred to F2.
 /// ponytail: sync list() kept for backward compat; list_async() is the new path.
@@ -2368,6 +2371,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum WriteMode {
         Success,
+        Warning,
         PreVerifyFailure,
         RecoveryRequired,
     }
@@ -2425,7 +2429,15 @@ mod tests {
                     // Verifying is emitted at the real verification boundary,
                     // BEFORE the terminal result — not post-hoc by the TUI.
                     if let Some(p) = &progress {
-                        let _ = p.send(crate::jobs::RemoteEditPhase::Verifying);
+                        p(crate::jobs::RemoteEditPhase::Verifying);
+                    }
+                    Ok(())
+                }
+                WriteMode::Warning => {
+                    // CommittedWithWarning shares the same verify merge point, so it
+                    // also passes through real Verifying before the terminal result.
+                    if let Some(p) = &progress {
+                        p(crate::jobs::RemoteEditPhase::Verifying);
                     }
                     Ok(())
                 }
@@ -2440,7 +2452,7 @@ mod tests {
                     // Real recovery transition: RollbackOrRecovery emitted at the
                     // genuine boundary before the terminal recovery error.
                     if let Some(p) = &progress {
-                        let _ = p.send(crate::jobs::RemoteEditPhase::RollbackOrRecovery);
+                        p(crate::jobs::RemoteEditPhase::RollbackOrRecovery);
                     }
                     Err(std::io::Error::other("recovery required"))
                 }
@@ -2472,20 +2484,21 @@ mod tests {
         cap: &std::sync::Arc<std::sync::Mutex<Vec<crate::jobs::RemoteEditPhase>>>,
         rev: &RemoteEditRevision,
     ) -> std::io::Result<()> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let r = provider
+        // ponytail: synchronous progress capture — same closure shape the TUI
+        // supplies. No channel, no spawn; ordering is program-order deterministic.
+        let cap2 = cap.clone();
+        let progress: crate::vfs::RemoteEditProgressFn = std::sync::Arc::new(move |phase| {
+            cap2.lock().unwrap().push(phase);
+        });
+        provider
             .write_file_bytes_if_unchanged(
                 "file.txt",
                 b"data",
                 rev,
                 &CancellationFlag::default(),
-                Some(tx),
+                Some(progress),
             )
-            .await;
-        while let Ok(p) = rx.try_recv() {
-            cap.lock().unwrap().push(p);
-        }
-        r
+            .await
     }
 
     #[tokio::test]
@@ -2515,17 +2528,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_write_progress_recovery_transition_is_rollback_or_recovery() {
+    async fn remote_write_progress_ordering_is_deterministic_and_never_late() {
         use crate::jobs::RemoteEditPhase;
         let (provider, cap) = make_mock("mock-host");
-        *provider.write_mode.lock().unwrap() = WriteMode::RecoveryRequired;
         let rev = RemoteEditRevision::new(b"abc123".to_vec(), 0o600, 1000, 1000);
-        let result = mock_write(&provider, &cap, &rev).await;
-        assert!(result.is_err(), "recovery path should fail");
+
+        // Success: exactly one Verifying, nothing after the terminal Ok.
+        let r = mock_write(&provider, &cap, &rev).await;
+        assert!(r.is_ok());
         assert_eq!(
             cap.lock().unwrap().clone(),
-            vec![RemoteEditPhase::RollbackOrRecovery],
-            "RollbackOrRecovery emitted at the real recovery transition"
+            vec![RemoteEditPhase::Verifying]
+        );
+        assert_eq!(
+            cap.lock()
+                .unwrap()
+                .iter()
+                .filter(|p| **p == RemoteEditPhase::Verifying)
+                .count(),
+            1,
+            "no duplicate Verifying"
+        );
+
+        // Warning: same single Verifying merge point, no extra phases.
+        *provider.write_mode.lock().unwrap() = WriteMode::Warning;
+        cap.lock().unwrap().clear();
+        let r = mock_write(&provider, &cap, &rev).await;
+        assert!(r.is_ok());
+        assert_eq!(
+            cap.lock().unwrap().clone(),
+            vec![RemoteEditPhase::Verifying]
+        );
+
+        // Recovery: RollbackOrRecovery at the real transition, then terminal Err.
+        *provider.write_mode.lock().unwrap() = WriteMode::RecoveryRequired;
+        cap.lock().unwrap().clear();
+        let r = mock_write(&provider, &cap, &rev).await;
+        assert!(r.is_err());
+        assert_eq!(
+            cap.lock().unwrap().clone(),
+            vec![RemoteEditPhase::RollbackOrRecovery]
+        );
+
+        // Pre-verify failure: no progress at all, no late Verifying.
+        *provider.write_mode.lock().unwrap() = WriteMode::PreVerifyFailure;
+        cap.lock().unwrap().clear();
+        let r = mock_write(&provider, &cap, &rev).await;
+        assert!(r.is_err());
+        assert!(
+            cap.lock().unwrap().is_empty(),
+            "no progress before/after terminal on pre-verify failure"
         );
     }
 

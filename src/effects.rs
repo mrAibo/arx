@@ -4,8 +4,7 @@
 /// such as `ProcessService` is allowed to perform the external operation.
 use std::path::PathBuf;
 
-use crate::vfs::{ListedEntry, Location, RemoteEditSession};
-use tokio::sync::mpsc;
+use crate::vfs::{ListedEntry, Location, RemoteEditProgressFn, RemoteEditSession};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -61,10 +60,11 @@ pub enum Effect {
 }
 
 /// ponytail: closure can't be Debug/Eq/Clone-trivially; wrap so Effect keeps its
-/// derives. Two effects are compared ignoring the progress sender (it's a
-/// behavior seam, not observable data).
+/// ponytail: progress is a narrow Send+Sync callback (Arc<dyn Fn>); it carries no
+/// data for Eq, so ProgressSlot stays PartialEq while the seam stays synchronous
+/// and ordering-deterministic.
 #[derive(Clone)]
-pub struct ProgressSlot(pub Option<mpsc::UnboundedSender<crate::jobs::RemoteEditPhase>>);
+pub struct ProgressSlot(pub Option<RemoteEditProgressFn>);
 impl std::fmt::Debug for ProgressSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ProgressSlot(..)")

@@ -6759,28 +6759,25 @@ fn finish_remote_editor(
     }
 
     session.state = RemoteEditState::WritingBack;
-    // #51/MAJOR#1: supply a narrow progress sender so Verifying is emitted at
-    // the real verification boundary inside the provider, not post-hoc here.
+    // #51/MAJOR#9: supply a narrow synchronous Send+Sync progress callback so
+    // Verifying is emitted at the real verification boundary inside the provider,
+    // in program order BEFORE the terminal event — no detached relay, no scheduler
+    // races. The callback captures only the Send+Sync handles (job_manager +
+    // event sink + id), never &AppState (AppState is not Sync). The provider never
+    // knows about JobManager; it just calls progress(phase).
     publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::ValidatingWorkingCopy);
     publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::WriteBack);
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<arx::jobs::RemoteEditPhase>();
-    // ponytail: receive on a worker task. Capture only the Send+Sync handles
-    // (job_manager + event sink + id), never &AppState — AppState is not Sync.
     let job_manager = state.job_manager.clone();
     let job_events = state.job_events.clone();
     let job_id = session.job_id.clone();
-    if let (Some(jm), Some(events)) = (job_manager, job_events) {
-        tokio::spawn(async move {
-            while let Some(phase) = rx.recv().await {
-                if let Some(ref id) = job_id {
-                    jm.publish_remote_edit_phase(&events, id, phase);
-                }
-            }
-        });
-    }
+    let progress: arx::vfs::RemoteEditProgressFn = std::sync::Arc::new(move |phase| {
+        if let (Some(jm), Some(events), Some(id)) = (&job_manager, &job_events, &job_id) {
+            jm.publish_remote_edit_phase(events, id, phase);
+        }
+    });
     Some(Effect::WriteBackRemoteFile {
         session,
-        progress: ProgressSlot(Some(tx)),
+        progress: ProgressSlot(Some(progress)),
     })
 }
 
