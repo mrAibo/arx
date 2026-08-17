@@ -2100,8 +2100,8 @@ mod metadata_tests {
         let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
             .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
         // First op acquires once; second op reuses the pooled session.
-        let _ = provider.mkdir("a").await;
-        let _ = provider.mkdir("b").await;
+        let _ = provider.connect_for_mutation().await;
+        let _ = provider.connect_for_mutation().await;
         assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -2110,7 +2110,7 @@ mod metadata_tests {
         let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
             .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
-        let _ = provider.mkdir("a").await;
+        let _ = provider.connect_for_mutation().await;
         assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -2120,8 +2120,8 @@ mod metadata_tests {
         let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
             .with_test_pool(Some(SftpInvalidation::TransportBroken), connects.clone());
         // Every acquire is stale → fresh replacement each time.
-        let _ = provider.mkdir("a").await;
-        let _ = provider.mkdir("b").await;
+        let _ = provider.connect_for_mutation().await;
+        let _ = provider.connect_for_mutation().await;
         assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
@@ -2130,8 +2130,8 @@ mod metadata_tests {
         let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
             .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
-        for name in ["a", "b", "c", "d"] {
-            let _ = provider.mkdir(name).await;
+        for _ in 0..4 {
+            let _ = provider.connect_for_mutation().await;
         }
         assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -2141,8 +2141,8 @@ mod metadata_tests {
         let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
             .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
-        for name in ["a", "b", "c"] {
-            let _ = provider.mkdir(name).await;
+        for _ in 0..3 {
+            let _ = provider.connect_for_mutation().await;
         }
         // Keep (no transport break) → never reconnect, regardless of op errors.
         assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -2154,7 +2154,7 @@ mod metadata_tests {
         let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
             .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
         // A single mutation acquires the session exactly once (no reconnect spin).
-        let _ = provider.mkdir("once").await;
+        let _ = provider.connect_for_mutation().await;
         assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
