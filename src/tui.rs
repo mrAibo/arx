@@ -6726,10 +6726,14 @@ fn finalize_received_effect(dispatcher: &EffectDispatcher, response: &mut Effect
     let was_cancelled = dispatcher
         .finish(response.id)
         .is_some_and(|cancellation| cancellation.is_cancelled());
-    if was_cancelled && matches!(&response.event, EffectEvent::Downloaded { .. }) {
-        response.event = EffectEvent::Failed {
-            label: "remote edit download".into(),
-            error: "cancelled before editor launch".into(),
+    // #48/MAJOR#1: an explicitly cancelled queued download is a typed Cancelled,
+    // never a generic Failed. apply_effect_event maps this to
+    // RemoteEditOutcome::Cancelled; the Failed branch is reserved for real
+    // provider/download errors.
+    if was_cancelled && let EffectEvent::Downloaded { session } = &response.event {
+        response.event = EffectEvent::RemoteEditCancelled {
+            name: session.name.clone(),
+            reason: arx::jobs::RemoteEditCancelReason::Queued,
         };
     }
 }
@@ -6752,10 +6756,12 @@ fn finish_remote_editor(
     }
 
     session.state = RemoteEditState::WritingBack;
-    // #51: observable write-back + verification phases (TUI still owns validation + commit).
+    // #51: observable phases, but only truthful ones. The real remote
+    // transaction (stage/commit/verification) runs later inside the SFTP write
+    // effect, so Verifying is published at the actual verification boundary in
+    // apply_effect_event (WrittenBack), NOT here before dispatch.
     publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::ValidatingWorkingCopy);
     publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::WriteBack);
-    publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::Verifying);
     Some(Effect::WriteBackRemoteFile { session })
 }
 
@@ -6844,6 +6850,10 @@ fn apply_effect_event(state: &mut AppState, event: EffectEvent) {
         }
         EffectEvent::WrittenBack { name } => {
             state.message = Some(format!("Uploaded: {name}"));
+            // #51/MAJOR#2: Verifying is published at the real verification
+            // boundary — the remote transaction committed and verified — not
+            // before the writeback effect ran.
+            publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::Verifying);
             terminate_remote_edit_job(state, arx::jobs::RemoteEditOutcome::Completed, None);
         }
         EffectEvent::NoChange { name } => {
@@ -7590,6 +7600,91 @@ mod tests {
         assert!(state.pending_remote_edit_job_id.is_none());
     }
 
+    // #48/MAJOR#1: runnable proof that queued-cancel → typed Cancelled and a
+    // real provider error → Failed, and the two cannot be confused. Drives the
+    // real `apply_effect_event` mapping (no host needed).
+    #[test]
+    fn remote_edit_cancel_vs_failure_outcomes_are_distinct_and_typed() {
+        use arx::jobs::{JobEvent, RemoteEditCancelReason, RemoteEditOutcome};
+
+        // Queued cancel → Cancelled terminal.
+        let mut cancel_state = AppState::default();
+        let jm_cancel = arx::jobs::JobManager::new();
+        let (tx_cancel, mut rx_cancel) = tokio::sync::mpsc::unbounded_channel::<JobEvent>();
+        cancel_state.job_manager = Some(jm_cancel);
+        cancel_state.job_events = Some(tx_cancel);
+        cancel_state.pending_remote_edit_job_id = Some(
+            cancel_state
+                .job_manager
+                .as_ref()
+                .unwrap()
+                .create_job(
+                    "remote-edit",
+                    arx::jobs::JobKind::RemoteEdit,
+                    "Remote edit",
+                    None,
+                    None,
+                )
+                .id
+                .clone(),
+        );
+        apply_effect_event(
+            &mut cancel_state,
+            EffectEvent::RemoteEditCancelled {
+                name: "note.txt".into(),
+                reason: RemoteEditCancelReason::Queued,
+            },
+        );
+        let mut cancel_outcome = None;
+        while let Ok(ev) = rx_cancel.try_recv() {
+            if let JobEvent::Cancelled { .. } = ev {
+                cancel_outcome = Some(RemoteEditOutcome::Cancelled);
+            }
+        }
+        assert_eq!(cancel_outcome, Some(RemoteEditOutcome::Cancelled));
+        assert!(cancel_state.pending_remote_edit_job_id.is_none());
+
+        // Real provider error → Failed terminal (never Cancelled).
+        let mut fail_state = AppState::default();
+        let jm_fail = arx::jobs::JobManager::new();
+        let (tx_fail, mut rx_fail) = tokio::sync::mpsc::unbounded_channel::<JobEvent>();
+        fail_state.job_manager = Some(jm_fail);
+        fail_state.job_events = Some(tx_fail);
+        fail_state.pending_remote_edit_job_id = Some(
+            fail_state
+                .job_manager
+                .as_ref()
+                .unwrap()
+                .create_job(
+                    "remote-edit",
+                    arx::jobs::JobKind::RemoteEdit,
+                    "Remote edit",
+                    None,
+                    None,
+                )
+                .id
+                .clone(),
+        );
+        apply_effect_event(
+            &mut fail_state,
+            EffectEvent::Failed {
+                label: "remote edit download".into(),
+                error: "connection reset".into(),
+            },
+        );
+        let mut fail_outcome = None;
+        let mut cancelled = false;
+        while let Ok(ev) = rx_fail.try_recv() {
+            match ev {
+                JobEvent::Failed { .. } => fail_outcome = Some(RemoteEditOutcome::Failed),
+                JobEvent::Cancelled { .. } => cancelled = true,
+                _ => {}
+            }
+        }
+        assert_eq!(fail_outcome, Some(RemoteEditOutcome::Failed));
+        assert!(!cancelled, "provider error must not be typed Cancelled");
+    }
+
     // #51 physical (requires host): cancel before editor prevents later launch
     // and clears the in-flight RemoteEdit job id.
     #[tokio::test]
@@ -7703,7 +7798,16 @@ mod tests {
             "queued response must remain cancellable"
         );
         finalize_received_effect(&dispatcher, &mut response);
-        assert!(matches!(&response.event, EffectEvent::Failed { .. }));
+        assert!(
+            matches!(
+                &response.event,
+                EffectEvent::RemoteEditCancelled {
+                    reason: arx::jobs::RemoteEditCancelReason::Queued,
+                    ..
+                }
+            ),
+            "explicit queued cancel must be typed Cancelled, not generic Failed"
+        );
         handle_effect_response(
             response,
             &mut state,

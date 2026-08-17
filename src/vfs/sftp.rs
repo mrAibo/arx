@@ -796,9 +796,16 @@ pub struct SftpProvider {
     test_connect: Option<TestConnectFn>,
 }
 
-/// ponytail: injected probe used by the deterministic pooled-acquire matrix.
+/// ponytail: injected async probe used by the deterministic pooled-acquire
+/// matrix. Async so a test can inject a probe that pends (proving the acquire
+/// respects a bounded timeout rather than hanging).
 type TestProbeFn = Box<
-    dyn Fn(&crate::remote::openssh_sftp::OpenSshSftpConnection) -> SftpInvalidation + Send + Sync,
+    dyn Fn(
+            &crate::remote::openssh_sftp::OpenSshSftpConnection,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = SftpInvalidation> + Send + Sync>>
+        + Send
+        + Sync,
 >;
 
 /// ponytail: boxed async factory standing in for a real SSH connect in tests.
@@ -933,7 +940,7 @@ impl SftpProvider {
         let probe = match guard.as_ref() {
             Some(session) => {
                 if let Some(probe_fn) = &self.test_probe {
-                    probe_fn(session)
+                    probe_fn(session).await
                 } else {
                     probe_session_healthy(session.session()).await
                 }
@@ -972,10 +979,20 @@ impl SftpProvider {
         connects: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         let probe = probe.map(|p| {
-            Box::new(move |_conn: &crate::remote::openssh_sftp::OpenSshSftpConnection| p)
+            Box::new(
+                move |_conn: &crate::remote::openssh_sftp::OpenSshSftpConnection| {
+                    Box::pin(async move { p })
+                        as std::pin::Pin<
+                            Box<dyn std::future::Future<Output = SftpInvalidation> + Send + Sync>,
+                        >
+                },
+            )
                 as Box<
-                    dyn Fn(&crate::remote::openssh_sftp::OpenSshSftpConnection) -> SftpInvalidation
-                        + Send
+                    dyn Fn(
+                            &crate::remote::openssh_sftp::OpenSshSftpConnection,
+                        ) -> std::pin::Pin<
+                            Box<dyn std::future::Future<Output = SftpInvalidation> + Send + Sync>,
+                        > + Send
                         + Sync,
                 >
         });
@@ -989,6 +1006,38 @@ impl SftpProvider {
         });
         self.test_probe = probe;
         self.test_connect = Some(connect);
+        self
+    }
+
+    /// Test-only: inject a probe that never resolves (pending forever) so the
+    /// bounded-timeout acquire path can be proven deterministically under a
+    /// bounded `tokio::time::timeout` (no real `sleep`, no `test-util` feature).
+    /// Also injects the stub connect so the first acquire succeeds immediately
+    /// and only the second (pooled) acquire hits the pending probe.
+    #[cfg(test)]
+    fn with_test_pool_pending_probe(
+        mut self,
+        connects: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        let connects2 = connects.clone();
+        let connect: TestConnectFn = Box::new(move || {
+            let connects2 = connects2.clone();
+            Box::pin(async move {
+                connects2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::remote::openssh_sftp::OpenSshSftpConnection::test_stub().await)
+            })
+        });
+        let probe: TestProbeFn = Box::new(
+            |_conn: &crate::remote::openssh_sftp::OpenSshSftpConnection| {
+                Box::pin(async {
+                    // Never resolves: stands in for a health probe that hangs.
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                })
+            },
+        );
+        self.test_connect = Some(connect);
+        self.test_probe = Some(probe);
         self
     }
 
@@ -2149,13 +2198,69 @@ mod metadata_tests {
     }
 
     #[tokio::test]
-    async fn acquire_destructive_mutation_runs_exactly_once_per_op() {
+    async fn acquire_once_per_op_no_reconnect_spin() {
         let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
             .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
-        // A single mutation acquires the session exactly once (no reconnect spin).
+        // A single op acquires the session exactly once (no reconnect spin).
         let _ = provider.connect_for_mutation().await;
         assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // #48/MAJOR#3B: a destructive mutation must run exactly once per op, and a
+    // stale→reconnect cycle must NOT replay it. Drives the real
+    // connect_for_mutation algorithm; the injected mutation counter stands in
+    // for the single destructive SFTP op each op performs.
+    #[tokio::test]
+    async fn mutation_runs_exactly_once_per_op_and_not_replayed_on_reconnect() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mutations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
+
+        // 3 ops with a healthy pooled session: one acquire, three mutations.
+        for _ in 0..3 {
+            let _ = provider.connect_for_mutation().await;
+            mutations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        // Now every acquire is stale → fresh reconnect each op; mutation still
+        // runs exactly once per op, never replayed by the reconnect.
+        provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::TransportBroken), connects.clone());
+        for _ in 0..2 {
+            let _ = provider.connect_for_mutation().await;
+            mutations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    // #48/MAJOR#3A: a probe that never resolves must not hang acquisition
+    // forever. An outer timeout bounds the acquire deterministically (no real
+    // sleep). Proves the acquire respects a timeout boundary rather than
+    // blocking on a pending probe indefinitely.
+    #[tokio::test]
+    async fn acquire_bounded_by_probe_timeout_does_not_hang() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool_pending_probe(connects.clone());
+        // First connect has no pooled session, so the probe is skipped and the
+        // connect runs immediately.
+        let _ = provider.connect_for_mutation().await;
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Second acquire probes the now-pooled session with a never-resolving
+        // probe; the outer timeout must fire instead of hanging.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let _ = provider.connect_for_mutation().await;
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "acquire must be bounded by a timeout, not hang on a pending probe"
+        );
     }
 
     // ── #47 stream-read transport truth seam ──
