@@ -138,21 +138,21 @@ impl OpenSshSftpConnection {
     }
 
     /// Test-only connection used by the deterministic pooled-acquire matrix.
-    /// It owns a spawned `sftp-server` child (for `abort()` coverage) but holds
-    /// NO live SFTP session — the injected test probe ignores the session, so no
-    /// handshake (no SSH, no network) runs. This keeps #48's acquire/probe/
-    /// reconnect tests fully local and flake-free, per the "no network / no
-    /// sleeps in deterministic tests" contract.
+    /// It owns a dummy child process (so `abort()` has something to kill) but
+    /// holds NO live SFTP session — the injected test probe ignores the
+    /// session, so no handshake (no SSH, no network, no external sftp-server
+    /// binary) runs. This keeps #48's acquire/probe/reconnect tests fully local
+    /// and flake-free across environments, per the "no network / no sleeps in
+    /// deterministic tests" contract.
     #[cfg(test)]
     pub(crate) async fn test_stub() -> Self {
         use tokio::process::Command;
-        let child = Command::new("/usr/lib/ssh/sftp-server")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+        // ponytail: portable dummy child (no sftp-server needed) — only exists
+        // so abort() can be exercised; the pooled tests never touch a session.
+        let child = Command::new("true")
             .kill_on_drop(true)
             .spawn()
-            .expect("test_stub sftp-server spawns");
+            .expect("test_stub dummy child spawns");
         Self {
             session: None,
             child,
