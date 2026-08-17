@@ -6926,17 +6926,27 @@ fn apply_effect_event(state: &mut AppState, event: EffectEvent) {
     }
 }
 
-/// Centralized RemoteEdit terminalization: clears all in-flight ownership
-/// (job id, origin, session) and emits exactly one typed terminal JobEvent.
-/// Called from every terminal production path so no job leaks as Running.
+/// Centralized RemoteEdit terminalization.
+///
+/// Session-scoped pending state (origin, session, deferred editor) is cleared
+/// UNCONDITIONALLY: once a Remote Edit reaches a terminal outcome, no leftover
+/// ownership may survive even when no JobId publication is available (e.g. an
+/// isolated lifecycle where the job id was never registered). Job terminal
+/// publication stays conditional on an actual job id so we never publish a
+/// terminal event for a job that does not exist.
+///
+/// Called from every terminal production path so no job leaks as Running and no
+/// stale session/origin remains.
 fn terminate_remote_edit_job(
     state: &mut AppState,
     outcome: arx::jobs::RemoteEditOutcome,
     error: Option<String>,
 ) {
+    // Unconditional cleanup of session-scoped pending ownership.
+    state.pending_remote_edit_origin = None;
+    state.pending_remote_edit_session = None;
+    state.pending_editor = false;
     if let Some(jid) = state.pending_remote_edit_job_id.take() {
-        state.pending_remote_edit_origin = None;
-        state.pending_remote_edit_session = None;
         state
             .job_manager
             .as_ref()
@@ -7199,12 +7209,32 @@ mod tests {
         let (dispatcher, mut responses) = EffectDispatcher::channel(registry.clone());
         let (pane_loader, _pane_responses, _next_page_responses) =
             PaneLoader::channel(registry.clone());
+        // Production-equivalent wiring: the one shared JobManager + event channel
+        // that run() binds, so the remote-edit job is real and observable.
+        let job_manager = arx::jobs::JobManager::new();
+        let (job_tx, mut job_rx) = tokio::sync::mpsc::unbounded_channel::<arx::jobs::JobEvent>();
         let mut state = AppState {
             registry: registry.clone(),
+            job_manager: Some(job_manager),
+            job_events: Some(job_tx),
             ..AppState::default()
         };
         state.left.location = location.clone();
         state.pending_remote_edit_origin = Some((Pane::Left, location.clone()));
+        // Production F4 start: create exactly one RemoteEdit job, store its id.
+        let re_job = state
+            .job_manager
+            .as_ref()
+            .expect("job manager bound")
+            .create_job(
+                "remote-edit",
+                arx::jobs::JobKind::RemoteEdit,
+                "Remote edit note.txt",
+                Some(location.clone()),
+                None,
+            );
+        let re_id = re_job.id.clone();
+        state.pending_remote_edit_job_id = Some(re_id.clone());
         let id = dispatcher.dispatch(
             EffectLane::RemoteEdit,
             EffectScope::Location(location.clone()),
@@ -7234,13 +7264,53 @@ mod tests {
         let temp_path = session.temp_dir.path().to_path_buf();
         let working_path = temp_path.join("working");
         let editor_result = DesktopService::open_editor("false", &working_path).await;
-        assert!(editor_result.is_err());
-        assert!(finish_remote_editor(session, editor_result, &mut state).is_none());
+        assert!(editor_result.is_err(), "editor must return non-zero");
+        // No writeback effect is scheduled on editor failure.
+        assert!(
+            finish_remote_editor(session, editor_result, &mut state).is_none(),
+            "editor failure must not schedule a writeback effect"
+        );
+        // Session-scoped pending state cleared (defensive, job-id-independent).
         assert!(state.pending_remote_edit_origin.is_none());
+        assert!(state.pending_remote_edit_session.is_none());
+        assert!(state.pending_remote_edit_job_id.is_none());
+        assert!(!state.pending_editor);
         assert!(
             !temp_path.exists(),
             "secure temporary directory must be dropped"
         );
+        // Exactly one RemoteEdit job, terminal as typed Failed, no leak.
+        let snap = state
+            .job_manager
+            .as_ref()
+            .expect("job manager bound")
+            .snapshot();
+        assert_eq!(snap.len(), 1, "exactly one RemoteEdit job");
+        assert_eq!(snap[0].id, re_id, "job id is the one created");
+        assert!(snap[0].status.is_terminal(), "job reached terminal truth");
+        assert_eq!(
+            snap[0].result,
+            Some(arx::jobs::JobResult::RemoteEdit(
+                arx::jobs::RemoteEditOutcome::Failed
+            )),
+            "terminal truth is typed RemoteEdit::Failed"
+        );
+        // Drain the event channel and confirm the typed Failed terminal arrived.
+        let mut terminal = None;
+        while let Ok(ev) = job_rx.try_recv() {
+            if let arx::jobs::JobEvent::Failed {
+                result: Some(arx::jobs::JobResult::RemoteEdit(o)),
+                ..
+            }
+            | arx::jobs::JobEvent::Completed {
+                result: arx::jobs::JobResult::RemoteEdit(o),
+                ..
+            } = ev
+            {
+                terminal = Some(o);
+            }
+        }
+        assert_eq!(terminal, Some(arx::jobs::RemoteEditOutcome::Failed));
         assert_remote_original(&registry, &location).await;
         fixture.cleanup().await;
     }

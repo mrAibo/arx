@@ -2947,6 +2947,231 @@ mod metadata_tests {
         );
     }
 
+    // ── Physical parent-policy boundaries (TRACK B #6/#7) ──
+    // Sticky writable parent (0o1777, /tmp-style) is accepted: the sticky bit
+    // protects the private transaction namespace, so the write may proceed.
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn track_e_sticky_writable_parent_accepted() {
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        crate::remote::validate_ssh_alias(&host).unwrap();
+        let token = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = format!("/tmp/arx-demo/arx-sticky-{token}");
+        assert!(
+            std::process::Command::new("ssh")
+                .arg(&host)
+                .arg(format!(
+                    "sh -c {}",
+                    shell_quote(&format!(
+                        "set -eu; rm -rf -- {b}; mkdir -m 1777 -- {b}; chown sftptest:sftptest -- {b}",
+                        b = shell_quote(&base)
+                    ))
+                ))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _fixture = RemoteFaultFixture {
+            host: host.clone(),
+            base: base.clone(),
+        };
+        let provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
+        let path = format!("{base}/file.txt");
+        seed_remote(&host, &path, b"old", 0o600).unwrap();
+        let revision = remote_revision(&provider, &path).await;
+        // Sticky writable parent: write-back is allowed and replaces the content.
+        let result = provider
+            .write_file_bytes_if_unchanged(
+                &path,
+                b"new",
+                &revision,
+                &CancellationFlag::default(),
+                None,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "sticky writable parent must be accepted: {result:?}"
+        );
+        assert_eq!(
+            provider.read_all_capped(&path, 16).await.unwrap().bytes,
+            b"new"
+        );
+        assert!(
+            transaction_artifacts(&provider, &base, "file.txt")
+                .await
+                .is_empty()
+        );
+    }
+
+    // Group/world-writable NON-sticky parent (0o777) is rejected fail-closed:
+    // the transaction protocol cannot prove exclusive namespace control there.
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn track_e_nonsicky_writable_parent_rejected() {
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        crate::remote::validate_ssh_alias(&host).unwrap();
+        let token = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = format!("/tmp/arx-demo/arx-nonsticky-{token}");
+        assert!(
+            std::process::Command::new("ssh")
+                .arg(&host)
+                .arg(format!(
+                    "sh -c {}",
+                    shell_quote(&format!(
+                        "set -eu; rm -rf -- {b}; mkdir -m 777 -- {b}; chown sftptest:sftptest -- {b}",
+                        b = shell_quote(&base)
+                    ))
+                ))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _fixture = RemoteFaultFixture {
+            host: host.clone(),
+            base: base.clone(),
+        };
+        let provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
+        let path = format!("{base}/file.txt");
+        seed_remote(&host, &path, b"old", 0o600).unwrap();
+        let revision = remote_revision(&provider, &path).await;
+        let error = provider
+            .write_file_bytes_if_unchanged(
+                &path,
+                b"new",
+                &revision,
+                &CancellationFlag::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsafe writable transaction parent"),
+            "non-sticky writable parent must fail closed: {}",
+            error
+        );
+        // Original untouched, no artifacts leaked.
+        assert_eq!(
+            provider.read_all_capped(&path, 16).await.unwrap().bytes,
+            b"old"
+        );
+        assert!(
+            transaction_artifacts(&provider, &base, "file.txt")
+                .await
+                .is_empty()
+        );
+    }
+
+    // ── Physical pool-health against the real container sshd (TRACK C) ──
+    // Unlike the deterministic #48 matrix (which stubs SSH I/O via test_probe),
+    // this drives the EXACT same `connect_for_mutation` algorithm against a real
+    // OpenSSH server and uses server-side process evidence (sshd client children)
+    // to prove reuse / stale-reconnect / no-replay.
+    async fn sshd_client_count(host: &str) -> usize {
+        let out = std::process::Command::new("ssh")
+            .arg(host)
+            .arg("ps -e -o args 2>/dev/null")
+            .output()
+            .unwrap();
+        let s = String::from_utf8_lossy(&out.stdout);
+        // `sshd:` (with colon) marks a per-connection child; the listener is bare `sshd`.
+        s.lines().filter(|l| l.contains("sshd:")).count()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn track_c_physical_pool_health_real_sshd() {
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        crate::remote::validate_ssh_alias(&host).unwrap();
+        let provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
+
+        // 1) HEALTHY REUSE: first acquire opens one sshd client; second reuses
+        //    the pooled session (the kernel connection, hence the sshd child,
+        //    is NOT re-created).
+        {
+            let _g = provider.connect_for_mutation().await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let after_first = sshd_client_count(&host).await;
+        assert_eq!(
+            after_first, 1,
+            "first acquire opens exactly one sshd client"
+        );
+        {
+            let _g = provider.connect_for_mutation().await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let after_second = sshd_client_count(&host).await;
+        assert_eq!(
+            after_second, after_first,
+            "second acquire reuses pooled session (no new sshd child)"
+        );
+
+        // 2) STALE REPLACEMENT: kill ONLY the server-side client connection while
+        //    sshd stays up; next acquire must detect the stale probe, discard the
+        //    stale session, and reconnect exactly once.
+        let _ = std::process::Command::new("ssh")
+            .arg(&host)
+            .arg("pkill -f 'sshd: '")
+            .status();
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        {
+            let _g = provider.connect_for_mutation().await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let after_reconnect = sshd_client_count(&host).await;
+        assert_eq!(
+            after_reconnect, 1,
+            "stale session discarded + exactly one fresh connection established"
+        );
+
+        // 3) NO DESTRUCTIVE REPLAY: a real mutation after reconnect runs once and
+        //    the pooled session is reused (count stays at one).
+        let base = format!(
+            "{}/track-c-pool",
+            std::env::var("ARX_SFTP_SMOKE_BASE").unwrap_or_else(|_| "/tmp".to_string())
+        );
+        let path = format!("{base}/pool-file.txt");
+        seed_remote(&host, &path, b"original", 0o600).unwrap();
+        let revision = remote_revision(&provider, &path).await;
+        provider
+            .write_file_bytes_if_unchanged(
+                &path,
+                b"mutated",
+                &revision,
+                &CancellationFlag::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.read_all_capped(&path, 16).await.unwrap().bytes,
+            b"mutated",
+            "single mutation applied exactly once"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let after_mut = sshd_client_count(&host).await;
+        assert_eq!(
+            after_mut, 1,
+            "mutation reused the pooled session (no reconnect spin)"
+        );
+        let _ = std::process::Command::new("ssh")
+            .arg(host)
+            .arg(format!(
+                "sh -c {}",
+                shell_quote(&format!("rm -rf -- {}", shell_quote(&base)))
+            ))
+            .status();
+    }
+
     #[test]
     fn mutation_failure_invalidates_session() {
         let source = include_str!("sftp.rs");
