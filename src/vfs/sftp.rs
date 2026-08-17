@@ -33,6 +33,25 @@ impl SftpInvalidation {
     }
 }
 
+/// Pooled-session reuse decision (TRACK C #48): the health-probe policy,
+/// extracted pure so it can be tested deterministically without any network
+/// or `sleep`. `connect_for_mutation` is the only caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PoolHealthAction {
+    /// Existing session probed healthy — reuse it, no reconnect.
+    Reuse,
+    /// No session, or probe said transport-broken — discard + open a fresh one.
+    DiscardAndReconnect,
+}
+
+pub(crate) fn pool_health_action(has_session: bool, probe: SftpInvalidation) -> PoolHealthAction {
+    if has_session && !probe.should_invalidate() {
+        PoolHealthAction::Reuse
+    } else {
+        PoolHealthAction::DiscardAndReconnect
+    }
+}
+
 /// Classify an `io::Error` produced by an SFTP operation.
 ///
 /// Definitive application outcomes (cancellation, validation refusal,
@@ -66,6 +85,19 @@ fn classify_russh_error(err: &russh_sftp::client::error::Error) -> SftpInvalidat
         russh_sftp::client::error::Error::Status(_) => SftpInvalidation::Keep,
         _ => SftpInvalidation::TransportBroken,
     }
+}
+
+/// Convert a raw russh-sftp error into `io::Error` while PRESERVING the
+/// transport-invalidation truth in the `ErrorKind` (TRACK C #47). Stringifying
+/// into `io::Error::other` would erase it and let a dead session survive; here
+/// `TransportBroken` maps to a transport `ErrorKind` so `classify_io_error`
+/// downstream can still invalidate the pooled connection.
+fn russh_to_io(err: russh_sftp::client::error::Error, ctx: &str) -> io::Error {
+    let kind = match classify_russh_error(&err) {
+        SftpInvalidation::TransportBroken => io::ErrorKind::BrokenPipe,
+        SftpInvalidation::Keep => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, format!("{ctx}: {err}"))
 }
 
 /// Bounded health probe for a pooled session before reuse (TRACK C #48).
@@ -245,7 +277,7 @@ async fn read_stable_snapshot(
     let before = session
         .symlink_metadata(path.to_string())
         .await
-        .map_err(|error| std::io::Error::other(format!("SFTP metadata {path}: {error}")))?;
+        .map_err(|error| russh_to_io(error, &format!("SFTP metadata {path}")))?;
     if !is_regular_file(&before) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -260,7 +292,7 @@ async fn read_stable_snapshot(
     let first_file = session
         .open(path.to_string())
         .await
-        .map_err(|error| std::io::Error::other(format!("SFTP open {path}: {error}")))?;
+        .map_err(|error| russh_to_io(error, &format!("SFTP open {path}")))?;
     let first = read_exact_len(first_file, read_len)
         .await
         .map_err(|error| std::io::Error::other(format!("SFTP read {path}: {error}")))?;
@@ -271,7 +303,7 @@ async fn read_stable_snapshot(
         let second_file = session
             .open(path.to_string())
             .await
-            .map_err(|error| std::io::Error::other(format!("SFTP reopen {path}: {error}")))?;
+            .map_err(|error| russh_to_io(error, &format!("SFTP reopen {path}")))?;
         read_exact_len(second_file, read_len)
             .await
             .map_err(|error| std::io::Error::other(format!("SFTP reread {path}: {error}")))?
@@ -279,7 +311,7 @@ async fn read_stable_snapshot(
     let after = session
         .symlink_metadata(path.to_string())
         .await
-        .map_err(|error| std::io::Error::other(format!("SFTP metadata {path}: {error}")))?;
+        .map_err(|error| russh_to_io(error, &format!("SFTP metadata {path}")))?;
 
     if !is_regular_file(&after)
         || after.size != Some(file_len)
@@ -856,8 +888,11 @@ impl SftpProvider {
             Some(session) => probe_session_healthy(&session.session).await,
             None => SftpInvalidation::Keep,
         };
-        if probe.should_invalidate()
-            && let Some(mut broken) = guard.take()
+        // #48: the health-probe policy decides reuse vs discard+reconnect.
+        if matches!(
+            pool_health_action(guard.is_some(), probe),
+            PoolHealthAction::DiscardAndReconnect
+        ) && let Some(mut broken) = guard.take()
         {
             broken.abort().await;
         }
@@ -1857,7 +1892,7 @@ impl SftpProvider {
             .session
             .symlink_metadata(path.to_string())
             .await
-            .map_err(|error| std::io::Error::other(format!("SFTP metadata {path}: {error}")))?;
+            .map_err(|error| russh_to_io(error, &format!("SFTP metadata {path}")))?;
         Ok(FileMetadata {
             len: meta.len(),
             is_regular: is_regular_file(&meta),
@@ -1871,6 +1906,78 @@ impl SftpProvider {
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
+
+    // ── #48 deterministic pool-health policy matrix (no network, no sleeps) ──
+    #[test]
+    fn pool_health_healthy_session_reused() {
+        assert_eq!(
+            pool_health_action(true, SftpInvalidation::Keep),
+            PoolHealthAction::Reuse
+        );
+    }
+
+    #[test]
+    fn pool_health_stale_session_discarded() {
+        assert_eq!(
+            pool_health_action(true, SftpInvalidation::TransportBroken),
+            PoolHealthAction::DiscardAndReconnect
+        );
+    }
+
+    #[test]
+    fn pool_health_no_session_connects() {
+        assert_eq!(
+            pool_health_action(false, SftpInvalidation::Keep),
+            PoolHealthAction::DiscardAndReconnect
+        );
+    }
+
+    #[test]
+    fn pool_health_status_probe_keeps_connection() {
+        // A definitive Status reply is a keep (transport still alive).
+        assert_eq!(
+            pool_health_action(true, SftpInvalidation::Keep),
+            PoolHealthAction::Reuse
+        );
+    }
+
+    #[test]
+    fn pool_health_timeout_or_transport_invalidates() {
+        assert_eq!(
+            pool_health_action(true, SftpInvalidation::TransportBroken),
+            PoolHealthAction::DiscardAndReconnect
+        );
+        // timeout/EOF/reset/broken all map to TransportBroken via classify_*.
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert_eq!(
+                pool_health_action(true, classify_io_error(&io::Error::new(kind, "x"))),
+                PoolHealthAction::DiscardAndReconnect
+            );
+        }
+    }
+
+    #[test]
+    fn pool_health_application_error_keeps_connection() {
+        // permission/cancel/conflict/validation → Keep (do not reconnect).
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::AlreadyExists,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::Unsupported,
+        ] {
+            assert_eq!(
+                pool_health_action(true, classify_io_error(&io::Error::new(kind, "x"))),
+                PoolHealthAction::Reuse
+            );
+        }
+    }
 
     #[test]
     fn sftp_mtime_uses_canonical_second_resolution() {

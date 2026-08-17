@@ -181,6 +181,26 @@ pub enum JobResult {
         completed_items: Option<usize>,
     },
     WorkspaceSync(SyncExecutionOutcome),
+    RemoteEdit(RemoteEditOutcome),
+}
+
+/// Typed terminal truth for a remote-edit session. Never string-encoded:
+/// RecoveryRequired and CommittedWithWarning are first-class, distinct from
+/// Failed/Completed so the Jobs UI and any observer can branch on them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteEditOutcome {
+    Completed,
+    NoChange,
+    Cancelled,
+    Failed,
+    RecoveryRequired,
+    CommittedWithWarning,
+}
+
+impl RemoteEditOutcome {
+    pub fn job_result(self) -> JobResult {
+        JobResult::RemoteEdit(self)
+    }
 }
 
 impl JobResult {
@@ -202,6 +222,7 @@ impl JobResult {
         match self {
             Self::Generic { message, .. } => message.as_deref(),
             Self::WorkspaceSync(_) => None,
+            Self::RemoteEdit(_) => None,
         }
     }
 }

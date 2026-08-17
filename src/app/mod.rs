@@ -331,9 +331,11 @@ pub struct AppState {
     // B4: render-only snapshot; JobManager owns runtime lifecycle.
     pub jobs: Vec<Job>,
     // PACK C #51: runtime JobManager + event sink so TUI observers (remote edit)
-    // can publish job events without threading the manager through every caller.
-    pub job_manager: crate::jobs::JobManager,
-    pub job_events: tokio::sync::mpsc::UnboundedSender<crate::jobs::JobEvent>,
+    // can publish job events. Owned by event_loop (the single source of truth
+    // driving state.jobs + the Jobs UI); bound via `bind_jobs`, never constructed
+    // independently so there is exactly ONE manager/channel in production.
+    pub job_manager: Option<crate::jobs::JobManager>,
+    pub job_events: Option<tokio::sync::mpsc::UnboundedSender<crate::jobs::JobEvent>>,
     pub show_jobs: bool,
     pub job_cursor: usize,
     // C1: directory compare
@@ -465,8 +467,8 @@ impl Default for AppState {
             ssh_pending_keygen: None,
             ssh_test_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             jobs: Vec::new(),
-            job_manager: crate::jobs::JobManager::new(),
-            job_events: tokio::sync::mpsc::unbounded_channel().0,
+            job_manager: None,
+            job_events: None,
             show_jobs: false,
             job_cursor: 0,
             show_diff: false,
