@@ -110,6 +110,12 @@ pub enum EffectEvent {
         name: String,
         warning: String,
     },
+    /// Typed remote-edit cancellation (queued or stale-origin). Surfaces as the
+    /// typed RemoteEditOutcome::Cancelled — never inferred from Failed text.
+    RemoteEditCancelled {
+        name: String,
+        reason: crate::jobs::RemoteEditCancelReason,
+    },
     Failed {
         label: String,
         error: String,

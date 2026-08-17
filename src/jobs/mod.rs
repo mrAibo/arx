@@ -135,6 +135,23 @@ impl SyncJobProgress {
 pub enum JobProgress {
     Generic(Progress),
     WorkspaceSync(SyncJobProgress),
+    RemoteEdit(RemoteEditPhase),
+}
+
+impl std::fmt::Display for RemoteEditPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Queued => "queued",
+            Self::Downloading => "downloading",
+            Self::AwaitingEditor => "awaiting editor",
+            Self::Editing => "editing",
+            Self::ValidatingWorkingCopy => "validating working copy",
+            Self::WriteBack => "writing back",
+            Self::Verifying => "verifying",
+            Self::RollbackOrRecovery => "rollback / recovery",
+        };
+        f.write_str(s)
+    }
 }
 
 impl JobProgress {
@@ -142,6 +159,7 @@ impl JobProgress {
         match self {
             Self::Generic(progress) => progress.percent(),
             Self::WorkspaceSync(progress) => progress.percent(),
+            Self::RemoteEdit(_) => None,
         }
     }
 }
@@ -170,6 +188,7 @@ impl std::fmt::Display for JobProgress {
                 human_bytes(progress.transferred_bytes),
                 human_bytes(progress.total_bytes)
             ),
+            Self::RemoteEdit(phase) => phase.fmt(f),
         }
     }
 }
@@ -197,10 +216,32 @@ pub enum RemoteEditOutcome {
     CommittedWithWarning,
 }
 
+/// Observable remote-edit lifecycle phase, surfaced through the Job Manager so
+/// the Jobs UI can show progress instead of repeated generic Running events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteEditPhase {
+    Queued,
+    Downloading,
+    AwaitingEditor,
+    Editing,
+    ValidatingWorkingCopy,
+    WriteBack,
+    Verifying,
+    RollbackOrRecovery,
+}
+
 impl RemoteEditOutcome {
     pub fn job_result(self) -> JobResult {
         JobResult::RemoteEdit(self)
     }
+}
+
+/// Why an in-flight remote edit was cancelled. Both surface as the typed
+/// `RemoteEditOutcome::Cancelled`; the reason is diagnostic context only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteEditCancelReason {
+    Queued,
+    StaleOrigin,
 }
 
 impl JobResult {
@@ -674,6 +715,50 @@ impl JobManager {
         }
         let _ = events.send(event);
         true
+    }
+
+    /// Publish an observable remote-edit phase transition (no terminal state).
+    pub fn publish_remote_edit_phase(
+        &self,
+        events: &mpsc::UnboundedSender<JobEvent>,
+        id: &str,
+        phase: RemoteEditPhase,
+    ) {
+        let _ = self.publish_event(
+            events,
+            JobEvent::Progress {
+                id: id.to_string(),
+                progress: JobProgress::RemoteEdit(phase),
+            },
+        );
+    }
+
+    /// Centralized terminalization: exactly one terminal JobEvent for a
+    /// RemoteEdit job, carrying the typed outcome. Call from every terminal
+    /// production path so no job can leak as Running.
+    pub fn terminate_remote_edit(
+        &self,
+        events: &mpsc::UnboundedSender<JobEvent>,
+        id: &str,
+        outcome: RemoteEditOutcome,
+        error: Option<String>,
+    ) {
+        let event = match outcome {
+            RemoteEditOutcome::Cancelled => JobEvent::Cancelled {
+                id: id.to_string(),
+                result: JobResult::RemoteEdit(RemoteEditOutcome::Cancelled),
+            },
+            RemoteEditOutcome::Failed => JobEvent::Failed {
+                id: id.to_string(),
+                error: error.unwrap_or_else(|| "remote edit failed".into()),
+                result: Some(JobResult::RemoteEdit(RemoteEditOutcome::Failed)),
+            },
+            other => JobEvent::Completed {
+                id: id.to_string(),
+                result: JobResult::RemoteEdit(other),
+            },
+        };
+        let _ = self.publish_event(events, event);
     }
 
     /// Spawn one workspace-sync job without a post-run verification pass.

@@ -127,6 +127,41 @@ impl OpenSshSftpConnection {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
     }
+
+    /// Test-only connection that owns a local `sftp-server` pipe instead of a
+    /// real SSH subsystem. This runs the real SFTP handshake over stdio against
+    /// the system `sftp-server` (no SSH, no network), so the pooled
+    /// acquire/probe/reconnect algorithm can be exercised deterministically.
+    #[cfg(test)]
+    pub(crate) async fn test_stub() -> Self {
+        use tokio::process::Command;
+        let mut child = Command::new("/usr/lib/ssh/sftp-server")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("test_stub sftp-server spawns");
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("sftp-server stdin unavailable"))
+            .expect("test_stub");
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("sftp-server stdout unavailable"))
+            .expect("test_stub");
+        let stream = SshSubsystemStream { stdin, stdout };
+        // ponytail: build the real SFTP session on the ambient test runtime
+        // (no nested block_on — that deadlocks inside #[tokio::test]).
+        let session = SftpSession::new(stream)
+            .await
+            .map_err(|error| io::Error::other(format!("sftp-server handshake: {error}")))
+            .expect("test_stub handshake");
+        session.set_timeout(30);
+        Self { session, child }
+    }
 }
 
 fn shell_quote(value: &str) -> String {

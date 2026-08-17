@@ -100,6 +100,23 @@ fn russh_to_io(err: russh_sftp::client::error::Error, ctx: &str) -> io::Error {
     io::Error::new(kind, format!("{ctx}: {err}"))
 }
 
+/// Classify a remote SFTP file stream read failure. A break/EOF/timeout
+/// mid-stream on a pooled connection is a transport failure (disconnect,
+/// reset, EOF, timeout, not-connected) → invalidate. Only local cooperative
+/// cancellation (Interrupted) keeps the connection. The original kind is
+/// folded into a BrokenPipe so downstream `classify_io_error` yields
+/// `TransportBroken`; classification is by `ErrorKind`, never by stringifying
+/// the message first.
+fn stream_read_error(error: io::Error, ctx: &str) -> io::Error {
+    let kind = match error.kind() {
+        // Local cooperative cancellation: keep the pooled session.
+        io::ErrorKind::Interrupted => io::ErrorKind::Interrupted,
+        // Every transport/EOF/ambiguous-health break → invalidate.
+        _ => io::ErrorKind::BrokenPipe,
+    };
+    io::Error::new(kind, format!("{ctx}: {error}"))
+}
+
 /// Bounded health probe for a pooled session before reuse (TRACK C #48).
 /// Uses a harmless `realpath(".")`; fails closed on timeout so a stale session
 /// is discarded rather than reused. No destructive operation is replayed.
@@ -295,7 +312,7 @@ async fn read_stable_snapshot(
         .map_err(|error| russh_to_io(error, &format!("SFTP open {path}")))?;
     let first = read_exact_len(first_file, read_len)
         .await
-        .map_err(|error| std::io::Error::other(format!("SFTP read {path}: {error}")))?;
+        .map_err(|error| stream_read_error(error, &format!("SFTP read {path}")))?;
 
     let second = if truncated {
         first.clone()
@@ -306,7 +323,7 @@ async fn read_stable_snapshot(
             .map_err(|error| russh_to_io(error, &format!("SFTP reopen {path}")))?;
         read_exact_len(second_file, read_len)
             .await
-            .map_err(|error| std::io::Error::other(format!("SFTP reread {path}: {error}")))?
+            .map_err(|error| stream_read_error(error, &format!("SFTP reread {path}")))?
     };
     let after = session
         .symlink_metadata(path.to_string())
@@ -771,7 +788,32 @@ pub struct SftpProvider {
     faults: AtomicWriteFaults,
     #[cfg(test)]
     pause_after_pin: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Test-only injectable seam for the pooled acquire/probe/reconnect
+    /// algorithm (TRACK C #48 deterministic matrix). When set,
+    /// `connect_for_mutation` uses these instead of a real SSH session, so the
+    /// exact same production algorithm runs without any network or `sleep`.
+    test_probe: Option<TestProbeFn>,
+    test_connect: Option<TestConnectFn>,
 }
+
+/// ponytail: injected probe used by the deterministic pooled-acquire matrix.
+type TestProbeFn = Box<
+    dyn Fn(&crate::remote::openssh_sftp::OpenSshSftpConnection) -> SftpInvalidation + Send + Sync,
+>;
+
+/// ponytail: boxed async factory standing in for a real SSH connect in tests.
+type TestConnectFn = Box<
+    dyn Fn() -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::io::Result<
+                            crate::remote::openssh_sftp::OpenSshSftpConnection,
+                        >,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
+>;
 
 impl std::fmt::Debug for SftpProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -791,6 +833,8 @@ impl SftpProvider {
             faults: AtomicWriteFaults::default(),
             #[cfg(test)]
             pause_after_pin: None,
+            test_probe: None,
+            test_connect: None,
         }
     }
 
@@ -884,8 +928,16 @@ impl SftpProvider {
     > {
         let mut guard = self.connection.lock().await;
         // Probe the pooled session (async); abort only on transport break.
+        // Test seam: if `test_probe` is injected, it stands in for the real
+        // `realpath(".")` health probe so the matrix runs without a network.
         let probe = match guard.as_ref() {
-            Some(session) => probe_session_healthy(&session.session).await,
+            Some(session) => {
+                if let Some(probe_fn) = &self.test_probe {
+                    probe_fn(session)
+                } else {
+                    probe_session_healthy(&session.session).await
+                }
+            }
             None => SftpInvalidation::Keep,
         };
         // #48: the health-probe policy decides reuse vs discard+reconnect.
@@ -897,12 +949,47 @@ impl SftpProvider {
             broken.abort().await;
         }
         if guard.is_none() {
-            *guard = Some(
+            let conn = if let Some(connect_fn) = &self.test_connect {
+                connect_fn().await?
+            } else {
                 crate::remote::openssh_sftp::OpenSshSftpConnection::connect(&self.host.ssh_alias)
-                    .await?,
-            );
+                    .await?
+            };
+            *guard = Some(conn);
         }
         Ok(guard)
+    }
+
+    /// Test-only: inject probe + a connect counter for the deterministic #48
+    /// acquire/probe/reconnect matrix. The same `connect_for_mutation` algorithm
+    /// runs; only the SSH I/O is replaced (by a harmless stub), so no network or
+    /// `sleep` is needed. `connects` is incremented exactly once per real
+    /// (re)connection, proving reuse vs fresh-replace behavior.
+    #[cfg(test)]
+    fn with_test_pool(
+        mut self,
+        probe: Option<SftpInvalidation>,
+        connects: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        let probe = probe.map(|p| {
+            Box::new(move |_conn: &crate::remote::openssh_sftp::OpenSshSftpConnection| p)
+                as Box<
+                    dyn Fn(&crate::remote::openssh_sftp::OpenSshSftpConnection) -> SftpInvalidation
+                        + Send
+                        + Sync,
+                >
+        });
+        let connects = connects.clone();
+        let connect: TestConnectFn = Box::new(move || {
+            let connects = connects.clone();
+            Box::pin(async move {
+                connects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::remote::openssh_sftp::OpenSshSftpConnection::test_stub().await)
+            })
+        });
+        self.test_probe = probe;
+        self.test_connect = Some(connect);
+        self
     }
 
     async fn mkdir(&self, path: &str) -> std::io::Result<()> {
@@ -1105,7 +1192,7 @@ impl SftpProvider {
                     tokio::io::AsyncReadExt::take(&mut file, cap as u64)
                         .read_to_end(&mut buf)
                         .await
-                        .map_err(|e| std::io::Error::other(format!("SFTP read {path}: {e}")))?;
+                        .map_err(|e| stream_read_error(e, &format!("SFTP read {path}")))?;
                     let truncated = buf.len() > max_bytes;
                     if truncated {
                         buf.truncate(max_bytes);
@@ -1977,6 +2064,109 @@ mod metadata_tests {
                 PoolHealthAction::Reuse
             );
         }
+    }
+
+    // ── #48 deterministic acquire/probe/reconnect matrix ──
+    // Drives the real `connect_for_mutation` algorithm via the injected seam;
+    // a counter proves exactly how many (re)connections happened. No network,
+    // no `sleep`.
+
+    #[tokio::test]
+    async fn acquire_healthy_session_reused_zero_extra_connects() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
+        // First op acquires once; second op reuses the pooled session.
+        let _ = provider.mkdir("a").await;
+        let _ = provider.mkdir("b").await;
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn acquire_no_session_connects_once() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
+        let _ = provider.mkdir("a").await;
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn acquire_stale_session_discarded_and_reconnected() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::TransportBroken), connects.clone());
+        // Every acquire is stale → fresh replacement each time.
+        let _ = provider.mkdir("a").await;
+        let _ = provider.mkdir("b").await;
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn acquire_status_probe_keeps_zero_extra_connects() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
+        for name in ["a", "b", "c", "d"] {
+            let _ = provider.mkdir(name).await;
+        }
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn acquire_application_error_keeps_connection() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
+        for name in ["a", "b", "c"] {
+            let _ = provider.mkdir(name).await;
+        }
+        // Keep (no transport break) → never reconnect, regardless of op errors.
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn acquire_destructive_mutation_runs_exactly_once_per_op() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
+        // A single mutation acquires the session exactly once (no reconnect spin).
+        let _ = provider.mkdir("once").await;
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // ── #47 stream-read transport truth seam ──
+    #[test]
+    fn stream_read_error_transport_kinds_invalidate() {
+        // Every listed transport/EOF/ambiguous-health break maps to BrokenPipe
+        // → TransportBroken → pool invalidation (per contract).
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::NotConnected,
+        ] {
+            let err = stream_read_error(io::Error::new(kind, "x"), "SFTP read x");
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "kind {kind:?}");
+            assert_eq!(
+                classify_io_error(&err),
+                SftpInvalidation::TransportBroken,
+                "kind {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_read_error_keeps_local_cancellation() {
+        // Only local cooperative cancellation keeps the pooled connection.
+        let err = stream_read_error(
+            io::Error::new(io::ErrorKind::Interrupted, "x"),
+            "SFTP read x",
+        );
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(classify_io_error(&err), SftpInvalidation::Keep);
     }
 
     #[test]
