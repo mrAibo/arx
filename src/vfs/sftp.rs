@@ -2470,8 +2470,19 @@ mod metadata_tests {
         use std::io::Write as _;
         use std::process::Stdio;
 
-        let quoted = shell_quote(path);
-        let script = format!("set -eu; umask 077; cat > {quoted}; chmod {mode:o} {quoted}");
+        let quoted_path = shell_quote(path);
+        let quoted_dir = shell_quote(
+            &std::path::Path::new(path)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".".to_string()),
+        );
+        let script = format!(
+            "set -eu; mkdir -p {dir}; umask 077; cat > {path}; chmod {mode:o} {path}",
+            dir = quoted_dir,
+            path = quoted_path,
+            mode = mode,
+        );
         let mut child = std::process::Command::new("ssh")
             .arg(host)
             .arg(format!("sh -c {}", shell_quote(&script)))
@@ -3039,13 +3050,15 @@ mod metadata_tests {
         };
         let provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
         let path = format!("{base}/file.txt");
+        // Seed via raw ssh: the provider refuses to even READ under a 0o777
+        // parent, so the workspace file is placed out-of-band.
         seed_remote(&host, &path, b"old", 0o600).unwrap();
-        let revision = remote_revision(&provider, &path).await;
+        // The write-back must fail closed with the unsafe-parent error.
         let error = provider
             .write_file_bytes_if_unchanged(
                 &path,
                 b"new",
-                &revision,
+                &RemoteEditRevision::new(b"old".to_vec(), 0o600, 0, 0),
                 &CancellationFlag::default(),
                 None,
             )
@@ -3055,18 +3068,25 @@ mod metadata_tests {
             error
                 .to_string()
                 .contains("unsafe writable transaction parent"),
-            "non-sticky writable parent must fail closed: {}",
-            error
+            "non-sticky writable parent must fail closed: {error}"
         );
-        // Original untouched, no artifacts leaked.
-        assert_eq!(
-            provider.read_all_capped(&path, 16).await.unwrap().bytes,
-            b"old"
-        );
+        // Original untouched (read back via raw ssh), no writeback occurred.
+        let remote = std::process::Command::new("ssh")
+            .arg(&host)
+            .arg(format!("cat -- {}", shell_quote(&path)))
+            .output()
+            .unwrap();
+        assert_eq!(remote.stdout, b"old", "original must be unchanged");
+        // No artifacts leaked into the directory.
+        let ls = std::process::Command::new("ssh")
+            .arg(&host)
+            .arg(format!("ls -A -- {}", shell_quote(&base)))
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&ls.stdout);
         assert!(
-            transaction_artifacts(&provider, &base, "file.txt")
-                .await
-                .is_empty()
+            !listing.contains(".arx-part-") && !listing.contains(".arx-txn-"),
+            "no transaction artifacts in non-sticky dir: {listing}"
         );
     }
 
@@ -3075,15 +3095,19 @@ mod metadata_tests {
     // this drives the EXACT same `connect_for_mutation` algorithm against a real
     // OpenSSH server and uses server-side process evidence (sshd client children)
     // to prove reuse / stale-reconnect / no-replay.
-    async fn sshd_client_count(host: &str) -> usize {
+    // Server-side session-child PIDs: each `connect_for_mutation` is one sshd
+    // session worker (`sshd: user@...`). The listener and `[priv]` do not match.
+    async fn sshd_session_pids(host: &str) -> std::collections::HashSet<String> {
         let out = std::process::Command::new("ssh")
             .arg(host)
-            .arg("ps -e -o args 2>/dev/null")
+            .arg("pgrep -f 'sshd: .*@'")
             .output()
             .unwrap();
-        let s = String::from_utf8_lossy(&out.stdout);
-        // `sshd:` (with colon) marks a per-connection child; the listener is bare `sshd`.
-        s.lines().filter(|l| l.contains("sshd:")).count()
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
     }
 
     #[tokio::test]
@@ -3093,48 +3117,62 @@ mod metadata_tests {
         crate::remote::validate_ssh_alias(&host).unwrap();
         let provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
 
-        // 1) HEALTHY REUSE: first acquire opens one sshd client; second reuses
-        //    the pooled session (the kernel connection, hence the sshd child,
-        //    is NOT re-created).
+        // Baseline: any pre-existing sessions on the shared fixture.
+        let baseline = sshd_session_pids(&host).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // 1) HEALTHY REUSE: first acquire opens exactly one new sshd session;
+        //    the second acquire reuses the SAME pooled session (no new PID).
         {
             let _g = provider.connect_for_mutation().await.unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let after_first = sshd_client_count(&host).await;
+        let after_first = sshd_session_pids(&host).await;
+        let new_first: Vec<_> = after_first.difference(&baseline).collect();
         assert_eq!(
-            after_first, 1,
-            "first acquire opens exactly one sshd client"
+            new_first.len(),
+            1,
+            "first acquire opens exactly one sshd session; baseline={baseline:?} after={after_first:?}"
         );
+        let session_pid = new_first[0].clone();
         {
             let _g = provider.connect_for_mutation().await.unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let after_second = sshd_client_count(&host).await;
-        assert_eq!(
-            after_second, after_first,
-            "second acquire reuses pooled session (no new sshd child)"
+        let after_second = sshd_session_pids(&host).await;
+        assert!(
+            after_second.contains(&session_pid),
+            "second acquire reuses the same pooled session (PID {session_pid} still present); now={after_second:?}"
         );
 
-        // 2) STALE REPLACEMENT: kill ONLY the server-side client connection while
-        //    sshd stays up; next acquire must detect the stale probe, discard the
-        //    stale session, and reconnect exactly once.
-        let _ = std::process::Command::new("ssh")
+        // 2) STALE REPLACEMENT: kill ONLY our server-side session while sshd stays
+        //    up; next acquire must detect the stale probe, discard the stale
+        //    session, and reconnect EXACTLY ONCE (a fresh PID, baseline size restored).
+        std::process::Command::new("ssh")
             .arg(&host)
-            .arg("pkill -f 'sshd: '")
-            .status();
+            .arg(format!("kill {session_pid}"))
+            .status()
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let after_kill = sshd_session_pids(&host).await;
+        assert!(
+            !after_kill.contains(&session_pid),
+            "killed session PID {session_pid} is gone; now={after_kill:?}"
+        );
         {
             let _g = provider.connect_for_mutation().await.unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let after_reconnect = sshd_client_count(&host).await;
+        let after_reconnect = sshd_session_pids(&host).await;
+        let new_after_reconnect: Vec<_> = after_reconnect.difference(&baseline).collect();
         assert_eq!(
-            after_reconnect, 1,
-            "stale session discarded + exactly one fresh connection established"
+            new_after_reconnect.len(),
+            1,
+            "stale session discarded + exactly one fresh connection; now={after_reconnect:?}"
         );
 
         // 3) NO DESTRUCTIVE REPLAY: a real mutation after reconnect runs once and
-        //    the pooled session is reused (count stays at one).
+        //    the pooled session is reused (PID count stays at one).
         let base = format!(
             "{}/track-c-pool",
             std::env::var("ARX_SFTP_SMOKE_BASE").unwrap_or_else(|_| "/tmp".to_string())
@@ -3158,10 +3196,12 @@ mod metadata_tests {
             "single mutation applied exactly once"
         );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let after_mut = sshd_client_count(&host).await;
+        let after_mut = sshd_session_pids(&host).await;
+        let new_after_mut: Vec<_> = after_mut.difference(&baseline).collect();
         assert_eq!(
-            after_mut, 1,
-            "mutation reused the pooled session (no reconnect spin)"
+            new_after_mut.len(),
+            1,
+            "mutation reused the pooled session (no reconnect spin); now={after_mut:?}"
         );
         let _ = std::process::Command::new("ssh")
             .arg(host)
