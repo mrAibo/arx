@@ -19,14 +19,28 @@ The Release Readiness gates below were completed and **v0.17.0 was published**:
 
 Release from current main after Product Truth and Release Readiness gates pass.
 
-## PACK C — current hardening (PR open)
+## PACK C — reliability hardening (MERGED)
 
-Issues #47–#53 are in-progress under PACK C post-release hardening (do not close):
+PACK C post-v0.17.0 hardening landed in `main` via **PR #155** (merged 2026-08-18, merge SHA `6e4b5fbb`). Issues **#47–#53 are CLOSED**.
 
-- **Reliability:** transport-only connection invalidation (#47), connection health probe (#48)
-- **Cleanup:** dead RemoteEditState variants (#49), double-lock (#52)
-- **Safety testing:** fault-injection suite (#50), parent policy (#53)
-- **Architecture:** Job Manager integration for Remote Edit (#51)
+Delivered:
+
+- **Reliability:** transport-only connection invalidation (#47), bounded pooled-session health probe (#48)
+- **Cleanup:** dead RemoteEditState variants (#49), double-lock removed (#52)
+- **Safety testing:** deterministic fault-injection suite (#50), writable non-sticky parent policy (#53)
+- **Architecture:** Remote Edit lifecycle integrated with Job Manager (#51), typed phases/outcomes, lane-isolated failure handling
+
+Physical SFTP Remote Edit acceptance (real OpenSSH fixture, `ARX_SFTP_SMOKE_HOST`):
+
+- **E1–E12** safety matrix — PASS
+- **fault/race** — PASS
+- **pool-health** (real sshd, reuse / stale-reconnect / no-replay) — PASS
+- **TUI lifecycle** (shared JobManager + job_events) — PASS
+- artifact audit: **0** partial-upload (`.arx-part-*`) fragments leaked
+
+## THEN — Next Public Release = v0.17.1
+
+Patch release from current `main` (post-PACK-C reliability hardening). Release Readiness gates apply; MSRV stays 1.88. No new major features, no WebDAV/Windows/plugin/S3-scope/router changes.
 
 ## FUTURE
 
