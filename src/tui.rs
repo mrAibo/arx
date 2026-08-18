@@ -6781,7 +6781,7 @@ fn finish_remote_editor(
     })
 }
 
-fn apply_effect_event(state: &mut AppState, event: EffectEvent) {
+fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent) {
     match event {
         EffectEvent::ShellCaptured {
             command,
@@ -6905,15 +6905,20 @@ fn apply_effect_event(state: &mut AppState, event: EffectEvent) {
             );
         }
         EffectEvent::Failed { label, error } => {
-            state.message = Some(format!("{label} failed: {error}"));
-            // Real provider/download failure for an in-flight remote edit:
-            // terminate as Failed (NOT Cancelled — cancellation has its own
-            // typed effect). No job may leak as Running.
-            terminate_remote_edit_job(
-                state,
-                arx::jobs::RemoteEditOutcome::Failed,
-                Some(format!("{label} failed: {error}")),
-            );
+            // #51/MAJOR: a generic failure only terminates an in-flight Remote
+            // Edit when it actually belongs to the RemoteEdit lane. An unrelated
+            // effect (LeftPane, GlobalProcess, …) must NOT mutate another
+            // session's lifecycle, job status, or pending ownership.
+            if lane == EffectLane::RemoteEdit {
+                state.message = Some(format!("{label} failed: {error}"));
+                terminate_remote_edit_job(
+                    state,
+                    arx::jobs::RemoteEditOutcome::Failed,
+                    Some(format!("{label} failed: {error}")),
+                );
+            } else {
+                state.message = Some(format!("{label} failed: {error}"));
+            }
         }
         EffectEvent::RemoteEditCancelled { name, reason } => {
             state.message = Some(format!("Remote edit cancelled: {name} ({reason:?})"));
@@ -7037,7 +7042,7 @@ fn handle_effect_response(
         && !matches!(&response.event, EffectEvent::Downloaded { .. });
 
     state.finish_effect(response.lane, response.id);
-    apply_effect_event(state, response.event);
+    apply_effect_event(state, response.lane, response.event);
     if remote_terminal {
         state.pending_remote_edit_origin = None;
     }
@@ -7715,6 +7720,7 @@ mod tests {
         );
         apply_effect_event(
             &mut cancel_state,
+            EffectLane::RemoteEdit,
             EffectEvent::RemoteEditCancelled {
                 name: "note.txt".into(),
                 reason: RemoteEditCancelReason::Queued,
@@ -7752,6 +7758,7 @@ mod tests {
         );
         apply_effect_event(
             &mut fail_state,
+            EffectLane::RemoteEdit,
             EffectEvent::Failed {
                 label: "remote edit download".into(),
                 error: "connection reset".into(),
@@ -7768,6 +7775,112 @@ mod tests {
         }
         assert_eq!(fail_outcome, Some(RemoteEditOutcome::Failed));
         assert!(!cancelled, "provider error must not be typed Cancelled");
+    }
+
+    // #51/MAJOR: an unrelated (non-RemoteEdit) Failed effect must NOT mutate an
+    // in-flight Remote Edit — same job id, still Running, ownership intact.
+    #[test]
+    fn unrelated_failed_effect_does_not_kill_active_remote_edit() {
+        let mut state = AppState::default();
+        let jm = arx::jobs::JobManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<arx::jobs::JobEvent>();
+        state.job_manager = Some(jm);
+        state.job_events = Some(tx);
+        state.left.location = Location::Sftp {
+            host: "h".into(),
+            path: "/x".into(),
+        };
+        state.pending_remote_edit_origin = Some((Pane::Left, state.left.location.clone()));
+        let re_job = state.job_manager.as_ref().unwrap().create_job(
+            "remote-edit",
+            arx::jobs::JobKind::RemoteEdit,
+            "Remote edit note.txt",
+            Some(state.left.location.clone()),
+            None,
+        );
+        let re_id = re_job.id.clone();
+        state.pending_remote_edit_job_id = Some(re_id.clone());
+
+        // Feed a generic failure on an unrelated lane (e.g. LeftPane).
+        apply_effect_event(
+            &mut state,
+            EffectLane::LeftPane,
+            EffectEvent::Failed {
+                label: "list directory".into(),
+                error: "permission denied".into(),
+            },
+        );
+
+        // Remote Edit must be completely untouched.
+        assert_eq!(
+            state.pending_remote_edit_job_id,
+            Some(re_id.clone()),
+            "job id must survive an unrelated failure"
+        );
+        assert!(
+            state.pending_remote_edit_origin.is_some(),
+            "origin must survive an unrelated failure"
+        );
+        assert!(
+            !state.pending_editor,
+            "editor flag must not be set, and must not be cleared by unrelated failure"
+        );
+        let job = state
+            .job_manager
+            .as_ref()
+            .unwrap()
+            .get(&re_id)
+            .expect("job still present");
+        assert_eq!(
+            job.status,
+            arx::jobs::JobStatus::Pending,
+            "in-flight Remote Edit job must not be terminalized by an unrelated failure"
+        );
+        // No RemoteEdit terminal event may have been published.
+        let mut terminal = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(
+                ev,
+                arx::jobs::JobEvent::Failed { .. }
+                    | arx::jobs::JobEvent::Cancelled { .. }
+                    | arx::jobs::JobEvent::Completed { .. }
+            ) {
+                terminal = true;
+            }
+        }
+        assert!(
+            !terminal,
+            "no RemoteEdit terminal event from unrelated failure"
+        );
+
+        // Now the same failure on the RemoteEdit lane DOES terminate it once.
+        apply_effect_event(
+            &mut state,
+            EffectLane::RemoteEdit,
+            EffectEvent::Failed {
+                label: "remote edit download".into(),
+                error: "connection reset".into(),
+            },
+        );
+        assert!(state.pending_remote_edit_job_id.is_none());
+        assert!(state.pending_remote_edit_origin.is_none());
+        let job = state
+            .job_manager
+            .as_ref()
+            .unwrap()
+            .get(&re_id)
+            .expect("job still present");
+        assert_eq!(job.status, arx::jobs::JobStatus::Failed);
+        let mut failed_once = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, arx::jobs::JobEvent::Failed { .. }) {
+                failed_once = true;
+            }
+        }
+        assert!(
+            failed_once,
+            "exactly one Failed terminal on RemoteEdit lane"
+        );
     }
 
     // #51 physical (requires host): cancel before editor prevents later launch
