@@ -73,8 +73,17 @@ URL="http://127.0.0.1:${HOST_PORT}/dav/"
 # Smoke: create a seeded file via curl with creds (test-only localhost).
 echo "arx-webdav-seed" | docker exec -i "$CONTAINER" sh -c "cat > ${WEBDAV_DIR}/.keep"
 
-echo "export ARX_WEBDAV_SMOKE_HOST=http://127.0.0.1:${HOST_PORT}/dav/"
-echo "export ARX_WEBDAV_SMOKE_USER=${USER}"
-echo "export ARX_WEBDAV_SMOKE_PASS=${PASS}"
-echo "export ARX_WEBDAV_CONTAINER=${CONTAINER}"
-echo "# SOURCE THIS OUTPUT. Credentials are ephemeral and local-only. Never reuse."
+# Blocker G: write credentials to a chmod 0600 file; print ONLY the path and a
+# source instruction. Never echo the password bytes to stdout/log/report.
+ENV_FILE="$(mktemp /tmp/arx-webdav-env.XXXXXX)"
+chmod 0600 "$ENV_FILE"
+cat > "$ENV_FILE" <<EOF
+export ARX_WEBDAV_SMOKE_HOST=http://127.0.0.1:${HOST_PORT}/dav/
+export ARX_WEBDAV_SMOKE_USER=${USER}
+export ARX_WEBDAV_SMOKE_PASS=${PASS}
+export ARX_WEBDAV_CONTAINER=${CONTAINER}
+EOF
+echo "# WebDAV acceptance fixture ready (Apache $(docker exec "$CONTAINER" httpd -v 2>/dev/null | head -1 | sed 's/^.*\///'))."
+echo "# Docker image: ${IMAGE}"
+echo "# Fixture address: ${URL}"
+echo "source ${ENV_FILE}   # credentials are ephemeral, local-only, chmod 0600; never reuse"

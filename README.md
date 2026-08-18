@@ -218,7 +218,7 @@ Menu entries appear in Command Center (Ctrl+P).
 | Host Center (F9) | ✅ |
 | Extension colors, heatmap, git status bar | ✅ |
 | S3 object-storage backend | ✅ AWS + MinIO PHYSICAL PASS (SUPPORTED MVP); Moto EMULATED PASS; R2/Wasabi UNVERIFIED (best-effort) |
-| WebDAV backend | ✅ MVP — PROPFIND/GET/PUT/DELETE/MKCOL/COPY/MOVE, Basic auth, keyring/env secret |
+| WebDAV backend | CANDIDATE (PACK E, PR #157 open) — PROPFIND/GET/PUT/DELETE/MKCOL/COPY/MOVE, Basic auth, keyring/env secret |
 
 ## S3 object storage
 
