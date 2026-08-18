@@ -17,13 +17,16 @@ fn target() -> Option<WebDavProvider> {
     let user = std::env::var("ARX_WEBDAV_SMOKE_USER").ok()?;
     let pass = std::env::var("ARX_WEBDAV_SMOKE_PASS").ok()?;
     Some(
-        WebDavProvider::new(WebDavTarget {
-            id: "accept".into(),
-            name: "accept".into(),
-            url: host,
-            username: user,
-            auth: pass,
-        })
+        WebDavProvider::new(
+            WebDavTarget {
+                id: "accept".into(),
+                name: "accept".into(),
+                url: host,
+                username: user,
+                auth: "basic".into(),
+            },
+            pass,
+        )
         .unwrap(),
     )
 }

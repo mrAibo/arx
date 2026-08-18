@@ -214,13 +214,16 @@ fn spawn_mock(
 }
 
 fn provider_for(url: &str, password: &str) -> WebDavProvider {
-    WebDavProvider::new(WebDavTarget {
-        id: "t".into(),
-        name: "t".into(),
-        url: url.to_string(),
-        username: "u".into(),
-        auth: password.to_string(),
-    })
+    WebDavProvider::new(
+        WebDavTarget {
+            id: "t".into(),
+            name: "t".into(),
+            url: url.to_string(),
+            username: "u".into(),
+            auth: "basic".into(),
+        },
+        password.to_string(),
+    )
     .expect("provider")
 }
 
@@ -291,8 +294,8 @@ async fn put_sends_body_and_201() {
     );
 }
 
-#[test]
-fn copy_sends_destination_and_overwrite_f() {
+#[tokio::test]
+async fn copy_sends_destination_and_overwrite_f() {
     let (url, log) = spawn_mock(|method, _, _, _, _| match method {
         "COPY" => {
             // dest is full URL per DAV spec; just don't panic
@@ -301,8 +304,14 @@ fn copy_sends_destination_and_overwrite_f() {
         _ => (404, Vec::new()),
     });
     let p = provider_for(&url, "x");
-    p.copy_files("/dav", "/dav2", &["src.txt".to_string()])
-        .expect("copy");
+    p.copy_or_move(
+        reqwest::Method::from_bytes(b"COPY").unwrap(),
+        "/dav/src.txt",
+        "/dav2/src.txt",
+        false,
+    )
+    .await
+    .expect("copy");
     let lg = log.lock().unwrap();
     let rec = lg
         .iter()

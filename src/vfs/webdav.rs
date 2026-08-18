@@ -82,24 +82,33 @@ pub(crate) struct PropFindEntry {
 /// A WebDAV provider bound to one configured target.
 pub struct WebDavProvider {
     target: WebDavTarget,
+    /// Resolved password (from keyring/ARX_WEBDAV_<ID>_PASSWORD at registry
+    /// build time). Never exposed via Debug.
+    password: String,
     /// Async client with TLS (rustls via reqwest defaults) + timeouts.
     client: reqwest::Client,
 }
 
 impl WebDavProvider {
-    pub fn new(target: WebDavTarget) -> io::Result<Self> {
+    pub fn new(target: WebDavTarget, password: String) -> io::Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| io::Error::other(format!("webdav client: {e}")))?;
-        Ok(Self { target, client })
+        Ok(Self {
+            target,
+            password,
+            client,
+        })
     }
 
     fn secret(&self) -> io::Result<String> {
-        // Secret already resolved from keyring/env at config-load into target.auth.
-        Ok(self.target.auth.clone())
+        // Password already resolved from the keyring/env path at registry
+        // build time (see ProviderRegistry::resolve_webdav_provider). `auth`
+        // is only the scheme; never a secret here.
+        Ok(self.password.clone())
     }
 
     /// Join the target root with a logical (decoded) path. Preserves the exact
@@ -156,6 +165,8 @@ impl WebDavProvider {
         }
     }
 
+    /// Join a destination path to a fully-qualified Destination header URL.
+    #[allow(dead_code)] // wired through the async transfer executor (Blocker B)
     fn destination_url(&self, dst: &str) -> String {
         self.join_url(dst)
     }
@@ -279,7 +290,7 @@ impl WebDavProvider {
         Err(self.status_error("MKCOL", status, &text))
     }
 
-    async fn copy_or_move(
+    pub(crate) async fn copy_or_move(
         &self,
         method: reqwest::Method,
         src: &str,
@@ -388,56 +399,30 @@ impl VfsProvider for WebDavProvider {
         self.get_bounded(path, max_bytes).await
     }
 
-    fn copy_files(&self, src: &str, dst: &str, names: &[String]) -> io::Result<usize> {
-        let name = names.first().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "WebDAV copy requires a name")
-        })?;
-        let src_path = join_path(src, name);
-        let dst_path = join_path(dst, name);
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(self.copy_or_move(
-                    reqwest::Method::from_bytes(b"COPY").unwrap(),
-                    &src_path,
-                    &dst_path,
-                    false,
-                ))
-        })?;
-        Ok(1)
+    fn copy_files(&self, _src: &str, _dst: &str, _names: &[String]) -> io::Result<usize> {
+        // ponytail/Blocker E: WebDAV copy/move is served by the async transfer
+        // executor (WebDavTransferSpec), not the sync Trait path. The sync
+        // VfsProvider file-ops would need a nested Tokio runtime here, which
+        // panics on a current-thread runtime. Fail closed instead of building
+        // one. Dataset-copy via F5 routes through `execute_webdav_transfer`.
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "WebDAV server-side copy is only available via the async transfer executor",
+        ))
     }
 
-    fn move_files(&self, src: &str, dst: &str, names: &[String]) -> io::Result<usize> {
-        let name = names.first().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "WebDAV move requires a name")
-        })?;
-        let src_path = join_path(src, name);
-        let dst_path = join_path(dst, name);
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(self.copy_or_move(
-                    reqwest::Method::from_bytes(b"MOVE").unwrap(),
-                    &src_path,
-                    &dst_path,
-                    false,
-                ))
-        })?;
-        Ok(1)
+    fn move_files(&self, _src: &str, _dst: &str, _names: &[String]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "WebDAV move is only available via the async transfer executor",
+        ))
     }
 
-    fn delete_files(&self, dir: &str, names: &[String]) -> io::Result<usize> {
-        let mut count = 0;
-        for name in names {
-            let path = join_path(dir, name);
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Runtime::new()
-                    .unwrap()
-                    .block_on(self.delete(&path))
-            })?;
-            count += 1;
-        }
-        Ok(count)
+    fn delete_files(&self, _dir: &str, _names: &[String]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "WebDAV delete is only available via the async transfer executor",
+        ))
     }
 
     async fn mkdir(&self, path: &str) -> io::Result<()> {
@@ -492,11 +477,6 @@ impl std::fmt::Debug for WebDavProvider {
 }
 
 // ---- helpers ----
-
-fn join_path(parent: &str, name: &str) -> String {
-    let p = parent.trim_end_matches('/');
-    format!("{p}/{name}")
-}
 
 /// Extract the path portion of an href, stripping any `scheme://host[:port]`
 /// prefix so logical-path comparisons are host-agnostic.

@@ -674,14 +674,31 @@ impl ProviderRegistry {
                     ),
                 )
             })?;
-        let provider: Arc<dyn VfsProvider> =
-            Arc::new(webdav::WebDavProvider::new(webdav::WebDavTarget {
+        // Ponytail/Blocker A: resolve the password through the real target-id
+        // secret path (keyring, ARX_WEBDAV_<ID>_PASSWORD fallback). `auth` is
+        // only the scheme; never treat it as a password. Fail closed if no
+        // secret is configured.
+        let password = crate::keyring::webdav_secret(&target.id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "no WebDAV secret configured for target {}",
+                    crate::config::sanitize_diag(&target.id)
+                ),
+            )
+        })?;
+        let provider: Arc<dyn VfsProvider> = Arc::new(webdav::WebDavProvider::new(
+            webdav::WebDavTarget {
                 id: target.id.clone(),
                 name: target.name.clone(),
                 url: target.url.clone(),
                 username: target.username.clone(),
+                // ponytail: only the scheme is stored here; the password is
+                // resolved per-request from the keyring keyed by id.
                 auth: target.auth.clone(),
-            })?);
+            },
+            password,
+        )?);
         let mut providers = self.providers.write().expect("provider registry poisoned");
         let registered = providers.entry(key).or_insert_with(|| RegisteredProvider {
             provider: Arc::clone(&provider),
