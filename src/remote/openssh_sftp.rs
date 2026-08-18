@@ -15,7 +15,7 @@ use tokio::time::timeout;
 /// known_hosts and host-key policy. russh-sftp only speaks the SFTP protocol
 /// over the already-authenticated subsystem stream.
 pub struct OpenSshSftpConnection {
-    pub session: SftpSession,
+    pub session: Option<SftpSession>,
     child: Child,
 }
 
@@ -57,7 +57,10 @@ impl OpenSshSftpConnection {
             .map_err(|error| io::Error::other(format!("SFTP handshake failed: {error}")))?;
         session.set_timeout(30);
 
-        Ok(Self { session, child })
+        Ok(Self {
+            session: Some(session),
+            child,
+        })
     }
 
     /// Create a transaction directory with mode 0700 in the creating syscall.
@@ -110,7 +113,9 @@ impl OpenSshSftpConnection {
     }
 
     pub async fn close(mut self) -> io::Result<()> {
-        let _ = self.session.close().await;
+        if let Some(session) = self.session.take() {
+            let _ = session.close().await;
+        }
         match timeout(Duration::from_secs(2), self.child.wait()).await {
             Ok(result) => {
                 let _ = result?;
@@ -123,9 +128,35 @@ impl OpenSshSftpConnection {
         Ok(())
     }
 
+    pub fn session(&self) -> &SftpSession {
+        self.session.as_ref().expect("connected session")
+    }
+
     pub async fn abort(&mut self) {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
+    }
+
+    /// Test-only connection used by the deterministic pooled-acquire matrix.
+    /// It owns a dummy child process (so `abort()` has something to kill) but
+    /// holds NO live SFTP session — the injected test probe ignores the
+    /// session, so no handshake (no SSH, no network, no external sftp-server
+    /// binary) runs. This keeps #48's acquire/probe/reconnect tests fully local
+    /// and flake-free across environments, per the "no network / no sleeps in
+    /// deterministic tests" contract.
+    #[cfg(test)]
+    pub(crate) async fn test_stub() -> Self {
+        use tokio::process::Command;
+        // ponytail: portable dummy child (no sftp-server needed) — only exists
+        // so abort() can be exercised; the pooled tests never touch a session.
+        let child = Command::new("true")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("test_stub dummy child spawns");
+        Self {
+            session: None,
+            child,
+        }
     }
 }
 

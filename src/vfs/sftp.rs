@@ -7,7 +7,143 @@ use anyhow::Context;
 use std::collections::BTreeSet;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
+
+/// Canonical decision: must the pooled SFTP session be invalidated?
+///
+/// TRACK B (#47): a pooled connection is invalidated ONLY for transport-level
+/// failure where safe reuse cannot be proven. Application-level results —
+/// conflict, cancelled, validation refusal, binary/UTF-8 refusal, unsupported,
+/// definitive remote permission/status — keep the connection, because the
+/// transport is still known-good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SftpInvalidation {
+    /// Disconnect / EOF / broken pipe / timeout with ambiguous reuse.
+    TransportBroken,
+    /// Keep: application-level outcome, transport still usable.
+    Keep,
+}
+
+impl SftpInvalidation {
+    /// Invalidate the pooled connection only for transport-level failure.
+    pub(crate) fn should_invalidate(self) -> bool {
+        matches!(self, Self::TransportBroken)
+    }
+}
+
+/// Pooled-session reuse decision (TRACK C #48): the health-probe policy,
+/// extracted pure so it can be tested deterministically without any network
+/// or `sleep`. `connect_for_mutation` is the only caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PoolHealthAction {
+    /// Existing session probed healthy — reuse it, no reconnect.
+    Reuse,
+    /// No session, or probe said transport-broken — discard + open a fresh one.
+    DiscardAndReconnect,
+}
+
+pub(crate) fn pool_health_action(has_session: bool, probe: SftpInvalidation) -> PoolHealthAction {
+    if has_session && !probe.should_invalidate() {
+        PoolHealthAction::Reuse
+    } else {
+        PoolHealthAction::DiscardAndReconnect
+    }
+}
+
+/// Classify an `io::Error` produced by an SFTP operation.
+///
+/// Definitive application outcomes (cancellation, validation refusal,
+/// unsupported, conflict, definitive remote permission/status) keep the
+/// connection. Transport-ambiguous transport signals invalidate it.
+pub(crate) fn classify_io_error(err: &io::Error) -> SftpInvalidation {
+    match err.kind() {
+        // Cancellation / validation refusal / unsupported / conflict / permission.
+        io::ErrorKind::Interrupted
+        | io::ErrorKind::InvalidInput
+        | io::ErrorKind::Unsupported
+        | io::ErrorKind::AlreadyExists
+        | io::ErrorKind::PermissionDenied => SftpInvalidation::Keep,
+        // Transport-ambiguous: the connection may be gone or wedged.
+        io::ErrorKind::TimedOut
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof => SftpInvalidation::TransportBroken,
+        _ => SftpInvalidation::Keep,
+    }
+}
+
+/// Classify a raw russh-sftp error. `Status` variants are definitive
+/// application outcomes (keep); non-Status transport/protocol errors
+/// invalidate. russh's `IO` variant wraps only a `String`, so its
+/// transport semantics cannot be narrowed — treat as transport-ambiguous
+/// (invalidate, the fail-closed choice).
+fn classify_russh_error(err: &russh_sftp::client::error::Error) -> SftpInvalidation {
+    match err {
+        russh_sftp::client::error::Error::Status(_) => SftpInvalidation::Keep,
+        _ => SftpInvalidation::TransportBroken,
+    }
+}
+
+/// Convert a raw russh-sftp error into `io::Error` while PRESERVING the
+/// transport-invalidation truth in the `ErrorKind` (TRACK C #47). Stringifying
+/// into `io::Error::other` would erase it and let a dead session survive; here
+/// `TransportBroken` maps to a transport `ErrorKind` so `classify_io_error`
+/// downstream can still invalidate the pooled connection.
+fn russh_to_io(err: russh_sftp::client::error::Error, ctx: &str) -> io::Error {
+    let kind = match classify_russh_error(&err) {
+        SftpInvalidation::TransportBroken => io::ErrorKind::BrokenPipe,
+        SftpInvalidation::Keep => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, format!("{ctx}: {err}"))
+}
+
+/// Classify a remote SFTP file stream read failure. A break/EOF/timeout
+/// mid-stream on a pooled connection is a transport failure (disconnect,
+/// reset, EOF, timeout, not-connected) → invalidate. Only local cooperative
+/// cancellation (Interrupted) keeps the connection. The original kind is
+/// folded into a BrokenPipe so downstream `classify_io_error` yields
+/// `TransportBroken`; classification is by `ErrorKind`, never by stringifying
+/// the message first.
+fn stream_read_error(error: io::Error, ctx: &str) -> io::Error {
+    let kind = match error.kind() {
+        // Local cooperative cancellation: keep the pooled session.
+        io::ErrorKind::Interrupted => io::ErrorKind::Interrupted,
+        // Every transport/EOF/ambiguous-health break → invalidate.
+        _ => io::ErrorKind::BrokenPipe,
+    };
+    io::Error::new(kind, format!("{ctx}: {error}"))
+}
+
+/// Bounded health probe for a pooled session before reuse (TRACK C #48).
+/// Uses a harmless `realpath(".")`; fails closed on timeout so a stale session
+/// is discarded rather than reused. No destructive operation is replayed.
+/// Run a health probe with a bounded timeout. The probe future itself is
+/// unbounded (a hang would otherwise wedge the pool); the bound lives HERE so
+/// production and the deterministic #48 matrix share one timeout path. A
+/// timeout classifies the session as `TransportBroken` → the pool discards it
+/// and reconnects exactly once.
+async fn bounded_health_probe<F>(duration: Duration, probe: F) -> SftpInvalidation
+where
+    F: std::future::Future<Output = SftpInvalidation>,
+{
+    match timeout(duration, probe).await {
+        Ok(v) => v,
+        Err(_elapsed) => SftpInvalidation::TransportBroken,
+    }
+}
+
+async fn probe_session_healthy(session: &russh_sftp::client::SftpSession) -> SftpInvalidation {
+    // ponytail: no internal timeout here — bounded_health_probe owns the bound.
+    // A definitive Status reply means the server is alive and answering →
+    // the session is reusable (application-level rejection, not transport).
+    match session.canonicalize(".").await {
+        Ok(_) => SftpInvalidation::Keep,
+        Err(error) => classify_russh_error(&error),
+    }
+}
 
 static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -77,7 +213,7 @@ async fn list_sftp(host: &Host, remote_path: &str) -> anyhow::Result<Vec<Entry>>
         .with_context(|| format!("OpenSSH SFTP connect to {}", host.ssh_alias))?;
 
     let read_dir = connection
-        .session
+        .session()
         .read_dir(remote_path.to_string())
         .await
         .with_context(|| format!("SFTP read_dir {remote_path}"))?;
@@ -171,7 +307,7 @@ async fn read_stable_snapshot(
     let before = session
         .symlink_metadata(path.to_string())
         .await
-        .map_err(|error| std::io::Error::other(format!("SFTP metadata {path}: {error}")))?;
+        .map_err(|error| russh_to_io(error, &format!("SFTP metadata {path}")))?;
     if !is_regular_file(&before) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -186,10 +322,10 @@ async fn read_stable_snapshot(
     let first_file = session
         .open(path.to_string())
         .await
-        .map_err(|error| std::io::Error::other(format!("SFTP open {path}: {error}")))?;
+        .map_err(|error| russh_to_io(error, &format!("SFTP open {path}")))?;
     let first = read_exact_len(first_file, read_len)
         .await
-        .map_err(|error| std::io::Error::other(format!("SFTP read {path}: {error}")))?;
+        .map_err(|error| stream_read_error(error, &format!("SFTP read {path}")))?;
 
     let second = if truncated {
         first.clone()
@@ -197,15 +333,15 @@ async fn read_stable_snapshot(
         let second_file = session
             .open(path.to_string())
             .await
-            .map_err(|error| std::io::Error::other(format!("SFTP reopen {path}: {error}")))?;
+            .map_err(|error| russh_to_io(error, &format!("SFTP reopen {path}")))?;
         read_exact_len(second_file, read_len)
             .await
-            .map_err(|error| std::io::Error::other(format!("SFTP reread {path}: {error}")))?
+            .map_err(|error| stream_read_error(error, &format!("SFTP reread {path}")))?
     };
     let after = session
         .symlink_metadata(path.to_string())
         .await
-        .map_err(|error| std::io::Error::other(format!("SFTP metadata {path}: {error}")))?;
+        .map_err(|error| russh_to_io(error, &format!("SFTP metadata {path}")))?;
 
     if !is_regular_file(&after)
         || after.size != Some(file_len)
@@ -404,7 +540,7 @@ async fn validate_transaction_parent(
     let uid = metadata
         .uid
         .ok_or_else(|| std::io::Error::other(format!("SFTP parent owner unavailable: {path}")))?;
-    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+    if parent_is_unsafe_writable(mode) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("SFTP unsafe writable transaction parent without sticky bit: {path}"),
@@ -416,6 +552,22 @@ async fn validate_transaction_parent(
         uid,
         gid: metadata.gid,
     })
+}
+
+/// TRACK H (#53): centralized, documented parent policy.
+///
+/// Group/world-writable target parents are rejected when exclusive namespace
+/// control cannot be proven — i.e. writable AND missing the sticky bit. A
+/// sticky `/tmp`-style parent (mode `0o1777`) is accepted because the sticky
+/// bit prevents another account from replacing our private transaction
+/// namespace. A private parent (`0o700`/`0o755`) is always accepted.
+///
+/// This is the single source of truth; `validate_transaction_parent` and all
+/// tests route through it. We do NOT implement a temp-directory pin workaround
+/// because no equivalent inode/namespace safety proof exists for a non-sticky
+/// writable parent — fail closed instead.
+pub(crate) fn parent_is_unsafe_writable(mode: u32) -> bool {
+    mode & 0o022 != 0 && mode & 0o1000 == 0
 }
 
 async fn verify_transaction_parent_unchanged(
@@ -613,6 +765,17 @@ enum AtomicWriteFault {
     BackupCleanup,
     ConcurrentTarget,
     CancelBeforeCommit,
+    /// Deterministic transport break injected immediately after the staged
+    /// payload is written (before backup). Simulates a break where the
+    /// original is intact and no backup yet exists.
+    StageWrite,
+    /// Deterministic transport break injected immediately after the backup
+    /// rename succeeds. Simulates a break where the backup IS preserved.
+    BackupRename,
+    /// Deterministic UID/GID metadata race: the staged file's ownership is
+    /// detected to differ from the expected revision, forcing recovery before
+    /// any silent replacement.
+    MetadataRace,
 }
 
 #[cfg(test)]
@@ -626,6 +789,9 @@ struct AtomicWriteFaults {
     backup_cleanup: bool,
     concurrent_target: bool,
     cancel_before_commit: bool,
+    stage_write: bool,
+    backup_rename: bool,
+    metadata_race: bool,
 }
 
 pub struct SftpProvider {
@@ -635,7 +801,43 @@ pub struct SftpProvider {
     faults: AtomicWriteFaults,
     #[cfg(test)]
     pause_after_pin: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Bound for the pooled-session health probe before reuse. Production: 5s.
+    /// Tests inject a near-zero value to exercise the SAME internal timeout
+    /// path (discard stale + reconnect once) without an outer tokio::time::timeout.
+    probe_timeout: Duration,
+    /// Test-only injectable seam for the pooled acquire/probe/reconnect
+    /// algorithm (TRACK C #48 deterministic matrix). When set,
+    /// `connect_for_mutation` uses these instead of a real SSH session, so the
+    /// exact same production algorithm runs without any network or `sleep`.
+    test_probe: Option<TestProbeFn>,
+    test_connect: Option<TestConnectFn>,
 }
+
+/// ponytail: injected async probe used by the deterministic pooled-acquire
+/// matrix. Async so a test can inject a probe that pends (proving the acquire
+/// respects a bounded timeout rather than hanging).
+type TestProbeFn = Box<
+    dyn Fn(
+            &crate::remote::openssh_sftp::OpenSshSftpConnection,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = SftpInvalidation> + Send + Sync>>
+        + Send
+        + Sync,
+>;
+
+/// ponytail: boxed async factory standing in for a real SSH connect in tests.
+type TestConnectFn = Box<
+    dyn Fn() -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::io::Result<
+                            crate::remote::openssh_sftp::OpenSshSftpConnection,
+                        >,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
+>;
 
 impl std::fmt::Debug for SftpProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -655,6 +857,9 @@ impl SftpProvider {
             faults: AtomicWriteFaults::default(),
             #[cfg(test)]
             pause_after_pin: None,
+            probe_timeout: Duration::from_secs(5),
+            test_probe: None,
+            test_connect: None,
         }
     }
 
@@ -681,6 +886,9 @@ impl SftpProvider {
                 AtomicWriteFault::BackupCleanup => self.faults.backup_cleanup,
                 AtomicWriteFault::ConcurrentTarget => self.faults.concurrent_target,
                 AtomicWriteFault::CancelBeforeCommit => self.faults.cancel_before_commit,
+                AtomicWriteFault::StageWrite => self.faults.stage_write,
+                AtomicWriteFault::BackupRename => self.faults.backup_rename,
+                AtomicWriteFault::MetadataRace => self.faults.metadata_race,
             }
         }
         #[cfg(not(test))]
@@ -691,7 +899,8 @@ impl SftpProvider {
     }
 
     async fn list_pooled(&self, path: &str) -> std::io::Result<Vec<Entry>> {
-        let mut guard = self.connection.lock().await;
+        // Probe the pooled session (transport break → fresh replace) before reuse.
+        let mut guard = self.connect_for_mutation().await?;
 
         // One reconnect attempt handles servers closing an idle subsystem
         // between directory reads while avoiding a reconnect per directory.
@@ -708,14 +917,17 @@ impl SftpProvider {
             let result = guard
                 .as_ref()
                 .expect("connection initialized")
-                .session
+                .session()
                 .read_dir(path.to_string())
                 .await;
 
             match result {
                 Ok(entries) => return Ok(entries_from_read_dir(entries.collect())),
                 Err(error) => {
-                    if let Some(mut broken) = guard.take() {
+                    // Transport-only invalidation: keep pool on application/Status error.
+                    if classify_russh_error(&error).should_invalidate()
+                        && let Some(mut broken) = guard.take()
+                    {
                         broken.abort().await;
                     }
                     if attempt == 1 {
@@ -731,6 +943,8 @@ impl SftpProvider {
     }
 
     /// Reuse pooled connection without retry (mutations are not retried).
+    /// Before reuse, runs a bounded health probe (TRACK C #48); a stale or
+    /// broken session is discarded and a fresh one acquired.
     #[allow(dead_code)]
     async fn connect_for_mutation(
         &self,
@@ -738,13 +952,121 @@ impl SftpProvider {
         tokio::sync::MutexGuard<'_, Option<crate::remote::openssh_sftp::OpenSshSftpConnection>>,
     > {
         let mut guard = self.connection.lock().await;
+        // Probe the pooled session (async); abort only on transport break.
+        // Test seam: if `test_probe` is injected, it stands in for the real
+        // `canonicalize(".")` health probe so the matrix runs without a network.
+        // Both paths run through `bounded_health_probe` — the SAME internal
+        // timeout (self.probe_timeout) that production uses, so the #48 matrix
+        // exercises the real discard-stale + reconnect-once semantics, not an
+        // outer tokio::time::timeout.
+        let probe = match guard.as_ref() {
+            Some(session) => {
+                let future: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = SftpInvalidation> + Send + Sync>,
+                > = if let Some(probe_fn) = &self.test_probe {
+                    probe_fn(session)
+                } else {
+                    Box::pin(probe_session_healthy(session.session()))
+                };
+                bounded_health_probe(self.probe_timeout, future).await
+            }
+            None => SftpInvalidation::Keep,
+        };
+        // #48: the health-probe policy decides reuse vs discard+reconnect.
+        if matches!(
+            pool_health_action(guard.is_some(), probe),
+            PoolHealthAction::DiscardAndReconnect
+        ) && let Some(mut broken) = guard.take()
+        {
+            broken.abort().await;
+        }
         if guard.is_none() {
-            *guard = Some(
+            let conn = if let Some(connect_fn) = &self.test_connect {
+                connect_fn().await?
+            } else {
                 crate::remote::openssh_sftp::OpenSshSftpConnection::connect(&self.host.ssh_alias)
-                    .await?,
-            );
+                    .await?
+            };
+            *guard = Some(conn);
         }
         Ok(guard)
+    }
+
+    /// Test-only: inject probe + a connect counter for the deterministic #48
+    /// acquire/probe/reconnect matrix. The same `connect_for_mutation` algorithm
+    /// runs; only the SSH I/O is replaced (by a harmless stub), so no network or
+    /// `sleep` is needed. `connects` is incremented exactly once per real
+    /// (re)connection, proving reuse vs fresh-replace behavior.
+    #[cfg(test)]
+    fn with_test_pool(
+        mut self,
+        probe: Option<SftpInvalidation>,
+        connects: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        let probe = probe.map(|p| {
+            Box::new(
+                move |_conn: &crate::remote::openssh_sftp::OpenSshSftpConnection| {
+                    Box::pin(async move { p })
+                        as std::pin::Pin<
+                            Box<dyn std::future::Future<Output = SftpInvalidation> + Send + Sync>,
+                        >
+                },
+            )
+                as Box<
+                    dyn Fn(
+                            &crate::remote::openssh_sftp::OpenSshSftpConnection,
+                        ) -> std::pin::Pin<
+                            Box<dyn std::future::Future<Output = SftpInvalidation> + Send + Sync>,
+                        > + Send
+                        + Sync,
+                >
+        });
+        let connects = connects.clone();
+        let connect: TestConnectFn = Box::new(move || {
+            let connects = connects.clone();
+            Box::pin(async move {
+                connects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::remote::openssh_sftp::OpenSshSftpConnection::test_stub().await)
+            })
+        });
+        self.test_probe = probe;
+        self.test_connect = Some(connect);
+        self
+    }
+
+    /// Test-only: inject a probe that never resolves (pending forever) and a
+    /// short internal `probe_timeout` so the SAME bounded path production uses
+    /// fires the internal timeout deterministically (discard stale + reconnect
+    /// once). No outer `tokio::time::timeout` — the test exercises the real
+    /// internal path. Also injects the stub connect so the first acquire
+    /// succeeds immediately and only the second (pooled) acquire hits the
+    /// pending probe.
+    #[cfg(test)]
+    fn with_test_pool_pending_probe(
+        mut self,
+        connects: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        let connects2 = connects.clone();
+        let connect: TestConnectFn = Box::new(move || {
+            let connects2 = connects2.clone();
+            Box::pin(async move {
+                connects2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::remote::openssh_sftp::OpenSshSftpConnection::test_stub().await)
+            })
+        });
+        let probe: TestProbeFn = Box::new(
+            |_conn: &crate::remote::openssh_sftp::OpenSshSftpConnection| {
+                Box::pin(async {
+                    // Never resolves: stands in for a health probe that hangs.
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                })
+            },
+        );
+        self.probe_timeout = Duration::from_millis(50);
+        self.test_connect = Some(connect);
+        self.test_probe = Some(probe);
+        self
     }
 
     async fn mkdir(&self, path: &str) -> std::io::Result<()> {
@@ -752,10 +1074,19 @@ impl SftpProvider {
         let conn = guard
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
-        match conn.session.create_dir(path.to_string()).await {
+        match conn
+            .session
+            .as_ref()
+            .expect("connected session")
+            .create_dir(path.to_string())
+            .await
+        {
             Ok(()) => Ok(()),
             Err(e) => {
-                if let Some(mut broken) = guard.take() {
+                // Transport-only invalidation: keep pool on application/Status error.
+                if classify_russh_error(&e).should_invalidate()
+                    && let Some(mut broken) = guard.take()
+                {
                     broken.abort().await;
                 }
                 Err(std::io::Error::other(format!("SFTP mkdir {path}: {e}")))
@@ -768,10 +1099,19 @@ impl SftpProvider {
         let conn = guard
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
-        match conn.session.remove_file(path.to_string()).await {
+        match conn
+            .session
+            .as_ref()
+            .expect("connected session")
+            .remove_file(path.to_string())
+            .await
+        {
             Ok(()) => Ok(()),
             Err(e) => {
-                if let Some(mut broken) = guard.take() {
+                // Transport-only invalidation: keep pool on application/Status error.
+                if classify_russh_error(&e).should_invalidate()
+                    && let Some(mut broken) = guard.take()
+                {
                     broken.abort().await;
                 }
                 Err(std::io::Error::other(format!(
@@ -786,10 +1126,19 @@ impl SftpProvider {
         let conn = guard
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
-        match conn.session.remove_dir(path.to_string()).await {
+        match conn
+            .session
+            .as_ref()
+            .expect("connected session")
+            .remove_dir(path.to_string())
+            .await
+        {
             Ok(()) => Ok(()),
             Err(e) => {
-                if let Some(mut broken) = guard.take() {
+                // Transport-only invalidation: keep pool on application/Status error.
+                if classify_russh_error(&e).should_invalidate()
+                    && let Some(mut broken) = guard.take()
+                {
                     broken.abort().await;
                 }
                 Err(std::io::Error::other(format!(
@@ -876,15 +1225,15 @@ impl VfsProvider for SftpProvider {
         data: &[u8],
         revision: &RemoteEditRevision,
         cancellation: &CancellationFlag,
+        progress: Option<crate::vfs::RemoteEditProgressFn>,
     ) -> std::io::Result<()> {
-        let result = self.write_atomic(path, data, revision, cancellation).await;
-        if result.is_err() {
-            let mut guard = self.connection.lock().await;
-            if let Some(mut connection) = guard.take() {
-                connection.abort().await;
-            }
-        }
-        result
+        // TRACK G (#52): no double-lock. `write_atomic` already invalidates the
+        // pooled connection itself when the transport breaks; application-level
+        // (Status) failures correctly keep the connection. Re-acquiring the lock
+        // here only to rediscover connection state would be a misleading second
+        // lock scope, so we just propagate the result.
+        self.write_atomic(path, data, revision, cancellation, progress)
+            .await
     }
 
     async fn metadata(&self, path: &str) -> std::io::Result<FileMetadata> {
@@ -912,7 +1261,8 @@ impl SftpProvider {
     async fn read_prefix(&self, path: &str, max_bytes: usize) -> std::io::Result<BoundedRead> {
         use tokio::io::AsyncReadExt;
 
-        let mut guard = self.connection.lock().await;
+        // Probe the pooled session (transport break → fresh replace) before reuse.
+        let mut guard = self.connect_for_mutation().await?;
 
         for attempt in 0..2 {
             if guard.is_none() {
@@ -928,7 +1278,12 @@ impl SftpProvider {
                 .as_ref()
                 .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
 
-            let open_result = conn.session.open(path.to_string()).await;
+            let open_result = conn
+                .session
+                .as_ref()
+                .expect("connected session")
+                .open(path.to_string())
+                .await;
 
             match open_result {
                 Ok(mut file) => {
@@ -939,7 +1294,7 @@ impl SftpProvider {
                     tokio::io::AsyncReadExt::take(&mut file, cap as u64)
                         .read_to_end(&mut buf)
                         .await
-                        .map_err(|e| std::io::Error::other(format!("SFTP read {path}: {e}")))?;
+                        .map_err(|e| stream_read_error(e, &format!("SFTP read {path}")))?;
                     let truncated = buf.len() > max_bytes;
                     if truncated {
                         buf.truncate(max_bytes);
@@ -953,7 +1308,10 @@ impl SftpProvider {
                     });
                 }
                 Err(error) => {
-                    if let Some(mut broken) = guard.take() {
+                    // Transport-only invalidation: keep pool on application/Status error.
+                    if classify_russh_error(&error).should_invalidate()
+                        && let Some(mut broken) = guard.take()
+                    {
                         broken.abort().await;
                     }
                     if attempt == 1 {
@@ -978,7 +1336,7 @@ impl SftpProvider {
         let session = &guard
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?
-            .session;
+            .session();
         let result = read_pinned_snapshot(
             session,
             path,
@@ -987,10 +1345,13 @@ impl SftpProvider {
             self.pause_after_pin(),
         )
         .await;
-        if result.is_err()
-            && let Some(mut broken) = guard.take()
-        {
-            broken.abort().await;
+        if let Err(error) = &result {
+            // Transport-only invalidation: keep pool on application/Status error.
+            if classify_io_error(error).should_invalidate()
+                && let Some(mut broken) = guard.take()
+            {
+                broken.abort().await;
+            }
         }
         result
     }
@@ -1003,6 +1364,7 @@ impl SftpProvider {
         data: &[u8],
         revision: &RemoteEditRevision,
         cancellation: &CancellationFlag,
+        progress: Option<crate::vfs::RemoteEditProgressFn>,
     ) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt;
 
@@ -1028,8 +1390,17 @@ impl SftpProvider {
         let session = &guard
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?
-            .session;
+            .session();
         let transaction_parent = validate_transaction_parent(session, path).await?;
+
+        // #51/MAJOR#1: narrow progress callback. RollbackOrRecovery is emitted at
+        // every real recovery transition (RecoveryRequired decision below); the
+        // provider never knows about JobManager.
+        let recovery = || {
+            if let Some(p) = &progress {
+                p(crate::jobs::RemoteEditPhase::RollbackOrRecovery);
+            }
+        };
 
         // Create an empty 0600 stage first. Its owner proves which account the
         // separate atomic mkdir command must create the private namespace for.
@@ -1097,12 +1468,7 @@ impl SftpProvider {
         .await
         {
             Ok(()) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::ConnectionAborted
-                ) =>
-            {
+            Err(error) if classify_io_error(&error).should_invalidate() => {
                 drop(remote);
                 let stage_cleanup = session.remove_file(stage_path.clone()).await.err();
                 return Err(remote_write_error(
@@ -1259,6 +1625,29 @@ impl SftpProvider {
             .await);
         }
         drop(remote);
+        if self.fault_enabled(AtomicWriteFault::MetadataRace) {
+            // UID/GID metadata race: detect ownership drift before any
+            // replacement and force recovery (never silently replace).
+            return Err(remote_write_error(
+                RemoteWriteFailureKind::RecoveryRequired,
+                format!(
+                    "SFTP RECOVERY REQUIRED {path}: UID/GID metadata race detected after staging (injected); stage={stage_path}; transaction={transaction_path}"
+                ),
+            ));
+        }
+        if self.fault_enabled(AtomicWriteFault::StageWrite) {
+            // Deterministic transport break after the staged payload is
+            // written but before backup exists. Original remains intact.
+            if let Some(mut broken) = guard.take() {
+                broken.abort().await;
+            }
+            return Err(remote_write_error(
+                RemoteWriteFailureKind::RecoveryRequired,
+                format!(
+                    "SFTP RECOVERY REQUIRED {path}: transport break after stage write (injected); original intact; stage={stage_path}; transaction={transaction_path}"
+                ),
+            ));
+        }
         if cancellation.is_cancelled() {
             return Err(
                 cancel_before_commit(session, path, &stage_path, Some(&transaction_path)).await,
@@ -1298,6 +1687,12 @@ impl SftpProvider {
         }
 
         // ── Verify staged content and metadata ──
+        // #51/MAJOR#1: truthful telemetry. Verifying is emitted at the real
+        // verification boundary (before verify_remote_matches), not post-hoc in
+        // the TUI after WrittenBack has already returned.
+        if let Some(progress) = &progress {
+            progress(crate::jobs::RemoteEditPhase::Verifying);
+        }
         match self
             .verify_remote_matches(
                 session,
@@ -1321,6 +1716,7 @@ impl SftpProvider {
                 .await);
             }
             Err(error) => {
+                recovery();
                 return Err(transaction_failure(
                     session,
                     path,
@@ -1422,7 +1818,22 @@ impl SftpProvider {
             .await);
         }
         match session.rename(path.to_string(), backup_path.clone()).await {
-            Ok(()) => {}
+            Ok(()) => {
+                if self.fault_enabled(AtomicWriteFault::BackupRename) {
+                    // Deterministic transport break after the backup rename
+                    // succeeds. Backup IS preserved; operation must reach
+                    // rollback/recovery terminal truth, never abandon.
+                    if let Some(mut broken) = guard.take() {
+                        broken.abort().await;
+                    }
+                    return Err(remote_write_error(
+                        RemoteWriteFailureKind::RecoveryRequired,
+                        format!(
+                            "SFTP RECOVERY REQUIRED {path}: transport break after backup rename (injected); backup preserved={backup_path}; stage={stage_path}; transaction={transaction_path}"
+                        ),
+                    ));
+                }
+            }
             Err(russh_sftp::client::error::Error::Status(status)) => {
                 return Err(transaction_failure(
                     session,
@@ -1437,6 +1848,7 @@ impl SftpProvider {
                 let message = format!(
                     "SFTP RECOVERY REQUIRED {path}: backup rename transport outcome is uncertain ({error}); backup={backup_path}; stage={stage_path}"
                 );
+                recovery();
                 if let Some(mut broken) = guard.take() {
                     broken.abort().await;
                 }
@@ -1684,10 +2096,10 @@ impl SftpProvider {
             .as_ref()
             .ok_or_else(|| std::io::Error::other("SFTP connection lost"))?;
         let meta = conn
-            .session
+            .session()
             .symlink_metadata(path.to_string())
             .await
-            .map_err(|error| std::io::Error::other(format!("SFTP metadata {path}: {error}")))?;
+            .map_err(|error| russh_to_io(error, &format!("SFTP metadata {path}")))?;
         Ok(FileMetadata {
             len: meta.len(),
             is_regular: is_regular_file(&meta),
@@ -1701,6 +2113,243 @@ impl SftpProvider {
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
+
+    // ── #48 deterministic pool-health policy matrix (no network, no sleeps) ──
+    #[test]
+    fn pool_health_healthy_session_reused() {
+        assert_eq!(
+            pool_health_action(true, SftpInvalidation::Keep),
+            PoolHealthAction::Reuse
+        );
+    }
+
+    #[test]
+    fn pool_health_stale_session_discarded() {
+        assert_eq!(
+            pool_health_action(true, SftpInvalidation::TransportBroken),
+            PoolHealthAction::DiscardAndReconnect
+        );
+    }
+
+    #[test]
+    fn pool_health_no_session_connects() {
+        assert_eq!(
+            pool_health_action(false, SftpInvalidation::Keep),
+            PoolHealthAction::DiscardAndReconnect
+        );
+    }
+
+    #[test]
+    fn pool_health_status_probe_keeps_connection() {
+        // A definitive Status reply is a keep (transport still alive).
+        assert_eq!(
+            pool_health_action(true, SftpInvalidation::Keep),
+            PoolHealthAction::Reuse
+        );
+    }
+
+    #[test]
+    fn pool_health_timeout_or_transport_invalidates() {
+        assert_eq!(
+            pool_health_action(true, SftpInvalidation::TransportBroken),
+            PoolHealthAction::DiscardAndReconnect
+        );
+        // timeout/EOF/reset/broken all map to TransportBroken via classify_*.
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert_eq!(
+                pool_health_action(true, classify_io_error(&io::Error::new(kind, "x"))),
+                PoolHealthAction::DiscardAndReconnect
+            );
+        }
+    }
+
+    #[test]
+    fn pool_health_application_error_keeps_connection() {
+        // permission/cancel/conflict/validation → Keep (do not reconnect).
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::AlreadyExists,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::Unsupported,
+        ] {
+            assert_eq!(
+                pool_health_action(true, classify_io_error(&io::Error::new(kind, "x"))),
+                PoolHealthAction::Reuse
+            );
+        }
+    }
+
+    // ── #48 deterministic acquire/probe/reconnect matrix ──
+    // Drives the real `connect_for_mutation` algorithm via the injected seam;
+    // a counter proves exactly how many (re)connections happened. No network,
+    // no `sleep`.
+
+    #[tokio::test]
+    async fn acquire_healthy_session_reused_zero_extra_connects() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
+        // First op acquires once; second op reuses the pooled session.
+        let _ = provider.connect_for_mutation().await;
+        let _ = provider.connect_for_mutation().await;
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn acquire_no_session_connects_once() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
+        let _ = provider.connect_for_mutation().await;
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn acquire_stale_session_discarded_and_reconnected() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::TransportBroken), connects.clone());
+        // Every acquire is stale → fresh replacement each time.
+        let _ = provider.connect_for_mutation().await;
+        let _ = provider.connect_for_mutation().await;
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn acquire_status_probe_keeps_zero_extra_connects() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
+        for _ in 0..4 {
+            let _ = provider.connect_for_mutation().await;
+        }
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn acquire_application_error_keeps_connection() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
+        for _ in 0..3 {
+            let _ = provider.connect_for_mutation().await;
+        }
+        // Keep (no transport break) → never reconnect, regardless of op errors.
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn acquire_once_per_op_no_reconnect_spin() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
+        // A single op acquires the session exactly once (no reconnect spin).
+        let _ = provider.connect_for_mutation().await;
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // #48/MAJOR#3B: a destructive mutation must run exactly once per op, and a
+    // stale→reconnect cycle must NOT replay it. Drives the real
+    // connect_for_mutation algorithm; the injected mutation counter stands in
+    // for the single destructive SFTP op each op performs.
+    #[tokio::test]
+    async fn mutation_runs_exactly_once_per_op_and_not_replayed_on_reconnect() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mutations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::Keep), connects.clone());
+
+        // 3 ops with a healthy pooled session: one acquire, three mutations.
+        for _ in 0..3 {
+            let _ = provider.connect_for_mutation().await;
+            mutations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        // Now every acquire is stale → fresh reconnect each op; mutation still
+        // runs exactly once per op, never replayed by the reconnect.
+        provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool(Some(SftpInvalidation::TransportBroken), connects.clone());
+        for _ in 0..2 {
+            let _ = provider.connect_for_mutation().await;
+            mutations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(mutations.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    // #48/MAJOR#3A: a probe that never resolves must not hang acquisition
+    // forever. An outer timeout bounds the acquire deterministically (no real
+    // sleep). Proves the acquire respects a timeout boundary rather than
+    // blocking on a pending probe indefinitely.
+    #[tokio::test]
+    async fn acquire_bounded_by_probe_timeout_does_not_hang() {
+        let connects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SftpProvider::new(crate::remote::Host::from_alias("test-host"))
+            .with_test_pool_pending_probe(connects.clone());
+        // First connect has no pooled session, so the probe is skipped and the
+        // connect runs immediately (count == 1). This is the NEW live session.
+        // Drop the guard so the connection Mutex is released before reuse.
+        let _g1 = provider.connect_for_mutation().await;
+        drop(_g1);
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Second acquire probes the now-pooled session with a never-resolving
+        // probe. The INTERNAL bounded_health_probe (probe_timeout = 50ms, set by
+        // the seam) must time out, classify TransportBroken, DISCARD the old
+        // pooled session, and RECONNECT exactly once — all WITHOUT an outer
+        // tokio::time::timeout. acquire returns successfully (no hang).
+        let result = provider.connect_for_mutation().await;
+        assert!(
+            result.is_ok(),
+            "internal probe timeout must not hang acquire"
+        );
+        drop(result);
+        // total fresh connects == 2: the initial one + exactly one replacement
+        // after the stale session was discarded. Never an unbounded spin.
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    // ── #47 stream-read transport truth seam ──
+    #[test]
+    fn stream_read_error_transport_kinds_invalidate() {
+        // Every listed transport/EOF/ambiguous-health break maps to BrokenPipe
+        // → TransportBroken → pool invalidation (per contract).
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::NotConnected,
+        ] {
+            let err = stream_read_error(io::Error::new(kind, "x"), "SFTP read x");
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "kind {kind:?}");
+            assert_eq!(
+                classify_io_error(&err),
+                SftpInvalidation::TransportBroken,
+                "kind {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_read_error_keeps_local_cancellation() {
+        // Only local cooperative cancellation keeps the pooled connection.
+        let err = stream_read_error(
+            io::Error::new(io::ErrorKind::Interrupted, "x"),
+            "SFTP read x",
+        );
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(classify_io_error(&err), SftpInvalidation::Keep);
+    }
 
     #[test]
     fn sftp_mtime_uses_canonical_second_resolution() {
@@ -1821,8 +2470,19 @@ mod metadata_tests {
         use std::io::Write as _;
         use std::process::Stdio;
 
-        let quoted = shell_quote(path);
-        let script = format!("set -eu; umask 077; cat > {quoted}; chmod {mode:o} {quoted}");
+        let quoted_path = shell_quote(path);
+        let quoted_dir = shell_quote(
+            &std::path::Path::new(path)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".".to_string()),
+        );
+        let script = format!(
+            "set -eu; mkdir -p {dir}; umask 077; cat > {path}; chmod {mode:o} {path}",
+            dir = quoted_dir,
+            path = quoted_path,
+            mode = mode,
+        );
         let mut child = std::process::Command::new("ssh")
             .arg(host)
             .arg(format!("sh -c {}", shell_quote(&script)))
@@ -1952,7 +2612,7 @@ mod metadata_tests {
         let mode_revision = remote_revision(&provider, &mode_path).await;
         provider.faults.preserve_mode = true;
         let mode_error = provider
-            .write_file_bytes_if_unchanged(&mode_path, b"new", &mode_revision, &cancellation)
+            .write_file_bytes_if_unchanged(&mode_path, b"new", &mode_revision, &cancellation, None)
             .await
             .unwrap_err();
         assert!(mode_error.to_string().contains("preserve metadata"));
@@ -1978,7 +2638,13 @@ mod metadata_tests {
             ..AtomicWriteFaults::default()
         };
         let commit_error = provider
-            .write_file_bytes_if_unchanged(&commit_path, b"new", &commit_revision, &cancellation)
+            .write_file_bytes_if_unchanged(
+                &commit_path,
+                b"new",
+                &commit_revision,
+                &cancellation,
+                None,
+            )
             .await
             .unwrap_err();
         assert!(!commit_error.to_string().contains("RECOVERY REQUIRED"));
@@ -2010,6 +2676,7 @@ mod metadata_tests {
                 b"new",
                 &recovery_revision,
                 &cancellation,
+                None,
             )
             .await
             .unwrap_err();
@@ -2034,7 +2701,13 @@ mod metadata_tests {
             ..AtomicWriteFaults::default()
         };
         let visible_error = provider
-            .write_file_bytes_if_unchanged(&visible_path, b"new", &visible_revision, &cancellation)
+            .write_file_bytes_if_unchanged(
+                &visible_path,
+                b"new",
+                &visible_revision,
+                &cancellation,
+                None,
+            )
             .await
             .unwrap_err();
         assert!(visible_error.to_string().contains("RECOVERY REQUIRED"));
@@ -2063,7 +2736,7 @@ mod metadata_tests {
             ..AtomicWriteFaults::default()
         };
         let race_error = provider
-            .write_file_bytes_if_unchanged(&race_path, b"new", &race_revision, &cancellation)
+            .write_file_bytes_if_unchanged(&race_path, b"new", &race_revision, &cancellation, None)
             .await
             .unwrap_err();
         assert!(race_error.to_string().contains("RECOVERY REQUIRED"));
@@ -2086,7 +2759,13 @@ mod metadata_tests {
             ..AtomicWriteFaults::default()
         };
         let warning_error = provider
-            .write_file_bytes_if_unchanged(&warning_path, b"new", &warning_revision, &cancellation)
+            .write_file_bytes_if_unchanged(
+                &warning_path,
+                b"new",
+                &warning_revision,
+                &cancellation,
+                None,
+            )
             .await
             .unwrap_err();
         assert!(warning_error.to_string().contains("COMMITTED WITH WARNING"));
@@ -2110,7 +2789,7 @@ mod metadata_tests {
         };
         let cancel = CancellationFlag::default();
         let cancel_error = provider
-            .write_file_bytes_if_unchanged(&cancel_path, b"new", &cancel_revision, &cancel)
+            .write_file_bytes_if_unchanged(&cancel_path, b"new", &cancel_revision, &cancel, None)
             .await
             .unwrap_err();
         assert_eq!(cancel_error.kind(), std::io::ErrorKind::Interrupted);
@@ -2127,6 +2806,409 @@ mod metadata_tests {
                 .await
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn track_b_classification_categories() {
+        use std::io::Error as IoError;
+        use std::io::ErrorKind as K;
+        // Transport-broken: must invalidate the pooled connection.
+        assert!(classify_io_error(&IoError::new(K::TimedOut, "x")).should_invalidate());
+        assert!(classify_io_error(&IoError::new(K::ConnectionAborted, "x")).should_invalidate());
+        assert!(classify_io_error(&IoError::new(K::ConnectionReset, "x")).should_invalidate());
+        assert!(classify_io_error(&IoError::new(K::BrokenPipe, "x")).should_invalidate());
+        assert!(classify_io_error(&IoError::new(K::UnexpectedEof, "x")).should_invalidate());
+        // Application: keep the connection (no destructive retry, no invalidate).
+        assert!(!classify_io_error(&IoError::new(K::Interrupted, "x")).should_invalidate());
+        assert!(!classify_io_error(&IoError::new(K::InvalidInput, "x")).should_invalidate());
+        assert!(!classify_io_error(&IoError::new(K::Unsupported, "x")).should_invalidate());
+        assert!(!classify_io_error(&IoError::new(K::AlreadyExists, "x")).should_invalidate());
+        assert!(!classify_io_error(&IoError::new(K::PermissionDenied, "x")).should_invalidate());
+        // Default conservative: unknown kinds keep (avoid over-invalidation).
+        assert!(!classify_io_error(&IoError::other("x")).should_invalidate());
+    }
+
+    #[test]
+    fn track_h_parent_policy_exhaustive() {
+        // Private parents always accepted.
+        assert!(!parent_is_unsafe_writable(0o700));
+        assert!(!parent_is_unsafe_writable(0o755));
+        assert!(!parent_is_unsafe_writable(0o750));
+        // Sticky writable (e.g. /tmp 0o1777) accepted: sticky bit protects namespace.
+        assert!(!parent_is_unsafe_writable(0o1777));
+        assert!(!parent_is_unsafe_writable(0o3777));
+        // Group/world-writable NON-sticky rejected (fail closed).
+        assert!(parent_is_unsafe_writable(0o777));
+        assert!(parent_is_unsafe_writable(0o775));
+        assert!(parent_is_unsafe_writable(0o722));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn track_e_stage_write_break_preserves_original() {
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        crate::remote::validate_ssh_alias(&host).unwrap();
+        let mut provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
+        let base = format!(
+            "{}/track-e-stage",
+            std::env::var("ARX_SFTP_SMOKE_BASE").unwrap_or_else(|_| "/tmp".to_string())
+        );
+        let path = format!("{base}/stage-write.txt");
+        seed_remote(&host, &path, b"original", 0o600).unwrap();
+        let revision = remote_revision(&provider, &path).await;
+        provider.faults = AtomicWriteFaults {
+            stage_write: true,
+            ..AtomicWriteFaults::default()
+        };
+        let error = provider
+            .write_file_bytes_if_unchanged(
+                &path,
+                b"new",
+                &revision,
+                &CancellationFlag::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("RECOVERY REQUIRED"));
+        assert!(message.contains("transport break after stage write"));
+        // Original intact (backup not yet created at this stage).
+        assert_eq!(
+            provider.read_all_capped(&path, 16).await.unwrap().bytes,
+            b"original"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn track_e_backup_rename_break_preserves_backup() {
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        crate::remote::validate_ssh_alias(&host).unwrap();
+        let mut provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
+        let base = format!(
+            "{}/track-e-backup",
+            std::env::var("ARX_SFTP_SMOKE_BASE").unwrap_or_else(|_| "/tmp".to_string())
+        );
+        let path = format!("{base}/backup-rename.txt");
+        seed_remote(&host, &path, b"original", 0o600).unwrap();
+        let revision = remote_revision(&provider, &path).await;
+        provider.faults = AtomicWriteFaults {
+            backup_rename: true,
+            ..AtomicWriteFaults::default()
+        };
+        let error = provider
+            .write_file_bytes_if_unchanged(
+                &path,
+                b"new",
+                &revision,
+                &CancellationFlag::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("RECOVERY REQUIRED"));
+        assert!(message.contains("transport break after backup rename"));
+        assert!(message.contains("backup preserved"));
+        // Backup artifact remains as exact recovery evidence.
+        let artifacts = transaction_artifacts(&provider, &base, "backup-rename.txt").await;
+        assert_eq!(artifacts.len(), 1, "{artifacts:?}");
+        let entries = provider
+            .list_async(&format!("{base}/{}", artifacts[0]))
+            .await
+            .unwrap();
+        assert!(entries.iter().any(|e| e.name == "backup"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn track_e_metadata_race_forces_recovery() {
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        crate::remote::validate_ssh_alias(&host).unwrap();
+        let mut provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
+        let base = format!(
+            "{}/track-e-mrace",
+            std::env::var("ARX_SFTP_SMOKE_BASE").unwrap_or_else(|_| "/tmp".to_string())
+        );
+        let path = format!("{base}/metadata-race.txt");
+        seed_remote(&host, &path, b"original", 0o600).unwrap();
+        let revision = remote_revision(&provider, &path).await;
+        provider.faults = AtomicWriteFaults {
+            metadata_race: true,
+            ..AtomicWriteFaults::default()
+        };
+        let error = provider
+            .write_file_bytes_if_unchanged(
+                &path,
+                b"new",
+                &revision,
+                &CancellationFlag::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("RECOVERY REQUIRED"));
+        assert!(message.contains("UID/GID metadata race"));
+        // Never silently replaced.
+        assert_eq!(
+            provider.read_all_capped(&path, 16).await.unwrap().bytes,
+            b"original"
+        );
+    }
+
+    // ── Physical parent-policy boundaries (TRACK B #6/#7) ──
+    // Sticky writable parent (0o1777, /tmp-style) is accepted: the sticky bit
+    // protects the private transaction namespace, so the write may proceed.
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn track_e_sticky_writable_parent_accepted() {
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        crate::remote::validate_ssh_alias(&host).unwrap();
+        let token = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = format!("/tmp/arx-demo/arx-sticky-{token}");
+        assert!(
+            std::process::Command::new("ssh")
+                .arg(&host)
+                .arg(format!(
+                    "sh -c {}",
+                    shell_quote(&format!(
+                        "set -eu; rm -rf -- {b}; mkdir -m 1777 -- {b}; chown sftptest:sftptest -- {b}",
+                        b = shell_quote(&base)
+                    ))
+                ))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _fixture = RemoteFaultFixture {
+            host: host.clone(),
+            base: base.clone(),
+        };
+        let provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
+        let path = format!("{base}/file.txt");
+        seed_remote(&host, &path, b"old", 0o600).unwrap();
+        let revision = remote_revision(&provider, &path).await;
+        // Sticky writable parent: write-back is allowed and replaces the content.
+        let result = provider
+            .write_file_bytes_if_unchanged(
+                &path,
+                b"new",
+                &revision,
+                &CancellationFlag::default(),
+                None,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "sticky writable parent must be accepted: {result:?}"
+        );
+        assert_eq!(
+            provider.read_all_capped(&path, 16).await.unwrap().bytes,
+            b"new"
+        );
+        assert!(
+            transaction_artifacts(&provider, &base, "file.txt")
+                .await
+                .is_empty()
+        );
+    }
+
+    // Group/world-writable NON-sticky parent (0o777) is rejected fail-closed:
+    // the transaction protocol cannot prove exclusive namespace control there.
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn track_e_nonsicky_writable_parent_rejected() {
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        crate::remote::validate_ssh_alias(&host).unwrap();
+        let token = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = format!("/tmp/arx-demo/arx-nonsticky-{token}");
+        assert!(
+            std::process::Command::new("ssh")
+                .arg(&host)
+                .arg(format!(
+                    "sh -c {}",
+                    shell_quote(&format!(
+                        "set -eu; rm -rf -- {b}; mkdir -m 777 -- {b}; chown sftptest:sftptest -- {b}",
+                        b = shell_quote(&base)
+                    ))
+                ))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _fixture = RemoteFaultFixture {
+            host: host.clone(),
+            base: base.clone(),
+        };
+        let provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
+        let path = format!("{base}/file.txt");
+        // Seed via raw ssh: the provider refuses to even READ under a 0o777
+        // parent, so the workspace file is placed out-of-band.
+        seed_remote(&host, &path, b"old", 0o600).unwrap();
+        // The write-back must fail closed with the unsafe-parent error.
+        let error = provider
+            .write_file_bytes_if_unchanged(
+                &path,
+                b"new",
+                &RemoteEditRevision::new(b"old".to_vec(), 0o600, 0, 0),
+                &CancellationFlag::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsafe writable transaction parent"),
+            "non-sticky writable parent must fail closed: {error}"
+        );
+        // Original untouched (read back via raw ssh), no writeback occurred.
+        let remote = std::process::Command::new("ssh")
+            .arg(&host)
+            .arg(format!("cat -- {}", shell_quote(&path)))
+            .output()
+            .unwrap();
+        assert_eq!(remote.stdout, b"old", "original must be unchanged");
+        // No artifacts leaked into the directory.
+        let ls = std::process::Command::new("ssh")
+            .arg(&host)
+            .arg(format!("ls -A -- {}", shell_quote(&base)))
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&ls.stdout);
+        assert!(
+            !listing.contains(".arx-part-") && !listing.contains(".arx-txn-"),
+            "no transaction artifacts in non-sticky dir: {listing}"
+        );
+    }
+
+    // ── Physical pool-health against the real container sshd (TRACK C) ──
+    // Unlike the deterministic #48 matrix (which stubs SSH I/O via test_probe),
+    // this drives the EXACT same `connect_for_mutation` algorithm against a real
+    // OpenSSH server and uses server-side process evidence (sshd client children)
+    // to prove reuse / stale-reconnect / no-replay.
+    // Server-side session-child PIDs: each `connect_for_mutation` is one sshd
+    // Count server-side sshd session workers (`sshd: sftptest@notty`). Each
+    // `pgrep` invocation itself opens one such session, so we subtract it; the
+    // constant cancels in deltas, leaving the provider's real connection count.
+    async fn sshd_session_count(host: &str) -> usize {
+        let out = std::process::Command::new("ssh")
+            .arg(host)
+            .arg("pgrep -f 'sshd: sftptest@'")
+            .output()
+            .unwrap();
+        let count = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        count.saturating_sub(1)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ARX_SFTP_SMOKE_HOST pointing at a disposable SSH/SFTP host"]
+    async fn track_c_physical_pool_health_real_sshd() {
+        let host = std::env::var("ARX_SFTP_SMOKE_HOST").unwrap();
+        crate::remote::validate_ssh_alias(&host).unwrap();
+        let provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
+
+        // Baseline (any pre-existing pooled sessions on the shared fixture).
+        let baseline = sshd_session_count(&host).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // 1) HEALTHY REUSE: first acquire opens PER_CONN sshd workers (ssh + sftp
+        //    subsystem); the second acquire reuses the SAME pooled session (delta
+        //    stays constant — no new worker is spawned).
+        {
+            let _g = provider.connect_for_mutation().await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let after_first = sshd_session_count(&host).await;
+        let delta = after_first - baseline;
+        assert!(
+            delta >= 1,
+            "first acquire opens at least one sshd session; baseline={baseline} after={after_first}"
+        );
+        {
+            let _g = provider.connect_for_mutation().await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let after_second = sshd_session_count(&host).await;
+        assert_eq!(
+            after_second, after_first,
+            "second acquire reuses the pooled session (no new sshd worker); now={after_second}"
+        );
+
+        // 2) STALE REPLACEMENT: kill ALL server-side sessions for our user while
+        //    sshd stays up; next acquire must detect the stale probe, discard the
+        //    stale session, and reconnect EXACTLY ONCE (delta restored).
+        std::process::Command::new("ssh")
+            .arg(&host)
+            .arg("pkill -f 'sshd: sftptest@'")
+            .status()
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let after_kill = sshd_session_count(&host).await;
+        assert!(
+            after_kill <= baseline,
+            "our killed session is gone; now={after_kill}"
+        );
+        {
+            let _g = provider.connect_for_mutation().await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let after_reconnect = sshd_session_count(&host).await;
+        assert_eq!(
+            after_reconnect,
+            baseline + delta,
+            "stale session discarded + exactly one fresh connection (delta={delta}); now={after_reconnect}"
+        );
+
+        // 3) NO DESTRUCTIVE REPLAY: a real mutation after reconnect runs once and
+        //    the pooled session is reused (worker count stays at baseline+delta).
+        let base = format!(
+            "{}/track-c-pool",
+            std::env::var("ARX_SFTP_SMOKE_BASE").unwrap_or_else(|_| "/tmp".to_string())
+        );
+        let path = format!("{base}/pool-file.txt");
+        seed_remote(&host, &path, b"original", 0o600).unwrap();
+        let revision = remote_revision(&provider, &path).await;
+        provider
+            .write_file_bytes_if_unchanged(
+                &path,
+                b"mutated",
+                &revision,
+                &CancellationFlag::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.read_all_capped(&path, 16).await.unwrap().bytes,
+            b"mutated",
+            "single mutation applied exactly once"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let after_mut = sshd_session_count(&host).await;
+        assert_eq!(
+            after_mut,
+            baseline + delta,
+            "mutation reused the pooled session (no reconnect spin); now={after_mut}"
+        );
+        let _ = std::process::Command::new("ssh")
+            .arg(host)
+            .arg(format!(
+                "sh -c {}",
+                shell_quote(&format!("rm -rf -- {}", shell_quote(&base)))
+            ))
+            .status();
     }
 
     #[test]

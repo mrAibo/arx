@@ -51,8 +51,8 @@ Download the archive and SHA256SUMS from the [latest GitHub Release](https://git
 sha256sum -c SHA256SUMS
 
 # Extract
-tar xzf arx-v0.16.0-x86_64-unknown-linux-gnu.tar.gz
-cd arx-v0.16.0-x86_64-unknown-linux-gnu
+tar xzf arx-v0.17.0-x86_64-unknown-linux-gnu.tar.gz
+cd arx-v0.17.0-x86_64-unknown-linux-gnu
 
 # Place on PATH
 sudo install -m 755 arx /usr/local/bin/arx
@@ -217,8 +217,37 @@ Menu entries appear in Command Center (Ctrl+P).
 | User menu with custom scripts | ✅ |
 | Host Center (F9) | ✅ |
 | Extension colors, heatmap, git status bar | ✅ |
-| S3 object-storage backend (AWS-shaped, MinIO + Moto-emulated acceptance) | ✅ RC (not yet AWS-physically released) |
+| S3 object-storage backend | ✅ AWS + MinIO PHYSICAL PASS (SUPPORTED MVP); Moto EMULATED PASS; R2/Wasabi UNVERIFIED (best-effort) |
 | WebDAV backend | stub |
+
+## S3 object storage
+
+Real AWS S3 and MinIO are physically accepted (20/20 physical tests against AWS account
+`715844024414`, immutable SHA `b5f0ee6`); Moto is emulated-accepted. Cloudflare R2 and
+Wasabi are **unverified — best-effort only, not claimed supported.**
+
+| Backend | Status |
+|---------|--------|
+| AWS S3 (account 715844024414) | ✅ PHYSICAL PASS — SUPPORTED MVP |
+| MinIO | ✅ PHYSICAL PASS — SUPPORTED MVP |
+| Moto (emulator) | ✅ EMULATED PASS |
+| Cloudflare R2 / Wasabi | ⚠️ UNVERIFIED — best-effort only |
+
+Capabilities: List / Read / Write / F3 (bounded object preview). Local↔S3
+single-object copy only — no S3→S3, no SFTP↔S3. F7 creates a zero-byte prefix marker (not
+a POSIX directory / bucket). F8 deletes an exact single object or a proven-empty marker (no
+recursive prefix delete, no bucket delete). F4 and F6 are disabled. No S3 rename, no
+recursive delete, no bucket delete.
+
+## SSH Host Manager (F12)
+
+ARX owns a dedicated managed config at `~/.ssh/arx_hosts.conf` (installed via at most one
+`Include` in your `~/.ssh/config`); your `~/.ssh/config` stays user-owned.
+
+- **Add / Edit / Delete / Test / Open** managed hosts.
+- **IdentityFile** — attach an existing key by **path only**; ARX never stores private-key bytes.
+- **Generate** an unencrypted Ed25519 key **only after explicit confirmation**.
+- **Passwords** remain OS-keyring-backed.
 
 ## Architecture
 

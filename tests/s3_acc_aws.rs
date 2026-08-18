@@ -4,8 +4,8 @@
 //! created with temporary STS credentials. Uses the SAME production
 //! S3Provider/runtime as MinIO/Moto — never an AWS-special executor.
 //!
-//! Classification: PHYSICAL PASS for real AWS only. This is the final gate that
-//! flips ARX_S3 from RC to SUPPORTED.
+//! Classification: PHYSICAL PASS for real AWS. This gate confirmed
+//! ARX_S3 as SUPPORTED in v0.17.0 (immutable SHA b5f0ee6, 20/20 physical).
 //!
 //! Covers (per DESIGN_S3 acceptance matrix):
 //!   S3-62  basic operations + >1000 pagination
