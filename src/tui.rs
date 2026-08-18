@@ -7786,15 +7786,32 @@ mod tests {
             registry: registry.clone(),
             ..AppState::default()
         };
+        let job_manager = arx::jobs::JobManager::new();
+        let (job_tx, _job_rx) = tokio::sync::mpsc::unbounded_channel::<arx::jobs::JobEvent>();
+        state.job_manager = Some(job_manager);
+        state.job_events = Some(job_tx);
         state.left.location = location.clone();
         state.pending_remote_edit_origin = Some((Pane::Left, location.clone()));
+        // Production F4 start: create exactly one RemoteEdit job and record its id.
+        let re_job = state
+            .job_manager
+            .as_ref()
+            .expect("job manager bound")
+            .create_job(
+                "remote-edit",
+                arx::jobs::JobKind::RemoteEdit,
+                "Remote edit note.txt",
+                Some(location.clone()),
+                None,
+            );
+        state.pending_remote_edit_job_id = Some(re_job.id.clone());
         let id = dispatcher.dispatch(
             EffectLane::RemoteEdit,
             EffectScope::Location(location.clone()),
             Effect::DownloadRemoteFile {
                 location: location.clone(),
                 name: "note.txt".into(),
-                editor: "false".into(),
+                editor: "sleep 1".into(),
             },
         );
         state.register_effect(EffectLane::RemoteEdit, id);

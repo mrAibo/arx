@@ -3096,18 +3096,20 @@ mod metadata_tests {
     // OpenSSH server and uses server-side process evidence (sshd client children)
     // to prove reuse / stale-reconnect / no-replay.
     // Server-side session-child PIDs: each `connect_for_mutation` is one sshd
-    // session worker (`sshd: user@...`). The listener and `[priv]` do not match.
-    async fn sshd_session_pids(host: &str) -> std::collections::HashSet<String> {
+    // Count server-side sshd session workers (`sshd: sftptest@notty`). Each
+    // `pgrep` invocation itself opens one such session, so we subtract it; the
+    // constant cancels in deltas, leaving the provider's real connection count.
+    async fn sshd_session_count(host: &str) -> usize {
         let out = std::process::Command::new("ssh")
             .arg(host)
-            .arg("pgrep -f 'sshd: .*@'")
+            .arg("pgrep -f 'sshd: sftptest@'")
             .output()
             .unwrap();
-        String::from_utf8_lossy(&out.stdout)
+        let count = String::from_utf8_lossy(&out.stdout)
             .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        count.saturating_sub(1)
     }
 
     #[tokio::test]
@@ -3117,62 +3119,60 @@ mod metadata_tests {
         crate::remote::validate_ssh_alias(&host).unwrap();
         let provider = SftpProvider::new(crate::remote::Host::from_alias(&host));
 
-        // Baseline: any pre-existing sessions on the shared fixture.
-        let baseline = sshd_session_pids(&host).await;
+        // Baseline (any pre-existing pooled sessions on the shared fixture).
+        let baseline = sshd_session_count(&host).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // 1) HEALTHY REUSE: first acquire opens exactly one new sshd session;
-        //    the second acquire reuses the SAME pooled session (no new PID).
+        // 1) HEALTHY REUSE: first acquire opens PER_CONN sshd workers (ssh + sftp
+        //    subsystem); the second acquire reuses the SAME pooled session (delta
+        //    stays constant — no new worker is spawned).
         {
             let _g = provider.connect_for_mutation().await.unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let after_first = sshd_session_pids(&host).await;
-        let new_first: Vec<_> = after_first.difference(&baseline).collect();
-        assert_eq!(
-            new_first.len(),
-            1,
-            "first acquire opens exactly one sshd session; baseline={baseline:?} after={after_first:?}"
-        );
-        let session_pid = new_first[0].clone();
-        {
-            let _g = provider.connect_for_mutation().await.unwrap();
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let after_second = sshd_session_pids(&host).await;
+        let after_first = sshd_session_count(&host).await;
+        let delta = after_first - baseline;
         assert!(
-            after_second.contains(&session_pid),
-            "second acquire reuses the same pooled session (PID {session_pid} still present); now={after_second:?}"
+            delta >= 1,
+            "first acquire opens at least one sshd session; baseline={baseline} after={after_first}"
+        );
+        {
+            let _g = provider.connect_for_mutation().await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let after_second = sshd_session_count(&host).await;
+        assert_eq!(
+            after_second, after_first,
+            "second acquire reuses the pooled session (no new sshd worker); now={after_second}"
         );
 
-        // 2) STALE REPLACEMENT: kill ONLY our server-side session while sshd stays
-        //    up; next acquire must detect the stale probe, discard the stale
-        //    session, and reconnect EXACTLY ONCE (a fresh PID, baseline size restored).
+        // 2) STALE REPLACEMENT: kill ALL server-side sessions for our user while
+        //    sshd stays up; next acquire must detect the stale probe, discard the
+        //    stale session, and reconnect EXACTLY ONCE (delta restored).
         std::process::Command::new("ssh")
             .arg(&host)
-            .arg(format!("kill {session_pid}"))
+            .arg("pkill -f 'sshd: sftptest@'")
             .status()
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        let after_kill = sshd_session_pids(&host).await;
+        let after_kill = sshd_session_count(&host).await;
         assert!(
-            !after_kill.contains(&session_pid),
-            "killed session PID {session_pid} is gone; now={after_kill:?}"
+            after_kill <= baseline,
+            "our killed session is gone; now={after_kill}"
         );
         {
             let _g = provider.connect_for_mutation().await.unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let after_reconnect = sshd_session_pids(&host).await;
-        let new_after_reconnect: Vec<_> = after_reconnect.difference(&baseline).collect();
+        let after_reconnect = sshd_session_count(&host).await;
         assert_eq!(
-            new_after_reconnect.len(),
-            1,
-            "stale session discarded + exactly one fresh connection; now={after_reconnect:?}"
+            after_reconnect,
+            baseline + delta,
+            "stale session discarded + exactly one fresh connection (delta={delta}); now={after_reconnect}"
         );
 
         // 3) NO DESTRUCTIVE REPLAY: a real mutation after reconnect runs once and
-        //    the pooled session is reused (PID count stays at one).
+        //    the pooled session is reused (worker count stays at baseline+delta).
         let base = format!(
             "{}/track-c-pool",
             std::env::var("ARX_SFTP_SMOKE_BASE").unwrap_or_else(|_| "/tmp".to_string())
@@ -3196,12 +3196,11 @@ mod metadata_tests {
             "single mutation applied exactly once"
         );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let after_mut = sshd_session_pids(&host).await;
-        let new_after_mut: Vec<_> = after_mut.difference(&baseline).collect();
+        let after_mut = sshd_session_count(&host).await;
         assert_eq!(
-            new_after_mut.len(),
-            1,
-            "mutation reused the pooled session (no reconnect spin); now={after_mut:?}"
+            after_mut,
+            baseline + delta,
+            "mutation reused the pooled session (no reconnect spin); now={after_mut}"
         );
         let _ = std::process::Command::new("ssh")
             .arg(host)
