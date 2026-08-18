@@ -542,6 +542,7 @@ pub fn navigation_parent_target(
     use crate::vfs::{Location, S3TargetBinding};
     match current {
         Location::Local(_) | Location::Sftp { .. } | Location::Archive { .. } => current.parent(),
+        Location::WebDav { .. } => current.parent(),
         Location::S3 {
             target,
             bucket,

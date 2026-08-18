@@ -258,6 +258,10 @@ fn endpoint_arg(
             method: TransferMethod::Rsync,
             reason: "rsync cannot address S3 locations directly".into(),
         }),
+        Location::WebDav { .. } => Err(TransferExecutionError::InvalidPlan {
+            method: TransferMethod::Rsync,
+            reason: "rsync cannot address WebDAV locations directly".into(),
+        }),
     }
 }
 

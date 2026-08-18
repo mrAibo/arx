@@ -683,6 +683,11 @@ impl DigestBuilder {
                 }
                 self.bytes(prefix.as_bytes());
             }
+            Location::WebDav { target, path } => {
+                self.u8(4);
+                self.bytes(target.as_bytes());
+                self.bytes(path.as_bytes());
+            }
         }
     }
 

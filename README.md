@@ -218,7 +218,7 @@ Menu entries appear in Command Center (Ctrl+P).
 | Host Center (F9) | ✅ |
 | Extension colors, heatmap, git status bar | ✅ |
 | S3 object-storage backend | ✅ AWS + MinIO PHYSICAL PASS (SUPPORTED MVP); Moto EMULATED PASS; R2/Wasabi UNVERIFIED (best-effort) |
-| WebDAV backend | stub |
+| WebDAV backend | ✅ MVP — PROPFIND/GET/PUT/DELETE/MKCOL/COPY/MOVE, Basic auth, keyring/env secret |
 
 ## S3 object storage
 
@@ -233,11 +233,32 @@ Wasabi are **unverified — best-effort only, not claimed supported.**
 | Moto (emulator) | ✅ EMULATED PASS |
 | Cloudflare R2 / Wasabi | ⚠️ UNVERIFIED — best-effort only |
 
-Capabilities: List / Read / Write / F3 (bounded object preview). Local↔S3
-single-object copy only — no S3→S3, no SFTP↔S3. F7 creates a zero-byte prefix marker (not
-a POSIX directory / bucket). F8 deletes an exact single object or a proven-empty marker (no
-recursive prefix delete, no bucket delete). F4 and F6 are disabled. No S3 rename, no
-recursive delete, no bucket delete.
+## WebDAV backend
+
+Production `VfsProvider` over `reqwest` + `quick-xml`. Real DAV semantics,
+no plaintext password in config, no hand-rolled XML string-splitting.
+
+```toml
+# ~/.config/arx/arx.toml
+[[webdav.targets]]
+id = "nextcloud"
+name = "Nextcloud"
+url = "https://cloud.example.com/remote.php/dav/files/me/"
+username = "me"
+# password resolved from OS keyring (id "nextcloud") or ARX_WEBDAV_NEXTCLOUD_PASSWORD;
+# never stored in this file
+```
+
+Capabilities: List / Read / F3 (bounded text preview) / Write (F5 one-file
+Local↔WebDAV PUT) / Mkdir (F7 MKCOL) / Delete (F8) / ServerSideCopy within one
+target (F5/F6 COPY/MOVE with `Overwrite: F`). F4 (remote edit) and F6 (move)
+across targets stay disabled — no server-agnostic compare-and-swap or
+cross-target move.
+
+Auth: HTTP Basic only (MVP). Digest/Bearer deferred. Secrets come from the OS
+keyring (`secret-tool`/macOS/Windows) keyed by target `id`, or the
+`ARX_WEBDAV_<ID>_PASSWORD` env var; config holds neither. URLs are redacted
+(`user:***@`) in diagnostics; passwords never reach logs.
 
 ## SSH Host Manager (F12)
 

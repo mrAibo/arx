@@ -68,10 +68,18 @@ pub const SFTP_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
 /// outside the provider contract until they have transactional semantics.
 pub const ARCHIVE_CAPABILITIES: CapabilitySet = CapabilitySet::NONE.with(Capability::List);
 
-/// The current WebDAV provider implements PROPFIND and GET only.
+/// WebDAV MVP (PACK E): PROPFIND listing, bounded GET preview, MKCOL, DELETE,
+/// same-target COPY/MOVE (server-side), and one-file PUT via Local↔WebDAV F5.
+/// Rename/Symlink/Chmod remain unimplemented; Remote Edit F4 stays Unsupported.
 pub const WEBDAV_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::List)
-    .with(Capability::Read);
+    .with(Capability::Read)
+    .with(Capability::Write)
+    .with(Capability::Mkdir)
+    .with(Capability::Delete)
+    .with(Capability::Copy)
+    .with(Capability::Move)
+    .with(Capability::ServerSideCopy);
 
 /// S3 implements listing/navigation (ListBuckets, ListObjectsV2), bounded
 /// preview reads (GetObject Range), single-object basic transfers
@@ -125,7 +133,9 @@ mod tests {
         assert!(!SFTP_CAPABILITIES.supports(Capability::Move));
         assert!(ARCHIVE_CAPABILITIES.supports(Capability::List));
         assert!(WEBDAV_CAPABILITIES.supports(Capability::Read));
-        assert!(!WEBDAV_CAPABILITIES.supports(Capability::Delete));
+        assert!(WEBDAV_CAPABILITIES.supports(Capability::Delete));
+        assert!(WEBDAV_CAPABILITIES.supports(Capability::Copy));
+        assert!(!WEBDAV_CAPABILITIES.supports(Capability::Symlink));
         assert!(S3_CAPABILITIES.supports(Capability::List));
         assert!(S3_CAPABILITIES.supports(Capability::Read));
         assert!(S3_CAPABILITIES.supports(Capability::Write));

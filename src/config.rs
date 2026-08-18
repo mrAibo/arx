@@ -7,6 +7,9 @@ pub struct ArxConfig {
     /// S3 target inventory. None = no S3 targets configured.
     #[serde(default)]
     pub s3: S3Config,
+    /// WebDAV target inventory. None = no WebDAV targets configured.
+    #[serde(default)]
+    pub webdav: WebDavConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -33,6 +36,7 @@ impl Default for ArxConfig {
                 editor: None,
             },
             s3: S3Config::default(),
+            webdav: WebDavConfig::default(),
         }
     }
 }
@@ -113,6 +117,99 @@ impl std::fmt::Debug for S3TargetConfig {
     }
 }
 
+/// Wrapper matching the `[[webdav.targets]]` TOML shape.
+#[derive(Debug, Default, Deserialize)]
+pub struct WebDavConfig {
+    #[serde(default)]
+    pub targets: Vec<WebDavTargetConfig>,
+}
+
+/// A single configured WebDAV target.
+///
+/// Secrets are NEVER stored here. The password is resolved at runtime from the
+/// OS keyring (`src/keyring.rs`, keyed by `webdav:<id>`) or the
+/// `ARX_WEBDAV_<ID>_PASSWORD` env var for tests. `auth` selects the wire
+/// mechanism; only `basic` is implemented in the MVP (Digest DEFERRED).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct WebDavTargetConfig {
+    /// Unique target id used by ARX location addressing. Not a secret.
+    pub id: String,
+    /// Human-readable name for the pane/UI.
+    pub name: String,
+    /// Absolute http(s) URL of the target root collection.
+    pub url: String,
+    /// Username for Basic auth.
+    pub username: String,
+    /// Auth mechanism. MVP supports `basic` only; anything else is rejected.
+    #[serde(default = "default_webdav_auth")]
+    pub auth: String,
+}
+
+fn default_webdav_auth() -> String {
+    "basic".into()
+}
+
+/// Parse + validate the WebDAV target inventory (no normalization of URLs).
+pub fn validate_webdav(targets: &[WebDavTargetConfig]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for t in targets {
+        if t.id.trim().is_empty() {
+            return Err("WebDAV target id must not be empty/whitespace".into());
+        }
+        if t.url.trim().is_empty() {
+            return Err(format!(
+                "WebDAV target {} url must not be empty",
+                sanitize_diag(&t.id)
+            ));
+        }
+        // Absolute http/https only; no embedded userinfo/credentials in the URL.
+        let u = t.url.trim();
+        if !(u.starts_with("http://") || u.starts_with("https://")) {
+            return Err(format!(
+                "WebDAV target {} url must be absolute http(s): {}",
+                sanitize_diag(&t.id),
+                sanitize_diag(u)
+            ));
+        }
+        if url_has_userinfo(u) {
+            return Err(format!(
+                "WebDAV target {} url must not embed credentials (userinfo)",
+                sanitize_diag(&t.id)
+            ));
+        }
+        if !["basic"].contains(&t.auth.as_str()) {
+            return Err(format!(
+                "WebDAV target {} auth '{}' not supported (MVP: basic only)",
+                sanitize_diag(&t.id),
+                sanitize_diag(&t.auth)
+            ));
+        }
+        if !seen.insert(t.id.clone()) {
+            return Err(format!(
+                "duplicate WebDAV target id: {}",
+                sanitize_diag(&t.id)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Output-only check: does the URL contain a `user:pass@` userinfo segment?
+/// Does not modify the stored value.
+fn url_has_userinfo(url: &str) -> bool {
+    // Strip scheme, then look for '@' before the first '/'.
+    let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = without_scheme
+        .split_once('/')
+        .map(|(a, _)| a)
+        .unwrap_or(without_scheme);
+    // A userinfo segment contains ':' before the '@' (user:pass@host).
+    authority
+        .rsplit_once('@')
+        .map(|(userinfo, _)| userinfo.contains(':'))
+        .unwrap_or(false)
+}
+
 /// Wrapper matching the `[[s3.targets]]` TOML shape.
 #[derive(Debug, Default, Deserialize)]
 pub struct S3Config {
@@ -127,6 +224,7 @@ pub struct S3Config {
 pub fn parse_config(content: &str) -> Result<ArxConfig, String> {
     let cfg: ArxConfig = toml::from_str(content).map_err(|e| e.to_string())?;
     validate_s3(&cfg.s3.targets)?;
+    validate_webdav(&cfg.webdav.targets)?;
     Ok(cfg)
 }
 

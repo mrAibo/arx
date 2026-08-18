@@ -91,6 +91,9 @@ async fn event_loop(
     // Install configured S3 target inventory (offline; no AWS load/client).
     // DESIGN_S3 §10 lazy per-target model: clients appear later inside providers.
     state.registry.register_s3_targets(&config.s3.targets);
+    state
+        .registry
+        .register_webdav_targets(&config.webdav.targets);
     let (pane_loader, mut pane_load_rx, mut pane_next_page_rx) =
         PaneLoader::channel(state.registry.clone());
     let (workspace_scanner, mut workspace_scan_rx) =

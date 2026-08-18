@@ -26,11 +26,18 @@ async-trait = "0.1"
 anyhow = "1"
 portable-pty = "0.8"
 keyring = "4.1.6"
+quick-xml = { version = "0.37" }
 reqwest = { version = "0.13.4", features = ["blocking", "json"] }
 mlua = { version = "0.12.0", features = ["lua54", "vendored", "send"] }
 thiserror = "2.0.19"
 tempfile = "3"
 aws-config = "=1.8.8"
 aws-sdk-s3 = "=1.109.0"
+
+[features]
+# Physical WebDAV acceptance (W1–W18) against a real Apache mod_dav server.
+# Off by default so CI without the fixture stays green. Enable with
+# `--features physical-webdav` and source scripts/setup_webdav_acceptance.sh.
+physical-webdav = []
 
 [dev-dependencies]
