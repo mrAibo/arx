@@ -5465,6 +5465,79 @@ fn build_s3_copy_spec(
     }
 }
 
+/// Build a frozen WebDAV copy spec (single object + Local pane).
+/// Returns `DownloadOne` for WebDAV -> Local, `UploadOne` for Local -> WebDAV.
+fn build_webdav_copy_spec(
+    src_provider: ProviderId,
+    _dst_provider: ProviderId,
+    src_loc: &Location,
+    dst_loc: &Location,
+    focused_listed: Option<&ListedEntry>,
+    other_listed: Option<&ListedEntry>,
+) -> Result<arx::transfer::WebDavTransferSpec, String> {
+    let webdav_is_source = src_provider == ProviderId::WebDAV;
+
+    // We need exactly one WebDAV object (focused on WebDAV pane) and a Local
+    // pane for the other side. Validate both.
+    if webdav_is_source {
+        // WebDAV -> Local download
+        let Location::Local(local_path) = &dst_loc else {
+            return Err("WebDAV download requires a Local destination".into());
+        };
+        let Some(listed) = focused_listed else {
+            return Err("Focus a WebDAV object to download".into());
+        };
+        let EntryIdentity::WebDavObject(obj) = &listed.identity else {
+            return Err("Download requires a WebDAV object (not a collection)".into());
+        };
+        // Verify the listed object belongs to the WebDAV target we're operating on.
+        let Location::WebDav { target, .. } = &src_loc else {
+            return Err("WebDAV source pane has no target".into());
+        };
+        if obj.target != *target {
+            return Err(format!(
+                "WebDAV object target '{}' does not match pane target '{}'",
+                obj.target, target
+            ));
+        }
+        // Local filename comes from the *display name* (presentation), not the
+        // raw href. The remote href is frozen from the identity.
+        let local_name = arx::transfer::webdav_download_local_name(obj, &listed.entry.name)
+            .map_err(|e| e.to_string())?;
+        Ok(arx::transfer::WebDavTransferSpec::DownloadOne {
+            source: obj.clone(),
+            local_destination: local_path.join(local_name),
+        })
+    } else {
+        // Local -> WebDAV upload
+        let Location::WebDav { target, path } = &dst_loc else {
+            return Err("WebDAV upload requires a WebDAV destination".into());
+        };
+        let Some(local_listed) = other_listed else {
+            return Err("Select a local file to upload".into());
+        };
+        // Source must be a single local file.
+        if local_listed.entry.kind != EntryKind::File {
+            return Err("Upload requires a single local file".into());
+        }
+        let local_path = match &src_loc {
+            Location::Local(p) => p.clone(),
+            _ => return Err("WebDAV upload requires a Local source".into()),
+        };
+        // Destination filename = local entry name; destination href is derived
+        // from the WebDAV pane's current collection path + filename.
+        let filename = local_listed.entry.name.as_str();
+        // Build the exact destination href: pane path + filename (percent-encoded).
+        let dest_href = format!("{}{}", path, arx::vfs::webdav::encode_segment(filename));
+        let destination = arx::transfer::webdav_upload_destination_ref(target, &dest_href, filename)
+            .map_err(|e| e.to_string())?;
+        Ok(arx::transfer::WebDavTransferSpec::UploadOne {
+            local_source: local_path.join(filename),
+            destination,
+        })
+    }
+}
+
 // ponytail: keep the one action seam instead of wrapping runtime services in a one-use context.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_ui_action(
@@ -5790,11 +5863,35 @@ async fn dispatch_ui_action(
                     None
                 };
 
-            let mut executors =
-                arx::transfer::probe::local_executors(arx::transfer::probe::detect_local_tools());
-            if s3_spec.is_some() {
-                executors.s3 = true;
-            }
+                // WebDAV basic transfer: a single WebDAV object paired with a Local pane.
+                let webdav_spec: Option<arx::transfer::WebDavTransferSpec> =
+                    if src_provider == ProviderId::WebDAV || dst_provider == ProviderId::WebDAV {
+                        match build_webdav_copy_spec(
+                            src_provider,
+                            dst_provider,
+                            &src_loc,
+                            &dst_loc,
+                            focused_listed,
+                            other_listed,
+                        ) {
+                            Ok(spec) => Some(spec),
+                            Err(msg) => {
+                                state.message = Some(msg);
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                let mut executors =
+                    arx::transfer::probe::local_executors(arx::transfer::probe::detect_local_tools());
+                if s3_spec.is_some() {
+                    executors.s3 = true;
+                }
+                if webdav_spec.is_some() {
+                    executors.webdav = true;
+                }
             let request = arx::transfer::TransferRequest {
                 source: src_loc.clone(),
                 destination: dst_loc.clone(),

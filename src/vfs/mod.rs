@@ -14,7 +14,7 @@ mod webdav_tests;
 
 pub use capabilities::{Capability, CapabilitySet};
 pub use s3::{S3BucketRef, S3ObjectRef, S3PrefixRef};
-pub use webdav::{WebDavCollectionRef, WebDavObjectRef};
+pub use webdav::{WebDavCollectionRef, WebDavObjectRef, encode_segment};
 
 // ── Provider Registry (new architecture — phased migration) ──
 // ponytail: add ProviderId + VfsProvider + Registry alongside old Location enum.

@@ -677,7 +677,9 @@ struct BoundedBody {
 /// Percent-encode one path segment for the wire. Encodes everything except a
 /// small unreserved set, preserving `%xx` already present in the logical path
 /// input (we operate on decoded names, so we re-encode fully).
-fn encode_segment(seg: &str) -> String {
+/// Percent-encode a single path segment (RFC 3986). Used for URL assembly.
+/// Ponytail: no normalization; only encodes bytes not in the unreserved set.
+pub fn encode_segment(seg: &str) -> String {
     let mut out = String::with_capacity(seg.len());
     for b in seg.bytes() {
         match b {
