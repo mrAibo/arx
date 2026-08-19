@@ -14,8 +14,9 @@
 //!   the behavioral level.
 
 use crate::vfs::{
-    BoundedRead, Entry, EntryKind, FileMetadata, ListedEntry, Location, RemoteEditProgressFn,
-    RemoteEditRevision, VfsProvider,
+    BoundedRead, Entry, EntryIdentity, EntryKind, FileMetadata, ListedEntry, Location,
+    ProviderContinuation, ProviderListingPage, RemoteEditProgressFn, RemoteEditRevision,
+    VfsProvider,
 };
 use quick_xml::events::Event;
 use std::io;
@@ -76,6 +77,23 @@ pub(crate) struct PropFindEntry {
     pub(crate) is_collection: bool,
     pub(crate) content_length: Option<u64>,
     pub(crate) modified_unix_ms: Option<u64>,
+}
+
+/// Provider-native object identity: exact target id + raw href returned by the
+/// server. Never reconstructed from `parent + entry.name` (href may carry
+/// percent-encoding, query, or opaque server paths).
+// ponytail: raw href is the authoritative WebDAV object key (F3/F5)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebDavObjectRef {
+    pub target: String,
+    pub href: String,
+}
+
+/// Provider-native collection identity: exact target id + raw href.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebDavCollectionRef {
+    pub target: String,
+    pub href: String,
 }
 
 /// A WebDAV provider bound to one configured target.
@@ -384,7 +402,94 @@ impl VfsProvider for WebDavProvider {
         listed: &ListedEntry,
         max_bytes: usize,
     ) -> io::Result<BoundedRead> {
-        self.get_bounded(&listed.entry.name, max_bytes).await
+        match &listed.identity {
+            EntryIdentity::WebDavObject(identity) => {
+                // Verify the target matches the provider's bound target, then GET
+                // the exact raw href — never reconstruct from parent + name.
+                if identity.target != self.target.id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "listed entry belongs to a different WebDAV target",
+                    ));
+                }
+                self.get_bounded(&identity.href, max_bytes).await
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "WebDAV read requires a WebDavObject identity (use list_page)",
+            )),
+        }
+    }
+
+    /// Provider-side paginated listing with authoritative WebDAV identity.
+    ///
+    /// Each entry carries a `WebDavObjectRef`/`WebDavCollectionRef` holding the
+    /// exact raw href, so downstream F5/F3 never reconstruct an address from
+    /// `entry.name` (which is presentation-only and may differ from the href).
+    async fn list_page(
+        &self,
+        location: &Location,
+        continuation: Option<&ProviderContinuation>,
+    ) -> io::Result<ProviderListingPage> {
+        if continuation.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "WebDAV provider does not support listing continuation",
+            ));
+        }
+        let path = Location::legacy_listing_path(location)?;
+        let mut url_path = path.to_string();
+        if !url_path.ends_with('/') {
+            url_path.push('/');
+        }
+        let entries = self.propfind(&url_path, "1").await?;
+        let self_href = self.join_url(&url_path);
+        let self_norm = self_href.trim_end_matches('/');
+        let logical = path.trim_start_matches('/').trim_end_matches('/');
+        let listed: Vec<ListedEntry> = entries
+            .into_iter()
+            .filter(|e| {
+                let h = href_path_only(&e.raw_href)
+                    .trim_end_matches('/')
+                    .trim_start_matches('/');
+                h != self_norm.trim_start_matches('/') && h != logical
+            })
+            .map(|e| {
+                let is_collection = e.is_collection;
+                let name = e
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| href_leaf(&e.raw_href));
+                let identity = if is_collection {
+                    EntryIdentity::WebDavCollection(WebDavCollectionRef {
+                        target: self.target.id.clone(),
+                        href: e.raw_href.clone(),
+                    })
+                } else {
+                    EntryIdentity::WebDavObject(WebDavObjectRef {
+                        target: self.target.id.clone(),
+                        href: e.raw_href.clone(),
+                    })
+                };
+                ListedEntry {
+                    entry: Entry {
+                        name,
+                        kind: if is_collection {
+                            EntryKind::Directory
+                        } else {
+                            EntryKind::File
+                        },
+                        size: e.content_length,
+                        modified_unix_ms: e.modified_unix_ms,
+                    },
+                    identity,
+                }
+            })
+            .collect();
+        Ok(ProviderListingPage {
+            entries: listed,
+            continuation: None,
+        })
     }
 
     async fn read_all_capped(&self, path: &str, max_bytes: usize) -> io::Result<BoundedRead> {

@@ -1649,6 +1649,8 @@ pub enum EntryIdentity {
     S3Object(s3::S3ObjectRef),
     S3Prefix(s3::S3PrefixRef),
     S3Bucket(s3::S3BucketRef),
+    WebDavObject(webdav::WebDavObjectRef),
+    WebDavCollection(webdav::WebDavCollectionRef),
     Other,
 }
 

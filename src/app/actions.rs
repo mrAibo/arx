@@ -506,6 +506,8 @@ pub fn listed_entry_navigation_target(
             })
         }
         crate::vfs::EntryIdentity::S3Object(_) => None,
+        crate::vfs::EntryIdentity::WebDavObject(_)
+        | crate::vfs::EntryIdentity::WebDavCollection(_) => None,
         crate::vfs::EntryIdentity::Other
             if listed.entry.kind == crate::vfs::EntryKind::Directory
                 && matches!(

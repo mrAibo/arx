@@ -613,8 +613,125 @@ async fn c_error_body_bounded() {
         _ => (404, Vec::new()),
     });
     let provider = provider_for(&url, "p");
-    let r = provider.read_prefix_bytes("/x", 1024).await;
-    assert!(r.is_err());
+    let r = provider.list_async("/dav").await;
+    assert!(r.is_err(), "oversized PROPFIND body must be rejected");
+}
+
+// ── B0: provider-native WebDAV identity ───────────────────────────────────────
+
+#[tokio::test]
+async fn b0_list_page_returns_native_object_and_collection_identity() {
+    let xml = br#"<?xml version="1.0"?>
+<multistatus xmlns="DAV:">
+  <response><href>/dav/</href>
+    <propstat><prop><resourcetype><collection/></resourcetype></prop><status>HTTP/1.1 200 OK</status></propstat></response>
+  <response><href>/dav/EVIL%20NAME.txt</href>
+    <propstat><prop><resourcetype/><getcontentlength>5</getcontentlength></prop><status>HTTP/1.1 200 OK</status></propstat></response>
+</multistatus>"#;
+    let (url, _) = spawn_mock(move |method, _, _, _, _| match method {
+        "PROPFIND" => (207, xml.to_vec()),
+        _ => (404, Vec::new()),
+    });
+    let provider = provider_for(&url, "p");
+    let page = provider
+        .list_page(
+            &crate::vfs::Location::WebDav {
+                target: "t".into(),
+                path: "/dav".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 1, "self-response collection filtered");
+    // First entry is the collection (self-response filtered by display, here kept).
+    let obj = page
+        .entries
+        .iter()
+        .find(|e| e.entry.name.contains("EVIL"))
+        .expect("object entry present");
+    match &obj.identity {
+        crate::vfs::EntryIdentity::WebDavObject(ref r) => {
+            assert_eq!(r.target, "t");
+            assert_eq!(r.href, "/dav/EVIL%20NAME.txt");
+        }
+        other => panic!("expected WebDavObject, got {:?}", other),
+    }
+    // No entry may carry the generic Other identity from list_page.
+    assert!(
+        page.entries
+            .iter()
+            .all(|e| !matches!(e.identity, crate::vfs::EntryIdentity::Other))
+    );
+}
+
+#[tokio::test]
+async fn b0_read_listed_uses_href_not_display_name() {
+    // The listed entry has a display name that, if used, would address a wrong path.
+    let (url, _) = spawn_mock(move |method, path, _, _, body| {
+        match method {
+        "PROPFIND" => (207, br#"<?xml version="1.0"?><multistatus xmlns="DAV:"><response><href>/dav/real.txt</href><propstat><prop><resourcetype/><getcontentlength>3</getcontentlength></prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>"#.to_vec()),
+        "GET" => {
+            // Assert the GET hits the exact raw href, never the display name.
+            assert_eq!(path, "/dav/real.txt", "GET must use raw href identity");
+            (200, b"abc".to_vec())
+        }
+        _ => (404, Vec::new()),
+    }
+    });
+    let provider = provider_for(&url, "p");
+    let listed = crate::vfs::ListedEntry {
+        entry: crate::vfs::Entry {
+            name: "WRONG-DISPLAY".into(),
+            kind: crate::vfs::EntryKind::File,
+            size: Some(3),
+            modified_unix_ms: None,
+        },
+        identity: crate::vfs::EntryIdentity::WebDavObject(crate::vfs::webdav::WebDavObjectRef {
+            target: "t".into(),
+            href: "/dav/real.txt".into(),
+        }),
+    };
+    let rd = provider
+        .read_listed_prefix_bytes(
+            &crate::vfs::Location::WebDav {
+                target: "t".into(),
+                path: "/dav".into(),
+            },
+            &listed,
+            1024,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rd.bytes, b"abc");
+}
+
+#[tokio::test]
+async fn b0_read_listed_rejects_mismatched_target() {
+    let provider = provider_for("http://127.0.0.1:1", "p");
+    let listed = crate::vfs::ListedEntry {
+        entry: crate::vfs::Entry {
+            name: "x".into(),
+            kind: crate::vfs::EntryKind::File,
+            size: None,
+            modified_unix_ms: None,
+        },
+        identity: crate::vfs::EntryIdentity::WebDavObject(crate::vfs::webdav::WebDavObjectRef {
+            target: "other".into(),
+            href: "/x".into(),
+        }),
+    };
+    let r = provider
+        .read_listed_prefix_bytes(
+            &crate::vfs::Location::WebDav {
+                target: "t".into(),
+                path: "/".into(),
+            },
+            &listed,
+            1024,
+        )
+        .await;
+    assert!(r.is_err(), "target mismatch must fail closed");
 }
 
 #[tokio::test]
