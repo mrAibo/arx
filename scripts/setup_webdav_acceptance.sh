@@ -16,8 +16,9 @@
 # Requires: docker. No external cloud. Test-only; plaintext Basic over 127.0.0.1
 # is acceptable per PACK E (explicit localhost/test use).
 set -euo pipefail
-cd "$(dirname "$0")/.."
-
+# NOTE: do NOT `cd` here. When sourced (CI), $0 is the runner's temp script,
+# so a relative cd would escape the repo. The script only uses docker and
+# writes to /tmp, so a cd is unnecessary and harmful.
 CONTAINER="arx-webdav-acceptance-$$"
 IMAGE="httpd:2.4"
 WEBDAV_DIR="/usr/local/apache2/htdocs/dav"
