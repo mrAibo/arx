@@ -21,6 +21,7 @@ use crate::vfs::{
 use quick_xml::events::Event;
 use std::io;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 /// Hard caps for multistatus parsing (quick-xml security boundary).
 const MAX_PROPFIND_BYTES: usize = 16 * 1024 * 1024;
@@ -121,6 +122,11 @@ impl WebDavProvider {
         })
     }
 
+    /// Accessor for the bound target (target id, username, url, auth).
+    pub fn target(&self) -> &WebDavTarget {
+        &self.target
+    }
+
     fn secret(&self) -> io::Result<String> {
         // Password already resolved from the keyring/env path at registry
         // build time (see ProviderRegistry::resolve_webdav_provider). `auth`
@@ -136,17 +142,109 @@ impl WebDavProvider {
         // Apache requires to address a collection). Only strip the root slash
         // when joining a non-empty sub-path.
         let root = &self.target.url;
-        let trimmed = path.trim_start_matches('/');
-        if trimmed.is_empty() {
+        // The listing identity's raw href may carry the target's own path prefix
+        // (e.g. "/dav/foo"); strip it so we don't double-prefix under the root.
+        // ponytail: one prefix-strip; if the server returns an absolute-origin
+        // href, url::Url parsing would be the upgrade path.
+        let root_path = match root.split_once("://") {
+            Some((_, rest)) => rest
+                .split_once('/')
+                .map(|(_, p)| p)
+                .unwrap_or("")
+                .trim_end_matches('/')
+                .to_string(),
+            None => String::new(),
+        };
+        let after_root = if !root_path.is_empty() {
+            path.trim_start_matches('/')
+                .strip_prefix(&root_path)
+                .map(|s| s.trim_start_matches('/'))
+                .unwrap_or_else(|| path.trim_start_matches('/'))
+        } else {
+            path.trim_start_matches('/')
+        };
+        if after_root.is_empty() {
             return root.to_string();
         }
         let root_base = root.trim_end_matches('/');
-        let encoded: String = trimmed
+        let encoded: String = after_root
             .split('/')
             .map(encode_segment)
             .collect::<Vec<_>>()
             .join("/");
         format!("{root_base}/{encoded}")
+    }
+
+    /// Path portion of the configured target URL (e.g. `/dav`), no trailing
+    /// slash. Empty when the target root is the origin itself.
+    fn root_path(&self) -> String {
+        let url = &self.target.url;
+        if let Some(idx) = url.find("://") {
+            let after = &url[idx + 3..];
+            if let Some(slash) = after.find('/') {
+                return after[slash..].trim_end_matches('/').to_string();
+            }
+        }
+        String::new()
+    }
+
+    /// Resolve an authoritative raw href (server-supplied identity) into a fully
+    /// qualified wire URL, strictly bounded to the target root.
+    ///
+    /// Fail-closed: rejects a href outside the target root (`/dav2/...`,
+    /// `/other/...`), encoded path traversal (`/dav/%2e%2e/secret`), and
+    /// cross-origin absolute hrefs. The href is used VERBATIM (no percent
+    /// re-encoding): a server `%20` stays `%20` and never becomes `%2520`.
+    pub(crate) fn wire_url_for_href(&self, href: &str) -> io::Result<String> {
+        let root = &self.target.url;
+        let root_path = self.root_path();
+        let href_path = href_path_only(href).to_string();
+        // cross-origin absolute href -> reject
+        if href.contains("://") && host_of(href) != host_of(root) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("href escapes target origin: {href}"),
+            ));
+        }
+        // containment to the target root
+        let rp = root_path.trim_end_matches('/');
+        let contained =
+            rp.is_empty() || href_path == rp || href_path.starts_with(&format!("{rp}/"));
+        if !contained {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("href escapes target root: {href}"),
+            ));
+        }
+        // traversal check on decoded segments
+        for seg in href_path.trim_start_matches('/').split('/') {
+            if seg.is_empty() {
+                continue;
+            }
+            let dec = percent_decode(seg);
+            if dec == ".." || dec == "." {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("href traversal rejected: {href}"),
+                ));
+            }
+        }
+        let origin_base = root
+            .trim_end_matches('/')
+            .trim_end_matches(root_path.as_str());
+        Ok(format!("{origin_base}{href_path}"))
+    }
+
+    /// Smart URL resolver: raw hrefs (under the target root) go through
+    /// `wire_url_for_href` (verbatim, contained); logical paths (no root
+    /// prefix, e.g. upload destinations) go through `join_url` (re-encoded).
+    fn resolve_url(&self, path: &str) -> io::Result<String> {
+        let rp = self.root_path();
+        if !rp.is_empty() && path.starts_with(&rp) {
+            self.wire_url_for_href(path)
+        } else {
+            Ok(self.join_url(path))
+        }
     }
 
     fn auth_req(&self, req: reqwest::RequestBuilder) -> io::Result<reqwest::RequestBuilder> {
@@ -224,7 +322,7 @@ impl WebDavProvider {
         path: &str,
         max_bytes: usize,
     ) -> io::Result<BoundedRead> {
-        let url = self.join_url(path);
+        let url = self.resolve_url(path)?;
         let req = self.auth_req(
             self.client
                 .get(&url)
@@ -256,8 +354,69 @@ impl WebDavProvider {
         })
     }
 
+    /// Stream a GET response body into `sink`, chunk by chunk, bounded by
+    /// `max_bytes`. Never buffers the whole object in memory (true streaming),
+    /// unlike `get_bounded` which loads up to the cap first.
+    pub(crate) async fn get_stream(
+        &self,
+        href: &str,
+        max_bytes: usize,
+        sink: &mut (impl tokio::io::AsyncWrite + Unpin),
+    ) -> io::Result<u64> {
+        let url = self.resolve_url(href)?;
+        let req = self.auth_req(self.client.get(&url))?;
+        let mut resp = req.send().await.map_err(map_reqwest)?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::UNAUTHORIZED
+        {
+            let text = read_fixed_text(resp).await;
+            return Err(self.status_error("GET", status, &text));
+        }
+        if status != reqwest::StatusCode::OK && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            let text = read_fixed_text(resp).await;
+            return Err(self.status_error("GET", status, &text));
+        }
+        let mut written: u64 = 0;
+        loop {
+            let chunk = match resp.chunk().await {
+                Ok(Some(c)) => c,
+                Ok(None) => break,
+                Err(e) => return Err(map_reqwest(e)),
+            };
+            if written + chunk.len() as u64 > max_bytes as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "object exceeds size cap",
+                ));
+            }
+            sink.write_all(&chunk).await.map_err(io::Error::other)?;
+            written += chunk.len() as u64;
+        }
+        Ok(written)
+    }
+
+    /// True if a resource exists at `path` (PROPFIND Depth:0 returns 2xx).
+    pub(crate) async fn exists(&self, path: &str) -> io::Result<bool> {
+        let url = self.resolve_url(path)?;
+        let body = r#"<?xml version="1.0" encoding="utf-8"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/></D:prop></D:propfind>"#;
+        let req = self.auth_req(
+            self.client
+                .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
+                .header("Depth", "0")
+                .header("Content-Type", "application/xml; charset=utf-8")
+                .body(body),
+        )?;
+        let resp = req.send().await.map_err(map_reqwest)?;
+        Ok(matches!(
+            resp.status(),
+            reqwest::StatusCode::OK | reqwest::StatusCode::MULTI_STATUS
+        ))
+    }
+
     pub(crate) async fn put(&self, path: &str, data: &[u8]) -> io::Result<()> {
-        let url = self.join_url(path);
+        let url = self.resolve_url(path)?;
         let req = self.auth_req(self.client.put(&url).body(data.to_vec()))?;
         let resp = req.send().await.map_err(map_reqwest)?;
         let status = resp.status();
@@ -271,8 +430,7 @@ impl WebDavProvider {
         Err(self.status_error("PUT", status, &text))
     }
 
-    async fn delete(&self, path: &str) -> io::Result<()> {
-        let url = self.join_url(path);
+    async fn delete_url(&self, url: String) -> io::Result<()> {
         let req = self.auth_req(self.client.delete(&url))?;
         let resp = req.send().await.map_err(map_reqwest)?;
         let status = resp.status();
@@ -283,6 +441,9 @@ impl WebDavProvider {
         Err(self.status_error("DELETE", status, &text))
     }
 
+    // ponytail: collections must be deleted with a trailing-slash URL; Apache
+    // 301-redirects a collection DELETE without it. Files must NOT carry the
+    // slash. Two thin methods over one DELETE body — no shared ambiguity.
     async fn mkcol(&self, path: &str) -> io::Result<()> {
         // Apache redirects MKCOL on a collection without a trailing slash to the
         // slashed form; send it directly (matches rclone behavior).
@@ -311,7 +472,7 @@ impl WebDavProvider {
         dst: &str,
         overwrite: bool,
     ) -> io::Result<()> {
-        let src_url = self.join_url(src);
+        let src_url = self.resolve_url(src)?;
         let dst_url = self.destination_url(dst);
         let req = self.auth_req(
             self.client
@@ -531,11 +692,18 @@ impl VfsProvider for WebDavProvider {
     }
 
     async fn remove_file(&self, path: &str) -> io::Result<()> {
-        self.delete(path).await
+        // Files: DELETE the exact URL, no trailing slash.
+        self.delete_url(self.join_url(path)).await
     }
 
     async fn remove_dir(&self, path: &str) -> io::Result<()> {
-        self.delete(path).await
+        // Collections: DELETE requires a trailing-slash URL (Apache 301
+        // otherwise); canonicalize here so callers need not know.
+        let mut url = self.join_url(path);
+        if !url.ends_with('/') {
+            url.push('/');
+        }
+        self.delete_url(url).await
     }
 
     async fn metadata(&self, path: &str) -> io::Result<FileMetadata> {
@@ -590,6 +758,14 @@ fn href_path_only(href: &str) -> &str {
         return "";
     }
     href
+}
+
+/// Host portion of a URL (between `://` and the next `/`), for origin checks.
+fn host_of(url: &str) -> &str {
+    url.split("://")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("")
 }
 
 /// Last path segment of a raw href, percent-decoded for presentation only.
@@ -893,7 +1069,7 @@ pub(crate) fn parse_multistatus(bytes: &[u8]) -> io::Result<Vec<PropFindEntry>> 
                                     });
                             let display_name =
                                 resp_props.get(&PropKey::DisplayName).and_then(|v| match v {
-                                    PropValue::Text(t) => Some(t.clone()),
+                                    PropValue::Text(t) => Some(percent_decode(t)),
                                     _ => None,
                                 });
                             entries.push(PropFindEntry {
@@ -1107,4 +1283,57 @@ pub async fn upload_local_to_webdav(
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("read local: {e}")))?;
     provider.put(remote_path, &data).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dav_provider(root: &str) -> WebDavProvider {
+        WebDavProvider::new(
+            WebDavTarget {
+                id: "t".into(),
+                name: "t".into(),
+                url: root.to_string(),
+                username: "u".into(),
+                auth: "basic".into(),
+            },
+            "p".into(),
+        )
+        .unwrap()
+    }
+
+    // Security boundary: an authoritative href must stay inside the target
+    // root and never allow traversal out of it.
+    #[test]
+    fn wire_url_for_href_rejects_escapes() {
+        let p = dav_provider("http://example/dav/");
+
+        // inside root -> resolved verbatim (no re-encoding)
+        let ok = p.wire_url_for_href("/dav/file.txt").unwrap();
+        assert_eq!(ok, "http://example/dav/file.txt");
+
+        // sibling collection at root level -> REJECT
+        assert!(p.wire_url_for_href("/dav2/file.txt").is_err());
+        // different root -> REJECT
+        assert!(p.wire_url_for_href("/other/file.txt").is_err());
+        // encoded traversal -> REJECT (must not escape target root)
+        assert!(p.wire_url_for_href("/dav/%2e%2e/secret").is_err());
+        // literal traversal -> REJECT
+        assert!(p.wire_url_for_href("/dav/../secret").is_err());
+    }
+
+    #[test]
+    fn wire_url_for_href_preserves_percent_encoding() {
+        let p = dav_provider("http://example/dav/");
+        // server-supplied `%20` must stay `%20`, never become `%2520`
+        let ok = p.wire_url_for_href("/dav/my%20file.txt").unwrap();
+        assert_eq!(ok, "http://example/dav/my%20file.txt");
+    }
+
+    #[test]
+    fn wire_url_for_href_rejects_cross_origin() {
+        let p = dav_provider("http://example/dav/");
+        assert!(p.wire_url_for_href("http://evil/dav/file.txt").is_err());
+    }
 }

@@ -13,8 +13,8 @@ pub use self::executor::{TransferOutcome, TransferProgress};
 pub use self::webdav_transfer::WebDavOverwritePolicy;
 
 use crate::vfs::{
-    Capability, CapabilitySet, Location, ProviderId, S3ObjectRef, WebDavObjectRef,
-    validate_child_name,
+    Capability, CapabilitySet, EntryIdentity, EntryKind, ListedEntry, Location, ProviderId,
+    S3ObjectRef, WebDavObjectRef, encode_segment, validate_child_name,
 };
 use std::path::PathBuf;
 
@@ -421,6 +421,80 @@ pub fn webdav_spec_for_objects(
         _ => Err(TransferPlanError::TooManyObjects(
             "WebDAV basic transfer currently supports one file per operation".to_string(),
         )),
+    }
+}
+
+/// Build a frozen WebDAV copy spec (single object + Local pane).
+/// Returns `DownloadOne` for WebDAV -> Local, `UploadOne` for Local -> WebDAV.
+///
+/// This is the single WebDAV F5 entry point shared by the TUI `Action::Copy`
+/// builder and the physical acceptance harness: both must go through the exact
+/// same spec construction so the product path is the only path.
+///
+/// The remote identity (raw href) is copied verbatim from the listing; the
+/// local filename is taken from the *display name* only. The href is never
+/// reconstructed from `parent + entry.name`.
+pub fn build_webdav_copy_spec(
+    src_provider: ProviderId,
+    _dst_provider: ProviderId,
+    src_loc: &Location,
+    dst_loc: &Location,
+    focused_listed: Option<&ListedEntry>,
+    other_listed: Option<&ListedEntry>,
+) -> Result<WebDavTransferSpec, String> {
+    let webdav_is_source = src_provider == ProviderId::WebDAV;
+
+    if webdav_is_source {
+        // WebDAV -> Local download
+        let Location::Local(local_path) = &dst_loc else {
+            return Err("WebDAV download requires a Local destination".into());
+        };
+        let Some(listed) = focused_listed else {
+            return Err("Focus a WebDAV object to download".into());
+        };
+        let EntryIdentity::WebDavObject(obj) = &listed.identity else {
+            return Err("Download requires a WebDAV object (not a collection)".into());
+        };
+        let Location::WebDav { target, .. } = &src_loc else {
+            return Err("WebDAV source pane has no target".into());
+        };
+        if obj.target != *target {
+            return Err(format!(
+                "WebDAV object target '{}' does not match pane target '{}'",
+                obj.target, target
+            ));
+        }
+        // Local filename from the *display name* (presentation), not the href.
+        let local_name =
+            webdav_download_local_name(obj, &listed.entry.name).map_err(|e| e.to_string())?;
+        Ok(WebDavTransferSpec::DownloadOne {
+            source: obj.clone(),
+            local_destination: local_path.join(local_name),
+        })
+    } else {
+        // Local -> WebDAV upload
+        let Location::WebDav { target, path } = &dst_loc else {
+            return Err("WebDAV upload requires a WebDAV destination".into());
+        };
+        let Some(local_listed) = other_listed else {
+            return Err("Select a local file to upload".into());
+        };
+        if local_listed.entry.kind != EntryKind::File {
+            return Err("Upload requires a single local file".into());
+        }
+        let local_path = match &src_loc {
+            Location::Local(p) => p.clone(),
+            _ => return Err("WebDAV upload requires a Local source".into()),
+        };
+        let filename = local_listed.entry.name.as_str();
+        // Exact destination href: pane path + filename (percent-encoded).
+        let dest_href = format!("{}{}", path, encode_segment(filename));
+        let destination = webdav_upload_destination_ref(target, &dest_href, filename)
+            .map_err(|e| e.to_string())?;
+        Ok(WebDavTransferSpec::UploadOne {
+            local_source: local_path.join(filename),
+            destination,
+        })
     }
 }
 

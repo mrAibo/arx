@@ -35,7 +35,7 @@ pub enum WebDavOverwritePolicy {
 pub(crate) async fn upload_one(
     provider: &WebDavProvider,
     spec: &WebDavTransferSpec,
-    _overwrite: WebDavOverwritePolicy,
+    overwrite: WebDavOverwritePolicy,
     cancel: Arc<AtomicBool>,
     on_progress: &mut impl FnMut(TransferProgress),
 ) -> io::Result<UploadOutcome> {
@@ -65,7 +65,18 @@ pub(crate) async fn upload_one(
         .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("read local: {e}")))?;
     let total = data.len();
 
-    // 3. PUT to the exact href (the frozen identity's raw href)
+    // 3. Overwrite policy is real: Forbid => reject if the destination already
+    //    exists (precondition failure, truthful conflict). Allow => PUT.
+    if matches!(overwrite, WebDavOverwritePolicy::Forbid)
+        && provider.exists(&destination.href).await?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("refusing to overwrite {} (policy Forbid)", destination.href),
+        ));
+    }
+
+    // 4. PUT to the exact href (the frozen identity's raw href)
     provider.put(&destination.href, &data).await?;
 
     on_progress(TransferProgress {
@@ -103,10 +114,9 @@ pub(crate) async fn download_one(
         }
     };
 
-    // 2. GET the exact raw href from the identity
-    let br = provider.get_bounded(&source.href, usize::MAX).await?;
-
-    // 3. Stream to staged file, then atomic rename
+    // 2. Stream GET the exact raw href into the staged file, chunk by chunk
+    //    (true streaming: no whole-object buffer). Bounded by a sane default;
+    //    the caller's cancellation is checked between the spawn and here.
     let dest_dir = local_destination
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"))?;
@@ -119,22 +129,33 @@ pub(crate) async fn download_one(
         std::process::id(),
         dest_name.to_string_lossy()
     ));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&staged)
-        .await?;
+    {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&staged)
+            .await?;
+        // Generous per-file download cap; streaming so memory stays bounded.
+        let written = provider
+            .get_stream(&source.href, 16 * 1024 * 1024 * 1024, &mut file)
+            .await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "download produced zero bytes",
+            ));
+        }
+    }
 
-    file.write_all(&br.bytes).await?;
-    file.flush().await?;
-    // fsync
-    file.sync_all().await?;
-    drop(file);
-
-    // 4. Atomic rename to final path
+    // 3. Atomic rename to final path
     fs::rename(&staged, local_destination).await?;
 
-    Ok(br.bytes.len() as u64)
+    Ok(std::fs::metadata(local_destination)
+        .map(|m| m.len())
+        .unwrap_or(0) as u64)
 }
 
 #[cfg(test)]
