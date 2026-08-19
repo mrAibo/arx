@@ -18,14 +18,13 @@ use crate::vfs::{
     RemoteEditRevision, VfsProvider,
 };
 use quick_xml::events::Event;
-use quick_xml::reader::Reader;
 use std::io;
 use std::time::Duration;
 
 /// Hard caps for multistatus parsing (quick-xml security boundary).
 const MAX_PROPFIND_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RESPONSES: usize = 50_000;
-const MAX_ACCUM_TEXT: usize = 64 * 1024;
+pub(crate) const MAX_ACCUM_TEXT: usize = 64 * 1024;
 
 /// Minimal config: no secret fields. `url` is the absolute target root.
 #[derive(Clone, PartialEq, Eq)]
@@ -290,6 +289,7 @@ impl WebDavProvider {
         Err(self.status_error("MKCOL", status, &text))
     }
 
+    #[allow(dead_code)] // wired into the async transfer executor in B
     pub(crate) async fn copy_or_move(
         &self,
         method: reqwest::Method,
@@ -591,198 +591,323 @@ fn hex_val(b: u8) -> u8 {
     }
 }
 
-// ---- multistatus parser (quick-xml, namespace-aware, bounded) ----
+// ---- multistatus parser (quick-xml NsReader, DAV-namespace + propstat aware) ----
+
+const MAX_PROPERTIES_PER_RESPONSE: usize = 256;
+const MAX_HREF_BYTES: usize = 8192;
 
 /// Parse a WebDAV multistatus PROPFIND response into entries.
 ///
-/// Security boundary: namespace-prefix tolerant (any prefix bound to DAV:),
-/// bounded response/property counts and accumulated text, no DTD/entity-
-/// expansion dependence. Raw href retained; display name decoded only for
-/// presentation.
+/// Resolved-namespace parser: only elements whose resolved namespace URI equals
+/// the DAV namespace (`DAV:`) drive protocol state. Non-DAV same-local-name
+/// elements are ignored. Multiple `propstat` blocks are supported; only 2xx
+/// propstat properties contribute, and a 404/403 propstat never overwrites a
+/// successful value or marks a collection. Hard caps (response count, properties
+/// per response, accumulated text, href length) return `InvalidData` rather than
+/// silently truncating.
 pub(crate) fn parse_multistatus(bytes: &[u8]) -> io::Result<Vec<PropFindEntry>> {
-    let mut reader = Reader::from_reader(bytes);
+    use quick_xml::NsReader;
+    use quick_xml::events::Event;
+
+    let mut reader = NsReader::from_reader(bytes);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
 
     let mut entries: Vec<PropFindEntry> = Vec::new();
+
+    // Per-<response> accumulation.
     let mut in_response = false;
-    let mut cur_href: Option<String> = None;
-    let mut cur_display: Option<String> = None;
-    let mut cur_is_collection = false;
-    let mut cur_length: Option<u64> = None;
-    let mut cur_modified: Option<u64> = None;
+    let mut resp_props: std::collections::BTreeMap<PropKey, PropValue> =
+        std::collections::BTreeMap::new();
+    let mut resp_prop_count: usize = 0;
+
+    // Per-<propstat> accumulation.
+    let mut in_propstat = false;
+    let mut ps_status_2xx = false;
+    let mut ps_have_status = false;
+    let mut ps_props: std::collections::BTreeMap<PropKey, PropValue> =
+        std::collections::BTreeMap::new();
+
+    // Per-property text accumulation.
+    let mut text_for: Option<PropKey> = None;
     let mut text_accum: String = String::new();
-    let mut text_for: Option<PropField> = None;
 
     loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let local = local_name(&e);
-                if local == "response" && entries.len() >= MAX_RESPONSES {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "PROPFIND response count exceeds cap",
-                    ));
+        // quick_xml NsReader resolves the namespace prefix to a stable id; we
+        // map it back to the URI only to compare against the DAV namespace.
+        let (ns, event) = reader.read_resolved_event_into(&mut buf).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("WebDAV XML read error: {e}"),
+            )
+        })?;
+        match event {
+            Event::Start(e) | Event::Empty(e) => {
+                let name = e.local_name();
+                let local = std::str::from_utf8(name.as_ref()).unwrap_or("");
+                let is_dav = match ns {
+                    quick_xml::name::ResolveResult::Bound(n) => n.0 == b"DAV:",
+                    // No explicit namespace in scope => default-namespace DAV.
+                    quick_xml::name::ResolveResult::Unbound => true,
+                    // Unknown prefix or error: do not treat as DAV.
+                    quick_xml::name::ResolveResult::Unknown(_) => false,
+                };
+                if !is_dav {
+                    // Non-DAV element with identical local name: skip it and its
+                    // subtree so it cannot perturb DAV state.
+                    skip_element(&mut reader, &mut buf, &mut text_for, &mut text_accum);
+                    continue;
                 }
-                on_open_tag(
-                    &local,
-                    &mut in_response,
-                    &mut entries,
-                    &mut cur_href,
-                    &mut cur_display,
-                    &mut cur_is_collection,
-                    &mut cur_length,
-                    &mut cur_modified,
-                    &mut text_for,
-                    &mut text_accum,
-                );
+                if local == "response" {
+                    if entries.len() >= MAX_RESPONSES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "PROPFIND response count exceeds cap",
+                        ));
+                    }
+                    in_response = true;
+                    resp_props.clear();
+                    resp_prop_count = 0;
+                } else if local == "propstat" {
+                    in_propstat = true;
+                    ps_status_2xx = false;
+                    ps_have_status = false;
+                    ps_props.clear();
+                } else if local == "prop" || local == "resourcetype" {
+                    // containers; children handled below
+                } else if local == "status" {
+                    text_for = Some(PropKey::Status);
+                    text_accum.clear();
+                } else if local == "href" {
+                    text_for = Some(PropKey::Href);
+                    text_accum.clear();
+                } else if local == "displayname" {
+                    text_for = Some(PropKey::DisplayName);
+                    text_accum.clear();
+                } else if local == "getcontentlength" {
+                    text_for = Some(PropKey::ContentLength);
+                    text_accum.clear();
+                } else if local == "getlastmodified" {
+                    text_for = Some(PropKey::LastModified);
+                    text_accum.clear();
+                } else if local == "collection" {
+                    if in_propstat {
+                        ps_props.insert(PropKey::Collection, PropValue::Collection);
+                    } else if in_response {
+                        resp_props.insert(PropKey::Collection, PropValue::Collection);
+                    }
+                } else {
+                    // Any other DAV leaf element is a property; capture its text so
+                    // it is committed and counts toward the per-response cap.
+                    text_for = Some(PropKey::Other(local.to_string()));
+                    text_accum.clear();
+                }
             }
-            Ok(Event::Empty(e)) => {
-                on_open_tag(
-                    &local_name(&e),
-                    &mut in_response,
-                    &mut entries,
-                    &mut cur_href,
-                    &mut cur_display,
-                    &mut cur_is_collection,
-                    &mut cur_length,
-                    &mut cur_modified,
-                    &mut text_for,
-                    &mut text_accum,
-                );
-            }
-            Ok(Event::End(e)) => {
-                let local = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
-                match local.as_str() {
+            Event::End(e) => {
+                let name = e.local_name();
+                let local = std::str::from_utf8(name.as_ref()).unwrap_or("");
+                match local {
                     "response" => {
                         if in_response {
+                            let href = resp_props
+                                .get(&PropKey::Href)
+                                .and_then(|v| match v {
+                                    PropValue::Text(t) => Some(t.clone()),
+                                    _ => None,
+                                })
+                                .filter(|h| !h.is_empty())
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "PROPFIND response missing href",
+                                    )
+                                })?;
+                            if href.len() > MAX_HREF_BYTES {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "PROPFIND href exceeds cap",
+                                ));
+                            }
+                            let is_collection = resp_props
+                                .get(&PropKey::Collection)
+                                .map(|v| matches!(v, PropValue::Collection))
+                                .unwrap_or(false);
+                            let content_length =
+                                resp_props
+                                    .get(&PropKey::ContentLength)
+                                    .and_then(|v| match v {
+                                        PropValue::Text(t) => t.trim().parse::<u64>().ok(),
+                                        _ => None,
+                                    });
+                            let modified_unix_ms =
+                                resp_props
+                                    .get(&PropKey::LastModified)
+                                    .and_then(|v| match v {
+                                        PropValue::Text(t) => parse_rfc2822_ms(t),
+                                        _ => None,
+                                    });
+                            let display_name =
+                                resp_props.get(&PropKey::DisplayName).and_then(|v| match v {
+                                    PropValue::Text(t) => Some(t.clone()),
+                                    _ => None,
+                                });
                             entries.push(PropFindEntry {
-                                raw_href: cur_href.clone().unwrap_or_default(),
-                                display_name: cur_display.clone(),
-                                is_collection: cur_is_collection,
-                                content_length: cur_length,
-                                modified_unix_ms: cur_modified,
+                                raw_href: href,
+                                display_name,
+                                is_collection,
+                                content_length,
+                                modified_unix_ms,
                             });
                         }
                         in_response = false;
                     }
-                    "href" | "displayname" | "getcontentlength" | "getlastmodified" => {
-                        commit_text(
-                            text_for.take(),
-                            &text_accum,
-                            &mut cur_href,
-                            &mut cur_display,
-                            &mut cur_length,
-                            &mut cur_modified,
-                        );
+                    "propstat" => {
+                        if in_propstat && ps_status_2xx {
+                            // Merge successful props into the response (first 2xx wins).
+                            for (k, v) in ps_props.iter() {
+                                if matches!(k, PropKey::Status) {
+                                    continue;
+                                }
+                                resp_props.entry(k.clone()).or_insert_with(|| v.clone());
+                            }
+                        }
+                        in_propstat = false;
+                        ps_props.clear();
+                        ps_have_status = false;
+                        ps_status_2xx = false;
+                    }
+                    _ => {
+                        // Any element that accumulated text (href, displayname,
+                        // getcontentlength, getlastmodified, status, or an unknown
+                        // property) commits its value through the same path.
+                        if let Some(key) = text_for.take() {
+                            let ok = commit_prop_value(
+                                key,
+                                &text_accum,
+                                if in_propstat {
+                                    &mut ps_props
+                                } else {
+                                    &mut resp_props
+                                },
+                                &mut ps_status_2xx,
+                                &mut ps_have_status,
+                                &mut resp_prop_count,
+                            );
+                            if !ok {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "PROPFIND properties exceed cap",
+                                ));
+                            }
+                        }
                         text_accum.clear();
                     }
-                    _ => {}
                 }
             }
-            Ok(Event::Text(e)) => {
+            Event::Text(e) => {
                 if text_for.is_some() {
                     let t = e.unescape().unwrap_or_default();
                     if text_accum.len() + t.len() <= MAX_ACCUM_TEXT {
                         text_accum.push_str(&t);
+                    } else if text_accum.len() < MAX_ACCUM_TEXT {
+                        // Hard cap: reject rather than silently truncate.
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "PROPFIND accumulated text exceeds cap",
+                        ));
                     }
                 }
             }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("WebDAV XML parse error: {e}"),
-                ));
-            }
+            Event::Eof => break,
+            _ => {}
         }
         buf.clear();
     }
     Ok(entries)
 }
 
-#[derive(Clone, Copy)]
-enum PropField {
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PropKey {
     Href,
     DisplayName,
     ContentLength,
     LastModified,
+    Collection,
+    Status,
+    Other(String),
 }
 
-/// Extract the local name regardless of namespace prefix (DAV: tolerant).
-fn local_name(e: &quick_xml::events::BytesStart) -> String {
-    String::from_utf8_lossy(e.local_name().as_ref()).to_string()
+#[derive(Clone)]
+enum PropValue {
+    Text(String),
+    Collection,
 }
 
-/// Shared open-tag dispatch for both `Start` and self-closing `Empty` events.
-/// `<collection/>` arrives as `Event::Empty`, which is why both must be handled.
-#[allow(clippy::too_many_arguments)]
-fn on_open_tag(
-    local: &str,
-    in_response: &mut bool,
-    entries: &mut [PropFindEntry],
-    cur_href: &mut Option<String>,
-    cur_display: &mut Option<String>,
-    cur_is_collection: &mut bool,
-    cur_length: &mut Option<u64>,
-    cur_modified: &mut Option<u64>,
-    text_for: &mut Option<PropField>,
+/// Skip a non-DAV element (and its descendants) so their text is not captured.
+fn skip_element(
+    reader: &mut quick_xml::NsReader<&[u8]>,
+    buf: &mut Vec<u8>,
+    text_for: &mut Option<PropKey>,
     text_accum: &mut String,
 ) {
-    match local {
-        "response" => {
-            if entries.len() >= MAX_RESPONSES {
-                return;
+    *text_for = None;
+    text_accum.clear();
+    let mut depth = 1usize;
+    while let Ok((_id, ev)) = reader.read_resolved_event_into(buf) {
+        match ev {
+            Event::Start(_) | Event::Empty(_) => depth += 1,
+            Event::End(_) => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
             }
-            *in_response = true;
-            *cur_href = None;
-            *cur_display = None;
-            *cur_is_collection = false;
-            *cur_length = None;
-            *cur_modified = None;
+            Event::Eof => break,
+            _ => {}
         }
-        "href" => {
-            *text_for = Some(PropField::Href);
-            text_accum.clear();
-        }
-        "displayname" => {
-            *text_for = Some(PropField::DisplayName);
-            text_accum.clear();
-        }
-        "collection" => {
-            if *in_response {
-                *cur_is_collection = true;
-            }
-        }
-        "getcontentlength" => {
-            *text_for = Some(PropField::ContentLength);
-            text_accum.clear();
-        }
-        "getlastmodified" => {
-            *text_for = Some(PropField::LastModified);
-            text_accum.clear();
-        }
-        _ => {}
+        buf.clear();
     }
 }
 
-fn commit_text(
-    field: Option<PropField>,
+/// Fold a captured text value into the right property slot, enforcing caps.
+/// Returns false if the value was rejected (e.g. property-count cap exceeded).
+fn commit_prop_value(
+    key: PropKey,
     text: &str,
-    href: &mut Option<String>,
-    display: &mut Option<String>,
-    length: &mut Option<u64>,
-    modified: &mut Option<u64>,
-) {
-    let value = text.trim().to_string();
-    match field {
-        Some(PropField::Href) => *href = Some(value),
-        Some(PropField::DisplayName) => *display = Some(value),
-        Some(PropField::ContentLength) => *length = value.parse::<u64>().ok(),
-        Some(PropField::LastModified) => *modified = parse_rfc2822_ms(&value),
-        None => {}
+    props: &mut std::collections::BTreeMap<PropKey, PropValue>,
+    ps_status_2xx: &mut bool,
+    ps_have_status: &mut bool,
+    resp_prop_count: &mut usize,
+) -> bool {
+    match key {
+        PropKey::Status => {
+            *ps_have_status = true;
+            *ps_status_2xx = text.trim().starts_with("HTTP/1.1 2");
+        }
+        PropKey::Collection => {
+            if *ps_status_2xx || !*ps_have_status {
+                props.insert(PropKey::Collection, PropValue::Collection);
+            }
+        }
+        other => {
+            let value = text.trim().to_string();
+            if value.is_empty() {
+                return true;
+            }
+            if other == PropKey::ContentLength && value.parse::<u64>().is_err() {
+                return true;
+            }
+            if !props.contains_key(&other) {
+                *resp_prop_count += 1;
+                if *resp_prop_count > MAX_PROPERTIES_PER_RESPONSE {
+                    // Hard cap: reject rather than silently drop.
+                    return false;
+                }
+            }
+            props.insert(other, PropValue::Text(value));
+        }
     }
+    true
 }
 
 /// Best-effort RFC2822 ("Mon, 02 Jan 2006 15:04:05 GMT") → unix millis.

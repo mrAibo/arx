@@ -6,8 +6,12 @@
 
 #![allow(clippy::too_many_lines)]
 
-use super::webdav::{WebDavProvider, WebDavTarget, parse_multistatus, parse_rfc2822_ms};
+use super::webdav::{
+    MAX_ACCUM_TEXT, PropFindEntry, WebDavProvider, WebDavTarget, parse_multistatus,
+    parse_rfc2822_ms,
+};
 use crate::vfs::{CancellationFlag, RemoteEditRevision, VfsProvider};
+use std::io;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
@@ -333,4 +337,182 @@ async fn delete_404_maps_to_not_found() {
     let p = provider_for(&url, "x");
     let r = p.remove_file("/dav/missing.txt").await;
     assert!(r.is_err());
+}
+
+// ---- D: DAV namespace + propstat semantics ----
+
+fn pm(xml: &str) -> io::Result<Vec<PropFindEntry>> {
+    parse_multistatus(xml.as_bytes())
+}
+
+#[test]
+fn d_default_dav_namespace() {
+    let xml = r#"<?xml version="1.0"?>
+<multistatus xmlns="DAV:">
+ <response>
+  <href>/dav/file.txt</href>
+  <propstat>
+   <prop><getcontentlength>5</getcontentlength></prop>
+   <status>HTTP/1.1 200 OK</status>
+  </propstat>
+ </response>
+</multistatus>"#;
+    let e = pm(xml).expect("parse");
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].content_length, Some(5));
+    assert!(!e[0].is_collection);
+}
+
+#[test]
+fn d_arbitrary_dav_prefix() {
+    let xml = r#"<?xml version="1.0"?>
+<D:multistatus xmlns:D="DAV:">
+ <D:response>
+  <D:href>/dav/file.txt</D:href>
+  <D:propstat>
+   <D:prop><D:getcontentlength>7</D:getcontentlength></D:prop>
+   <D:status>HTTP/1.1 200 OK</D:status>
+  </D:propstat>
+ </D:response>
+</D:multistatus>"#;
+    let e = pm(xml).expect("parse");
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].content_length, Some(7));
+}
+
+#[test]
+fn d_evil_namespace_ignored() {
+    let xml = r#"<?xml version="1.0"?>
+<x:multistatus xmlns:x="http://evil.example/ns">
+ <x:response>
+  <x:href>/dav/file.txt</x:href>
+  <x:propstat>
+   <x:prop><x:getcontentlength>999</x:getcontentlength></x:prop>
+   <x:status>HTTP/1.1 200 OK</x:status>
+  </x:propstat>
+ </x:response>
+</x:multistatus>"#;
+    // Non-DAV elements must be ignored entirely: no entries emitted.
+    let r = pm(xml);
+    assert!(
+        r.is_err() || r.unwrap().is_empty(),
+        "evil namespace must not produce DAV entries"
+    );
+}
+
+#[test]
+fn d_200_and_404_propstat_length_5() {
+    let xml = r#"<?xml version="1.0"?>
+<multistatus xmlns="DAV:">
+ <response>
+  <href>/dav/file.txt</href>
+  <propstat>
+   <prop><getcontentlength>5</getcontentlength></prop>
+   <status>HTTP/1.1 200 OK</status>
+  </propstat>
+  <propstat>
+   <prop><getcontentlength>999</getcontentlength></prop>
+   <status>HTTP/1.1 404 Not Found</status>
+  </propstat>
+ </response>
+</multistatus>"#;
+    let e = pm(xml).expect("parse");
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].content_length, Some(5));
+}
+
+#[test]
+fn d_reversed_propstat_ordering_length_5() {
+    let xml = r#"<?xml version="1.0"?>
+<multistatus xmlns="DAV:">
+ <response>
+  <href>/dav/file.txt</href>
+  <propstat>
+   <prop><getcontentlength>999</getcontentlength></prop>
+   <status>HTTP/1.1 404 Not Found</status>
+  </propstat>
+  <propstat>
+   <prop><getcontentlength>5</getcontentlength></prop>
+   <status>HTTP/1.1 200 OK</status>
+  </propstat>
+ </response>
+</multistatus>"#;
+    let e = pm(xml).expect("parse");
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].content_length, Some(5));
+}
+
+#[test]
+fn d_404_collection_not_directory() {
+    let xml = r#"<?xml version="1.0"?>
+<multistatus xmlns="DAV:">
+ <response>
+  <href>/dav/file.txt</href>
+  <propstat>
+   <prop>
+    <resourcetype><collection/></resourcetype>
+    <getcontentlength>5</getcontentlength>
+   </prop>
+   <status>HTTP/1.1 404 Not Found</status>
+  </propstat>
+  <propstat>
+   <prop><getcontentlength>5</getcontentlength></prop>
+   <status>HTTP/1.1 200 OK</status>
+  </propstat>
+ </response>
+</multistatus>"#;
+    let e = pm(xml).expect("parse");
+    assert_eq!(e.len(), 1);
+    assert!(
+        !e[0].is_collection,
+        "404 collection must not mark a directory"
+    );
+    assert_eq!(e[0].content_length, Some(5));
+}
+
+#[test]
+fn d_excessive_response_count_errors() {
+    let mut xml = String::from(r#"<?xml version="1.0"?><multistatus xmlns="DAV:">"#);
+    for _ in 0..50001 {
+        xml.push_str(r#"<response><href>/dav/a</href><propstat><prop><getcontentlength>1</getcontentlength></prop><status>HTTP/1.1 200 OK</status></propstat></response>"#);
+    }
+    xml.push_str("</multistatus>");
+    let r = pm(&xml);
+    assert!(r.is_err(), "excessive response count must error");
+}
+
+#[test]
+fn d_excessive_property_count_errors() {
+    let mut props = String::new();
+    for i in 0..300 {
+        props.push_str(&format!("<x{i}>v</x{i}>", i = i));
+    }
+    let xml = format!(
+        r#"<?xml version="1.0"?><multistatus xmlns="DAV:"><response><href>/dav/a</href><propstat><prop>{props}</prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>"#,
+        props = props
+    );
+    let r = pm(&xml);
+    assert!(r.is_err(), "excessive property count must error");
+}
+
+#[test]
+fn d_oversized_text_errors() {
+    let big = "x".repeat(MAX_ACCUM_TEXT + 100);
+    let xml = format!(
+        r#"<?xml version="1.0"?><multistatus xmlns="DAV:"><response><href>/dav/a</href><propstat><prop><displayname>{big}</displayname></prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>"#,
+        big = big
+    );
+    let r = pm(&xml);
+    assert!(
+        r.is_err(),
+        "oversized text must error, not silently truncate"
+    );
+}
+
+#[test]
+fn d_malformed_xml_errors() {
+    // A bare closing-slash token with no matching open element is a hard error.
+    let xml = r#"<multistatus xmlns="DAV:"><response></multistatus>"#;
+    let r = pm(xml);
+    assert!(r.is_err(), "malformed XML must error");
 }
