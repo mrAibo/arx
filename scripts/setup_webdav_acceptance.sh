@@ -81,6 +81,7 @@ cat > "$ENV_FILE" <<EOF
 export ARX_WEBDAV_SMOKE_HOST=http://127.0.0.1:${HOST_PORT}/dav/
 export ARX_WEBDAV_SMOKE_USER=${USER}
 export ARX_WEBDAV_SMOKE_PASS=${PASS}
+export ARX_WEBDAV_ACCEPT_PASSWORD=${PASS}
 export ARX_WEBDAV_CONTAINER=${CONTAINER}
 EOF
 echo "# WebDAV acceptance fixture ready (Apache $(docker exec "$CONTAINER" httpd -v 2>/dev/null | head -1 | sed 's/^.*\///'))."

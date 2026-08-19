@@ -436,14 +436,20 @@ impl WebDavProvider {
         let mut written: u64 = 0;
         loop {
             if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "download cancelled"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "download cancelled",
+                ));
             }
             let next = resp.chunk().await.map_err(map_reqwest)?;
             let Some(chunk) = next else {
                 break;
             };
             if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "download cancelled"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "download cancelled",
+                ));
             }
             if written + chunk.len() as u64 > max_bytes as u64 {
                 return Err(io::Error::new(
