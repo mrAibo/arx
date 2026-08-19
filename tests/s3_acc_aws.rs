@@ -101,6 +101,7 @@ async fn upload_bytes(registry: &ProviderRegistry, key: &str, data: &[u8]) {
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
         s3_spec: Some(spec),
+        webdav_spec: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let outcome = execute_transfer(&plan, &[key.to_string()], registry, cancel, |_| {})
@@ -129,6 +130,7 @@ async fn download_bytes(registry: &ProviderRegistry, key: &str) -> Vec<u8> {
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
         s3_spec: Some(spec),
+        webdav_spec: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let outcome = execute_transfer(&plan, &[key.to_string()], registry, cancel, |_| {})
@@ -342,6 +344,7 @@ async fn aws_multipart_upload_roundtrip() {
                 key: key.clone(),
             },
         }),
+        webdav_spec: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let out = execute_transfer(&plan, std::slice::from_ref(&key), &reg, cancel, |_| {})
@@ -366,6 +369,7 @@ async fn aws_multipart_upload_roundtrip() {
             },
             local_destination: dl.clone(),
         }),
+        webdav_spec: None,
     };
     let cancel2 = Arc::new(AtomicBool::new(false));
     let dout = execute_transfer(&dplan, std::slice::from_ref(&key), &reg, cancel2, |_| {})
@@ -426,6 +430,7 @@ async fn aws_multipart_cancel_aborts_without_completed_object() {
                 key: key.clone(),
             },
         }),
+        webdav_spec: None,
     };
     // cancel set BEFORE execute => no usable object may appear
     let cancel = Arc::new(AtomicBool::new(true));
@@ -473,6 +478,7 @@ async fn aws_multipart_cancel_after_first_part_aborts() {
                 key: key.clone(),
             },
         }),
+        webdav_spec: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_hook = cancel.clone();
@@ -558,6 +564,7 @@ async fn aws_denial_put_object() {
                 key: key.clone(),
             },
         }),
+        webdav_spec: None,
     };
     let c = Arc::new(AtomicBool::new(false));
     let res = execute_transfer(&plan, std::slice::from_ref(&key), &deny, c, |_| {}).await;
@@ -709,6 +716,7 @@ async fn aws_bucket_bound_target_works_without_list_all_my_buckets() {
                 key: key.clone(),
             },
         }),
+        webdav_spec: None,
     };
     let c = Arc::new(AtomicBool::new(false));
     execute_transfer(&up, std::slice::from_ref(&key), &registry, c, |_| {})
@@ -750,6 +758,7 @@ async fn download_bytes_in(registry: &ProviderRegistry, target: &str, key: &str)
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
         s3_spec: Some(spec),
+        webdav_spec: None,
     };
     let c = Arc::new(AtomicBool::new(false));
     execute_transfer(&plan, &[key.to_string()], registry, c, |_| {})
@@ -830,6 +839,7 @@ async fn aws_denial_get_object() {
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
         s3_spec: Some(spec),
+        webdav_spec: None,
     };
     let c = Arc::new(AtomicBool::new(false));
     let get_res = execute_transfer(&plan, std::slice::from_ref(&key), &deny, c, |_| {}).await;
@@ -941,6 +951,7 @@ async fn aws_object_disappears_mid_op() {
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
         s3_spec: Some(spec),
+        webdav_spec: None,
     };
     let c = Arc::new(AtomicBool::new(false));
     let res = execute_transfer(&plan, std::slice::from_ref(&key), &reg, c, |_| {}).await;

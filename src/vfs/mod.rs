@@ -14,6 +14,7 @@ mod webdav_tests;
 
 pub use capabilities::{Capability, CapabilitySet};
 pub use s3::{S3BucketRef, S3ObjectRef, S3PrefixRef};
+pub use webdav::{WebDavCollectionRef, WebDavObjectRef};
 
 // ── Provider Registry (new architecture — phased migration) ──
 // ponytail: add ProviderId + VfsProvider + Registry alongside old Location enum.
@@ -578,6 +579,12 @@ pub struct RegisteredProvider {
     /// client — no second client cache.
     // ponytail: same-instance alias; resolve_s3_provider populates both
     pub s3: Option<Arc<s3::S3Provider>>,
+    /// Concrete WebDAV provider when this instance is a `WebDavTarget(id)`;
+    /// `None` otherwise. For WebDAV registrations this aliases the exact
+    /// `provider` Arc (same underlying `WebDavProvider`), so the transfer path
+    /// reuses the listing client — no second client cache.
+    // ponytail: same-instance alias; resolve_webdav_provider populates both
+    pub webdav: Option<Arc<webdav::WebDavProvider>>,
 }
 
 /// Cloneable, async-safe provider registry.
@@ -687,7 +694,9 @@ impl ProviderRegistry {
                 ),
             )
         })?;
-        let provider: Arc<dyn VfsProvider> = Arc::new(webdav::WebDavProvider::new(
+        // ponytail: BOTH arcs alias the same WebDavProvider allocation — no second
+        // client cache; transfer + listing share one provider instance.
+        let webdav_provider: Arc<webdav::WebDavProvider> = Arc::new(webdav::WebDavProvider::new(
             webdav::WebDavTarget {
                 id: target.id.clone(),
                 name: target.name.clone(),
@@ -699,10 +708,12 @@ impl ProviderRegistry {
             },
             password,
         )?);
+        let provider: Arc<dyn VfsProvider> = webdav_provider.clone();
         let mut providers = self.providers.write().expect("provider registry poisoned");
         let registered = providers.entry(key).or_insert_with(|| RegisteredProvider {
             provider: Arc::clone(&provider),
             s3: None,
+            webdav: Some(webdav_provider.clone()),
         });
         Ok(Arc::clone(&registered.provider))
     }
@@ -759,7 +770,14 @@ impl ProviderRegistry {
         self.providers
             .write()
             .expect("provider registry poisoned")
-            .insert(key, RegisteredProvider { provider, s3: None });
+            .insert(
+                key,
+                RegisteredProvider {
+                    provider,
+                    s3: None,
+                    webdav: None,
+                },
+            );
         self.capabilities
             .write()
             .expect("provider capabilities poisoned")
@@ -939,6 +957,7 @@ impl ProviderRegistry {
         let registered = providers.entry(key).or_insert_with(|| RegisteredProvider {
             provider: Arc::clone(&provider),
             s3: None,
+            webdav: None,
         });
         let provider = Arc::clone(&registered.provider);
         drop(providers);
@@ -1011,6 +1030,7 @@ impl ProviderRegistry {
         let registered = providers.entry(key).or_insert_with(|| RegisteredProvider {
             provider: Arc::clone(&provider),
             s3: Some(s3_provider.clone()),
+            webdav: None,
         });
         Ok(Arc::clone(&registered.provider))
     }
@@ -1172,6 +1192,32 @@ impl ProviderRegistry {
             .cloned();
         match registered.and_then(|r| r.s3) {
             Some(s3) => Ok(s3),
+            None => Err(RegistryError::NotFound(target_id.to_string())),
+        }
+    }
+
+    /// Resolve the concrete `WebDavTarget(id)` provider for a transfer operation.
+    ///
+    /// Returns the SAME `Arc<WebDavProvider>` already registered under
+    /// `ProviderInstanceKey::WebDavTarget(target_id)` (the listing path uses the same
+    /// resolver, so the HTTP client is shared — no second client cache). Unknown
+    /// target id fails factually with `RegistryError::NotFound`.
+    // ponytail: reuses resolve_webdav_provider (list_page's resolver); no second inventory
+    pub fn webdav_provider_for_transfer(
+        &self,
+        target_id: &str,
+    ) -> Result<Arc<webdav::WebDavProvider>, RegistryError> {
+        self.resolve_webdav_provider(target_id)
+            .map_err(|_| RegistryError::NotFound(target_id.to_string()))?;
+        let key = ProviderInstanceKey::WebDavTarget(target_id.to_string());
+        let registered = self
+            .providers
+            .read()
+            .expect("provider registry poisoned")
+            .get(&key)
+            .cloned();
+        match registered.and_then(|r| r.webdav) {
+            Some(webdav) => Ok(webdav),
             None => Err(RegistryError::NotFound(target_id.to_string())),
         }
     }

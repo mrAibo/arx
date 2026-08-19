@@ -68,6 +68,7 @@ fn remote_matrix(host: &str) -> SyncExecutorMatrix {
             rsync: false,
             sftp: true,
             s3: false,
+            webdav: false,
         },
     )
 }

@@ -85,6 +85,7 @@ async fn run_multipart_roundtrip(reg: &ProviderRegistry, target: &str) {
                 key: key.clone(),
             },
         }),
+        webdav_spec: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let out = execute_transfer(&plan, &[k_up], reg, cancel, |_| {})
@@ -106,6 +107,7 @@ async fn run_multipart_roundtrip(reg: &ProviderRegistry, target: &str) {
             },
             local_destination: dl.clone(),
         }),
+        webdav_spec: None,
     };
     let cancel2 = Arc::new(AtomicBool::new(false));
     let dout = execute_transfer(&dplan, &[k_dl], reg, cancel2, |_| {})
@@ -158,6 +160,7 @@ async fn run_multipart_cancel_before(reg: &ProviderRegistry, target: &str) {
                 key: key.clone(),
             },
         }),
+        webdav_spec: None,
     };
     // cancel already set BEFORE execute => must not create a usable object
     let cancel = Arc::new(AtomicBool::new(true));

@@ -5806,6 +5806,7 @@ async fn dispatch_ui_action(
                 executors,
                 delete_extraneous: false,
                 s3_spec,
+                webdav_spec: None,
             };
             let plan = match arx::transfer::TransferPlanner::plan(request) {
                 Ok(p) => p,
@@ -5937,6 +5938,7 @@ async fn dispatch_ui_action(
                 executors,
                 delete_extraneous: false,
                 s3_spec: None,
+                webdav_spec: None,
             };
             let plan = match arx::transfer::TransferPlanner::plan(request) {
                 Ok(p) => p,
@@ -10528,9 +10530,11 @@ mod tests {
                     rsync: false,
                     sftp: false,
                     s3: true,
+                    webdav: false,
                 },
                 delete_extraneous: false,
                 s3_spec: Some(spec),
+                webdav_spec: None,
             };
             let plan = TransferPlanner::plan(request).unwrap();
             assert_eq!(plan.method, TransferMethod::S3);

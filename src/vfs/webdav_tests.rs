@@ -651,7 +651,7 @@ async fn b0_list_page_returns_native_object_and_collection_identity() {
         .find(|e| e.entry.name.contains("EVIL"))
         .expect("object entry present");
     match &obj.identity {
-        crate::vfs::EntryIdentity::WebDavObject(ref r) => {
+        crate::vfs::EntryIdentity::WebDavObject(r) => {
             assert_eq!(r.target, "t");
             assert_eq!(r.href, "/dav/EVIL%20NAME.txt");
         }
@@ -668,7 +668,7 @@ async fn b0_list_page_returns_native_object_and_collection_identity() {
 #[tokio::test]
 async fn b0_read_listed_uses_href_not_display_name() {
     // The listed entry has a display name that, if used, would address a wrong path.
-    let (url, _) = spawn_mock(move |method, path, _, _, body| {
+    let (url, _) = spawn_mock(move |method, path, _, _, _body| {
         match method {
         "PROPFIND" => (207, br#"<?xml version="1.0"?><multistatus xmlns="DAV:"><response><href>/dav/real.txt</href><propstat><prop><resourcetype/><getcontentlength>3</getcontentlength></prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>"#.to_vec()),
         "GET" => {

@@ -7,9 +7,14 @@ pub mod sftp_copy;
 pub mod s3_download;
 pub mod s3_multipart;
 pub mod s3_upload;
+pub mod webdav_transfer;
+
+pub use self::executor::{TransferOutcome, TransferProgress};
+pub use self::webdav_transfer::WebDavOverwritePolicy;
 
 use crate::vfs::{
-    Capability, CapabilitySet, Location, ProviderId, S3ObjectRef, validate_child_name,
+    Capability, CapabilitySet, Location, ProviderId, S3ObjectRef, WebDavObjectRef,
+    validate_child_name,
 };
 use std::path::PathBuf;
 
@@ -24,6 +29,11 @@ pub enum TransferMethod {
     /// still refuses it until the executor card lands.
     // ponytail: planner selection only (S3-31/32/33); executor stays fail-closed
     S3,
+    /// WebDAV data-movement executor. Selected only for a Local<->WebDAV `Copy`
+    /// with an available WebDAV executor and a frozen `WebDavTransferSpec`.
+    /// GET/PUT address the exact raw href from the listing identity — never a
+    /// reconstructed path. Executor is live (B1/B2).
+    WebDav,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +52,9 @@ pub struct TransferPlan {
     /// Frozen S3 payload for this plan, carried verbatim from the request.
     /// None for non-S3 transfers.
     pub s3_spec: Option<S3TransferSpec>,
+    /// Frozen WebDAV payload for this plan, carried verbatim from the request.
+    /// None for non-WebDAV transfers.
+    pub webdav_spec: Option<WebDavTransferSpec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +65,10 @@ pub struct ExecutorAvailability {
     /// S3 data-movement executor availability. Required (together with a frozen
     /// `S3TransferSpec`) for the planner to select `TransferMethod::S3`.
     pub s3: bool,
+    /// WebDAV data-movement executor availability. Required (together with a
+    /// frozen `WebDavTransferSpec`) for the planner to select
+    /// `TransferMethod::WebDav`.
+    pub webdav: bool,
 }
 
 impl ExecutorAvailability {
@@ -60,6 +77,7 @@ impl ExecutorAvailability {
         rsync: false,
         sftp: false,
         s3: false,
+        webdav: false,
     };
 
     pub const fn local() -> Self {
@@ -68,6 +86,7 @@ impl ExecutorAvailability {
             rsync: false,
             sftp: false,
             s3: false,
+            webdav: false,
         }
     }
 }
@@ -86,6 +105,9 @@ pub struct TransferRequest {
     /// Frozen S3 payload for this request, built by the caller (TUI/planner).
     /// The planner never reconstructs it. None for non-S3 transfers.
     pub s3_spec: Option<S3TransferSpec>,
+    /// Frozen WebDAV payload for this request, built by the caller.
+    /// The planner never reconstructs it. None for non-WebDAV transfers.
+    pub webdav_spec: Option<WebDavTransferSpec>,
 }
 
 /// Frozen, transferred S3 identity/payload. The `S3ObjectRef` is the sole
@@ -101,6 +123,32 @@ pub enum S3TransferSpec {
         source: S3ObjectRef,
         local_destination: PathBuf,
     },
+}
+
+/// Frozen, transferred WebDAV identity/payload. The `WebDavObjectRef` (exact
+/// target id + raw `href` from the listing) is the sole authority for the
+/// remote object — never reconstructed from a `Location` + name.
+// ponytail: identity boundary only; WebDavProvider executes both directions
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebDavTransferSpec {
+    UploadOne {
+        local_source: PathBuf,
+        destination: WebDavObjectRef,
+    },
+    DownloadOne {
+        source: WebDavObjectRef,
+        local_destination: PathBuf,
+    },
+}
+
+impl WebDavTransferSpec {
+    /// The exact target id this spec is bound to (authority check on execution).
+    pub fn target(&self) -> &str {
+        match self {
+            Self::UploadOne { destination, .. } => &destination.target,
+            Self::DownloadOne { source, .. } => &source.target,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +204,7 @@ impl TransferPlanner {
             intent: request.intent,
             method,
             s3_spec: request.s3_spec,
+            webdav_spec: request.webdav_spec,
         })
     }
 
@@ -170,6 +219,20 @@ impl TransferPlanner {
                 // there is nothing to execute and no name-based fallback.
                 return if request.s3_spec.is_some() {
                     Ok(TransferMethod::S3)
+                } else {
+                    Err(Self::unsupported(request))
+                };
+            }
+            return Err(Self::unsupported(request));
+        }
+
+        // Every WebDAV-touching plan is decided here and never falls through.
+        if request.source_provider == ProviderId::WebDAV
+            || request.destination_provider == ProviderId::WebDAV
+        {
+            if Self::is_webdav_pair(request) && request.executors.webdav {
+                return if request.webdav_spec.is_some() {
+                    Ok(TransferMethod::WebDav)
                 } else {
                     Err(Self::unsupported(request))
                 };
@@ -224,6 +287,15 @@ impl TransferPlanner {
             && matches!(
                 (request.source_provider, request.destination_provider),
                 (ProviderId::Local, ProviderId::S3) | (ProviderId::S3, ProviderId::Local)
+            )
+    }
+
+    /// Local<->WebDAV `Copy` is the only WebDAV shape the planner supports.
+    fn is_webdav_pair(request: &TransferRequest) -> bool {
+        request.intent == TransferIntent::Copy
+            && matches!(
+                (request.source_provider, request.destination_provider),
+                (ProviderId::Local, ProviderId::WebDAV) | (ProviderId::WebDAV, ProviderId::Local)
             )
     }
 
@@ -301,6 +373,57 @@ pub fn s3_spec_for_objects(objects: &[S3ObjectRef]) -> Result<&S3ObjectRef, Tran
     }
 }
 
+/// Validate `presentation_name` is exactly one safe local child name and return
+/// it. Fails closed with a factual error for unsafe names; never sanitizes.
+// ponytail: WebDAV download uses the listing identity's exact href; local name
+/// is purely for the destination file on disk — same validation as S3.
+pub fn webdav_download_local_name(
+    _object: &WebDavObjectRef,
+    presentation_name: &str,
+) -> Result<String, TransferPlanError> {
+    validate_child_name(presentation_name).map_err(|_| {
+        TransferPlanError::InvalidLocalName(
+            "object cannot be represented as a single local filename".to_string(),
+        )
+    })?;
+    Ok(presentation_name.to_string())
+}
+
+/// Build a frozen WebDAV destination `WebDavObjectRef` for an upload.
+///
+/// The `href` comes from the listing identity (exact raw href from server).
+/// `filename` must be a safe single local child (fail closed otherwise).
+/// The ref is constructed from the authoritative `target` + server href,
+// ponytail: no path reconstruction; exact server href is the identity
+pub fn webdav_upload_destination_ref(
+    target: &str,
+    href: &str,
+    filename: &str,
+) -> Result<WebDavObjectRef, TransferPlanError> {
+    validate_child_name(filename).map_err(|_| {
+        TransferPlanError::InvalidLocalName(
+            "object cannot be represented as a single local filename".to_string(),
+        )
+    })?;
+    Ok(WebDavObjectRef {
+        target: target.to_string(),
+        href: href.to_string(),
+    })
+}
+
+/// Assert exactly one object for a WebDAV basic transfer, returning it.
+/// Fails closed otherwise — WebDAV basic transfer moves one file per operation.
+pub fn webdav_spec_for_objects(
+    objects: &[WebDavObjectRef],
+) -> Result<&WebDavObjectRef, TransferPlanError> {
+    match objects {
+        [only] => Ok(only),
+        _ => Err(TransferPlanError::TooManyObjects(
+            "WebDAV basic transfer currently supports one file per operation".to_string(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +462,7 @@ mod tests {
             executors: ExecutorAvailability::local(),
             delete_extraneous: false,
             s3_spec: None,
+            webdav_spec: None,
         })
         .unwrap();
         assert_eq!(plan.method, TransferMethod::Native);
@@ -359,9 +483,11 @@ mod tests {
                 rsync: true,
                 sftp: true,
                 s3: false,
+                webdav: false,
             },
             delete_extraneous: false,
             s3_spec: None,
+            webdav_spec: None,
         };
 
         assert_eq!(
@@ -392,9 +518,11 @@ mod tests {
                 rsync: true,
                 sftp: true,
                 s3: false,
+                webdav: false,
             },
             delete_extraneous: false,
             s3_spec: None,
+            webdav_spec: None,
         };
 
         assert!(matches!(
@@ -422,9 +550,11 @@ mod tests {
                 rsync: true,
                 sftp: true,
                 s3: false,
+                webdav: false,
             },
             delete_extraneous: false,
             s3_spec: None,
+            webdav_spec: None,
         })
         .unwrap_err();
 
@@ -453,9 +583,11 @@ mod tests {
                 rsync: true,
                 sftp: true,
                 s3: false,
+                webdav: false,
             },
             delete_extraneous: true,
             s3_spec: None,
+            webdav_spec: None,
         })
         .unwrap_err();
         assert_eq!(error, TransferPlanError::PreviewRequired);
@@ -474,6 +606,7 @@ mod tests {
             executors: ExecutorAvailability::NONE,
             delete_extraneous: false,
             s3_spec: None,
+            webdav_spec: None,
         })
         .unwrap_err();
 
@@ -546,9 +679,11 @@ mod tests {
                 rsync: true,
                 sftp: true,
                 s3: s3_executor,
+                webdav: false,
             },
             delete_extraneous: false,
             s3_spec,
+            webdav_spec: None,
         }
     }
 
@@ -774,6 +909,7 @@ mod tests {
             executors: ExecutorAvailability::local(),
             delete_extraneous: false,
             s3_spec,
+            webdav_spec: None,
         };
         // Some: copied into the plan by the planner.
         let plan = TransferPlanner::plan(build(Some(spec.clone()))).unwrap();

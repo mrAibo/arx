@@ -219,7 +219,11 @@ impl WebDavProvider {
     /// truncation. If the server ignores Range and returns 200 with the full
     /// body, we still truncate locally (no unbounded memory). 416 means an
     /// empty file.
-    async fn get_bounded(&self, path: &str, max_bytes: usize) -> io::Result<BoundedRead> {
+    pub(crate) async fn get_bounded(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> io::Result<BoundedRead> {
         let url = self.join_url(path);
         let req = self.auth_req(
             self.client
@@ -252,7 +256,7 @@ impl WebDavProvider {
         })
     }
 
-    async fn put(&self, path: &str, data: &[u8]) -> io::Result<()> {
+    pub(crate) async fn put(&self, path: &str, data: &[u8]) -> io::Result<()> {
         let url = self.join_url(path);
         let req = self.auth_req(self.client.put(&url).body(data.to_vec()))?;
         let resp = req.send().await.map_err(map_reqwest)?;
