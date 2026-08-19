@@ -180,6 +180,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "toml",
+ "url",
 ]
 
 [[package]]

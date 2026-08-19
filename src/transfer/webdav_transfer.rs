@@ -14,7 +14,7 @@ use crate::vfs::webdav::WebDavProvider;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::fs::{self, OpenOptions};
+use tokio::fs::File as TokioFile;
 use tokio::io::AsyncWriteExt;
 
 /// Result of an upload: bytes physically sent.
@@ -65,19 +65,13 @@ pub(crate) async fn upload_one(
         .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("read local: {e}")))?;
     let total = data.len();
 
-    // 3. Overwrite policy is real: Forbid => reject if the destination already
-    //    exists (precondition failure, truthful conflict). Allow => PUT.
-    if matches!(overwrite, WebDavOverwritePolicy::Forbid)
-        && provider.exists(&destination.href).await?
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("refusing to overwrite {} (policy Forbid)", destination.href),
-        ));
-    }
-
-    // 4. PUT to the exact href (the frozen identity's raw href)
-    provider.put(&destination.href, &data).await?;
+    // 3. PUT with overwrite policy enforced at the HTTP layer (no
+    //    existence preflight — racing TOCTOU is unsafe). For Forbid we
+    //    send If-None-Match: * so the server rejects an existing resource
+    //    with 412; Allow is a plain PUT.
+    provider
+        .put_with_policy(&destination.href, &data, overwrite)
+        .await?;
 
     on_progress(TransferProgress {
         completed: total,
@@ -92,14 +86,9 @@ pub(crate) async fn upload_one(
 pub(crate) async fn download_one(
     provider: &WebDavProvider,
     spec: &WebDavTransferSpec,
+    overwrite: WebDavOverwritePolicy,
     cancel: Arc<AtomicBool>,
 ) -> io::Result<DownloadOutcome> {
-    if cancel.load(Ordering::Relaxed) {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "download cancelled",
-        ));
-    }
     // 1. Extract download spec
     let (source, local_destination) = match spec {
         WebDavTransferSpec::DownloadOne {
@@ -114,48 +103,104 @@ pub(crate) async fn download_one(
         }
     };
 
-    // 2. Stream GET the exact raw href into the staged file, chunk by chunk
-    //    (true streaming: no whole-object buffer). Bounded by a sane default;
-    //    the caller's cancellation is checked between the spawn and here.
+    // 2. Stream GET into a tokio temp file in the destination directory
+    //    (RAII cleanup guard ensures cleanup on any error/cancel/exit).
     let dest_dir = local_destination
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"))?;
-    let dest_name = local_destination.file_name().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "destination has no filename")
-    })?;
 
-    let staged = dest_dir.join(format!(
-        ".arx-download-{}-{}",
-        std::process::id(),
-        dest_name.to_string_lossy()
-    ));
-    {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&staged)
-            .await?;
-        // Generous per-file download cap; streaming so memory stays bounded.
-        let written = provider
-            .get_stream(&source.href, 16 * 1024 * 1024 * 1024, &mut file)
-            .await?;
-        file.flush().await?;
-        file.sync_all().await?;
-        drop(file);
-        if written == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "download produced zero bytes",
-            ));
-        }
+    // cancel before GET
+    if cancel.load(Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "download cancelled",
+        ));
     }
 
-    // 3. Atomic rename to final path
-    fs::rename(&staged, local_destination).await?;
+    // Create a unique temp file path in the destination directory
+    let temp_path = dest_dir.join(format!(
+        ".arx-download-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        local_destination
+            .file_name()
+            .ok_or_else(|| io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "destination has no filename"
+            ))?
+            .to_string_lossy()
+    ));
 
-    Ok(std::fs::metadata(local_destination)
+    // RAII cleanup guard
+    struct TempFileGuard {
+        path: std::path::PathBuf,
+    }
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+    let _guard = TempFileGuard {
+        path: temp_path.clone(),
+    };
+
+    // Open with tokio for async streaming
+    let mut temp_file = TokioFile::options()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)
+        .await?;
+
+    {
+        // 3. Stream body with cancellation check between chunks.
+        let max_bytes: usize = 16 * 1024 * 1024 * 1024;
+        provider
+            .get_stream(&source.href, max_bytes, &mut temp_file, Some(&cancel))
+            .await?;
+    }
+
+    temp_file.flush().await?;
+    temp_file.sync_all().await?;
+    drop(temp_file); // ensure closed before persist
+
+    // pre-persist cancellation: never finalize a staged download after cancel
+    if cancel.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "download cancelled",
+        ));
+    }
+
+    // 4. Finalize: persist noclobber for Forbid, replace for Allow.
+    if matches!(overwrite, WebDavOverwritePolicy::Forbid) {
+        // Forbid: noclobber — fail if destination exists.
+        // Use std::fs to avoid async rename issues across filesystems
+        match std::fs::rename(&temp_path, local_destination) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "refusing to overwrite existing destination (policy Forbid)",
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        // Allow: replace existing destination.
+        std::fs::rename(&temp_path, local_destination)?;
+    }
+
+    // Guard disarmed — file moved successfully
+    std::mem::forget(_guard);
+
+    // 5. Return bytes written (zero is valid).
+    let size = std::fs::metadata(local_destination)
         .map(|m| m.len())
-        .unwrap_or(0) as u64)
+        .unwrap_or(0) as u64;
+    Ok(size)
 }
 
 #[cfg(test)]

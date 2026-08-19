@@ -136,9 +136,14 @@ pub async fn execute_transfer(
                     .map_err(TransferExecutionError::Io)?;
                 }
                 WebDavTransferSpec::DownloadOne { .. } => {
-                    webdav_download_one(&provider, spec, cancel.clone())
-                        .await
-                        .map_err(TransferExecutionError::Io)?;
+                    webdav_download_one(
+                        &provider,
+                        spec,
+                        WebDavOverwritePolicy::Forbid,
+                        cancel.clone(),
+                    )
+                    .await
+                    .map_err(TransferExecutionError::Io)?;
                 }
             }
             Ok(TransferOutcome {

@@ -13,6 +13,7 @@
 //!   Implemented as clean ARX-native code; MIT rclone patterns adapted only at
 //!   the behavioral level.
 
+use crate::transfer::WebDavOverwritePolicy;
 use crate::vfs::{
     BoundedRead, Entry, EntryIdentity, EntryKind, FileMetadata, ListedEntry, Location,
     ProviderContinuation, ProviderListingPage, RemoteEditProgressFn, RemoteEditRevision,
@@ -20,6 +21,8 @@ use crate::vfs::{
 };
 use quick_xml::events::Event;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
@@ -113,6 +116,7 @@ impl WebDavProvider {
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(|e| io::Error::other(format!("webdav client: {e}")))?;
         Ok(Self {
@@ -191,32 +195,79 @@ impl WebDavProvider {
     /// Resolve an authoritative raw href (server-supplied identity) into a fully
     /// qualified wire URL, strictly bounded to the target root.
     ///
-    /// Fail-closed: rejects a href outside the target root (`/dav2/...`,
-    /// `/other/...`), encoded path traversal (`/dav/%2e%2e/secret`), and
-    /// cross-origin absolute hrefs. The href is used VERBATIM (no percent
-    /// re-encoding): a server `%20` stays `%20` and never becomes `%2520`.
+    /// Fail-closed, origin-aware (scheme+host+port), using a real URL parser:
+    ///
+    /// Rejects:
+    ///   - a href outside the target root (`/dav2/...`, `/other/...`),
+    ///   - encoded path traversal (`/dav/%2e%2e/secret`),
+    ///   - cross-origin absolute hrefs (different scheme/host/port),
+    ///   - userinfo or fragment in an absolute href,
+    ///   - relative href forms that are not path-absolute.
+    ///
+    /// The href is used VERBATIM (no percent re-encoding): a server `%20` stays
+    /// `%20` and never becomes `%2520`.
     pub(crate) fn wire_url_for_href(&self, href: &str) -> io::Result<String> {
         let root = &self.target.url;
-        let root_path = self.root_path();
-        let href_path = href_path_only(href).to_string();
-        // cross-origin absolute href -> reject
-        if href.contains("://") && host_of(href) != host_of(root) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("href escapes target origin: {href}"),
-            ));
+        let root_parsed = url::Url::parse(root).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("bad target url: {e}"))
+        })?;
+        let root_path = root_parsed.path().trim_end_matches('/');
+
+        // Absolute href: parse with a real URL parser and compare origin.
+        if let Ok(h) = url::Url::parse(href) {
+            if h.scheme() != root_parsed.scheme() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "href scheme mismatch",
+                ));
+            }
+            if h.host_str() != root_parsed.host_str()
+                || h.port_or_known_default() != root_parsed.port_or_known_default()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "href origin mismatch",
+                ));
+            }
+            if h.username() != "" || h.password().is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "href must not carry credentials",
+                ));
+            }
+            if h.fragment().is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "href must not carry fragment",
+                ));
+            }
+            let hp = h.path();
+            return self.check_contained(root_path, hp, href);
         }
-        // containment to the target root
-        let rp = root_path.trim_end_matches('/');
-        let contained =
-            rp.is_empty() || href_path == rp || href_path.starts_with(&format!("{rp}/"));
+
+        // Path-absolute href: preserve raw path/query verbatim, prefix origin.
+        if href.starts_with('/') {
+            return self.check_contained(root_path, href, href);
+        }
+
+        // Other relative forms (e.g. `a/b`, `./a`) are not supported for PACK E.
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported relative href: {href}"),
+        ))
+    }
+
+    /// Containment + traversal check on an already-path (raw) href.
+    fn check_contained(&self, root_path: &str, href_path: &str, raw: &str) -> io::Result<String> {
+        let contained = root_path.is_empty()
+            || href_path == root_path
+            || href_path.starts_with(&format!("{root_path}/"));
         if !contained {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("href escapes target root: {href}"),
+                format!("href escapes target root: {raw}"),
             ));
         }
-        // traversal check on decoded segments
         for seg in href_path.trim_start_matches('/').split('/') {
             if seg.is_empty() {
                 continue;
@@ -225,13 +276,15 @@ impl WebDavProvider {
             if dec == ".." || dec == "." {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("href traversal rejected: {href}"),
+                    format!("href traversal rejected: {raw}"),
                 ));
             }
         }
-        let origin_base = root
+        let origin_base = self
+            .target
+            .url
             .trim_end_matches('/')
-            .trim_end_matches(root_path.as_str());
+            .trim_end_matches(root_path);
         Ok(format!("{origin_base}{href_path}"))
     }
 
@@ -357,11 +410,13 @@ impl WebDavProvider {
     /// Stream a GET response body into `sink`, chunk by chunk, bounded by
     /// `max_bytes`. Never buffers the whole object in memory (true streaming),
     /// unlike `get_bounded` which loads up to the cap first.
+    /// Checks `cancel` between chunks for cooperative cancellation.
     pub(crate) async fn get_stream(
         &self,
         href: &str,
         max_bytes: usize,
         sink: &mut (impl tokio::io::AsyncWrite + Unpin),
+        cancel: Option<&Arc<AtomicBool>>,
     ) -> io::Result<u64> {
         let url = self.resolve_url(href)?;
         let req = self.auth_req(self.client.get(&url))?;
@@ -380,11 +435,16 @@ impl WebDavProvider {
         }
         let mut written: u64 = 0;
         loop {
-            let chunk = match resp.chunk().await {
-                Ok(Some(c)) => c,
-                Ok(None) => break,
-                Err(e) => return Err(map_reqwest(e)),
+            if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "download cancelled"));
+            }
+            let next = resp.chunk().await.map_err(map_reqwest)?;
+            let Some(chunk) = next else {
+                break;
             };
+            if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "download cancelled"));
+            }
             if written + chunk.len() as u64 > max_bytes as u64 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -397,27 +457,21 @@ impl WebDavProvider {
         Ok(written)
     }
 
-    /// True if a resource exists at `path` (PROPFIND Depth:0 returns 2xx).
-    pub(crate) async fn exists(&self, path: &str) -> io::Result<bool> {
+    /// PUT with the overwrite policy enforced at the HTTP layer (no
+    /// existence preflight — racing TOCTOU is unsafe). For `Forbid` we send
+    /// `If-None-Match: *` so the server rejects an existing resource with 412.
+    pub(crate) async fn put_with_policy(
+        &self,
+        path: &str,
+        data: &[u8],
+        policy: WebDavOverwritePolicy,
+    ) -> io::Result<()> {
         let url = self.resolve_url(path)?;
-        let body = r#"<?xml version="1.0" encoding="utf-8"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/></D:prop></D:propfind>"#;
-        let req = self.auth_req(
-            self.client
-                .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
-                .header("Depth", "0")
-                .header("Content-Type", "application/xml; charset=utf-8")
-                .body(body),
-        )?;
-        let resp = req.send().await.map_err(map_reqwest)?;
-        Ok(matches!(
-            resp.status(),
-            reqwest::StatusCode::OK | reqwest::StatusCode::MULTI_STATUS
-        ))
-    }
-
-    pub(crate) async fn put(&self, path: &str, data: &[u8]) -> io::Result<()> {
-        let url = self.resolve_url(path)?;
-        let req = self.auth_req(self.client.put(&url).body(data.to_vec()))?;
+        let mut builder = self.client.put(&url).body(data.to_vec());
+        if matches!(policy, WebDavOverwritePolicy::Forbid) {
+            builder = builder.header("If-None-Match", "*");
+        }
+        let req = self.auth_req(builder)?;
         let resp = req.send().await.map_err(map_reqwest)?;
         let status = resp.status();
         if status == reqwest::StatusCode::CREATED
@@ -426,8 +480,22 @@ impl WebDavProvider {
         {
             return Ok(());
         }
+        if status == reqwest::StatusCode::PRECONDITION_FAILED {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "refusing to overwrite existing resource (policy Forbid)",
+            ));
+        }
         let text = read_fixed_text(resp).await;
         Err(self.status_error("PUT", status, &text))
+    }
+
+    /// Plain PUT that allows overwriting (used by internal callers that have
+    /// already resolved the policy elsewhere). Thin wrapper over
+    /// `put_with_policy(Allow)`.
+    pub(crate) async fn put(&self, path: &str, data: &[u8]) -> io::Result<()> {
+        self.put_with_policy(path, data, WebDavOverwritePolicy::Allow)
+            .await
     }
 
     async fn delete_url(&self, url: String) -> io::Result<()> {
@@ -758,14 +826,6 @@ fn href_path_only(href: &str) -> &str {
         return "";
     }
     href
-}
-
-/// Host portion of a URL (between `://` and the next `/`), for origin checks.
-fn host_of(url: &str) -> &str {
-    url.split("://")
-        .nth(1)
-        .and_then(|r| r.split('/').next())
-        .unwrap_or("")
 }
 
 /// Last path segment of a raw href, percent-decoded for presentation only.

@@ -30,6 +30,7 @@ quick-xml = { version = "0.37" }
 reqwest = { version = "0.13.4", features = ["blocking", "json", "stream"] }
 mlua = { version = "0.12.0", features = ["lua54", "vendored", "send"] }
 thiserror = "2.0.19"
+url = "2.5"
 tempfile = "3"
 aws-config = "=1.8.8"
 aws-sdk-s3 = "=1.109.0"
