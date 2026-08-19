@@ -217,6 +217,50 @@ fn spawn_mock(
     (format!("http://{addr}"), log)
 }
 
+/// Stream `total` bytes in `chunk`-sized pieces so the client can disconnect
+/// early (proving it never reads the full body past the cap).
+fn spawn_chunked(total: usize, chunk: usize) -> (String, ()) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        if let Ok(stream) = listener.incoming().next().unwrap() {
+            let mut stream = stream;
+            stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+            // Read the request headers (ignore), then start streaming the body.
+            let mut buf = [0u8; 8192];
+            let mut req = Vec::new();
+            loop {
+                let n = match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                req.extend_from_slice(&buf[..n]);
+                if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(headers.as_bytes());
+            let piece = vec![b'A'; chunk.min(total)];
+            let mut sent = 0;
+            while sent < total {
+                if stream.write_all(&piece).is_err() {
+                    // Client disconnected early: proves it did not read it all.
+                    break;
+                }
+                sent += piece.len();
+                if sent > total {
+                    let _ = stream.write_all(&piece[..total - (sent - piece.len())]);
+                    break;
+                }
+            }
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}"), ())
+}
+
 fn provider_for(url: &str, password: &str) -> WebDavProvider {
     WebDavProvider::new(
         WebDavTarget {
@@ -515,4 +559,77 @@ fn d_malformed_xml_errors() {
     let xml = r#"<multistatus xmlns="DAV:"><response></multistatus>"#;
     let r = pm(xml);
     assert!(r.is_err(), "malformed XML must error");
+}
+
+// ── C: bounded HTTP body ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn c_preview_cap_limits_allocation_and_truncates() {
+    // Server streams 10 MiB but the preview cap is 64 KiB.
+    const CAP: usize = 64 * 1024;
+    const TOTAL: usize = 10 * 1024 * 1024;
+    let (url, _h) = spawn_chunked(TOTAL, 4096);
+    let provider = provider_for(&url, "p");
+    let read = provider.read_prefix_bytes("/big.bin", CAP).await.unwrap();
+    assert!(read.bytes.len() <= CAP, "allocation must stay within cap");
+    assert!(read.truncated, "10 MiB body must be reported truncated");
+}
+
+#[tokio::test]
+async fn c_get_500_is_error_not_contents() {
+    let (url, _) = spawn_mock(|method, _, _, _, _| match method {
+        "GET" => (500, b"internal explosion".to_vec()),
+        _ => (404, Vec::new()),
+    });
+    let provider = provider_for(&url, "p");
+    let r = provider.read_prefix_bytes("/x", 1024).await;
+    assert!(
+        r.is_err(),
+        "GET 500 must error, never yield body as file content"
+    );
+}
+
+#[tokio::test]
+async fn c_only_200_or_206_accepted() {
+    // 416 without Content-Range must NOT be treated as empty file.
+    let (url, _) = spawn_mock(|method, _, _, _, _| match method {
+        "GET" => (416, b"Range Not Satisfiable".to_vec()),
+        _ => (404, Vec::new()),
+    });
+    let provider = provider_for(&url, "p");
+    let r = provider.read_prefix_bytes("/x", 1024).await;
+    assert!(
+        r.is_err(),
+        "arbitrary 416 must be a status error, not empty file"
+    );
+}
+
+#[tokio::test]
+async fn c_error_body_bounded() {
+    // Large error body must not be fully buffered into the diagnostic string.
+    let big = "X".repeat(8192);
+    let (url, _) = spawn_mock(move |method, _, _, _, _| match method {
+        "GET" => (500, big.as_bytes().to_vec()),
+        _ => (404, Vec::new()),
+    });
+    let provider = provider_for(&url, "p");
+    let r = provider.read_prefix_bytes("/x", 1024).await;
+    assert!(r.is_err());
+}
+
+#[tokio::test]
+async fn c_propfind_over_cap_is_invalid_data() {
+    // PROPFIND returning an oversized body must be rejected, not parsed.
+    let big = format!(
+        r#"<?xml version="1.0"?><multistatus xmlns="DAV:"><response><href>/dav/a</href><propstat><prop><displayname>{}</displayname></prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>"#,
+        "y".repeat(20 * 1024 * 1024)
+    );
+    let (url, _) = spawn_mock(move |method, _, _, _, _| match method {
+        "PROPFIND" => (207, big.as_bytes().to_vec()),
+        _ => (404, Vec::new()),
+    });
+    let provider = provider_for(&url, "p");
+    // list_async -> propfind -> read_body_bounded(MAX_PROPFIND_BYTES) -> truncated error
+    let r = provider.list_async("/dav").await;
+    assert!(r.is_err(), "oversized PROPFIND body must be rejected");
 }

@@ -187,14 +187,14 @@ impl WebDavProvider {
             let text = read_fixed_text(resp).await;
             return Err(self.status_error("PROPFIND", status, &text));
         }
-        let bytes = resp.bytes().await.map_err(map_reqwest)?;
-        if bytes.len() > MAX_PROPFIND_BYTES {
+        let bytes = read_body_bounded(resp, MAX_PROPFIND_BYTES).await?;
+        if bytes.truncated {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "PROPFIND response exceeds size cap",
             ));
         }
-        parse_multistatus(&bytes)
+        parse_multistatus(&bytes.bytes)
     }
 
     /// Bounded GET: request a Range, then read at most `max_bytes` and track
@@ -217,25 +217,17 @@ impl WebDavProvider {
             let text = read_fixed_text(resp).await;
             return Err(self.status_error("GET", status, &text));
         }
-        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-            return Ok(BoundedRead {
-                bytes: Vec::new(),
-                truncated: false,
-                unix_mode: None,
-                unix_uid: None,
-                unix_gid: None,
-            });
+        // Only 200/206 carry a body we may read. Any other status (incl. 416
+        // without proof of a zero-length resource via Content-Range) is a
+        // protocol/status error, never treated as an empty file.
+        if status != reqwest::StatusCode::OK && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            let text = read_fixed_text(resp).await;
+            return Err(self.status_error("GET", status, &text));
         }
-        let full = resp.bytes().await.map_err(map_reqwest)?;
-        let truncated = full.len() > max_bytes;
-        let bytes: Vec<u8> = if truncated {
-            full[..max_bytes].to_vec()
-        } else {
-            full.to_vec()
-        };
+        let body = read_body_bounded(resp, max_bytes).await?;
         Ok(BoundedRead {
-            bytes,
-            truncated,
+            bytes: body.bytes,
+            truncated: body.truncated,
             unix_mode: None,
             unix_uid: None,
             unix_gid: None,
@@ -525,10 +517,52 @@ fn map_reqwest(e: reqwest::Error) -> io::Error {
 }
 
 async fn read_fixed_text(resp: reqwest::Response) -> String {
-    match resp.text().await {
-        Ok(t) => t.chars().take(1024).collect(),
+    match read_body_bounded(resp, 4096).await {
+        Ok(b) => String::from_utf8_lossy(&b.bytes)
+            .chars()
+            .take(4096)
+            .collect(),
         Err(_) => String::new(),
     }
+}
+
+/// Stream a response body, stopping at `max` bytes (+1 probe). Never reads past
+/// the cap: once `max+1` bytes are observed we truncate to `max` and drop the
+/// response, so the client never allocates or consumes the unbounded body.
+async fn read_body_bounded(mut resp: reqwest::Response, max: usize) -> io::Result<BoundedBody> {
+    let mut out: Vec<u8> = Vec::with_capacity(max.min(64 * 1024));
+    loop {
+        let chunk = match resp.chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => return Err(map_reqwest(e)),
+        };
+        let remaining_probe = max.saturating_add(1).saturating_sub(out.len());
+        if remaining_probe == 0 {
+            return Ok(BoundedBody {
+                bytes: out[..max].to_vec(),
+                truncated: true,
+            });
+        }
+        let take = chunk.len().min(remaining_probe);
+        out.extend_from_slice(&chunk[..take]);
+        if out.len() > max {
+            out.truncate(max);
+            return Ok(BoundedBody {
+                bytes: out,
+                truncated: true,
+            });
+        }
+    }
+    Ok(BoundedBody {
+        bytes: out,
+        truncated: false,
+    })
+}
+
+struct BoundedBody {
+    bytes: Vec<u8>,
+    truncated: bool,
 }
 
 /// Percent-encode one path segment for the wire. Encodes everything except a
