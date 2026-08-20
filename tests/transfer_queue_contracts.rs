@@ -83,9 +83,7 @@ fn queue_contract_safe_retry_is_three_total_attempts_not_four() {
         assert_eq!(queue.next_runnable().as_deref(), Some("job"));
         assert_eq!(queue.attempts_started("job"), Some(attempt));
 
-        let decision = queue
-            .failure("job", RetryDisposition::SafeToRetry)
-            .unwrap();
+        let decision = queue.failure("job", RetryDisposition::SafeToRetry).unwrap();
         if attempt < MAX_TOTAL_TRANSFER_ATTEMPTS {
             assert_eq!(
                 decision,
