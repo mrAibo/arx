@@ -66,3 +66,12 @@ fn copy_and_move_product_paths_enqueue_into_persistent_runtime() {
         "legacy direct Copy/Move executor spawn must not return to the TUI product path"
     );
 }
+
+#[test]
+fn pause_resume_controls_remain_unexposed_until_runtime_pause_is_real() {
+    assert!(
+        !TUI_SOURCE.contains("sync.transfers.pause(")
+            && !TUI_SOURCE.contains("sync.transfers.resume("),
+        "Pause/Resume must not be exposed in the TUI before cooperative pause checkpoints, same-task resume, and worker joining are implemented and Q14-Q30 are green"
+    );
+}
