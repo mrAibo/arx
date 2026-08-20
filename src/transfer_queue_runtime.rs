@@ -14,11 +14,12 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 use crate::jobs::{JobEvent, JobKind, JobManager, JobProgress, JobResult, Progress};
-use crate::transfer::executor::{TransferExecutionError, TransferProgress, execute_transfer};
-use crate::transfer::{TransferMethod, TransferPlan};
+use crate::transfer::TransferPlan;
+use crate::transfer::executor::{TransferExecutionError, execute_transfer};
 use crate::transfer_queue::{
-    CancelAction, QueueError, RetryDecision, RetryDisposition, SchedulerState, TransferQueueConfig,
-    TransferQueueCore, TransferRateEstimator,
+    CancelAction, QueueError, RetryDecision, RetryDisposition, SchedulerState,
+    TransferProgressTracker, TransferQueueConfig, TransferQueueCore, TransferRateEstimator,
+    TypedTransferProgress,
 };
 use crate::transfer_retry;
 use crate::vfs::ProviderRegistry;
@@ -169,6 +170,13 @@ impl TransferQueueRuntime {
             let _ = self
                 .manager
                 .publish_event(&self.events, JobEvent::Running { id: job_id.clone() });
+            let _ = self.manager.publish_event(
+                &self.events,
+                JobEvent::Progress {
+                    id: job_id.clone(),
+                    progress: JobProgress::Generic(Progress::Indeterminate),
+                },
+            );
 
             let runtime = self.clone();
             tokio::spawn(async move {
@@ -187,8 +195,9 @@ impl TransferQueueRuntime {
         let progress_manager = self.manager.clone();
         let progress_events = self.events.clone();
         let progress_id = job_id.clone();
-        let method = work.plan.method;
         let mut rate = TransferRateEstimator::default();
+        let mut tracker = TransferProgressTracker::default();
+        tracker.reset_attempt();
 
         let result = execute_transfer(
             &work.plan,
@@ -196,7 +205,10 @@ impl TransferQueueRuntime {
             &self.registry,
             cancel.clone(),
             move |event| {
-                let progress = job_progress(method, event, &mut rate);
+                if tracker.observe(event).is_err() {
+                    return;
+                }
+                let progress = job_progress(event, &mut rate);
                 let _ = progress_manager.publish_event(
                     &progress_events,
                     JobEvent::Progress {
@@ -233,7 +245,12 @@ impl TransferQueueRuntime {
                 source: error,
                 disposition,
             }) => {
-                if error.kind() == std::io::ErrorKind::Interrupted && cancel.load(Ordering::Acquire)
+                if error.kind() == std::io::ErrorKind::Interrupted
+                    && cancel.load(Ordering::Acquire)
+                    && matches!(
+                        disposition,
+                        RetryDisposition::SafeToRetry | RetryDisposition::NeverRetry
+                    )
                 {
                     self.finish_scheduler(&job_id);
                     let _ = self.manager.publish_event(
@@ -386,35 +403,25 @@ impl TransferQueueRuntime {
     }
 }
 
-fn job_progress(
-    method: TransferMethod,
-    progress: TransferProgress,
-    rate: &mut TransferRateEstimator,
-) -> JobProgress {
-    match method {
-        // Current WebDAV upload callbacks report bytes. Downloads do not yet
-        // expose streaming progress and therefore stay indeterminate until the
-        // executor/provider progress seam is widened later in PACK G.
-        TransferMethod::WebDav => {
-            let done = u64::try_from(progress.completed).unwrap_or(u64::MAX);
-            let total = u64::try_from(progress.total).unwrap_or(u64::MAX);
-            let bytes_per_second = rate.observe_at(Instant::now(), done).unwrap_or(0);
+fn job_progress(progress: TypedTransferProgress, rate: &mut TransferRateEstimator) -> JobProgress {
+    match progress {
+        TypedTransferProgress::Bytes { completed, total } => {
+            let bytes_per_second = rate.observe_at(Instant::now(), completed).unwrap_or(0);
+            let Some(total) = total else {
+                return JobProgress::Generic(Progress::Indeterminate);
+            };
             JobProgress::Generic(Progress::Bytes {
-                done,
+                done: completed,
                 total,
                 rate: bytes_per_second,
             })
         }
-        // Native/rsync/SFTP callbacks are item counts. S3 upload callbacks are
-        // currently part counts (including 1/1 for a single PUT), not bytes.
-        // Do not fabricate byte speed/ETA from those values.
-        TransferMethod::Native
-        | TransferMethod::Rsync
-        | TransferMethod::Sftp
-        | TransferMethod::Scp
-        | TransferMethod::S3 => JobProgress::Generic(Progress::Items {
-            done: progress.completed,
-            total: progress.total,
-        }),
+        TypedTransferProgress::Items { completed, total } => match total {
+            Some(total) => JobProgress::Generic(Progress::Items {
+                done: usize::try_from(completed).unwrap_or(usize::MAX),
+                total: usize::try_from(total).unwrap_or(usize::MAX),
+            }),
+            None => JobProgress::Generic(Progress::Indeterminate),
+        },
     }
 }

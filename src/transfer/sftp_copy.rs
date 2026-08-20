@@ -1,3 +1,4 @@
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,8 +11,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::remote::openssh_sftp::OpenSshSftpConnection;
 use crate::vfs::Location;
 
-use crate::transfer::executor::{TransferExecutionError, TransferOutcome, TransferProgress};
+use crate::transfer::executor::{TransferExecutionError, TransferOutcome};
 use crate::transfer::{TransferIntent, TransferMethod, TransferPlan};
+use crate::transfer_queue::{RetryDisposition, TypedTransferProgress};
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -19,7 +21,7 @@ pub(crate) async fn execute_sftp_copy(
     plan: &TransferPlan,
     names: &[String],
     cancel: Arc<AtomicBool>,
-    on_progress: &mut impl FnMut(TransferProgress),
+    on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> Result<TransferOutcome, TransferExecutionError> {
     if plan.intent != TransferIntent::Copy {
         return Err(invalid(
@@ -52,6 +54,25 @@ pub(crate) async fn execute_sftp_copy(
     let connection = OpenSshSftpConnection::connect(host).await?;
     let total = names.len();
     let mut completed = 0;
+    let mut cumulative_written = 0;
+    let mut total_bytes = Some(0_u64);
+
+    for name in names {
+        validate_name(name)?;
+        let size = match direction {
+            Direction::Upload { src, .. } => tokio::fs::metadata(src.join(name))
+                .await
+                .map_err(TransferExecutionError::safe_to_retry)?
+                .len(),
+            Direction::Download { remote_dir, .. } => connection
+                .session()
+                .metadata(remote_join(remote_dir, name))
+                .await
+                .map_err(|error| phase_sftp(name, error, RetryDisposition::SafeToRetry))?
+                .len(),
+        };
+        total_bytes = total_bytes.and_then(|total| total.checked_add(size));
+    }
 
     let result = async {
         for name in names {
@@ -59,15 +80,36 @@ pub(crate) async fn execute_sftp_copy(
             check_cancelled(&cancel, completed)?;
             match direction {
                 Direction::Upload { src, remote_dir } => {
-                    upload_file(&connection, src, remote_dir, name, &cancel, completed).await?;
+                    upload_file(
+                        &connection,
+                        src,
+                        remote_dir,
+                        name,
+                        &cancel,
+                        completed,
+                        &mut cumulative_written,
+                        total_bytes,
+                        on_progress,
+                    )
+                    .await?;
                 }
                 Direction::Download { remote_dir, dst } => {
-                    download_file(&connection, remote_dir, dst, name, &cancel, completed).await?;
+                    download_file(
+                        &connection,
+                        remote_dir,
+                        dst,
+                        name,
+                        &cancel,
+                        completed,
+                        &mut cumulative_written,
+                        total_bytes,
+                        on_progress,
+                    )
+                    .await?;
                 }
             }
 
             completed += 1;
-            on_progress(TransferProgress { completed, total });
         }
         Ok(TransferOutcome { completed, total })
     }
@@ -84,6 +126,7 @@ enum Direction<'a> {
     Download { remote_dir: &'a str, dst: &'a Path },
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_file(
     connection: &OpenSshSftpConnection,
     src_dir: &Path,
@@ -91,9 +134,14 @@ async fn upload_file(
     name: &str,
     cancel: &AtomicBool,
     completed: usize,
+    cumulative_written: &mut u64,
+    total_bytes: Option<u64>,
+    on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> Result<(), TransferExecutionError> {
     let local_path = src_dir.join(name);
-    let local_meta = tokio::fs::metadata(&local_path).await?;
+    let local_meta = tokio::fs::metadata(&local_path)
+        .await
+        .map_err(|e| phase_err(e, RetryDisposition::SafeToRetry))?;
     if !local_meta.is_file() {
         return Err(invalid(
             "SFTP fallback currently supports regular files only",
@@ -105,48 +153,80 @@ async fn upload_file(
     let temp = format!("{target}.arx-part-{token}");
     let backup = format!("{target}.arx-bak-{token}");
 
-    let mut local = tokio::fs::File::open(&local_path).await?;
-    let mut remote = connection
-        .session()
-        .create(temp.clone())
+    let mut local = tokio::fs::File::open(&local_path)
         .await
-        .map_err(|error| sftp_failure(name, error))?;
+        .map_err(|e| phase_err(e, RetryDisposition::SafeToRetry))?;
+    let mut remote = match connection.session().create(temp.clone()).await {
+        Ok(remote) => remote,
+        Err(error) => {
+            return Err(clean_remote_stage(
+                connection,
+                &temp,
+                phase_sftp(name, error, RetryDisposition::SafeToRetry),
+            )
+            .await);
+        }
+    };
 
-    if let Err(error) = copy_stream(&mut local, &mut remote, cancel, completed).await {
-        let _ = connection.session().remove_file(temp.clone()).await;
-        return Err(error);
+    if let Err(error) = copy_stream(
+        &mut local,
+        &mut remote,
+        cancel,
+        completed,
+        cumulative_written,
+        total_bytes,
+        on_progress,
+    )
+    .await
+    {
+        return Err(clean_remote_stage(connection, &temp, error).await);
     }
     if let Err(error) = remote.flush().await {
-        let _ = connection.session().remove_file(temp.clone()).await;
-        return Err(error.into());
+        return Err(clean_remote_stage(
+            connection,
+            &temp,
+            phase_err(error, RetryDisposition::SafeToRetry),
+        )
+        .await);
     }
     if let Err(error) = remote.shutdown().await {
-        let _ = connection.session().remove_file(temp.clone()).await;
-        return Err(error.into());
+        return Err(clean_remote_stage(
+            connection,
+            &temp,
+            phase_err(error, RetryDisposition::SafeToRetry),
+        )
+        .await);
     }
 
     let staged = match connection.session().metadata(temp.clone()).await {
         Ok(staged) => staged,
         Err(error) => {
-            let _ = connection.session().remove_file(temp.clone()).await;
-            return Err(sftp_failure(name, error));
+            return Err(clean_remote_stage(
+                connection,
+                &temp,
+                phase_sftp(name, error, RetryDisposition::SafeToRetry),
+            )
+            .await);
         }
     };
     if staged.len() != local_meta.len() {
-        let _ = connection.session().remove_file(temp.clone()).await;
-        return Err(invalid(
-            "SFTP upload verification failed: staged size differs",
-        ));
+        return Err(clean_remote_stage(
+            connection,
+            &temp,
+            phase_err(
+                io::Error::other("SFTP upload verification failed: staged size differs"),
+                RetryDisposition::SafeToRetry,
+            ),
+        )
+        .await);
     }
     if let Err(cancelled) = check_cancelled(cancel, completed) {
-        let _ = connection.session().remove_file(temp.clone()).await;
-        return Err(cancelled);
+        return Err(clean_remote_stage(connection, &temp, cancelled).await);
     }
     let had_target = match remote_exists(connection.session(), &target).await {
         Ok(exists) => exists,
         Err(error) => {
-            let _ = connection.session().remove_file(temp.clone()).await;
-            return Err(error);
+            return Err(clean_remote_stage(connection, &temp, error).await);
         }
     };
     if had_target
@@ -155,18 +235,34 @@ async fn upload_file(
             .rename(target.clone(), backup.clone())
             .await
     {
-        let _ = connection.session().remove_file(temp.clone()).await;
-        return Err(sftp_failure(name, error));
+        return Err(clean_remote_stage(
+            connection,
+            &temp,
+            phase_sftp(name, error, RetryDisposition::SafeToRetry),
+        )
+        .await);
     }
     // Cancellation after target→backup must roll the original target back
     // instead of committing the staged replacement.
     if let Err(cancelled) = check_cancelled(cancel, completed) {
-        let _ = connection.session().remove_file(temp.clone()).await;
-        if had_target {
-            let _ = connection
+        if let Err(cleanup) = connection.session().remove_file(temp.clone()).await {
+            return Err(phase_sftp(
+                &temp,
+                cleanup,
+                RetryDisposition::RecoveryRequired,
+            ));
+        }
+        if had_target
+            && connection
                 .session()
                 .rename(backup.clone(), target.clone())
-                .await;
+                .await
+                .is_err()
+        {
+            return Err(phase_err(
+                io::Error::other("SFTP cancellation rollback failed"),
+                RetryDisposition::RecoveryRequired,
+            ));
         }
         return Err(cancelled);
     }
@@ -176,15 +272,19 @@ async fn upload_file(
         .await
     {
         let _ = connection.session().remove_file(temp).await;
-        if had_target {
-            let _ = connection.session().rename(backup, target).await;
+        if had_target && connection.session().rename(backup, target).await.is_err() {
+            return Err(phase_err(
+                io::Error::other("SFTP commit failed and rollback failed"),
+                RetryDisposition::RecoveryRequired,
+            ));
         }
-        return Err(sftp_failure(name, error));
+        return Err(phase_sftp(name, error, RetryDisposition::AmbiguousMutation));
     }
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_file(
     connection: &OpenSshSftpConnection,
     remote_dir: &str,
@@ -192,13 +292,16 @@ async fn download_file(
     name: &str,
     cancel: &AtomicBool,
     completed: usize,
+    cumulative_written: &mut u64,
+    total_bytes: Option<u64>,
+    on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> Result<(), TransferExecutionError> {
     let source = remote_join(remote_dir, name);
     let remote_meta = connection
         .session()
         .metadata(source.clone())
         .await
-        .map_err(|error| sftp_failure(name, error))?;
+        .map_err(|error| phase_sftp(name, error, RetryDisposition::SafeToRetry))?;
     if !remote_meta.is_regular() {
         return Err(invalid(
             "SFTP fallback currently supports regular files only",
@@ -214,63 +317,95 @@ async fn download_file(
         .session()
         .open(source)
         .await
-        .map_err(|error| sftp_failure(name, error))?;
-    let mut local = tokio::fs::File::create(&temp).await?;
+        .map_err(|error| phase_sftp(name, error, RetryDisposition::SafeToRetry))?;
+    let mut local = match tokio::fs::File::create(&temp).await {
+        Ok(local) => local,
+        Err(error) => {
+            return Err(
+                clean_local_stage(&temp, phase_err(error, RetryDisposition::SafeToRetry)).await,
+            );
+        }
+    };
 
-    if let Err(error) = copy_stream(&mut remote, &mut local, cancel, completed).await {
-        let _ = tokio::fs::remove_file(&temp).await;
-        return Err(error);
+    if let Err(error) = copy_stream(
+        &mut remote,
+        &mut local,
+        cancel,
+        completed,
+        cumulative_written,
+        total_bytes,
+        on_progress,
+    )
+    .await
+    {
+        return Err(clean_local_stage(&temp, error).await);
     }
     if let Err(error) = local.flush().await {
-        let _ = tokio::fs::remove_file(&temp).await;
-        return Err(error.into());
+        return Err(
+            clean_local_stage(&temp, phase_err(error, RetryDisposition::SafeToRetry)).await,
+        );
     }
     if let Err(error) = local.sync_all().await {
-        let _ = tokio::fs::remove_file(&temp).await;
-        return Err(error.into());
+        return Err(
+            clean_local_stage(&temp, phase_err(error, RetryDisposition::SafeToRetry)).await,
+        );
     }
 
     let staged = match tokio::fs::metadata(&temp).await {
         Ok(staged) => staged,
         Err(error) => {
-            let _ = tokio::fs::remove_file(&temp).await;
-            return Err(error.into());
+            return Err(
+                clean_local_stage(&temp, phase_err(error, RetryDisposition::SafeToRetry)).await,
+            );
         }
     };
     if staged.len() != remote_meta.len() {
-        let _ = tokio::fs::remove_file(&temp).await;
-        return Err(invalid(
-            "SFTP download verification failed: staged size differs",
-        ));
+        return Err(clean_local_stage(
+            &temp,
+            phase_err(
+                io::Error::other("SFTP download verification failed: staged size differs"),
+                RetryDisposition::SafeToRetry,
+            ),
+        )
+        .await);
     }
     if let Err(cancelled) = check_cancelled(cancel, completed) {
-        let _ = tokio::fs::remove_file(&temp).await;
-        return Err(cancelled);
+        return Err(clean_local_stage(&temp, cancelled).await);
     }
     let had_target = match local_exists(&target).await {
         Ok(exists) => exists,
         Err(error) => {
-            let _ = tokio::fs::remove_file(&temp).await;
-            return Err(error);
+            return Err(clean_local_stage(&temp, error).await);
         }
     };
     if had_target && let Err(error) = tokio::fs::rename(&target, &backup).await {
-        let _ = tokio::fs::remove_file(&temp).await;
-        return Err(error.into());
+        return Err(
+            clean_local_stage(&temp, phase_err(error, RetryDisposition::SafeToRetry)).await,
+        );
     }
     if let Err(cancelled) = check_cancelled(cancel, completed) {
-        let _ = tokio::fs::remove_file(&temp).await;
-        if had_target {
-            let _ = tokio::fs::rename(&backup, &target).await;
+        if let Err(error) = tokio::fs::remove_file(&temp).await
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(phase_err(error, RetryDisposition::RecoveryRequired));
+        }
+        if had_target && tokio::fs::rename(&backup, &target).await.is_err() {
+            return Err(phase_err(
+                io::Error::other("SFTP cancellation rollback failed"),
+                RetryDisposition::RecoveryRequired,
+            ));
         }
         return Err(cancelled);
     }
     if let Err(error) = tokio::fs::rename(&temp, &target).await {
         let _ = tokio::fs::remove_file(&temp).await;
-        if had_target {
-            let _ = tokio::fs::rename(&backup, &target).await;
+        if had_target && tokio::fs::rename(&backup, &target).await.is_err() {
+            return Err(phase_err(
+                io::Error::other("SFTP commit failed and rollback failed"),
+                RetryDisposition::RecoveryRequired,
+            ));
         }
-        return Err(error.into());
+        return Err(phase_err(error, RetryDisposition::AmbiguousMutation));
     }
 
     Ok(())
@@ -281,6 +416,9 @@ async fn copy_stream<R, W>(
     writer: &mut W,
     cancel: &AtomicBool,
     completed: usize,
+    cumulative_written: &mut u64,
+    total_bytes: Option<u64>,
+    on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> Result<(), TransferExecutionError>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -289,11 +427,22 @@ where
     let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
     loop {
         check_cancelled(cancel, completed)?;
-        let read = reader.read(&mut buffer).await?;
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|e| phase_err(e, RetryDisposition::SafeToRetry))?;
         if read == 0 {
             return Ok(());
         }
-        writer.write_all(&buffer[..read]).await?;
+        writer
+            .write_all(&buffer[..read])
+            .await
+            .map_err(|e| phase_err(e, RetryDisposition::SafeToRetry))?;
+        *cumulative_written = cumulative_written.saturating_add(read as u64);
+        on_progress(TypedTransferProgress::Bytes {
+            completed: *cumulative_written,
+            total: total_bytes,
+        });
         check_cancelled(cancel, completed)?;
     }
 }
@@ -305,7 +454,7 @@ async fn remote_exists(
     match session.metadata(path.to_string()).await {
         Ok(_) => Ok(true),
         Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => Ok(false),
-        Err(error) => Err(sftp_failure(path, error)),
+        Err(error) => Err(phase_sftp(path, error, RetryDisposition::SafeToRetry)),
     }
 }
 
@@ -313,7 +462,7 @@ async fn local_exists(path: &Path) -> Result<bool, TransferExecutionError> {
     match tokio::fs::metadata(path).await {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(phase_err(error, RetryDisposition::SafeToRetry)),
     }
 }
 
@@ -371,6 +520,47 @@ fn sftp_failure(item: &str, error: SftpError) -> TransferExecutionError {
     TransferExecutionError::Worker(format!("SFTP {item}: {error}"))
 }
 
+fn phase_sftp(
+    item: &str,
+    error: SftpError,
+    disposition: RetryDisposition,
+) -> TransferExecutionError {
+    phase_err(
+        io::Error::other(format!("SFTP {item}: {error}")),
+        disposition,
+    )
+}
+
+async fn clean_local_stage(
+    path: &Path,
+    original: TransferExecutionError,
+) -> TransferExecutionError {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => original,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => original,
+        Err(e) => phase_err(e, RetryDisposition::RecoveryRequired),
+    }
+}
+
+async fn clean_remote_stage(
+    connection: &OpenSshSftpConnection,
+    path: &str,
+    original: TransferExecutionError,
+) -> TransferExecutionError {
+    match connection.session().remove_file(path.to_string()).await {
+        Ok(()) => original,
+        Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => original,
+        Err(error) => phase_sftp(path, error, RetryDisposition::RecoveryRequired),
+    }
+}
+
+fn phase_err(error: io::Error, disposition: RetryDisposition) -> TransferExecutionError {
+    TransferExecutionError::Io {
+        source: error,
+        disposition,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +576,20 @@ mod tests {
         assert!(validate_name("../secret").is_err());
         assert!(validate_name("a/b").is_err());
         assert!(validate_name("file.txt").is_ok());
+    }
+
+    #[test]
+    fn phase_error_preserves_retry_disposition() {
+        for disposition in [
+            RetryDisposition::SafeToRetry,
+            RetryDisposition::AmbiguousMutation,
+            RetryDisposition::RecoveryRequired,
+        ] {
+            assert_eq!(
+                phase_err(io::Error::other("phase"), disposition).retry_disposition(),
+                disposition
+            );
+        }
     }
 
     #[test]

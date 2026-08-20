@@ -9,7 +9,7 @@ pub mod s3_multipart;
 pub mod s3_upload;
 pub mod webdav_transfer;
 
-pub use self::executor::{TransferOutcome, TransferProgress};
+pub use self::executor::TransferOutcome;
 pub use self::webdav_transfer::WebDavOverwritePolicy;
 
 use crate::vfs::{
@@ -1079,9 +1079,14 @@ mod physical_acceptance {
             source: object.clone(),
             local_destination: dst.clone(),
         };
-        let got = s3_download::download_one(&provider, &down, Arc::new(AtomicBool::new(false)))
-            .await
-            .expect("download must succeed against live endpoint");
+        let got = s3_download::download_one(
+            &provider,
+            &down,
+            Arc::new(AtomicBool::new(false)),
+            &mut |_| {},
+        )
+        .await
+        .expect("download must succeed against live endpoint");
         assert_eq!(got as usize, payload.len());
 
         let back = std::fs::read(&dst).unwrap();

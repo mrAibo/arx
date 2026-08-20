@@ -196,6 +196,39 @@ fn queue_contract_progress_cannot_regress_or_change_units_mid_attempt() {
 }
 
 #[test]
+fn queue_contract_items_are_monotonic_and_zero_is_exact() {
+    let mut tracker = TransferProgressTracker::default();
+    for completed in [0, 1, 1, 2] {
+        tracker
+            .observe(TypedTransferProgress::Items {
+                completed,
+                total: Some(2),
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        TypedTransferProgress::Bytes {
+            completed: 0,
+            total: Some(0),
+        }
+        .total(),
+        Some(0)
+    );
+}
+
+#[test]
+fn queue_contract_items_do_not_enter_byte_rate_estimator() {
+    let progress = TypedTransferProgress::Items {
+        completed: 1,
+        total: Some(2),
+    };
+    assert_eq!(progress.unit(), arx::transfer_queue::ProgressUnit::Items);
+    let estimator = TransferRateEstimator::default();
+    assert_eq!(estimator.rate(), 0);
+    assert_eq!(estimator.eta(1, None), None);
+}
+
+#[test]
 fn queue_contract_unknown_total_has_no_fake_percentage() {
     assert_eq!(
         TypedTransferProgress::Bytes {
@@ -437,4 +470,73 @@ async fn product_path_terminal_job_does_not_resurrect() {
     let action = runtime.cancel(&id).expect("cancel terminal");
     assert_eq!(action, CancelAction::AlreadyFinished);
     assert_eq!(runtime.manager().snapshot()[0].status, JobStatus::Completed);
+}
+
+// ── Typed progress and retry classification contracts ─────────────────────
+
+#[test]
+fn typed_items_and_bytes_are_monotonic_with_stable_units() {
+    for events in [
+        [
+            TypedTransferProgress::Items {
+                completed: 0,
+                total: Some(2),
+            },
+            TypedTransferProgress::Items {
+                completed: 2,
+                total: Some(2),
+            },
+        ],
+        [
+            TypedTransferProgress::Bytes {
+                completed: 0,
+                total: Some(128),
+            },
+            TypedTransferProgress::Bytes {
+                completed: 128,
+                total: Some(128),
+            },
+        ],
+    ] {
+        let mut tracker = TransferProgressTracker::default();
+        for event in events {
+            tracker.observe(event).unwrap();
+        }
+    }
+}
+
+#[test]
+fn typed_zero_and_unknown_byte_totals_never_fake_a_percentage() {
+    for event in [
+        TypedTransferProgress::Bytes {
+            completed: 0,
+            total: Some(0),
+        },
+        TypedTransferProgress::Bytes {
+            completed: 100,
+            total: None,
+        },
+    ] {
+        assert_eq!(event.percent(), None);
+    }
+}
+
+#[test]
+fn ambiguous_and_recovery_dispositions_stop_after_one_attempt() {
+    for disposition in [
+        RetryDisposition::AmbiguousMutation,
+        RetryDisposition::RecoveryRequired,
+    ] {
+        let mut queue = TransferQueueCore::new(TransferQueueConfig::new(1).unwrap());
+        queue.enqueue("provider-phase").unwrap();
+        assert_eq!(queue.next_runnable().as_deref(), Some("provider-phase"));
+        assert_eq!(
+            queue.failure("provider-phase", disposition).unwrap(),
+            RetryDecision::Stop {
+                disposition,
+                attempts_started: 1,
+            }
+        );
+        assert_eq!(queue.attempts_started("provider-phase"), Some(1));
+    }
 }

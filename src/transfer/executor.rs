@@ -14,12 +14,7 @@ use super::webdav_transfer::{
 };
 use super::{S3TransferSpec, TransferIntent, TransferMethod, TransferPlan, WebDavTransferSpec};
 use crate::transfer::sftp_copy;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransferProgress {
-    pub completed: usize,
-    pub total: usize,
-}
+use crate::transfer_queue::TypedTransferProgress;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferOutcome {
@@ -118,7 +113,7 @@ pub async fn execute_transfer(
     names: &[String],
     registry: &ProviderRegistry,
     cancel: Arc<AtomicBool>,
-    mut on_progress: impl FnMut(TransferProgress),
+    mut on_progress: impl FnMut(TypedTransferProgress),
 ) -> Result<TransferOutcome, TransferExecutionError> {
     match plan.method {
         TransferMethod::Native => execute_native(plan, names, cancel, &mut on_progress).await,
@@ -165,7 +160,25 @@ pub async fn execute_transfer(
                         &mut on_progress,
                     )
                     .await
-                    .map_err(TransferExecutionError::ambiguous)?;
+                    .map_err(|e| {
+                        // Preserve a typed disposition already carried inside the
+                        // io::Error (e.g. RecoveryRequired from a failed multipart
+                        // abort). Genuine io errors stay fail-closed as
+                        // AmbiguousMutation (never blind-replayed).
+                        match e
+                            .get_ref()
+                            .and_then(|inner| inner.downcast_ref::<TransferExecutionError>())
+                        {
+                            Some(te) => {
+                                let disposition = te.retry_disposition();
+                                TransferExecutionError::Io {
+                                    source: e,
+                                    disposition,
+                                }
+                            }
+                            None => TransferExecutionError::ambiguous(e),
+                        }
+                    })?;
                 }
                 S3TransferSpec::DownloadOne { .. } => {
                     // The current download core returns plain io::Error across
@@ -174,9 +187,8 @@ pub async fn execute_transfer(
                     // whole-function SafeToRetry wrapper is unsafe. Default to
                     // NeverRetry and let the provider restore SafeToRetry only
                     // on proven pre-finalization failures.
-                    s3_download::download_one(&provider, spec, cancel.clone())
-                        .await
-                        .map_err(TransferExecutionError::from)?;
+                    s3_download::download_one(&provider, spec, cancel.clone(), &mut on_progress)
+                        .await?;
                 }
             }
             Ok(TransferOutcome {
@@ -209,7 +221,25 @@ pub async fn execute_transfer(
                         &mut on_progress,
                     )
                     .await
-                    .map_err(TransferExecutionError::ambiguous)?;
+                    .map_err(|e| {
+                        // Preserve a typed disposition already carried inside the
+                        // io::Error (e.g. RecoveryRequired from a failed multipart
+                        // abort). Genuine io errors stay fail-closed as
+                        // AmbiguousMutation (never blind-replayed).
+                        match e
+                            .get_ref()
+                            .and_then(|inner| inner.downcast_ref::<TransferExecutionError>())
+                        {
+                            Some(te) => {
+                                let disposition = te.retry_disposition();
+                                TransferExecutionError::Io {
+                                    source: e,
+                                    disposition,
+                                }
+                            }
+                            None => TransferExecutionError::ambiguous(e),
+                        }
+                    })?;
                 }
                 WebDavTransferSpec::DownloadOne { .. } => {
                     // As with S3 download, plain io::Error currently crosses
@@ -221,6 +251,7 @@ pub async fn execute_transfer(
                         spec,
                         WebDavOverwritePolicy::Forbid,
                         cancel.clone(),
+                        &mut on_progress,
                     )
                     .await
                     .map_err(TransferExecutionError::from)?;
@@ -238,7 +269,7 @@ async fn execute_native(
     plan: &TransferPlan,
     names: &[String],
     cancel: Arc<AtomicBool>,
-    on_progress: &mut impl FnMut(TransferProgress),
+    on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> Result<TransferOutcome, TransferExecutionError> {
     let (Location::Local(src), Location::Local(dst)) = (&plan.source, &plan.destination) else {
         return Err(TransferExecutionError::InvalidPlan {
@@ -274,7 +305,10 @@ async fn execute_native(
         .map_err(|error| TransferExecutionError::Worker(error.to_string()))??;
 
         completed += 1;
-        on_progress(TransferProgress { completed, total });
+        on_progress(TypedTransferProgress::Items {
+            completed: completed as u64,
+            total: Some(total as u64),
+        });
     }
 
     Ok(TransferOutcome { completed, total })
@@ -284,7 +318,7 @@ async fn execute_rsync(
     plan: &TransferPlan,
     names: &[String],
     cancel: Arc<AtomicBool>,
-    on_progress: &mut impl FnMut(TransferProgress),
+    on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> Result<TransferOutcome, TransferExecutionError> {
     if plan.intent == TransferIntent::Move {
         return Err(TransferExecutionError::InvalidPlan {
@@ -316,7 +350,10 @@ async fn execute_rsync(
         let args = build_rsync_args(plan, item)?;
         run_rsync(&args, &cancel, completed, item.unwrap_or(".")).await?;
         completed += 1;
-        on_progress(TransferProgress { completed, total });
+        on_progress(TypedTransferProgress::Items {
+            completed: completed as u64,
+            total: Some(total as u64),
+        });
     }
 
     Ok(TransferOutcome { completed, total })
@@ -492,7 +529,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.completed, 2);
-        assert_eq!(progress.last().unwrap().completed, 2);
+        assert_eq!(progress.last().unwrap().completed(), 2);
         assert!(dst.path().join("a.txt").exists());
         assert!(dst.path().join("b.txt").exists());
     }
@@ -720,9 +757,8 @@ mod tests {
 
     // Routing proof for download: registered target resolves; the S3 arm
     // dispatches into download_one, which fails locally (nonexistent destination
-    // parent) before any GetObject network work. The phase is not yet typed by
-    // the provider, so the executor must fail closed instead of guessing that
-    // the whole download is safely replayable.
+    // parent) before any GetObject network work. The typed provider phase proves
+    // no finalization occurred, so the local stage-create failure is retryable.
     #[tokio::test]
     async fn s3_download_arm_dispatches_to_download_core() {
         let registry = ProviderRegistry::new();
@@ -743,7 +779,7 @@ mod tests {
         assert!(matches!(&err, TransferExecutionError::Io { .. }));
         assert_eq!(
             err.retry_disposition(),
-            crate::transfer_queue::RetryDisposition::NeverRetry
+            crate::transfer_queue::RetryDisposition::SafeToRetry
         );
     }
 }

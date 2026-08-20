@@ -8,18 +8,20 @@
 //! - cancellation truth: pre-create => clean Interrupted; post-create =>
 //!   Abort attempted, outcome classified truthfully
 //! - diagnostics are sanitized: no key, credentials, signed query, or auth header
-//! - progress reported as part counts via `TransferProgress`; no 100% before
+//! - progress reported as typed item counts; no 100% before
 //!   Complete success
 //! - post-transfer verification: a SEPARATE HeadObject after PutObject /
 //!   CompleteMultipartUpload asserts the remote size + ETag equal the expected
 //!   values; READ-ONLY on the local file (never rewritten or touched)
 
 use crate::transfer::S3TransferSpec;
-use crate::transfer::executor::TransferProgress;
+use crate::transfer::executor::TransferExecutionError;
 use crate::transfer::integrity::ObjectIntegrity;
 use crate::transfer::s3_multipart::{self};
+use crate::transfer_queue::{RetryDisposition, TypedTransferProgress};
 use crate::vfs::S3ObjectRef;
 use crate::vfs::s3::S3Provider;
+
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::{ByteStream, Length};
@@ -145,7 +147,7 @@ pub(crate) async fn upload_one(
     spec: &S3TransferSpec,
     policy: S3OverwritePolicy,
     cancel: Arc<AtomicBool>,
-    on_progress: &mut impl FnMut(TransferProgress),
+    on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> io::Result<UploadOutcome> {
     // 1. Extract the UploadOne payload.
     let (local_source, destination) = match spec {
@@ -277,7 +279,7 @@ async fn single_put(
     local_source: &std::path::Path,
     destination: S3ObjectRef,
     file_size: u64,
-    on_progress: &mut impl FnMut(TransferProgress),
+    on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> io::Result<UploadOutcome> {
     let body = ByteStream::from_path(local_source).await.map_err(|e| {
         io::Error::other(format!("S3 upload failed to open local source stream: {e}"))
@@ -292,10 +294,6 @@ async fn single_put(
 
     match put {
         Ok(resp) => {
-            on_progress(TransferProgress {
-                completed: 1,
-                total: 1,
-            });
             let put_etag = resp.e_tag().map(|s| s.to_string());
             verify_uploaded_object(
                 provider,
@@ -303,6 +301,10 @@ async fn single_put(
                 ObjectIntegrity::new(file_size, put_etag),
             )
             .await?;
+            on_progress(TypedTransferProgress::Items {
+                completed: 1,
+                total: Some(1),
+            });
             Ok(file_size)
         }
         Err(_) => Err(io::Error::other("S3 PutObject upload failed")),
@@ -325,7 +327,7 @@ async fn multipart_upload(
     client: &aws_sdk_s3::Client,
     cancel: Arc<AtomicBool>,
     provider: &S3Provider,
-    on_progress: &mut impl FnMut(TransferProgress),
+    on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> io::Result<UploadOutcome> {
     let parts = s3_multipart::multipart_parts(&plan);
 
@@ -336,9 +338,9 @@ async fn multipart_upload(
     let part_count = op.plan.part_count as usize;
 
     // Initial progress: 0 parts done.
-    on_progress(TransferProgress {
+    on_progress(TypedTransferProgress::Items {
         completed: 0,
-        total: part_count,
+        total: Some(part_count as u64),
     });
 
     // B. Sequential UploadPart loop (NO concurrency). Each part streams from a
@@ -347,20 +349,22 @@ async fn multipart_upload(
     for part_spec in parts.iter() {
         if cancel.load(Ordering::Relaxed) {
             let outcome = attempt_abort(client, &op).await;
-            return Err(abort_or_recovery(outcome, &op));
+            return Err(io::Error::other(abort_or_recovery(outcome)));
         }
         match upload_one_multipart_part(client, local_source, &mut op, part_spec).await {
             Ok(()) => {
                 let done = op.completed_parts.len();
-                on_progress(TransferProgress {
-                    completed: done,
-                    total: part_count,
-                });
+                if done < part_count {
+                    on_progress(TypedTransferProgress::Items {
+                        completed: done as u64,
+                        total: Some(part_count as u64),
+                    });
+                }
             }
             Err(_) => {
                 // Part failed: stop scheduling further parts, attempt abort.
                 let outcome = attempt_abort(client, &op).await;
-                return Err(abort_or_recovery(outcome, &op));
+                return Err(io::Error::other(abort_or_recovery(outcome)));
             }
         }
     }
@@ -456,7 +460,7 @@ async fn complete_multipart_upload(
     file_size: u64,
     part_count: usize,
     provider: &S3Provider,
-    on_progress: &mut impl FnMut(TransferProgress),
+    on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> io::Result<UploadOutcome> {
     let ordered = op.ordered_parts();
     let mut completed_multipart = aws_sdk_s3::types::CompletedMultipartUpload::builder();
@@ -479,10 +483,6 @@ async fn complete_multipart_upload(
         .await
     {
         Ok(resp) => {
-            on_progress(TransferProgress {
-                completed: part_count,
-                total: part_count,
-            });
             let complete_etag = resp.e_tag().map(|s| s.to_string());
             verify_uploaded_object(
                 provider,
@@ -490,6 +490,10 @@ async fn complete_multipart_upload(
                 ObjectIntegrity::new(file_size, complete_etag),
             )
             .await?;
+            on_progress(TypedTransferProgress::Items {
+                completed: part_count as u64,
+                total: Some(part_count as u64),
+            });
             Ok(file_size)
         }
         Err(_) => {
@@ -577,16 +581,28 @@ async fn attempt_abort(client: &aws_sdk_s3::Client, op: &MultipartOperation) -> 
 /// Map an abort outcome to either a clean Interrupted error (confirmed) or a
 /// truthful RecoveryRequired error (failed/unknown — orphaned data may remain).
 ///
-/// Never reports Failed/Unknown as "cleanly cancelled".
-fn abort_or_recovery(outcome: AbortOutcome, _op: &MultipartOperation) -> io::Error {
-    match outcome {
-        AbortOutcome::Confirmed => io::Error::new(
-            io::ErrorKind::Interrupted,
-            "upload cancelled; multipart upload aborted cleanly",
+/// Never reports Failed/Unknown as "cleanly cancelled". Returns the typed
+/// `TransferExecutionError` directly so the `RecoveryRequired` disposition is
+/// preserved across the boundary (no caller-side re-wrap that would discard it).
+fn abort_or_recovery(outcome: AbortOutcome) -> TransferExecutionError {
+    let (source, disposition) = match outcome {
+        AbortOutcome::Confirmed => (
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "upload cancelled; multipart upload aborted cleanly",
+            ),
+            RetryDisposition::NeverRetry,
         ),
-        AbortOutcome::Failed | AbortOutcome::Unknown => io::Error::other(
-            "S3 multipart upload cancellation could not confirm remote cleanup; orphaned multipart data may remain",
+        AbortOutcome::Failed | AbortOutcome::Unknown => (
+            io::Error::other(
+                "S3 multipart upload cancellation could not confirm remote cleanup; orphaned multipart data may remain",
+            ),
+            RetryDisposition::RecoveryRequired,
         ),
+    };
+    TransferExecutionError::Io {
+        source,
+        disposition,
     }
 }
 
@@ -856,23 +872,7 @@ mod tests {
     fn abort_failure_message_is_truthful() {
         // The factual message for unconfirmed abort is hard-coded in
         // abort_or_recovery — assert it does NOT claim clean cancellation.
-        let err = abort_or_recovery(
-            AbortOutcome::Failed,
-            &MultipartOperation {
-                destination: S3ObjectRef {
-                    target: "t".into(),
-                    bucket: "b".into(),
-                    key: "k".into(),
-                },
-                upload_id: "uid".into(),
-                plan: s3_multipart::MultipartPlan {
-                    object_size: 0,
-                    part_size: 0,
-                    part_count: 0,
-                },
-                completed_parts: Vec::new(),
-            },
-        );
+        let err = abort_or_recovery(AbortOutcome::Failed);
         let msg = err.to_string();
         assert!(
             !msg.contains("cleanly cancelled"),
@@ -885,26 +885,22 @@ mod tests {
 
     #[test]
     fn abort_unknown_is_not_clean_cancellation() {
-        let err = abort_or_recovery(
-            AbortOutcome::Unknown,
-            &MultipartOperation {
-                destination: S3ObjectRef {
-                    target: "t".into(),
-                    bucket: "b".into(),
-                    key: "k".into(),
-                },
-                upload_id: "uid".into(),
-                plan: s3_multipart::MultipartPlan {
-                    object_size: 0,
-                    part_size: 0,
-                    part_count: 0,
-                },
-                completed_parts: Vec::new(),
-            },
-        );
+        let err = abort_or_recovery(AbortOutcome::Unknown);
         let msg = err.to_string();
         assert!(!msg.contains("cleanly cancelled"));
         assert!(msg.contains("orphaned multipart data may remain"));
+    }
+
+    #[test]
+    fn abort_cleanup_failure_is_recovery_required() {
+        assert_eq!(
+            abort_or_recovery(AbortOutcome::Failed).retry_disposition(),
+            RetryDisposition::RecoveryRequired
+        );
+        assert_eq!(
+            abort_or_recovery(AbortOutcome::Unknown).retry_disposition(),
+            RetryDisposition::RecoveryRequired
+        );
     }
 
     // ── 16. Complete failure never claims Completed ────────────────────────
@@ -1387,6 +1383,7 @@ mod physical_acceptance {
             &provider,
             &down_spec,
             Arc::new(AtomicBool::new(false)),
+            &mut |_| {},
         )
         .await
         .expect("download must succeed");

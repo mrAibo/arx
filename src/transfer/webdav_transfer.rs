@@ -9,7 +9,8 @@
 //! - cancellation truth: staged file removed, never a partial final path
 //! - no overwrite of an existing final path without a frozen policy
 
-use crate::transfer::{TransferProgress, WebDavTransferSpec};
+use crate::transfer::WebDavTransferSpec;
+use crate::transfer_queue::TypedTransferProgress;
 use crate::vfs::webdav::WebDavProvider;
 use std::io;
 use std::sync::Arc;
@@ -37,7 +38,7 @@ pub(crate) async fn upload_one(
     spec: &WebDavTransferSpec,
     overwrite: WebDavOverwritePolicy,
     cancel: Arc<AtomicBool>,
-    on_progress: &mut impl FnMut(TransferProgress),
+    on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> io::Result<UploadOutcome> {
     if cancel.load(Ordering::Relaxed) {
         return Err(io::Error::new(
@@ -73,9 +74,9 @@ pub(crate) async fn upload_one(
         .put_with_policy(&destination.href, &data, overwrite)
         .await?;
 
-    on_progress(TransferProgress {
-        completed: total,
-        total,
+    on_progress(TypedTransferProgress::Bytes {
+        completed: total as u64,
+        total: Some(total as u64),
     });
 
     Ok(total as u64)
@@ -88,6 +89,7 @@ pub(crate) async fn download_one(
     spec: &WebDavTransferSpec,
     overwrite: WebDavOverwritePolicy,
     cancel: Arc<AtomicBool>,
+    on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> io::Result<DownloadOutcome> {
     // 1. Extract download spec
     let (source, local_destination) = match spec {
@@ -135,7 +137,15 @@ pub(crate) async fn download_one(
         // that fact instead of reconstructing it later from best-effort metadata.
         let max_bytes: usize = 16 * 1024 * 1024 * 1024;
         let written = provider
-            .get_stream(&source.href, max_bytes, &mut temp_file, Some(&cancel))
+            .get_stream(
+                &source.href,
+                max_bytes,
+                &mut temp_file,
+                Some(&cancel),
+                |completed, total| {
+                    on_progress(stream_progress(completed, total));
+                },
+            )
             .await?;
         temp_file.flush().await?;
         temp_file.sync_all().await?;
@@ -180,6 +190,37 @@ pub(crate) async fn download_one(
     }
 
     Ok(written)
+}
+
+fn stream_progress(completed: u64, total: Option<u64>) -> TypedTransferProgress {
+    TypedTransferProgress::Bytes { completed, total }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn missing_content_length_stays_unknown() {
+        assert_eq!(
+            stream_progress(7, None),
+            TypedTransferProgress::Bytes {
+                completed: 7,
+                total: None,
+            }
+        );
+    }
+
+    #[test]
+    fn streamed_terminal_bytes_are_exact() {
+        assert_eq!(
+            stream_progress(19, Some(19)),
+            TypedTransferProgress::Bytes {
+                completed: 19,
+                total: Some(19),
+            }
+        );
+    }
 }
 
 #[cfg(test)]

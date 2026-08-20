@@ -20,8 +20,9 @@
 
 mod s3_acceptance;
 
-use arx::transfer::executor::{TransferProgress, execute_transfer};
+use arx::transfer::executor::execute_transfer;
 use arx::transfer::{S3TransferSpec, TransferIntent, TransferMethod, TransferPlan};
+use arx::transfer_queue::TypedTransferProgress;
 use arx::vfs::{
     ListedEntry, Location, ProviderContinuation, ProviderListingPage, ProviderRegistry, S3ObjectRef,
 };
@@ -483,8 +484,8 @@ async fn aws_multipart_cancel_after_first_part_aborts() {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_hook = cancel.clone();
     // deterministic: once >=1 part completed, raise cancellation before the next part.
-    let on_progress = move |p: TransferProgress| {
-        if p.completed >= 1 {
+    let on_progress = move |p: TypedTransferProgress| {
+        if p.completed() >= 1 {
             cancel_hook.store(true, Ordering::Relaxed);
         }
     };
