@@ -1,6 +1,6 @@
 # ARX
 
-Terminal commander for local ↔ remote workspaces.
+Terminal commander for local ↔ remote workspaces on Linux.
 
 ![ARX Remote Workspace — Compare, Preview, Sync, Verify](docs/assets/remote-workspace-update.gif)
 
@@ -20,8 +20,9 @@ Verify the real result.
   size before execution.
 - **Safe default.** Update mode preserves destination-only entries.
   Mirror is distinct and requires explicit confirmation.
-- **Truthful background jobs.** Queued, running, cancelling, cancelled,
-  failed, completed, and verification remain separate states.
+- **Truthful background jobs.** Queued, running, pause-pending, paused,
+  cancelling, cancelled, retry-waiting, failed, completed, and verification
+  remain separate states.
 - **Verification after execution.** A completed job does not automatically
   mean the two roots are synchronized. ARX rescans both and reports
   `Synchronized`, `DifferencesRemain`, or `Inconclusive`.
@@ -30,6 +31,12 @@ Verify the real result.
 
 Current Remote Workspace execution supports local → local, local → SFTP,
 and SFTP → local. SFTP → SFTP synchronization is intentionally blocked.
+
+## Platform support
+
+ARX is intentionally a **Linux application**. The published binary target is
+Linux x86_64. Native Windows support is not planned; the project stays focused
+on Linux terminal workflows instead of broadening the platform surface.
 
 ## Quick start
 
@@ -51,8 +58,8 @@ Download the archive and SHA256SUMS from the [latest GitHub Release](https://git
 sha256sum -c SHA256SUMS
 
 # Extract
-tar xzf arx-v0.18.0-x86_64-unknown-linux-gnu.tar.gz
-cd arx-v0.18.0-x86_64-unknown-linux-gnu
+tar xzf arx-v0.19.0-x86_64-unknown-linux-gnu.tar.gz
+cd arx-v0.19.0-x86_64-unknown-linux-gnu
 
 # Place on PATH
 sudo install -m 755 arx /usr/local/bin/arx
@@ -135,7 +142,8 @@ of truth.
 | Ctrl+P | Command Center — fuzzy search hosts, bookmarks, history, quick actions |
 | F9 | Remote Hosts |
 | Ctrl+B | Bookmarks |
-| Ctrl+J | Job queue with progress |
+| Ctrl+J | Job queue with progress and transfer Pause/Resume/Cancel |
+| Ctrl+Y | Transfer Center — active transfer queue and truthful progress |
 | Ctrl+O | Drop to subshell |
 | Ctrl+R | Refresh panes |
 | : | Run shell command |
@@ -165,7 +173,14 @@ of truth.
 [ui]
 show_hidden = false
 editor = "hx"       # overrides $EDITOR/$VISUAL
+
+[transfer]
+concurrency = 2      # default 2; valid range 1..=8
 ```
+
+Transfer concurrency bounds simultaneous transfer jobs. Invalid values are rejected
+by configuration validation; the scheduler and configuration layer share the same
+bounds.
 
 ### `~/.config/arx/hosts.toml`
 
@@ -199,6 +214,7 @@ Menu entries appear in Command Center (Ctrl+P).
 | Local + SFTP + archive browsing | ✅ |
 | Remote Workspace — compare → preview → execute → verify | ✅ |
 | Transfer planner — native / rsync / SFTP streaming | ✅ |
+| Transfer Queue — bounded FIFO, default N=2 (1..=8), progress/rate/ETA, Pause/Resume/Cancel, safe retry ≤3 total attempts | ✅ |
 | Transactional SFTP copy with rollback | ✅ |
 | SFTP F3 bounded text preview | ✅ |
 | SFTP F4 conflict-safe text editing | ✅ |
@@ -220,6 +236,20 @@ Menu entries appear in Command Center (Ctrl+P).
 | S3 object-storage backend | ✅ AWS + MinIO PHYSICAL PASS (SUPPORTED MVP); Moto EMULATED PASS; R2/Wasabi UNVERIFIED (best-effort) |
 | WebDAV backend | ✅ **SUPPORTED MVP** — Apache mod_dav PHYSICAL PASS (W1–W18); Basic auth only; Nextcloud/ownCloud UNVERIFIED |
 
+## Transfer Queue
+
+Copy/Move work on supported transfer paths runs through one persistent bounded FIFO
+runtime instead of creating a second lifecycle. The default concurrency is 2 and can
+be configured from 1 through 8. The status bar and Transfer Center report the primary
+running transfer's percentage, byte rate, and ETA only when those facts are known;
+an unknown total is never rendered as zero.
+
+Pause/Resume is cooperative and resumes the same JobId/execution attempt at a safe
+checkpoint. Cancel affects the selected transfer without cancelling unrelated work.
+Automatic retry is bounded to at most 3 total attempts and is allowed only for errors
+classified `SafeToRetry`; ambiguous remote mutations and recovery-required outcomes
+are never blindly replayed.
+
 ## S3 object storage
 
 Real AWS S3 and MinIO are physically accepted (20/20 physical tests against AWS account
@@ -235,9 +265,10 @@ Wasabi are **unverified — best-effort only, not claimed supported.**
 
 ## WebDAV backend
 
-Production `VfsProvider` over `reqwest` + `quick-xml`. The v0.18.0 MVP uses real DAV
-semantics, authoritative raw-href identity, bounded parsing/preview, no plaintext
-password in config, and no blind retry of ambiguous mutations.
+Production `VfsProvider` over `reqwest` + `quick-xml`. The WebDAV MVP introduced in
+v0.18.0 uses real DAV semantics, authoritative raw-href identity, bounded
+parsing/preview, no plaintext password in config, and no blind retry of ambiguous
+mutations.
 
 Physical support status:
 
@@ -339,7 +370,8 @@ disabled; WebDAV F4 is likewise intentionally unsupported in the MVP.
 **Transfer Stack:** `TransferPlanner` builds a frozen plan from a
 `TransferRequest`. The planner picks native, rsync, SFTP streaming, S3, or WebDAV
 execution according to the source/destination pair and capabilities. No plan mutates
-after dispatch.
+after dispatch. A persistent Transfer Queue schedules supported plans in the
+background; it does not create new provider combinations.
 
 **SFTP:** Connection pooling per host. Ambiguous transport failures
 invalidate the session; definitive protocol errors don't. SFTP copies
@@ -348,7 +380,8 @@ use transactional staging (temp → backup → commit → rollback).
 **Safety:** SFTP copies stage to temp first. Destructive sync requires
 Preview. Cancel leaves source untouched. Host key verification uses the
 user's OpenSSH. WebDAV overwrite-forbid is atomic at the HTTP/file-finalization
-boundaries. Logs don't leak credentials.
+boundaries. Transfer retries are phase-aware and never blindly replay ambiguous
+mutations. Logs don't leak credentials.
 
 ## Development
 
