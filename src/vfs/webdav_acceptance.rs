@@ -589,11 +589,11 @@ async fn physical_w1_through_w18() {
     )
     .unwrap();
     let proxy_arc = Arc::new(proxy_provider);
-    let proxy_reg = registry_with(&proxy_arc);
-    let proxy_target_id = proxy_arc.target().id.clone();
 
-    // Seed remote with OLD bytes directly on Apache (bypass proxy).
-    let ov = format!("/{}-w15.txt", run);
+    // Seed remote with bytes directly on Apache (bypass proxy), then prove
+    // the overwrite policy at the PUT itself via the proxy.
+    let ov = format!("/{}-w15-new.txt", run);
+    let ov_name = ov.trim_start_matches('/');
     p_arc
         .write_file_bytes_if_unchanged(
             &ov,
@@ -605,55 +605,20 @@ async fn physical_w1_through_w18() {
         .await
         .expect("W15: seed OLD on Apache");
 
-    // Local NEW file (basename must match the upload entry name).
-    let ov_local = std::env::temp_dir().join(format!("{}-w15-new.txt", run));
-    std::fs::write(&ov_local, b"NEW").expect("W15: write local NEW");
+    // First PUT via proxy (Forbid on a fresh name: succeeds -> PUT #1).
+    proxy_arc
+        .put_with_policy(&ov, b"NEW", crate::transfer::WebDavOverwritePolicy::Forbid)
+        .await
+        .expect("W15: first PUT via proxy");
 
-    let ov_name = ov.trim_start_matches('/');
-    let ov_src = Location::Local(ov_local.parent().unwrap().to_path_buf());
-
-    // First upload: must succeed (Apache has OLD, but If-None-Match:* only
-    // rejects an existing resource AT THE SAME URL; we put a fresh name path so
-    // use a distinct destination to prove the precondition is sent).
-    let ov_dst2 = Location::WebDav {
-        target: proxy_target_id.clone(),
-        path: format!("/{}-w15-new.txt", run),
-    };
-    let ov_name2 = format!("{}-w15-new.txt", run);
-    let ov_loc_entry2 = ListedEntry {
-        entry: crate::vfs::Entry {
-            name: ov_name2.clone(),
-            kind: EntryKind::File,
-            size: Some(ov_local.metadata().unwrap().len()),
-            modified_unix_ms: None,
-        },
-        identity: EntryIdentity::Other,
-    };
-    run_f5(
-        &proxy_reg,
-        ov_src.clone(),
-        ov_dst2.clone(),
-        None,
-        Some(&ov_loc_entry2),
-        &ov_name2,
-    )
-    .await
-    .expect("W15: first upload via proxy");
-
-    // Second upload to the SAME proxy URL with Forbid => If-None-Match:* => 412.
-    let conflict = run_f5(
-        &proxy_reg,
-        ov_src,
-        ov_dst2.clone(),
-        None,
-        Some(&ov_loc_entry2),
-        &ov_name2,
-    )
-    .await;
+    // Second PUT to the SAME url with Forbid => If-None-Match:* => 412.
+    let conflict = proxy_arc
+        .put_with_policy(&ov, b"NEW2", crate::transfer::WebDavOverwritePolicy::Forbid)
+        .await;
     assert!(conflict.is_err(), "W15: overwrite conflict rejected");
 
-    // Prove: exactly 1 PUT for the first, 1 for the second (no retry after
-    // failure), and If-None-Match:* was present on the (rejected) PUT.
+    // Prove: exactly 2 PUTs (no blind replay after 412), If-None-Match:*
+    // observed on the rejected PUT, and remote still holds OLD (no overwrite).
     let rec = proxy.record.lock().await;
     assert_eq!(rec.put_count, 2, "W15: PUT count == 2 (no blind replay)");
     assert!(
@@ -666,8 +631,6 @@ async fn physical_w1_through_w18() {
     let remote_after = p_arc.read_all_capped(&ov, 64).await.expect("W15: read OLD");
     assert_eq!(remote_after.bytes, b"OLD", "W15: remote OLD unchanged");
     let _ = p_arc.remove_file(&ov).await;
-    let _ = p_arc.remove_file(&format!("/{}-w15-new.txt", run)).await;
-    let _ = std::fs::remove_file(&ov_local);
 
     // W16: real Apache LOCK -> 423 on ARX mutation without token.
     // Test-only LOCK/UNLOCK directly against Apache with fixture creds.
