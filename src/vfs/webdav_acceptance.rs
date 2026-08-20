@@ -189,7 +189,6 @@ async fn physical_w1_through_w18() {
     let local_parent = local_path.parent().unwrap().to_path_buf();
     let dl_name = format!("{}-dl.txt", run);
     let dl_path = std::env::temp_dir().join(&dl_name);
-    let dl_parent = dl_path.parent().unwrap().to_path_buf();
 
     // W1: PRODUCTION resolver chain (ArxConfig/WebDavTargetConfig ->
     // register_webdav_targets -> keyring/env secret resolver ->
@@ -352,6 +351,8 @@ async fn physical_w1_through_w18() {
     );
 
     // W8: WebDAV -> Local via REAL TUI F5 path, keeping exact href.
+    // Dedicated download dir so it never collides with W7's source file.
+    let w8_dir = tempfile::tempdir().expect("W8: dest dir");
     let w8_page = p_arc
         .list_page(
             &Location::WebDav {
@@ -374,7 +375,7 @@ async fn physical_w1_through_w18() {
     run_f5(
         &registry,
         webdav_dst.clone(),
-        Location::Local(dl_parent.clone()),
+        Location::Local(w8_dir.path().to_path_buf()),
         Some(&ListedEntry {
             entry: crate::vfs::Entry {
                 name: local_name.clone(),
@@ -391,7 +392,8 @@ async fn physical_w1_through_w18() {
     .expect("W8: WebDAV -> Local F5");
     // The download uses the listing display name for the local file (per spec),
     // which is `local_name`; read that path, not the dl_name alias.
-    let dl_bytes = std::fs::read(dl_parent.join(&local_name)).expect("W8: read downloaded file");
+    let dl_bytes =
+        std::fs::read(w8_dir.path().join(&local_name)).expect("W8: read downloaded file");
     assert_eq!(
         dl_bytes, b"local-source-bytes",
         "W8: download content preserved"
