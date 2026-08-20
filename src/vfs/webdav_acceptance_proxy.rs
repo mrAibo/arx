@@ -6,11 +6,11 @@
 //!
 //! Modes:
 //!   PassThroughRecord — forward everything, record method counts + headers.
-//!   DropGetBody       — forward the REAL Apache response, then truncate the
-//!                       body mid-stream (real Apache status + partial body).
-//!   AmbiguousPut      — forward complete PUT, read Apache's full response
-//!                       (confirm server committed), then discard it and close
-//!                       the ARX side (ambiguous: server may have applied it).
+//!   DropGetBody       — forward the REAL Apache response head + only part of
+//!                       its real body, then close before Content-Length bytes.
+//!   AmbiguousPut      — forward the complete PUT by Content-Length, observe
+//!                       Apache's response head (confirm server completed), then
+//!                       discard it and close the ARX side.
 //!
 //! ponytail: test infra only, compiled under `physical-webdav`. Not a product.
 
@@ -34,7 +34,7 @@ pub struct ProxyRecord {
     pub head_count: usize,
     pub propfind_count: usize,
     pub seen_if_none_match: bool,
-    /// W18: proxy observed Apache's response for the PUT (server committed).
+    /// W18: proxy observed a complete Apache response head for the PUT.
     pub apache_response_seen: bool,
 }
 
@@ -97,6 +97,25 @@ pub async fn start_proxy(upstream_url: &str, mode: ProxyMode) -> std::io::Result
     })
 }
 
+fn header_end(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+}
+
+fn content_length(headers: &[u8]) -> Option<usize> {
+    let text = String::from_utf8_lossy(headers);
+    text.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("Content-Length") {
+            value.trim().parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
 async fn handle_conn(
     mut client: TcpStream,
     upstream_host: String,
@@ -105,10 +124,12 @@ async fn handle_conn(
     mode: ProxyMode,
     rec: Arc<Mutex<ProxyRecord>>,
 ) {
-    // Read the request line + headers (bounded).
+    // Read the request line + headers (bounded). The final read may also contain
+    // some request-body bytes; `request_head_end` lets fault modes account for
+    // those bytes exactly instead of waiting for a keep-alive EOF.
     let mut buf = vec![0u8; 64 * 1024];
     let mut filled = 0usize;
-    loop {
+    let request_head_end = loop {
         if filled >= buf.len() {
             return;
         }
@@ -117,17 +138,18 @@ async fn handle_conn(
             _ => return,
         };
         filled += n;
-        if buf[..filled].windows(4).any(|w| &w[..4] == b"\r\n\r\n") {
-            break;
+        if let Some(end) = header_end(&buf[..filled]) {
+            break end;
         }
-    }
-    let header_text = String::from_utf8_lossy(&buf[..filled]);
+    };
+    let header_text = String::from_utf8_lossy(&buf[..request_head_end]);
     let first_line = header_text.lines().next().unwrap_or("");
     let method = first_line
         .split_whitespace()
         .next()
         .unwrap_or("")
         .to_ascii_uppercase();
+    let request_content_length = content_length(&buf[..request_head_end]);
     let mut seen_inm = false;
     for line in header_text.lines().skip(1) {
         let (k, _v) = match line.split_once(':') {
@@ -167,7 +189,8 @@ async fn handle_conn(
         Err(_) => return,
     };
 
-    // Forward the captured request head.
+    // Forward everything already captured (headers plus any body bytes that
+    // arrived in the same read).
     if upstream.write_all(&buf[..filled]).await.is_err() {
         return;
     }
@@ -178,37 +201,49 @@ async fn handle_conn(
         }
         ProxyMode::DropGetBody => {
             if method == "GET" {
-                // Forward the REAL Apache response, then truncate mid-body.
-                // Read response head + first body chunk from Apache...
+                // Read through the REAL Apache response header. The read that
+                // finds CRLFCRLF may already contain the whole short body, so we
+                // deliberately forward only < Content-Length bytes from it.
                 let mut resp = vec![0u8; 64 * 1024];
                 let mut got = 0usize;
-                loop {
+                let response_head_end = loop {
                     if got >= resp.len() {
-                        break;
+                        return;
                     }
-                    match upstream.read(&mut resp[got..]).await {
-                        Ok(n) if n > 0 => {
-                            got += n;
-                            // Stop once we have the head and a little body.
-                            if resp[..got].windows(4).any(|w| &w[..4] == b"\r\n\r\n") {
-                                // Read a bit more real body, then truncate.
-                                let mut tail = [0u8; 64];
-                                match upstream.read(&mut tail).await {
-                                    Ok(b) if b > 0 => {
-                                        resp.extend_from_slice(&tail[..b]);
-                                        got += b;
-                                    }
-                                    _ => {}
-                                }
-                                break;
-                            }
-                        }
+                    let n = match upstream.read(&mut resp[got..]).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    got += n;
+                    if let Some(end) = header_end(&resp[..got]) {
+                        break end;
+                    }
+                };
+
+                let declared = match content_length(&resp[..response_head_end]) {
+                    Some(n) if n > 0 => n,
+                    _ => return,
+                };
+                let partial_target = declared.saturating_sub(1).min(8);
+                let captured_body = got.saturating_sub(response_head_end);
+                let mut partial_body = resp
+                    [response_head_end..response_head_end + captured_body.min(partial_target)]
+                    .to_vec();
+
+                while partial_body.len() < partial_target {
+                    let need = partial_target - partial_body.len();
+                    let mut tail = [0u8; 64];
+                    let want = need.min(tail.len());
+                    match upstream.read(&mut tail[..want]).await {
+                        Ok(n) if n > 0 => partial_body.extend_from_slice(&tail[..n]),
                         _ => break,
                     }
                 }
-                // ...forward the real Apache head+partial body to ARX...
-                let _ = client.write_all(&resp[..got]).await;
-                // ...then abruptly close ARX side before the body completes.
+
+                // Preserve Apache's real status and headers, including its
+                // original Content-Length, but deliver fewer real body bytes.
+                let _ = client.write_all(&resp[..response_head_end]).await;
+                let _ = client.write_all(&partial_body).await;
                 let _ = client.shutdown().await;
             } else {
                 pipe(&mut client, &mut upstream).await;
@@ -216,25 +251,53 @@ async fn handle_conn(
         }
         ProxyMode::AmbiguousPut => {
             if method == "PUT" {
-                // Forward complete PUT body until client EOF (full request sent).
-                let _ = tokio::io::copy(&mut client, &mut upstream).await;
-                // Read Apache's FULL response to confirm the backend committed
-                // the mutation. Do NOT forward it to ARX.
-                let mut sink = vec![0u8; 64 * 1024];
-                let mut total = 0usize;
-                loop {
-                    match upstream.read(&mut sink).await {
-                        Ok(n) if n > 0 => {
-                            total += n;
-                            if total > sink.len() {
-                                // already proved a response arrived
-                                break;
-                            }
-                        }
-                        _ => break,
-                    }
+                // reqwest sends this Vec-backed PUT with Content-Length. Forward
+                // exactly the remaining declared bytes; do not wait for EOF on
+                // the keep-alive client connection.
+                let declared = match request_content_length {
+                    Some(n) => n,
+                    None => return,
+                };
+                let captured_body = filled.saturating_sub(request_head_end);
+                if captured_body > declared {
+                    return;
                 }
-                if total > 0 {
+                let mut remaining = declared - captured_body;
+                let mut body_buf = [0u8; 16 * 1024];
+                while remaining > 0 {
+                    let want = remaining.min(body_buf.len());
+                    let n = match client.read(&mut body_buf[..want]).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    if upstream.write_all(&body_buf[..n]).await.is_err() {
+                        return;
+                    }
+                    remaining -= n;
+                }
+                if upstream.flush().await.is_err() {
+                    return;
+                }
+
+                // Receiving a complete Apache response head proves the server
+                // finished processing the PUT. Intentionally discard it so ARX
+                // cannot know whether the mutation committed.
+                let mut response = vec![0u8; 64 * 1024];
+                let mut response_len = 0usize;
+                let saw_response_head = loop {
+                    if response_len >= response.len() {
+                        break false;
+                    }
+                    let n = match upstream.read(&mut response[response_len..]).await {
+                        Ok(n) if n > 0 => n,
+                        _ => break false,
+                    };
+                    response_len += n;
+                    if header_end(&response[..response_len]).is_some() {
+                        break true;
+                    }
+                };
+                if saw_response_head {
                     let mut r = rec.lock().await;
                     r.apache_response_seen = true;
                 }
