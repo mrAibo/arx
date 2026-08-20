@@ -359,6 +359,7 @@ impl Job {
             JobStatus::Running => "⚡",
             JobStatus::Cancelling => "⏹",
             JobStatus::Paused => "⏸",
+            JobStatus::RetryWaiting => "⟳",
             JobStatus::Completed => "✅",
             JobStatus::Failed => "❌",
             JobStatus::Cancelled => "🚫",
@@ -427,6 +428,9 @@ pub enum JobStatus {
     Running,
     Cancelling,
     Paused,
+    /// Waiting out bounded backoff before a safe (read-side / staged) retry.
+    /// Truthful: not Running, not terminal, not Paused.
+    RetryWaiting,
     Completed,
     Failed,
     Cancelled,
@@ -446,6 +450,11 @@ pub enum JobEvent {
     Progress {
         id: String,
         progress: JobProgress,
+    },
+    /// Waiting out bounded retry backoff for a safe (read-side / staged)
+    /// retry. Truthful: not Running, not Paused, not terminal.
+    RetryWaiting {
+        id: String,
     },
     Completed {
         id: String,
@@ -470,6 +479,7 @@ impl JobEvent {
         match self {
             Self::Running { id }
             | Self::Progress { id, .. }
+            | Self::RetryWaiting { id }
             | Self::Completed { id, .. }
             | Self::Failed { id, .. }
             | Self::Paused { id }
@@ -548,7 +558,7 @@ impl JobManager {
         job.cancel.store(true, Ordering::Relaxed);
         if matches!(
             job.status,
-            JobStatus::Pending | JobStatus::Running | JobStatus::Paused
+            JobStatus::Pending | JobStatus::Running | JobStatus::Paused | JobStatus::RetryWaiting
         ) {
             job.status = JobStatus::Cancelling;
         }
@@ -580,7 +590,7 @@ impl JobManager {
 
         match event {
             JobEvent::Running { .. } => {
-                if job.status == JobStatus::Pending {
+                if job.status == JobStatus::Pending || job.status == JobStatus::RetryWaiting {
                     job.status = JobStatus::Running;
                     true
                 } else {
@@ -590,8 +600,19 @@ impl JobManager {
                     job.status == JobStatus::Cancelling
                 }
             }
+            JobEvent::RetryWaiting { .. } => {
+                if job.status == JobStatus::Running {
+                    job.status = JobStatus::RetryWaiting;
+                    true
+                } else {
+                    false
+                }
+            }
             JobEvent::Progress { progress, .. } => {
-                if matches!(job.status, JobStatus::Running | JobStatus::Cancelling) {
+                if matches!(
+                    job.status,
+                    JobStatus::Running | JobStatus::Cancelling | JobStatus::RetryWaiting
+                ) {
                     job.progress = progress.clone();
                     true
                 } else {

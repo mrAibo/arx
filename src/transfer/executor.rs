@@ -40,8 +40,72 @@ pub enum TransferExecutionError {
     RsyncFailed { item: String, code: Option<i32> },
     #[error("transfer worker failed: {0}")]
     Worker(String),
-    #[error(transparent)]
-    Io(#[from] io::Error),
+    #[error("transfer I/O failed: {source}")]
+    Io {
+        #[source]
+        source: io::Error,
+        /// Explicit mutation-certainty classification. The executor attaches
+        /// this at the operation boundary; a raw `?` from a provider defaults
+        /// to `NeverRetry` so we never silently replay an ambiguous mutation.
+        disposition: crate::transfer_queue::RetryDisposition,
+    },
+}
+
+impl TransferExecutionError {
+    /// A remote write/commit whose outcome may already be partially applied on
+    /// the server. Never auto-replayed: exactly one attempt.
+    pub fn ambiguous(source: io::Error) -> Self {
+        Self::Io {
+            source,
+            disposition: crate::transfer_queue::RetryDisposition::AmbiguousMutation,
+        }
+    }
+
+    /// A read-side or staged-local failure where no remote mutation was
+    /// committed (or a local staged destination was not finalized). Safe to
+    /// replay because restart is idempotent at the local boundary.
+    pub fn safe_to_retry(source: io::Error) -> Self {
+        Self::Io {
+            source,
+            disposition: crate::transfer_queue::RetryDisposition::SafeToRetry,
+        }
+    }
+
+    /// Mutation-certainty classification consumed by the queue runtime.
+    pub fn retry_disposition(&self) -> crate::transfer_queue::RetryDisposition {
+        match self {
+            // Cancelled is terminal; do not retry under any policy.
+            Self::Cancelled { .. } => crate::transfer_queue::RetryDisposition::NeverRetry,
+            Self::InvalidPlan { .. } => crate::transfer_queue::RetryDisposition::NeverRetry,
+            Self::RsyncFailed { .. } => crate::transfer_queue::RetryDisposition::NeverRetry,
+            Self::Worker(_) => crate::transfer_queue::RetryDisposition::NeverRetry,
+            Self::Io { disposition, .. } => *disposition,
+        }
+    }
+
+    /// Remap the mutation-certainty disposition of an already-built error
+    /// (used at operation boundaries where the caller knows the phase).
+    pub fn with_disposition(
+        mut self,
+        disposition: crate::transfer_queue::RetryDisposition,
+    ) -> Self {
+        if let Self::Io {
+            disposition: slot, ..
+        } = &mut self
+        {
+            *slot = disposition;
+        }
+        self
+    }
+}
+
+impl From<io::Error> for TransferExecutionError {
+    fn from(source: io::Error) -> Self {
+        Self::Io {
+            source,
+            disposition: crate::transfer_queue::RetryDisposition::NeverRetry,
+        }
+    }
 }
 
 /// Execute a previously validated transfer plan without blocking the async TUI.
@@ -60,7 +124,17 @@ pub async fn execute_transfer(
         TransferMethod::Native => execute_native(plan, names, cancel, &mut on_progress).await,
         TransferMethod::Rsync => execute_rsync(plan, names, cancel, &mut on_progress).await,
         TransferMethod::Sftp => {
-            sftp_copy::execute_sftp_copy(plan, names, cancel, &mut on_progress).await
+            // ponytail: Copy reads remote data (safe to replay locally); Move
+            // performs a remote rename/commit whose outcome may be partially
+            // applied, so its failure is ambiguous and never auto-replayed.
+            let disposition = if plan.intent == TransferIntent::Move {
+                crate::transfer_queue::RetryDisposition::AmbiguousMutation
+            } else {
+                crate::transfer_queue::RetryDisposition::SafeToRetry
+            };
+            sftp_copy::execute_sftp_copy(plan, names, cancel, &mut on_progress)
+                .await
+                .map_err(|e| e.with_disposition(disposition))
         }
         TransferMethod::Scp => Err(TransferExecutionError::InvalidPlan {
             method: plan.method,
@@ -95,12 +169,12 @@ pub async fn execute_transfer(
                         &mut on_progress,
                     )
                     .await
-                    .map_err(TransferExecutionError::Io)?;
+                    .map_err(TransferExecutionError::ambiguous)?;
                 }
                 S3TransferSpec::DownloadOne { .. } => {
                     s3_download::download_one(&provider, spec, cancel.clone())
                         .await
-                        .map_err(TransferExecutionError::Io)?;
+                        .map_err(TransferExecutionError::safe_to_retry)?;
                 }
             }
             Ok(TransferOutcome {
@@ -133,7 +207,7 @@ pub async fn execute_transfer(
                         &mut on_progress,
                     )
                     .await
-                    .map_err(TransferExecutionError::Io)?;
+                    .map_err(TransferExecutionError::ambiguous)?;
                 }
                 WebDavTransferSpec::DownloadOne { .. } => {
                     webdav_download_one(
@@ -143,7 +217,7 @@ pub async fn execute_transfer(
                         cancel.clone(),
                     )
                     .await
-                    .map_err(TransferExecutionError::Io)?;
+                    .map_err(TransferExecutionError::safe_to_retry)?;
                 }
             }
             Ok(TransferOutcome {
@@ -635,7 +709,7 @@ mod tests {
         let err = execute_transfer(&plan, &[], &registry, cancel, |_| {})
             .await
             .unwrap_err();
-        assert!(matches!(err, TransferExecutionError::Io(_)));
+        assert!(matches!(err, TransferExecutionError::Io { .. }));
     }
 
     // Routing proof for download: registered target resolves; the S3 arm
@@ -658,6 +732,6 @@ mod tests {
         let err = execute_transfer(&plan, &[], &registry, cancel, |_| {})
             .await
             .unwrap_err();
-        assert!(matches!(err, TransferExecutionError::Io(_)));
+        assert!(matches!(err, TransferExecutionError::Io { .. }));
     }
 }

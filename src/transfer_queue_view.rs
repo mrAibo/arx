@@ -28,6 +28,7 @@ pub fn transfer_job_counts(jobs: &[Job]) -> TransferJobCounts {
             JobStatus::Running => counts.running += 1,
             JobStatus::Paused => counts.paused += 1,
             JobStatus::Cancelling => counts.cancelling += 1,
+            JobStatus::RetryWaiting => counts.queued += 1,
             JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled => {}
         }
     }

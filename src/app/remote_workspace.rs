@@ -328,6 +328,9 @@ impl RemoteWorkspaceState {
             JobStatus::Paused => WorkspaceSyncUxState::Running {
                 job_id: job.id.clone(),
             },
+            JobStatus::RetryWaiting => WorkspaceSyncUxState::Running {
+                job_id: job.id.clone(),
+            },
             JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled => {
                 let needs_verification = match &job.result {
                     Some(JobResult::WorkspaceSync(outcome)) => outcome.needs_verification(),

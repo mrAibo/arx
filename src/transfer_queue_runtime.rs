@@ -17,9 +17,10 @@ use crate::jobs::{JobEvent, JobKind, JobManager, JobProgress, JobResult, Progres
 use crate::transfer::executor::{TransferExecutionError, TransferProgress, execute_transfer};
 use crate::transfer::{TransferMethod, TransferPlan};
 use crate::transfer_queue::{
-    CancelAction, QueueError, RetryDisposition, TransferQueueConfig, TransferQueueCore,
-    TransferRateEstimator,
+    CancelAction, QueueError, RetryDecision, RetryDisposition, SchedulerState, TransferQueueConfig,
+    TransferQueueCore, TransferRateEstimator,
 };
+use crate::transfer_retry;
 use crate::vfs::ProviderRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,34 +222,128 @@ impl TransferQueueRuntime {
                     },
                 );
             }
-            Err(TransferExecutionError::Io(error))
-                if error.kind() == std::io::ErrorKind::Interrupted
-                    && cancel.load(Ordering::Acquire) =>
-            {
-                self.finish_scheduler(&job_id);
-                let _ = self.manager.publish_event(
-                    &self.events,
-                    JobEvent::Cancelled {
-                        id: job_id,
-                        result: JobResult::generic_message("transfer cancelled"),
-                    },
-                );
+            Err(TransferExecutionError::Io {
+                source: error,
+                disposition,
+            }) => {
+                if error.kind() == std::io::ErrorKind::Interrupted && cancel.load(Ordering::Acquire)
+                {
+                    self.finish_scheduler(&job_id);
+                    let _ = self.manager.publish_event(
+                        &self.events,
+                        JobEvent::Cancelled {
+                            id: job_id,
+                            result: JobResult::generic_message("transfer cancelled"),
+                        },
+                    );
+                } else {
+                    self.classify_failure(&job_id, disposition, &error);
+                }
             }
             Err(error) => {
-                // Current TransferExecutionError does not yet prove whether a
-                // remote mutation was dispatched. Fail closed: exactly one
-                // attempt until providers expose typed retry disposition.
-                self.fail_scheduler(&job_id, RetryDisposition::NeverRetry);
+                // Fail closed on every other error kind. The executor attaches
+                // a typed disposition where it knows mutation certainty; a
+                // default error is never auto-replayed.
+                let disposition = error.retry_disposition();
+                self.classify_failure(&job_id, disposition, &error);
+            }
+        }
+    }
+
+    /// Truthfully terminalize or safely retry a failed attempt.
+    ///
+    /// `SafeToRetry` (read-side / staged-local failures) may be replayed up to
+    /// `MAX_TOTAL_TRANSFER_ATTEMPTS`, honoring bounded backoff and a
+    /// `RetryWaiting` status. Every other disposition — including ambiguous
+    /// remote mutations — stops at exactly one attempt.
+    fn classify_failure(
+        &self,
+        job_id: &str,
+        disposition: RetryDisposition,
+        error: &dyn std::fmt::Display,
+    ) {
+        // `core.failure` is the single authoritative transition: it moves
+        // Active -> RetryWaiting (safe retry within bounds) or Active ->
+        // Finished (stop). We must not call it twice, so subsequent handling
+        // only removes the work entry and publishes the truthful event.
+        let decision = {
+            let mut state = self.lock_state();
+            match state.core.state(job_id) {
+                Some(SchedulerState::Active | SchedulerState::PausePending) => {
+                    state.core.failure(job_id, disposition)
+                }
+                _ => Ok(RetryDecision::Stop {
+                    disposition,
+                    attempts_started: state.core.attempts_started(job_id).unwrap_or(1),
+                }),
+            }
+        };
+
+        match decision {
+            Ok(RetryDecision::RetryAfterBackoff {
+                next_attempt,
+                max_total_attempts,
+            }) => {
+                // Truthful RetryWaiting status, then bounded backoff, then
+                // re-enter the scheduler with the SAME JobId.
+                let _ = self.manager.publish_event(
+                    &self.events,
+                    JobEvent::RetryWaiting {
+                        id: job_id.to_string(),
+                    },
+                );
+                if let Some(delay) = transfer_retry::retry_backoff(next_attempt, max_total_attempts)
+                {
+                    let runtime = self.clone();
+                    let job_id = job_id.to_string();
+                    let work = {
+                        let state = self.lock_state();
+                        state.work.get(&job_id).cloned()
+                    };
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let Some(work) = work else {
+                            runtime.terminalize(&job_id);
+                            return;
+                        };
+                        {
+                            let mut state = runtime.lock_state();
+                            let _ = state.core.release_retry(&job_id);
+                        }
+                        runtime.pump();
+                        let _ = &work;
+                    });
+                }
+                self.pump();
+            }
+            Ok(RetryDecision::Stop {
+                disposition: _disposition,
+                attempts_started,
+            }) => {
                 let _ = self.manager.publish_event(
                     &self.events,
                     JobEvent::Failed {
-                        id: job_id,
-                        error: error.to_string(),
+                        id: job_id.to_string(),
+                        error: format!(
+                            "transfer failed after {attempts_started} attempt(s): {error}"
+                        ),
                         result: None,
                     },
                 );
+                self.terminalize(job_id);
+            }
+            Err(_) => {
+                self.terminalize(job_id);
             }
         }
+    }
+
+    /// Remove a job from the runtime scheduler state without re-applying a
+    /// transition (the transition already happened in `classify_failure`).
+    fn terminalize(&self, job_id: &str) {
+        let mut state = self.lock_state();
+        let _ = state.core.finish(job_id);
+        state.work.remove(job_id);
     }
 
     fn finish_scheduler(&self, job_id: &str) {
