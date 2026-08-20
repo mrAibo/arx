@@ -200,6 +200,7 @@ async fn event_loop(
                 focused_kind,
                 editor.is_some(),
                 msg.as_deref(),
+                &sync_runtime,
             )
         })?;
         state.message = None; // one-shot clear after render
@@ -1249,6 +1250,7 @@ async fn event_loop(
 
                     // Jobs panel: Ctrl+J
                     if state.show_jobs {
+                        let sync = &sync_runtime;
                         match key.code {
                             KeyCode::Esc | KeyCode::Char('j')
                                 if key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -1265,6 +1267,36 @@ async fn event_loop(
                                 if state.job_cursor < max {
                                     state.job_cursor += 1;
                                 }
+                            }
+                            KeyCode::Char('p') => {
+                                if let Some(job) = state.jobs.get(state.job_cursor)
+                                    && job.kind == arx::jobs::JobKind::Transfer
+                                    && sync.transfers.request_pause(&job.id).is_ok()
+                                {
+                                    state.message = Some(
+                                        "Pause requested (will checkpoint at next safe boundary)"
+                                            .into(),
+                                    );
+                                }
+                            }
+                            KeyCode::Char('r') => {
+                                if let Some(job) = state.jobs.get(state.job_cursor)
+                                    && job.kind == arx::jobs::JobKind::Transfer
+                                    && sync.transfers.resume(&job.id).is_ok()
+                                {
+                                    state.message = Some("Resume requested".into());
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    if state.show_transfer_center {
+                        match key.code {
+                            KeyCode::Esc => state.close_overlay(OverlayKind::TransferCenter),
+                            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                state.toggle_overlay(OverlayKind::TransferCenter);
                             }
                             _ => {}
                         }
@@ -1914,6 +1946,10 @@ async fn event_loop(
                                 );
                                 state.register_effect(EffectLane::Tree, id);
                             }
+                        }
+                        // Ctrl+Y: toggle Transfer Center
+                        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.toggle_overlay(OverlayKind::TransferCenter);
                         }
                         // Type in tree filter (when tree is shown) — Esc to close
                         KeyCode::Esc if state.show_tree => {
@@ -3121,6 +3157,7 @@ fn render(
     focused_kind: Option<EntryKind>,
     editor_available: bool,
     message: Option<&str>,
+    sync: &SyncUiRuntime,
 ) {
     let area = frame.area();
     let session_callout = session_callout_text(state, key_router);
@@ -3622,6 +3659,10 @@ fn render(
         render_jobs(frame, area, state);
     }
 
+    if state.show_transfer_center {
+        render_transfer_center(frame, area, &sync.transfers);
+    }
+
     // User menu overlay
     if state.show_menu {
         render_menu(frame, area, state);
@@ -3720,6 +3761,7 @@ fn render(
     };
     let git_info = state.git_status.as_str();
     let msg_hint = message.map(|m| format!(" | {m}")).unwrap_or_default();
+    let transfer_summary = sync.transfers.summary();
 
     // Workspace Ribbon — provider-truthful identity + workflow phase
     let ribbon_text = workspace_ribbon_text(state);
@@ -3731,9 +3773,12 @@ fn render(
 
     // Status line — lean, no duplicate path info
     let status = Paragraph::new(Line::from(format!(
-        "ARX v{} | sel: {} |{hint}{msg_hint}{git_info}",
+        "ARX v{} | sel: {} | transfers: {} running, {} waiting, {} paused |{hint}{msg_hint}{git_info}",
         env!("CARGO_PKG_VERSION"),
         selection_count,
+        transfer_summary.running,
+        transfer_summary.waiting,
+        transfer_summary.paused,
     )))
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(status, chunks[2]);
@@ -4865,6 +4910,53 @@ fn render_jobs(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
         )
         .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
     frame.render_stateful_widget(list, popup_area, &mut list_state);
+}
+
+fn render_transfer_center(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    transfers: &arx::transfer_queue_runtime::TransferQueueRuntime,
+) {
+    let popup_area = centered_rect(70, 70, area);
+    frame.render_widget(Clear, popup_area);
+
+    let items: Vec<ListItem> = transfers
+        .manager()
+        .snapshot()
+        .into_iter()
+        .filter(|job| job.kind == arx::jobs::JobKind::Transfer)
+        .map(|job| {
+            let id: String = job.id.chars().take(12).collect();
+            let status = match job.status {
+                arx::jobs::JobStatus::Pending => "waiting",
+                arx::jobs::JobStatus::Running => "running",
+                arx::jobs::JobStatus::PausePending => "pause pending",
+                arx::jobs::JobStatus::Cancelling => "cancelling",
+                arx::jobs::JobStatus::Paused => "paused",
+                arx::jobs::JobStatus::RetryWaiting => "retry waiting",
+                arx::jobs::JobStatus::Completed => "completed",
+                arx::jobs::JobStatus::Failed => "failed",
+                arx::jobs::JobStatus::Cancelled => "cancelled",
+            };
+            let percent = job
+                .progress
+                .percent()
+                .map_or_else(|| "--".into(), |percent| format!("{percent}%"));
+            ListItem::new(Line::from(format!("  {id:<12} {status:<15} {percent}")))
+        })
+        .collect();
+    let items = if items.is_empty() {
+        vec![ListItem::new(Line::from("  No transfer jobs."))]
+    } else {
+        items
+    };
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Transfer Center (Ctrl+T: close) "),
+    );
+    frame.render_widget(list, popup_area);
 }
 
 fn render_menu(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {

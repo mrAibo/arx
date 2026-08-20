@@ -12,6 +12,7 @@ pub enum OverlayKind {
     Bookmarks,
     Hosts,
     Jobs,
+    TransferCenter,
     UserMenu,
     History,
     Hotlist,
@@ -37,6 +38,8 @@ impl AppState {
             Some(OverlayKind::Hosts)
         } else if self.show_jobs {
             Some(OverlayKind::Jobs)
+        } else if self.show_transfer_center {
+            Some(OverlayKind::TransferCenter)
         } else if self.show_menu {
             Some(OverlayKind::UserMenu)
         } else if self.show_history {
@@ -65,6 +68,7 @@ impl AppState {
         self.show_bookmarks = false;
         self.show_hosts = false;
         self.show_jobs = false;
+        self.show_transfer_center = false;
         self.show_menu = false;
         self.show_history = false;
         self.show_hotlist = false;
@@ -92,6 +96,7 @@ impl AppState {
                 self.show_jobs = true;
                 self.job_cursor = 0;
             }
+            OverlayKind::TransferCenter => self.show_transfer_center = true,
             OverlayKind::UserMenu => {
                 self.show_menu = true;
                 self.menu_cursor = 0;

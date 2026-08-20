@@ -645,6 +645,7 @@ impl AppState {
                 Some(super::OverlayKind::Bookmarks) => InputContext::Bookmarks,
                 Some(super::OverlayKind::Hosts) => InputContext::Hosts,
                 Some(super::OverlayKind::Jobs) => InputContext::Jobs,
+                Some(super::OverlayKind::TransferCenter) => InputContext::Jobs,
                 Some(super::OverlayKind::UserMenu) => InputContext::UserMenu,
                 Some(super::OverlayKind::SyncPreview) => match self.remote_workspace.ux {
                     super::WorkspaceSyncUxState::ConfirmationRequired { .. } => {

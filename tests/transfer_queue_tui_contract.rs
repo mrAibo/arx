@@ -68,10 +68,17 @@ fn copy_and_move_product_paths_enqueue_into_persistent_runtime() {
 }
 
 #[test]
-fn pause_resume_controls_remain_unexposed_until_runtime_pause_is_real() {
-    assert!(
-        !TUI_SOURCE.contains("sync.transfers.pause(")
-            && !TUI_SOURCE.contains("sync.transfers.resume("),
-        "Pause/Resume must not be exposed in the TUI before cooperative pause checkpoints, same-task resume, and worker joining are implemented and Q14-Q30 are green"
-    );
+fn pause_resume_controls_wired_for_transfer_jobs() {
+    assert!(TUI_SOURCE.contains("sync.transfers.request_pause("));
+    assert!(TUI_SOURCE.contains("sync.transfers.resume("));
+
+    let jobs_panel = TUI_SOURCE
+        .find("if state.show_jobs")
+        .expect("Jobs-panel handler must exist");
+    let delete_arm = TUI_SOURCE
+        .find("KeyCode::Delete if state.show_jobs")
+        .expect("Jobs-panel Delete key arm must exist");
+    let handler = &TUI_SOURCE[jobs_panel..delete_arm];
+    assert!(handler.contains("sync.transfers.request_pause("));
+    assert!(handler.contains("sync.transfers.resume("));
 }
