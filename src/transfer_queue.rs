@@ -291,9 +291,7 @@ impl TransferQueueCore {
     pub fn request_cancel(&mut self, job_id: &str) -> Result<CancelAction, QueueError> {
         let entry = self.entry_mut(job_id)?;
         match entry.state {
-            SchedulerState::Waiting
-            | SchedulerState::RetryWaiting
-            | SchedulerState::Parked => {
+            SchedulerState::Waiting | SchedulerState::RetryWaiting | SchedulerState::Parked => {
                 entry.state = SchedulerState::Finished;
                 Ok(CancelAction::TerminalizeWithoutExecution)
             }
@@ -458,14 +456,8 @@ pub enum ProgressUnit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypedTransferProgress {
-    Items {
-        completed: u64,
-        total: Option<u64>,
-    },
-    Bytes {
-        completed: u64,
-        total: Option<u64>,
-    },
+    Items { completed: u64, total: Option<u64> },
+    Bytes { completed: u64, total: Option<u64> },
 }
 
 impl TypedTransferProgress {
@@ -770,7 +762,8 @@ mod tests {
         assert_eq!(queue.next_runnable().as_deref(), Some("a"));
 
         assert_eq!(
-            queue.failure("a", RetryDisposition::AmbiguousMutation)
+            queue
+                .failure("a", RetryDisposition::AmbiguousMutation)
                 .unwrap(),
             RetryDecision::Stop {
                 disposition: RetryDisposition::AmbiguousMutation,
@@ -788,7 +781,8 @@ mod tests {
         queue.next_runnable();
 
         assert_eq!(
-            queue.failure("a", RetryDisposition::RecoveryRequired)
+            queue
+                .failure("a", RetryDisposition::RecoveryRequired)
                 .unwrap(),
             RetryDecision::Stop {
                 disposition: RetryDisposition::RecoveryRequired,
