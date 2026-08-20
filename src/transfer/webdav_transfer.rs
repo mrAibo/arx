@@ -89,6 +89,7 @@ pub(crate) async fn download_one(
     spec: &WebDavTransferSpec,
     overwrite: WebDavOverwritePolicy,
     cancel: Arc<AtomicBool>,
+    pause: crate::transfer_queue::PauseGate,
     on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> io::Result<DownloadOutcome> {
     // 1. Extract download spec
@@ -142,6 +143,7 @@ pub(crate) async fn download_one(
                 max_bytes,
                 &mut temp_file,
                 Some(&cancel),
+                Some(&pause),
                 |completed, total| {
                     on_progress(stream_progress(completed, total));
                 },

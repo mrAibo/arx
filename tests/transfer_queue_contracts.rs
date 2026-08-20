@@ -1,11 +1,14 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use arx::jobs::{JobKind, JobManager, JobStatus};
+use arx::jobs::{JobKind, JobManager, JobProgress, JobStatus, Progress};
 use arx::transfer::{TransferIntent, TransferMethod, TransferPlan};
 use arx::transfer_queue::{
     CancelAction, DEFAULT_TRANSFER_CONCURRENCY, MAX_TOTAL_TRANSFER_ATTEMPTS, PauseAction,
-    QueueError, RetryDecision, RetryDisposition, SchedulerState, TransferProgressTracker,
-    TransferQueueConfig, TransferQueueCore, TransferRateEstimator, TypedTransferProgress,
+    PauseGate, QueueError, RetryDecision, RetryDisposition, RunnableAction, SchedulerState,
+    TransferProgressTracker, TransferQueueConfig, TransferQueueCore, TransferRateEstimator,
+    TypedTransferProgress,
 };
 use arx::transfer_queue_runtime::TransferQueueRuntime;
 use arx::vfs::Location;
@@ -78,6 +81,7 @@ fn queue_contract_pause_is_pending_until_safe_checkpoint() {
     let mut queue = TransferQueueCore::new(TransferQueueConfig::new(1).unwrap());
     queue.enqueue("job-a").unwrap();
     queue.enqueue("job-b").unwrap();
+    queue.enqueue("job-c").unwrap();
     assert_eq!(queue.next_runnable().as_deref(), Some("job-a"));
 
     assert_eq!(
@@ -85,11 +89,14 @@ fn queue_contract_pause_is_pending_until_safe_checkpoint() {
         PauseAction::AwaitSafeCheckpoint
     );
     assert_eq!(queue.state("job-a"), Some(SchedulerState::PausePending));
+    assert_eq!(queue.active_count(), 1, "PausePending retains its slot");
     assert!(queue.next_runnable().is_none());
 
     queue.confirm_paused("job-a").unwrap();
-    assert_eq!(queue.state("job-a"), Some(SchedulerState::Parked));
+    assert_eq!(queue.state("job-a"), Some(SchedulerState::ParkedActive));
+    assert_eq!(queue.active_count(), 0, "ParkedActive releases its slot");
     assert_eq!(queue.next_runnable().as_deref(), Some("job-b"));
+    assert!(queue.next_runnable().is_none(), "third job still waits");
 }
 
 #[test]
@@ -105,6 +112,114 @@ fn queue_contract_resume_keeps_job_id_and_attempt_number() {
 
     assert_eq!(queue.next_runnable().as_deref(), Some("same-job"));
     assert_eq!(queue.attempts_started("same-job"), Some(1));
+}
+
+#[test]
+fn queue_contract_resume_waits_for_slot_then_resumes_same_attempt() {
+    let mut queue = TransferQueueCore::new(TransferQueueConfig::new(1).unwrap());
+    queue.enqueue("paused").unwrap();
+    queue.enqueue("occupant").unwrap();
+    assert_eq!(
+        queue.next_action(),
+        Some(RunnableAction::Start("paused".into()))
+    );
+    queue.request_pause("paused").unwrap();
+    queue.confirm_paused("paused").unwrap();
+    assert_eq!(
+        queue.next_action(),
+        Some(RunnableAction::Start("occupant".into()))
+    );
+    queue.resume("paused").unwrap();
+    assert_eq!(queue.state("paused"), Some(SchedulerState::ResumeWaiting));
+    assert_eq!(queue.attempts_started("paused"), Some(1));
+    assert_eq!(
+        queue.next_action(),
+        None,
+        "occupied slot blocks live resume"
+    );
+    queue.finish("occupant").unwrap();
+    assert_eq!(
+        queue.next_action(),
+        Some(RunnableAction::Resume("paused".into()))
+    );
+    assert_eq!(queue.attempts_started("paused"), Some(1));
+}
+
+#[test]
+fn queue_contract_pause_retry_waiting_reports_pause_transition() {
+    let mut queue = TransferQueueCore::new(TransferQueueConfig::new(1).unwrap());
+    queue.enqueue("retry").unwrap();
+    queue.next_action();
+    queue
+        .failure("retry", RetryDisposition::SafeToRetry)
+        .unwrap();
+    assert_eq!(
+        queue.request_pause("retry"),
+        Err(QueueError::InvalidTransition {
+            job_id: "retry".into(),
+            from: SchedulerState::RetryWaiting,
+            action: "pause",
+        })
+    );
+}
+
+#[test]
+fn queue_contract_repeated_controls_are_idempotent_or_invalid_without_resurrection() {
+    let mut queue = TransferQueueCore::new(TransferQueueConfig::new(1).unwrap());
+    queue.enqueue("job").unwrap();
+    queue.next_action();
+    assert_eq!(
+        queue.request_pause("job"),
+        Ok(PauseAction::AwaitSafeCheckpoint)
+    );
+    assert_eq!(
+        queue.request_pause("job"),
+        Ok(PauseAction::AwaitSafeCheckpoint)
+    );
+    queue.confirm_paused("job").unwrap();
+    assert_eq!(queue.request_pause("job"), Ok(PauseAction::AlreadyParked));
+    queue.resume("job").unwrap();
+    assert!(matches!(
+        queue.resume("job"),
+        Err(QueueError::InvalidTransition {
+            action: "resume",
+            ..
+        })
+    ));
+    queue.finish("job").unwrap();
+    assert_eq!(queue.request_pause("job"), Ok(PauseAction::AlreadyFinished));
+    assert!(matches!(
+        queue.resume("job"),
+        Err(QueueError::InvalidTransition {
+            action: "resume",
+            ..
+        })
+    ));
+    assert_eq!(queue.next_action(), None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pause_gate_same_task_waits_and_cancel_wakes_it() {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let gate = PauseGate::new(cancelled.clone());
+    gate.request();
+    let worker_gate = gate.clone();
+    let worker = tokio::spawn(async move {
+        worker_gate.checkpoint().await;
+    });
+    tokio::time::timeout(Duration::from_secs(1), gate.wait_checkpoint())
+        .await
+        .expect("the executing task reaches its pause checkpoint");
+    assert!(
+        !worker.is_finished(),
+        "the same executing task stays parked"
+    );
+    cancelled.store(true, Ordering::Release);
+    gate.wake_cancelled();
+    tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("cancel wakes the parked task")
+        .expect("parked task exits cleanly");
 }
 
 #[test]
@@ -472,6 +587,48 @@ async fn product_path_terminal_job_does_not_resurrect() {
     assert_eq!(runtime.manager().snapshot()[0].status, JobStatus::Completed);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_closes_queue_and_joins_owned_work() {
+    let (runtime, scratch) = local_runtime(1);
+    let src = scratch.join("shutdown-src");
+    let dst = scratch.join("shutdown-dst");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("x"), b"x").unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    runtime
+        .enqueue(local_copy_plan(&src, &dst), vec!["x".into()])
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), runtime.shutdown())
+        .await
+        .expect("shutdown wakes and joins workers");
+    assert!(matches!(
+        runtime.enqueue(local_copy_plan(&src, &dst), vec!["x".into()]),
+        Err(QueueError::Closed)
+    ));
+    assert_eq!(runtime.summary().running, 0);
+    let nonterminal = runtime
+        .manager()
+        .snapshot()
+        .into_iter()
+        .filter(|job| {
+            job.kind == JobKind::Transfer
+                && matches!(
+                    job.status,
+                    JobStatus::Pending
+                        | JobStatus::Running
+                        | JobStatus::PausePending
+                        | JobStatus::Paused
+                        | JobStatus::RetryWaiting
+                        | JobStatus::Cancelling
+                )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        nonterminal.is_empty(),
+        "shutdown left transfer jobs: {nonterminal:?}"
+    );
+}
+
 // ── Typed progress and retry classification contracts ─────────────────────
 
 #[test]
@@ -517,8 +674,38 @@ fn typed_zero_and_unknown_byte_totals_never_fake_a_percentage() {
             total: None,
         },
     ] {
-        assert_eq!(event.percent(), None);
+        assert_eq!(
+            event.percent(),
+            if event.total() == Some(0) {
+                Some(0)
+            } else {
+                None
+            }
+        );
     }
+}
+
+#[test]
+fn unknown_total_progress_preserves_done_rate_and_rendering() {
+    let progress = Progress::Bytes {
+        done: 4_096,
+        total: None,
+        rate: 1_024,
+    };
+    assert_eq!(progress.percent(), None);
+    assert_eq!(
+        progress,
+        Progress::Bytes {
+            done: 4_096,
+            total: None,
+            rate: 1_024,
+        }
+    );
+    assert_eq!(progress.to_string(), "4.0 KB · unknown total (1.0 KB/s)");
+    assert_eq!(
+        JobProgress::Generic(progress).to_string(),
+        "4.0 KB · unknown total (1.0 KB/s)"
+    );
 }
 
 #[test]

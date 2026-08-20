@@ -10,11 +10,89 @@
 //! recovery-required outcomes are never replayed automatically.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 pub const DEFAULT_TRANSFER_CONCURRENCY: usize = 2;
 pub const MAX_TRANSFER_CONCURRENCY: usize = 8;
 pub const MAX_TOTAL_TRANSFER_ATTEMPTS: u8 = 3;
+
+#[derive(Debug, Clone)]
+pub struct PauseGate {
+    requested: Arc<AtomicBool>,
+    checkpoint_reached: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+    settled: Arc<AtomicBool>,
+    resume: Arc<Notify>,
+    checkpoint: Arc<Notify>,
+}
+
+impl PauseGate {
+    pub fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+            checkpoint_reached: Arc::new(AtomicBool::new(false)),
+            cancelled,
+            settled: Arc::new(AtomicBool::new(false)),
+            resume: Arc::new(Notify::new()),
+            checkpoint: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self::new(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+    pub fn resume(&self) {
+        self.requested.store(false, Ordering::Release);
+        self.checkpoint_reached.store(false, Ordering::Release);
+        self.resume.notify_waiters();
+    }
+    pub fn wake_cancelled(&self) {
+        self.resume.notify_waiters();
+        self.checkpoint.notify_waiters();
+    }
+    pub fn settle(&self) {
+        self.settled.store(true, Ordering::Release);
+        self.wake_cancelled();
+    }
+    pub fn reset_attempt(&self) {
+        self.requested.store(false, Ordering::Release);
+        self.checkpoint_reached.store(false, Ordering::Release);
+        self.settled.store(false, Ordering::Release);
+    }
+    pub fn checkpoint_reached(&self) -> bool {
+        self.checkpoint_reached.load(Ordering::Acquire)
+    }
+    pub async fn wait_checkpoint(&self) {
+        while !self.checkpoint_reached()
+            && !self.cancelled.load(Ordering::Acquire)
+            && !self.settled.load(Ordering::Acquire)
+        {
+            let notified = self.checkpoint.notified();
+            if self.checkpoint_reached() {
+                break;
+            }
+            notified.await;
+        }
+    }
+    pub async fn checkpoint(&self) {
+        while self.requested.load(Ordering::Acquire) && !self.cancelled.load(Ordering::Acquire) {
+            let notified = self.resume.notified();
+            self.checkpoint_reached.store(true, Ordering::Release);
+            self.checkpoint.notify_waiters();
+            if !self.requested.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferQueueConfig {
@@ -82,7 +160,9 @@ pub enum SchedulerState {
     Waiting,
     Active,
     PausePending,
-    Parked,
+    ParkedBeforeStart,
+    ParkedActive,
+    ResumeWaiting,
     RetryWaiting,
     Cancelling,
     Finished,
@@ -90,6 +170,7 @@ pub enum SchedulerState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueError {
+    Closed,
     InvalidConcurrency(usize),
     DuplicateJob(String),
     UnknownJob(String),
@@ -109,6 +190,7 @@ pub enum QueueError {
 impl std::fmt::Display for QueueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Closed => write!(f, "transfer queue is closed"),
             Self::InvalidConcurrency(value) => write!(
                 f,
                 "transfer concurrency must be between 1 and {MAX_TRANSFER_CONCURRENCY}, got {value}"
@@ -167,6 +249,7 @@ struct QueueEntry {
     /// Resume after a genuine pause keeps this false so pause/resume never
     /// inflates the retry-attempt counter.
     start_new_attempt: bool,
+    live_resume: bool,
 }
 
 impl QueueEntry {
@@ -175,6 +258,7 @@ impl QueueEntry {
             state: SchedulerState::Waiting,
             attempts_started: 0,
             start_new_attempt: true,
+            live_resume: false,
         }
     }
 }
@@ -248,7 +332,9 @@ impl TransferQueueCore {
             .filter(|entry| {
                 matches!(
                     entry.state,
-                    SchedulerState::Waiting | SchedulerState::RetryWaiting
+                    SchedulerState::Waiting
+                        | SchedulerState::ResumeWaiting
+                        | SchedulerState::RetryWaiting
                 )
             })
             .count()
@@ -257,7 +343,12 @@ impl TransferQueueCore {
     pub fn parked_count(&self) -> usize {
         self.entries
             .values()
-            .filter(|entry| entry.state == SchedulerState::Parked)
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    SchedulerState::ParkedBeforeStart | SchedulerState::ParkedActive
+                )
+            })
             .count()
     }
 
@@ -265,7 +356,7 @@ impl TransferQueueCore {
     ///
     /// Attempts are counted when execution actually starts, not when a job is
     /// enqueued or enters backoff.
-    pub fn next_runnable(&mut self) -> Option<String> {
+    pub fn next_action(&mut self) -> Option<RunnableAction> {
         if self.active_count() >= self.config.concurrency {
             return None;
         }
@@ -274,28 +365,46 @@ impl TransferQueueCore {
             let Some(entry) = self.entries.get_mut(&job_id) else {
                 continue;
             };
-            if entry.state != SchedulerState::Waiting {
-                continue;
+            match entry.state {
+                SchedulerState::Waiting => {
+                    entry.state = SchedulerState::Active;
+                    if entry.start_new_attempt {
+                        entry.attempts_started = entry.attempts_started.saturating_add(1);
+                        entry.start_new_attempt = false;
+                    }
+                    return Some(RunnableAction::Start(job_id));
+                }
+                SchedulerState::ResumeWaiting if entry.live_resume => {
+                    entry.state = SchedulerState::Active;
+                    entry.live_resume = false;
+                    return Some(RunnableAction::Resume(job_id));
+                }
+                _ => continue,
             }
-            entry.state = SchedulerState::Active;
-            if entry.start_new_attempt {
-                entry.attempts_started = entry.attempts_started.saturating_add(1);
-                entry.start_new_attempt = false;
-            }
-            return Some(job_id);
         }
 
         None
     }
 
+    pub fn next_runnable(&mut self) -> Option<String> {
+        match self.next_action()? {
+            RunnableAction::Start(id) | RunnableAction::Resume(id) => Some(id),
+        }
+    }
+
     pub fn request_cancel(&mut self, job_id: &str) -> Result<CancelAction, QueueError> {
         let entry = self.entry_mut(job_id)?;
         match entry.state {
-            SchedulerState::Waiting | SchedulerState::RetryWaiting | SchedulerState::Parked => {
+            SchedulerState::Waiting
+            | SchedulerState::RetryWaiting
+            | SchedulerState::ParkedBeforeStart => {
                 entry.state = SchedulerState::Finished;
                 Ok(CancelAction::TerminalizeWithoutExecution)
             }
-            SchedulerState::Active | SchedulerState::PausePending => {
+            SchedulerState::Active
+            | SchedulerState::PausePending
+            | SchedulerState::ParkedActive
+            | SchedulerState::ResumeWaiting => {
                 entry.state = SchedulerState::Cancelling;
                 Ok(CancelAction::SignalActiveExecution)
             }
@@ -312,14 +421,18 @@ impl TransferQueueCore {
                 Ok(PauseAction::AwaitSafeCheckpoint)
             }
             SchedulerState::PausePending => Ok(PauseAction::AwaitSafeCheckpoint),
-            SchedulerState::Waiting | SchedulerState::RetryWaiting => {
-                entry.state = SchedulerState::Parked;
+            SchedulerState::Waiting => {
+                entry.state = SchedulerState::ParkedBeforeStart;
                 Ok(PauseAction::ParkedBeforeExecution)
             }
-            SchedulerState::Parked => Ok(PauseAction::AlreadyParked),
-            SchedulerState::Cancelling => Err(QueueError::InvalidTransition {
+            SchedulerState::ParkedBeforeStart | SchedulerState::ParkedActive => {
+                Ok(PauseAction::AlreadyParked)
+            }
+            SchedulerState::RetryWaiting
+            | SchedulerState::Cancelling
+            | SchedulerState::ResumeWaiting => Err(QueueError::InvalidTransition {
                 job_id: job_id.to_string(),
-                from: SchedulerState::Cancelling,
+                from: entry.state,
                 action: "pause",
             }),
             SchedulerState::Finished => Ok(PauseAction::AlreadyFinished),
@@ -338,21 +451,27 @@ impl TransferQueueCore {
                 action: "confirm pause",
             });
         }
-        entry.state = SchedulerState::Parked;
+        entry.state = SchedulerState::ParkedActive;
         Ok(())
     }
 
     /// Re-enter scheduler control with the same JobId.
     pub fn resume(&mut self, job_id: &str) -> Result<(), QueueError> {
         let entry = self.entry_mut(job_id)?;
-        if entry.state != SchedulerState::Parked {
-            return Err(QueueError::InvalidTransition {
-                job_id: job_id.to_string(),
-                from: entry.state,
-                action: "resume",
-            });
+        match entry.state {
+            SchedulerState::ParkedBeforeStart => entry.state = SchedulerState::Waiting,
+            SchedulerState::ParkedActive => {
+                entry.state = SchedulerState::ResumeWaiting;
+                entry.live_resume = true;
+            }
+            from => {
+                return Err(QueueError::InvalidTransition {
+                    job_id: job_id.to_string(),
+                    from,
+                    action: "resume",
+                });
+            }
         }
-        entry.state = SchedulerState::Waiting;
         // `start_new_attempt` intentionally remains unchanged:
         // - pause of active work -> false (resume same attempt)
         // - pause before first/retry execution -> true (attempt not started yet)
@@ -448,6 +567,12 @@ impl TransferQueueCore {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunnableAction {
+    Start(String),
+    Resume(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressUnit {
     Items,
@@ -483,7 +608,10 @@ impl TypedTransferProgress {
     pub fn percent(self) -> Option<u8> {
         let total = self.total()?;
         if total == 0 {
-            return None;
+            return match self {
+                Self::Bytes { .. } => Some(0),
+                Self::Items { .. } => None,
+            };
         }
         Some(
             (((self.completed() as u128) * 100 / (total as u128)).min(100))
@@ -704,7 +832,7 @@ mod tests {
         assert!(queue.next_runnable().is_none());
 
         queue.confirm_paused("a").unwrap();
-        assert_eq!(queue.state("a"), Some(SchedulerState::Parked));
+        assert_eq!(queue.state("a"), Some(SchedulerState::ParkedActive));
         assert_eq!(queue.next_runnable().as_deref(), Some("b"));
     }
 
@@ -719,6 +847,66 @@ mod tests {
 
         assert_eq!(queue.next_runnable().as_deref(), Some("same"));
         assert_eq!(queue.attempts_started("same"), Some(1));
+    }
+
+    #[test]
+    fn queued_and_live_resume_actions_stay_distinct() {
+        let mut queue = TransferQueueCore::new(TransferQueueConfig::new(1).unwrap());
+        queue.enqueue("live").unwrap();
+        queue.enqueue("queued").unwrap();
+        assert_eq!(
+            queue.next_action(),
+            Some(RunnableAction::Start("live".into()))
+        );
+        queue.request_pause("live").unwrap();
+        queue.confirm_paused("live").unwrap();
+        assert_eq!(
+            queue.next_action(),
+            Some(RunnableAction::Start("queued".into()))
+        );
+        queue.request_pause("live").unwrap();
+        queue.resume("live").unwrap();
+        assert_eq!(queue.state("live"), Some(SchedulerState::ResumeWaiting));
+        queue.finish("queued").unwrap();
+        assert_eq!(
+            queue.next_action(),
+            Some(RunnableAction::Resume("live".into()))
+        );
+        assert_eq!(queue.attempts_started("live"), Some(1));
+    }
+
+    #[test]
+    fn queued_pause_resume_starts_exactly_once() {
+        let mut queue = TransferQueueCore::default();
+        queue.enqueue("queued").unwrap();
+        assert_eq!(
+            queue.request_pause("queued").unwrap(),
+            PauseAction::ParkedBeforeExecution
+        );
+        assert_eq!(
+            queue.state("queued"),
+            Some(SchedulerState::ParkedBeforeStart)
+        );
+        queue.resume("queued").unwrap();
+        assert_eq!(
+            queue.next_action(),
+            Some(RunnableAction::Start("queued".into()))
+        );
+        assert_eq!(queue.attempts_started("queued"), Some(1));
+    }
+
+    #[test]
+    fn parked_active_cancel_signals_worker() {
+        let mut queue = TransferQueueCore::default();
+        queue.enqueue("live").unwrap();
+        queue.next_action();
+        queue.request_pause("live").unwrap();
+        queue.confirm_paused("live").unwrap();
+        assert_eq!(
+            queue.request_cancel("live").unwrap(),
+            CancelAction::SignalActiveExecution
+        );
+        assert_eq!(queue.state("live"), Some(SchedulerState::Cancelling));
     }
 
     #[test]
@@ -871,6 +1059,14 @@ mod tests {
             }
             .percent(),
             None
+        );
+        assert_eq!(
+            TypedTransferProgress::Bytes {
+                completed: 0,
+                total: Some(0)
+            }
+            .percent(),
+            Some(0)
         );
         assert_eq!(
             TypedTransferProgress::Items {

@@ -32,6 +32,7 @@ pub(crate) async fn download_one(
     provider: &S3Provider,
     spec: &S3TransferSpec,
     cancel: Arc<AtomicBool>,
+    pause: crate::transfer_queue::PauseGate,
     on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> Result<DownloadOutcome, TransferExecutionError> {
     // 1. Extract download spec
@@ -183,6 +184,7 @@ pub(crate) async fn download_one(
             .await);
         }
 
+        pause.checkpoint().await;
         let n = match body.read(&mut buf).await {
             Ok(0) => break, // EOF
             Ok(n) => n,
@@ -607,6 +609,7 @@ mod physical_acceptance {
             &provider,
             &down_spec,
             Arc::new(AtomicBool::new(false)),
+            crate::transfer_queue::PauseGate::disabled(),
             &mut |_| {},
         )
         .await

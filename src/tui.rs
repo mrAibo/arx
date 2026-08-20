@@ -5313,6 +5313,7 @@ fn parse_size(s: &str) -> Result<u64, ()> {
 fn job_event_id(event: &arx::jobs::JobEvent) -> &str {
     match event {
         arx::jobs::JobEvent::Running { id }
+        | arx::jobs::JobEvent::PausePending { id }
         | arx::jobs::JobEvent::Paused { id }
         | arx::jobs::JobEvent::RetryWaiting { id }
         | arx::jobs::JobEvent::Progress { id, .. }
@@ -5412,6 +5413,7 @@ fn handle_job_event(ev: &arx::jobs::JobEvent, state: &mut AppState) -> bool {
             true
         }
         arx::jobs::JobEvent::Running { .. }
+        | arx::jobs::JobEvent::PausePending { .. }
         | arx::jobs::JobEvent::Progress { .. }
         | arx::jobs::JobEvent::Paused { .. }
         | arx::jobs::JobEvent::RetryWaiting { .. } => false,

@@ -105,9 +105,16 @@ async fn upload_bytes(registry: &ProviderRegistry, key: &str, data: &[u8]) {
         webdav_spec: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
-    let outcome = execute_transfer(&plan, &[key.to_string()], registry, cancel, |_| {})
-        .await
-        .expect("upload");
+    let outcome = execute_transfer(
+        &plan,
+        &[key.to_string()],
+        registry,
+        cancel,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await
+    .expect("upload");
     assert_eq!(outcome.completed, 1, "exactly one object uploaded");
     let _ = std::fs::remove_file(&tmp);
 }
@@ -134,9 +141,16 @@ async fn download_bytes(registry: &ProviderRegistry, key: &str) -> Vec<u8> {
         webdav_spec: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
-    let outcome = execute_transfer(&plan, &[key.to_string()], registry, cancel, |_| {})
-        .await
-        .expect("download");
+    let outcome = execute_transfer(
+        &plan,
+        &[key.to_string()],
+        registry,
+        cancel,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await
+    .expect("download");
     assert_eq!(outcome.completed, 1, "exactly one object downloaded");
     let data = std::fs::read(&tmp).expect("read downloaded fixture");
     let _ = std::fs::remove_file(&tmp);
@@ -348,9 +362,16 @@ async fn aws_multipart_upload_roundtrip() {
         webdav_spec: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
-    let out = execute_transfer(&plan, std::slice::from_ref(&key), &reg, cancel, |_| {})
-        .await
-        .expect("multipart upload");
+    let out = execute_transfer(
+        &plan,
+        std::slice::from_ref(&key),
+        &reg,
+        cancel,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await
+    .expect("multipart upload");
     assert_eq!(out.completed, 1, "multipart upload completed");
     let dl = std::env::temp_dir().join(format!(
         "arx-big-dl-{}-{}.bin",
@@ -373,9 +394,16 @@ async fn aws_multipart_upload_roundtrip() {
         webdav_spec: None,
     };
     let cancel2 = Arc::new(AtomicBool::new(false));
-    let dout = execute_transfer(&dplan, std::slice::from_ref(&key), &reg, cancel2, |_| {})
-        .await
-        .expect("multipart download");
+    let dout = execute_transfer(
+        &dplan,
+        std::slice::from_ref(&key),
+        &reg,
+        cancel2,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await
+    .expect("multipart download");
     assert_eq!(dout.completed, 1);
     assert_eq!(
         std::fs::metadata(&dl).unwrap().len(),
@@ -435,7 +463,15 @@ async fn aws_multipart_cancel_aborts_without_completed_object() {
     };
     // cancel set BEFORE execute => no usable object may appear
     let cancel = Arc::new(AtomicBool::new(true));
-    let res = execute_transfer(&plan, std::slice::from_ref(&key), &reg, cancel, |_| {}).await;
+    let res = execute_transfer(
+        &plan,
+        std::slice::from_ref(&key),
+        &reg,
+        cancel,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await;
     let _ = std::fs::remove_file(&tmp);
     assert!(
         res.is_err(),
@@ -489,7 +525,15 @@ async fn aws_multipart_cancel_after_first_part_aborts() {
             cancel_hook.store(true, Ordering::Relaxed);
         }
     };
-    let res = execute_transfer(&plan, std::slice::from_ref(&key), &reg, cancel, on_progress).await;
+    let res = execute_transfer(
+        &plan,
+        std::slice::from_ref(&key),
+        &reg,
+        cancel,
+        arx::transfer_queue::PauseGate::disabled(),
+        on_progress,
+    )
+    .await;
     let _ = std::fs::remove_file(&tmp);
     // Abort path returns Err (not a silent completed object).
     assert!(res.is_err(), "cancel after first part must not complete");
@@ -568,7 +612,15 @@ async fn aws_denial_put_object() {
         webdav_spec: None,
     };
     let c = Arc::new(AtomicBool::new(false));
-    let res = execute_transfer(&plan, std::slice::from_ref(&key), &deny, c, |_| {}).await;
+    let res = execute_transfer(
+        &plan,
+        std::slice::from_ref(&key),
+        &deny,
+        c,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await;
     let _ = std::fs::remove_file(&tmp);
     assert!(res.is_err(), "PutObject denied must fail, no false success");
     // Verify absence via FULL identity (exact run-prefix/object identity),
@@ -720,9 +772,16 @@ async fn aws_bucket_bound_target_works_without_list_all_my_buckets() {
         webdav_spec: None,
     };
     let c = Arc::new(AtomicBool::new(false));
-    execute_transfer(&up, std::slice::from_ref(&key), &registry, c, |_| {})
-        .await
-        .expect("bucket-bound upload");
+    execute_transfer(
+        &up,
+        std::slice::from_ref(&key),
+        &registry,
+        c,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await
+    .expect("bucket-bound upload");
     let _ = std::fs::remove_file(&tmp);
     let _page = registry
         .list_page(&root, None)
@@ -762,9 +821,16 @@ async fn download_bytes_in(registry: &ProviderRegistry, target: &str, key: &str)
         webdav_spec: None,
     };
     let c = Arc::new(AtomicBool::new(false));
-    execute_transfer(&plan, &[key.to_string()], registry, c, |_| {})
-        .await
-        .expect("download");
+    execute_transfer(
+        &plan,
+        &[key.to_string()],
+        registry,
+        c,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await
+    .expect("download");
     let data = std::fs::read(&tmp).expect("read");
     let _ = std::fs::remove_file(&tmp);
     data
@@ -843,7 +909,15 @@ async fn aws_denial_get_object() {
         webdav_spec: None,
     };
     let c = Arc::new(AtomicBool::new(false));
-    let get_res = execute_transfer(&plan, std::slice::from_ref(&key), &deny, c, |_| {}).await;
+    let get_res = execute_transfer(
+        &plan,
+        std::slice::from_ref(&key),
+        &deny,
+        c,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await;
     assert!(
         get_res.is_err(),
         "GetObject denied must fail, no false bytes / zero-byte success"
@@ -955,7 +1029,15 @@ async fn aws_object_disappears_mid_op() {
         webdav_spec: None,
     };
     let c = Arc::new(AtomicBool::new(false));
-    let res = execute_transfer(&plan, std::slice::from_ref(&key), &reg, c, |_| {}).await;
+    let res = execute_transfer(
+        &plan,
+        std::slice::from_ref(&key),
+        &reg,
+        c,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await;
     assert!(
         res.is_err(),
         "download of vanished object must error, not zero-byte success"

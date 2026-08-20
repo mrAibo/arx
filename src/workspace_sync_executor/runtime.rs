@@ -450,6 +450,7 @@ impl WorkspaceSyncExecutor {
                 std::slice::from_ref(name),
                 &self.registry,
                 cancel,
+                crate::transfer_queue::PauseGate::disabled(),
                 |_| {},
             )
             .await

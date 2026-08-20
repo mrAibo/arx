@@ -319,7 +319,7 @@ impl RemoteWorkspaceState {
             JobStatus::Pending => WorkspaceSyncUxState::Queued {
                 job_id: job.id.clone(),
             },
-            JobStatus::Running => WorkspaceSyncUxState::Running {
+            JobStatus::Running | JobStatus::PausePending => WorkspaceSyncUxState::Running {
                 job_id: job.id.clone(),
             },
             JobStatus::Cancelling => WorkspaceSyncUxState::Cancelling {

@@ -13,7 +13,7 @@ use crate::vfs::Location;
 
 use crate::transfer::executor::{TransferExecutionError, TransferOutcome};
 use crate::transfer::{TransferIntent, TransferMethod, TransferPlan};
-use crate::transfer_queue::{RetryDisposition, TypedTransferProgress};
+use crate::transfer_queue::{PauseGate, RetryDisposition, TypedTransferProgress};
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -21,6 +21,7 @@ pub(crate) async fn execute_sftp_copy(
     plan: &TransferPlan,
     names: &[String],
     cancel: Arc<AtomicBool>,
+    pause: PauseGate,
     on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> Result<TransferOutcome, TransferExecutionError> {
     if plan.intent != TransferIntent::Copy {
@@ -86,6 +87,7 @@ pub(crate) async fn execute_sftp_copy(
                         remote_dir,
                         name,
                         &cancel,
+                        &pause,
                         completed,
                         &mut cumulative_written,
                         total_bytes,
@@ -100,6 +102,7 @@ pub(crate) async fn execute_sftp_copy(
                         dst,
                         name,
                         &cancel,
+                        &pause,
                         completed,
                         &mut cumulative_written,
                         total_bytes,
@@ -133,6 +136,7 @@ async fn upload_file(
     remote_dir: &str,
     name: &str,
     cancel: &AtomicBool,
+    pause: &PauseGate,
     completed: usize,
     cumulative_written: &mut u64,
     total_bytes: Option<u64>,
@@ -172,6 +176,7 @@ async fn upload_file(
         &mut local,
         &mut remote,
         cancel,
+        pause,
         completed,
         cumulative_written,
         total_bytes,
@@ -291,6 +296,7 @@ async fn download_file(
     dst_dir: &Path,
     name: &str,
     cancel: &AtomicBool,
+    pause: &PauseGate,
     completed: usize,
     cumulative_written: &mut u64,
     total_bytes: Option<u64>,
@@ -331,6 +337,7 @@ async fn download_file(
         &mut remote,
         &mut local,
         cancel,
+        pause,
         completed,
         cumulative_written,
         total_bytes,
@@ -411,10 +418,12 @@ async fn download_file(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn copy_stream<R, W>(
     reader: &mut R,
     writer: &mut W,
     cancel: &AtomicBool,
+    pause: &PauseGate,
     completed: usize,
     cumulative_written: &mut u64,
     total_bytes: Option<u64>,
@@ -426,6 +435,7 @@ where
 {
     let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
     loop {
+        pause.checkpoint().await;
         check_cancelled(cancel, completed)?;
         let read = reader
             .read(&mut buffer)

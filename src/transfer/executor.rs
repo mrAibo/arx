@@ -113,10 +113,13 @@ pub async fn execute_transfer(
     names: &[String],
     registry: &ProviderRegistry,
     cancel: Arc<AtomicBool>,
+    pause: crate::transfer_queue::PauseGate,
     mut on_progress: impl FnMut(TypedTransferProgress),
 ) -> Result<TransferOutcome, TransferExecutionError> {
     match plan.method {
-        TransferMethod::Native => execute_native(plan, names, cancel, &mut on_progress).await,
+        TransferMethod::Native => {
+            execute_native(plan, names, cancel, pause, &mut on_progress).await
+        }
         TransferMethod::Rsync => execute_rsync(plan, names, cancel, &mut on_progress).await,
         TransferMethod::Sftp => {
             // Fail closed until the SFTP implementation exposes the actual
@@ -125,7 +128,7 @@ pub async fn execute_transfer(
             // boundaries and downloads have local finalization boundaries.
             // Raw provider/executor errors therefore keep their own typed
             // disposition; unclassified I/O remains NeverRetry.
-            sftp_copy::execute_sftp_copy(plan, names, cancel, &mut on_progress).await
+            sftp_copy::execute_sftp_copy(plan, names, cancel, pause, &mut on_progress).await
         }
         TransferMethod::Scp => Err(TransferExecutionError::InvalidPlan {
             method: plan.method,
@@ -187,8 +190,14 @@ pub async fn execute_transfer(
                     // whole-function SafeToRetry wrapper is unsafe. Default to
                     // NeverRetry and let the provider restore SafeToRetry only
                     // on proven pre-finalization failures.
-                    s3_download::download_one(&provider, spec, cancel.clone(), &mut on_progress)
-                        .await?;
+                    s3_download::download_one(
+                        &provider,
+                        spec,
+                        cancel.clone(),
+                        pause,
+                        &mut on_progress,
+                    )
+                    .await?;
                 }
             }
             Ok(TransferOutcome {
@@ -251,6 +260,7 @@ pub async fn execute_transfer(
                         spec,
                         WebDavOverwritePolicy::Forbid,
                         cancel.clone(),
+                        pause,
                         &mut on_progress,
                     )
                     .await
@@ -269,6 +279,7 @@ async fn execute_native(
     plan: &TransferPlan,
     names: &[String],
     cancel: Arc<AtomicBool>,
+    pause: crate::transfer_queue::PauseGate,
     on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> Result<TransferOutcome, TransferExecutionError> {
     let (Location::Local(src), Location::Local(dst)) = (&plan.source, &plan.destination) else {
@@ -285,6 +296,7 @@ async fn execute_native(
     let mut completed = 0;
 
     for name in names {
+        pause.checkpoint().await;
         ensure_not_cancelled(&cancel, completed)?;
         let src = src.clone();
         let dst = dst.clone();
@@ -523,6 +535,7 @@ mod tests {
             &["a.txt".into(), "b.txt".into()],
             &ProviderRegistry::new(),
             cancel,
+            crate::transfer_queue::PauseGate::disabled(),
             |event| progress.push(event),
         )
         .await
@@ -554,6 +567,7 @@ mod tests {
             &["a.txt".into()],
             &ProviderRegistry::new(),
             cancel,
+            crate::transfer_queue::PauseGate::disabled(),
             |_| {},
         )
         .await
@@ -597,7 +611,7 @@ mod tests {
     fn byte_progress_saturates_instead_of_overflowing() {
         let progress = crate::jobs::Progress::Bytes {
             done: u64::MAX,
-            total: u64::MAX,
+            total: Some(u64::MAX),
             rate: 1,
         };
         assert_eq!(progress.percent(), Some(100));
@@ -621,6 +635,7 @@ mod tests {
                 &["x".into()],
                 &ProviderRegistry::new(),
                 cancel,
+                crate::transfer_queue::PauseGate::disabled(),
                 |_| {}
             )
             .await,
@@ -646,6 +661,7 @@ mod tests {
                 &["x".into()],
                 &ProviderRegistry::new(),
                 cancel,
+                crate::transfer_queue::PauseGate::disabled(),
                 |_| {}
             )
             .await,
@@ -711,9 +727,16 @@ mod tests {
         let plan = s3_plan(TransferMethod::S3, None);
         let registry = ProviderRegistry::new();
         let cancel = Arc::new(AtomicBool::new(false));
-        let err = execute_transfer(&plan, &[], &registry, cancel, |_| {})
-            .await
-            .unwrap_err();
+        let err = execute_transfer(
+            &plan,
+            &[],
+            &registry,
+            cancel,
+            crate::transfer_queue::PauseGate::disabled(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             TransferExecutionError::InvalidPlan {
@@ -728,9 +751,16 @@ mod tests {
         let plan = s3_plan(TransferMethod::S3, Some(s3_upload_spec("ghost", "bk")));
         let registry = ProviderRegistry::new();
         let cancel = Arc::new(AtomicBool::new(false));
-        let err = execute_transfer(&plan, &[], &registry, cancel, |_| {})
-            .await
-            .unwrap_err();
+        let err = execute_transfer(
+            &plan,
+            &[],
+            &registry,
+            cancel,
+            crate::transfer_queue::PauseGate::disabled(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             TransferExecutionError::InvalidPlan {
@@ -749,9 +779,16 @@ mod tests {
         registry.register_s3_targets(&[s3_target_config("tgt", "bk")]);
         let plan = s3_plan(TransferMethod::S3, Some(s3_upload_spec("tgt", "bk")));
         let cancel = Arc::new(AtomicBool::new(false));
-        let err = execute_transfer(&plan, &[], &registry, cancel, |_| {})
-            .await
-            .unwrap_err();
+        let err = execute_transfer(
+            &plan,
+            &[],
+            &registry,
+            cancel,
+            crate::transfer_queue::PauseGate::disabled(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, TransferExecutionError::Io { .. }));
     }
 
@@ -773,9 +810,16 @@ mod tests {
         };
         let plan = s3_plan(TransferMethod::S3, Some(spec));
         let cancel = Arc::new(AtomicBool::new(false));
-        let err = execute_transfer(&plan, &[], &registry, cancel, |_| {})
-            .await
-            .unwrap_err();
+        let err = execute_transfer(
+            &plan,
+            &[],
+            &registry,
+            cancel,
+            crate::transfer_queue::PauseGate::disabled(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(&err, TransferExecutionError::Io { .. }));
         assert_eq!(
             err.retry_disposition(),

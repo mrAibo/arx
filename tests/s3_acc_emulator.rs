@@ -70,9 +70,16 @@ async fn upload_bytes(registry: &ProviderRegistry, key: &str, data: &[u8]) {
         webdav_spec: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
-    let outcome = execute_transfer(&plan, &[key.to_string()], registry, cancel, |_| {})
-        .await
-        .expect("upload via transfer");
+    let outcome = execute_transfer(
+        &plan,
+        &[key.to_string()],
+        registry,
+        cancel,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await
+    .expect("upload via transfer");
     assert_eq!(outcome.completed, 1, "exactly one object uploaded");
     let _ = std::fs::remove_file(&tmp);
 }
@@ -97,9 +104,16 @@ async fn download_bytes(registry: &ProviderRegistry, key: &str) -> Vec<u8> {
         webdav_spec: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
-    let outcome = execute_transfer(&plan, &[key.to_string()], registry, cancel, |_| {})
-        .await
-        .expect("download via transfer");
+    let outcome = execute_transfer(
+        &plan,
+        &[key.to_string()],
+        registry,
+        cancel,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await
+    .expect("download via transfer");
     assert_eq!(outcome.completed, 1, "exactly one object downloaded");
     let data = std::fs::read(&tmp).expect("read downloaded fixture");
     let _ = std::fs::remove_file(&tmp);

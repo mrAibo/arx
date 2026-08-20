@@ -154,6 +154,7 @@ async fn run_f5(
         &[filename.to_string()],
         registry,
         cancel,
+        crate::transfer_queue::PauseGate::disabled(),
         |_| {},
     )
     .await

@@ -1383,6 +1383,7 @@ mod physical_acceptance {
             &provider,
             &down_spec,
             Arc::new(AtomicBool::new(false)),
+            crate::transfer_queue::PauseGate::disabled(),
             &mut |_| {},
         )
         .await

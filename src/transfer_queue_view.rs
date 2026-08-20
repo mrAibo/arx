@@ -25,7 +25,7 @@ pub fn transfer_job_counts(jobs: &[Job]) -> TransferJobCounts {
     for job in jobs.iter().filter(|job| job.kind == JobKind::Transfer) {
         match job.status {
             JobStatus::Pending => counts.queued += 1,
-            JobStatus::Running => counts.running += 1,
+            JobStatus::Running | JobStatus::PausePending => counts.running += 1,
             JobStatus::Paused => counts.paused += 1,
             JobStatus::Cancelling => counts.cancelling += 1,
             JobStatus::RetryWaiting => counts.queued += 1,
@@ -75,11 +75,16 @@ pub fn transfer_status_bar(jobs: &[Job]) -> Option<String> {
 
     match &primary.progress {
         JobProgress::Generic(Progress::Bytes { done, total, rate }) => {
-            if *total > 0 {
-                let percent = (((*done as u128) * 100) / (*total as u128)).min(100);
-                detail.push(format!("{percent}%"));
-            } else {
-                detail.push(format_bytes(*done));
+            match total {
+                Some(0) => detail.push("0%".into()),
+                Some(total) => {
+                    let percent = (((*done as u128) * 100) / (*total as u128)).min(100);
+                    detail.push(format!("{percent}%"));
+                }
+                None => {
+                    detail.push(format_bytes(*done));
+                    detail.push("unknown total".into());
+                }
             }
             if *rate > 0 {
                 detail.push(format!("{}/s", format_bytes(*rate)));
@@ -192,7 +197,7 @@ mod tests {
                 id: first.id.clone(),
                 progress: JobProgress::Generic(Progress::Bytes {
                     done: 512,
-                    total: 1024,
+                    total: Some(1024),
                     rate: 256,
                 }),
             },
@@ -210,6 +215,29 @@ mod tests {
         assert!(text.contains("50%"));
         assert!(text.contains("256 B/s"));
         assert!(text.contains("ETA 2s"));
+    }
+
+    #[test]
+    fn unknown_and_zero_byte_totals_render_distinct_truth() {
+        for (total, expected) in [(None, "unknown total"), (Some(0), "0%")] {
+            let manager = JobManager::new();
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let job = transfer_job(&manager);
+            assert!(manager.publish_event(&tx, JobEvent::Running { id: job.id.clone() }));
+            assert!(manager.publish_event(
+                &tx,
+                JobEvent::Progress {
+                    id: job.id,
+                    progress: JobProgress::Generic(Progress::Bytes {
+                        done: 0,
+                        total,
+                        rate: 0,
+                    }),
+                },
+            ));
+            let text = transfer_status_bar(&manager.snapshot()).unwrap();
+            assert!(text.contains(expected), "{text}");
+        }
     }
 
     #[test]
