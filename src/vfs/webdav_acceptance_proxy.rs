@@ -5,10 +5,12 @@
 //! NEVER Authorization / password / Lock-Token bytes.
 //!
 //! Modes:
-//!   PassThroughRecord — forward everything, record PUT count + headers.
-//!   DropGetBody       — forward GET, stream first 1 chunk, then close ARX side.
-//!   AmbiguousPut      — forward complete PUT, get Apache response, discard it,
-//!                       close ARX side (ambiguous: server may have applied it).
+//!   PassThroughRecord — forward everything, record method counts + headers.
+//!   DropGetBody       — forward the REAL Apache response, then truncate the
+//!                       body mid-stream (real Apache status + partial body).
+//!   AmbiguousPut      — forward complete PUT, read Apache's full response
+//!                       (confirm server committed), then discard it and close
+//!                       the ARX side (ambiguous: server may have applied it).
 //!
 //! ponytail: test infra only, compiled under `physical-webdav`. Not a product.
 
@@ -28,14 +30,23 @@ pub enum ProxyMode {
 
 pub struct ProxyRecord {
     pub put_count: usize,
+    pub get_count: usize,
+    pub head_count: usize,
+    pub propfind_count: usize,
     pub seen_if_none_match: bool,
+    /// W18: proxy observed Apache's response for the PUT (server committed).
+    pub apache_response_seen: bool,
 }
 
 impl ProxyRecord {
     fn new() -> Self {
         ProxyRecord {
             put_count: 0,
+            get_count: 0,
+            head_count: 0,
+            propfind_count: 0,
             seen_if_none_match: false,
+            apache_response_seen: false,
         }
     }
 }
@@ -112,8 +123,11 @@ async fn handle_conn(
     }
     let header_text = String::from_utf8_lossy(&buf[..filled]);
     let first_line = header_text.lines().next().unwrap_or("");
-    let method = first_line.split_whitespace().next().unwrap_or("");
-    let mut is_put = false;
+    let method = first_line
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
     let mut seen_inm = false;
     for line in header_text.lines().skip(1) {
         let (k, _v) = match line.split_once(':') {
@@ -132,10 +146,16 @@ async fn handle_conn(
             continue;
         }
     }
-    if method.eq_ignore_ascii_case("PUT") {
-        is_put = true;
+    // Record safe method counts (never Authorization/password/Lock-Token).
+    {
         let mut r = rec.lock().await;
-        r.put_count += 1;
+        match method.as_str() {
+            "PUT" => r.put_count += 1,
+            "GET" => r.get_count += 1,
+            "HEAD" => r.head_count += 1,
+            "PROPFIND" => r.propfind_count += 1,
+            _ => {}
+        }
         if seen_inm {
             r.seen_if_none_match = true;
         }
@@ -157,43 +177,68 @@ async fn handle_conn(
             pipe(&mut client, &mut upstream).await;
         }
         ProxyMode::DropGetBody => {
-            if method.eq_ignore_ascii_case("GET") {
-                // Fault injection: drop the body. Consume the upstream response
-                // head (so Apache closes cleanly), then hand ARX a response that
-                // promises a large body and is abruptly cut -> early EOF error.
-                let mut resp_head = vec![0u8; 64 * 1024];
+            if method == "GET" {
+                // Forward the REAL Apache response, then truncate mid-body.
+                // Read response head + first body chunk from Apache...
+                let mut resp = vec![0u8; 64 * 1024];
                 let mut got = 0usize;
                 loop {
-                    if got >= resp_head.len() {
+                    if got >= resp.len() {
                         break;
                     }
-                    match upstream.read(&mut resp_head[got..]).await {
+                    match upstream.read(&mut resp[got..]).await {
                         Ok(n) if n > 0 => {
                             got += n;
-                            if resp_head[..got].windows(4).any(|w| &w[..4] == b"\r\n\r\n") {
+                            // Stop once we have the head and a little body.
+                            if resp[..got].windows(4).any(|w| &w[..4] == b"\r\n\r\n") {
+                                // Read a bit more real body, then truncate.
+                                let mut tail = [0u8; 64];
+                                match upstream.read(&mut tail).await {
+                                    Ok(b) if b > 0 => {
+                                        resp.extend_from_slice(&tail[..b]);
+                                        got += b;
+                                    }
+                                    _ => {}
+                                }
                                 break;
                             }
                         }
                         _ => break,
                     }
                 }
-                // Drop the upstream side; we won't forward its body.
-                let _ = upstream.shutdown().await;
-                // Craft a response promising more bytes than we deliver.
-                let crafted = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n";
-                let _ = client.write_all(crafted).await;
-                // Send a fragment, then abruptly close (no clean chunk terminator).
-                let _ = client.write_all(b"partial-").await;
+                // ...forward the real Apache head+partial body to ARX...
+                let _ = client.write_all(&resp[..got]).await;
+                // ...then abruptly close ARX side before the body completes.
                 let _ = client.shutdown().await;
             } else {
                 pipe(&mut client, &mut upstream).await;
             }
         }
         ProxyMode::AmbiguousPut => {
-            if is_put {
-                // Forward complete body until client EOF.
+            if method == "PUT" {
+                // Forward complete PUT body until client EOF (full request sent).
                 let _ = tokio::io::copy(&mut client, &mut upstream).await;
-                // Discard upstream response, close ARX side (ambiguous).
+                // Read Apache's FULL response to confirm the backend committed
+                // the mutation. Do NOT forward it to ARX.
+                let mut sink = vec![0u8; 64 * 1024];
+                let mut total = 0usize;
+                loop {
+                    match upstream.read(&mut sink).await {
+                        Ok(n) if n > 0 => {
+                            total += n;
+                            if total > sink.len() {
+                                // already proved a response arrived
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                if total > 0 {
+                    let mut r = rec.lock().await;
+                    r.apache_response_seen = true;
+                }
+                // Close ARX side: ARX never learns the outcome (ambiguous).
                 let _ = client.shutdown().await;
             } else {
                 pipe(&mut client, &mut upstream).await;

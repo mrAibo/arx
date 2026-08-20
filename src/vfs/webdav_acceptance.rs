@@ -22,9 +22,9 @@
 //!   W13 wrong credentials -> AuthFailed
 //!   W14 404 truthful mapping
 //!   W15 overwrite conflict / fail-closed
-//!   W16 423 Locked (deferred: needs deterministic lock fixture)
-//!   W17 connection drop of a GET reader (deferred: needs fault proxy)
-//!   W18 ambiguous PUT, observed PUT count == 1 (deferred: needs fault proxy)
+//!   W16 423 Locked (real Apache LOCK)
+//!   W17 connection drop of a GET reader (real Apache response, truncated)
+//!   W18 ambiguous PUT, observed PUT count == 1 (proxy confirms backend commit)
 //!
 //! Every physical resource uses a unique run namespace so repeated runs never
 //! collide with prior containers.
@@ -41,6 +41,7 @@ use crate::vfs::{
     CancellationFlag, EntryIdentity, EntryKind, ListedEntry, Location, ProviderRegistry,
     RemoteEditRevision, VfsProvider,
 };
+use std::io;
 use std::sync::Arc;
 
 fn physical_run_id() -> String {
@@ -563,9 +564,8 @@ async fn physical_w1_through_w18() {
     let missing = p_arc.read_all_capped("/does-not-exist-xyz.txt", 64).await;
     assert!(missing.is_err(), "W14: 404 -> err");
 
-    // W15: overwrite conflict / fail-closed — HTTP precondition proof via proxy.
-    // Proxy in PassThroughRecord records PUT count + If-None-Match header and
-    // forwards to real Apache. ARX targets the proxy URL, not Apache directly.
+    // W15: overwrite fail-closed — ONE product F5 (Local -> WebDAV) through the
+    // proxy. The proxy records method counts + If-None-Match, never secrets.
     let upstream = p_arc.target().url.clone();
     let proxy = webdav_acceptance_proxy::start_proxy(
         &upstream,
@@ -575,35 +575,26 @@ async fn physical_w1_through_w18() {
     .expect("W15: start proxy");
     let proxy_url = proxy.listen_addr.clone();
 
-    // Build a provider + registry pointing at the PROXY (not real Apache) so we
-    // can observe ARX's exact HTTP behavior.
-    // Build proxy providers pointing at the PROXY (not real Apache) so we can
-    // observe ARX's exact HTTP behavior. Each call gets a FRESH provider (fresh
-    // reqwest client => fresh connection pool) so keep-alive pipelining does
-    // not collapse two PUTs onto one proxied TCP connection.
-    let mk_proxy = || {
-        WebDavProvider::new(
-            WebDavTarget {
-                id: "accept".into(),
-                name: "accept".into(),
-                url: proxy_url.clone(),
-                username: p_arc.target().username.clone(),
-                auth: "basic".into(),
-            },
-            std::env::var("ARX_WEBDAV_SMOKE_PASS").unwrap(),
-        )
-        .unwrap()
-    };
-    let proxy_arc = Arc::new(mk_proxy());
+    // ARX targets the proxy (not Apache directly) so we observe exact HTTP.
+    let proxy_provider = WebDavProvider::new(
+        WebDavTarget {
+            id: "accept".into(),
+            name: "accept".into(),
+            url: proxy_url.clone(),
+            username: p_arc.target().username.clone(),
+            auth: "basic".into(),
+        },
+        std::env::var("ARX_WEBDAV_SMOKE_PASS").unwrap(),
+    )
+    .unwrap();
+    let proxy_arc = Arc::new(proxy_provider);
+    let proxy_reg = registry_with(&proxy_arc);
 
-    // Seed a SEPARATE resource with OLD bytes directly on Apache (bypass proxy),
-    // then prove the overwrite policy at the PUT itself via the proxy on a
-    // FRESH name.
-    let ov_seed = format!("/{}-w15-seed.txt", run);
-    let ov = format!("/{}-w15-new.txt", run);
+    // Seed the SAME target resource directly on Apache (bypass proxy) with OLD.
+    let ov = format!("/{}-w15.txt", run);
     p_arc
         .write_file_bytes_if_unchanged(
-            &ov_seed,
+            &ov,
             b"OLD",
             &RemoteEditRevision::new(vec![], 0, 0, 0),
             &CancellationFlag::default(),
@@ -612,106 +603,106 @@ async fn physical_w1_through_w18() {
         .await
         .expect("W15: seed OLD on Apache");
 
-    // First PUT via proxy (Forbid on a fresh name: succeeds -> PUT #1).
-    proxy_arc
-        .put_with_policy(&ov, b"NEW", crate::transfer::WebDavOverwritePolicy::Forbid)
-        .await
-        .expect("W15: first PUT via proxy");
+    // Local file with the SAME basename and NEW bytes.
+    let ov_local = std::env::temp_dir().join(ov.trim_start_matches('/'));
+    std::fs::write(&ov_local, b"NEW").expect("W15: write local NEW");
 
-    // Second PUT to the SAME url with Forbid => If-None-Match:* => 412.
-    // Fresh provider => fresh connection so the proxy records it as a second PUT.
-    let conflict = Arc::new(mk_proxy())
-        .put_with_policy(&ov, b"NEW2", crate::transfer::WebDavOverwritePolicy::Forbid)
-        .await;
-    assert!(conflict.is_err(), "W15: overwrite conflict rejected");
+    // Exactly ONE product F5 upload (Local -> WebDAV) via the proxy.
+    let conflict = run_f5(
+        &proxy_reg,
+        Location::Local(ov_local.parent().unwrap().to_path_buf()),
+        Location::WebDav {
+            target: "accept".into(),
+            path: ov.clone(),
+        },
+        None,
+        Some(&ListedEntry {
+            entry: crate::vfs::Entry {
+                name: ov.trim_start_matches('/').to_string(),
+                kind: EntryKind::File,
+                size: Some(ov_local.metadata().unwrap().len()),
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::Other,
+        }),
+        ov.trim_start_matches('/'),
+    )
+    .await;
+    // Product F5 must surface the conflict (Forbid => 412 => AlreadyExists).
+    assert!(conflict.is_err(), "W15: one product F5 rejected conflict");
 
-    // Prove: exactly 2 PUTs (no blind replay after 412), If-None-Match:*
-    // observed on the rejected PUT, and remote still holds the first NEW
-    // (the 412 prevented the second write).
+    // Proxy evidence: exactly one PUT with If-None-Match:*, and crucially NO
+    // overwrite preflight (HEAD == 0, PROPFIND == 0). The direct Apache seed
+    // bypassed the proxy, so these counts are purely the product F5.
     let rec = proxy.record.lock().await;
-    assert_eq!(rec.put_count, 2, "W15: PUT count == 2 (no blind replay)");
+    assert_eq!(rec.put_count, 1, "W15: PUT count == 1 (single product F5)");
     assert!(
         rec.seen_if_none_match,
         "W15: If-None-Match:* observed on PUT"
     );
+    assert_eq!(rec.head_count, 0, "W15: no HEAD preflight");
+    assert_eq!(rec.propfind_count, 0, "W15: no PROPFIND preflight");
     drop(rec);
 
-    // Remote holds NEW (first PUT), not overwritten by the rejected second.
-    let remote_after = p_arc.read_all_capped(&ov, 64).await.expect("W15: read NEW");
-    assert_eq!(
-        remote_after.bytes, b"NEW",
-        "W15: remote NEW (not overwritten)"
-    );
+    // Remote still holds OLD (the existing resource was not overwritten).
+    let remote_after = p_arc.read_all_capped(&ov, 64).await.expect("W15: read OLD");
+    assert_eq!(remote_after.bytes, b"OLD", "W15: remote OLD unchanged");
     let _ = p_arc.remove_file(&ov).await;
-    let _ = p_arc.remove_file(&ov_seed).await;
+    let _ = std::fs::remove_file(&ov_local);
 
-    // W16: real Apache LOCK -> 423 on ARX mutation without token.
-    // Test-only LOCK/UNLOCK directly against Apache with fixture creds.
-    let lock_res = lock_resource(
+    // W16: real Apache LOCK -> 423 on ARX mutation without token (MUST EXECUTE).
+    // Fixture loads mod_dav_lock, so LOCK is expected to succeed. No SKIP path.
+    let w16_path = format!("/{}-w16.txt", run);
+    p_arc
+        .write_file_bytes_if_unchanged(
+            &w16_path,
+            b"before",
+            &RemoteEditRevision::new(vec![], 0, 0, 0),
+            &CancellationFlag::default(),
+            None,
+        )
+        .await
+        .expect("W16: seed");
+    let token = lock_resource(
         &upstream,
-        ov_seed.trim_start_matches('/'),
+        w16_path.trim_start_matches('/'),
+        p_arc.target().username.as_str(),
+        &std::env::var("ARX_WEBDAV_SMOKE_PASS").unwrap(),
+    )
+    .await
+    .expect("W16: LOCK accepted (mod_dav_lock loaded)");
+    // ARX mutation WITHOUT the token must be rejected (423 / PermissionDenied).
+    let mut_w = p_arc
+        .write_file_bytes_if_unchanged(
+            &w16_path,
+            b"after",
+            &RemoteEditRevision::new(vec![], 0, 0, 0),
+            &CancellationFlag::default(),
+            None,
+        )
+        .await;
+    let kind = mut_w.as_ref().err().map(|e| e.kind());
+    assert_eq!(
+        kind,
+        Some(io::ErrorKind::PermissionDenied),
+        "W16: mutation under lock without token -> PermissionDenied"
+    );
+    // Original bytes unchanged.
+    let after = p_arc
+        .read_all_capped(&w16_path, 64)
+        .await
+        .expect("W16: read");
+    assert_eq!(after.bytes, b"before", "W16: original bytes unchanged");
+    // Cleanup: UNLOCK so the fixture is not left locked.
+    unlock_resource(
+        &upstream,
+        w16_path.trim_start_matches('/'),
+        &token,
         p_arc.target().username.as_str(),
         &std::env::var("ARX_WEBDAV_SMOKE_PASS").unwrap(),
     )
     .await;
-    // If the fixture supports LOCK (mod_dav_lock loaded), Apache returns a
-    // Lock-Token. Capture it (never logged) and UNLOCK in finally-style.
-    if let Some(_token) = lock_res {
-        // ARX mutation WITHOUT the token must be rejected with 423.
-        let locked_path = format!("/{}-w16.txt", run);
-        p_arc
-            .write_file_bytes_if_unchanged(
-                &locked_path,
-                b"before",
-                &RemoteEditRevision::new(vec![], 0, 0, 0),
-                &CancellationFlag::default(),
-                None,
-            )
-            .await
-            .expect("W16: seed");
-        // Re-LOCK that specific resource, then attempt ARX overwrite without token.
-        let tok2 = lock_resource(
-            &upstream,
-            locked_path.trim_start_matches('/'),
-            p_arc.target().username.as_str(),
-            &std::env::var("ARX_WEBDAV_SMOKE_PASS").unwrap(),
-        )
-        .await
-        .expect("W16: lock resource");
-        let mut_w = p_arc
-            .write_file_bytes_if_unchanged(
-                &locked_path,
-                b"after",
-                &RemoteEditRevision::new(vec![], 0, 0, 0),
-                &CancellationFlag::default(),
-                None,
-            )
-            .await;
-        // Truthful 423 mapping: ARX must surface a conflict/permission error.
-        assert!(
-            mut_w.is_err(),
-            "W16: mutation under lock without token rejected"
-        );
-        // Original bytes unchanged.
-        let after = p_arc
-            .read_all_capped(&locked_path, 64)
-            .await
-            .expect("W16: read");
-        assert_eq!(after.bytes, b"before", "W16: original bytes unchanged");
-        // Cleanup: UNLOCK so the fixture is not left locked.
-        unlock_resource(
-            &upstream,
-            locked_path.trim_start_matches('/'),
-            &tok2,
-            p_arc.target().username.as_str(),
-            &std::env::var("ARX_WEBDAV_SMOKE_PASS").unwrap(),
-        )
-        .await;
-        let _ = p_arc.remove_file(&locked_path).await;
-    } else {
-        // Fixture does not expose mod_dav_lock; skip W16 truthfully (no fake pass).
-        eprintln!("W16 SKIP: fixture does not support LOCK (mod_dav_lock not loaded)");
-    }
+    let _ = p_arc.remove_file(&w16_path).await;
 
     // W17: GET body drop via proxy -> GET count == 1, error, no retry.
     let drop_proxy = webdav_acceptance_proxy::start_proxy(
@@ -762,10 +753,14 @@ async fn physical_w1_through_w18() {
             _ => None,
         })
         .expect("W17: object identity");
+    // Dedicated destination dir: product F5 derives the local name from the
+    // listed display name, so the real final path is dir/{listed name}.
+    let w17_dir = tempfile::tempdir().expect("W17: dest dir");
+    let expected_final = w17_dir.path().join(w17_file.trim_start_matches('/'));
     let w17_res = run_f5(
         &registry_with(&w17_arc),
         w17_src_loc.clone(),
-        Location::Local(w17_dl.parent().unwrap().to_path_buf()),
+        Location::Local(w17_dir.path().to_path_buf()),
         Some(&ListedEntry {
             entry: crate::vfs::Entry {
                 name: w17_file.trim_start_matches('/').to_string(),
@@ -776,12 +771,32 @@ async fn physical_w1_through_w18() {
             identity: EntryIdentity::WebDavObject(w17_obj),
         }),
         None,
-        &w17_dl.file_name().unwrap().to_string_lossy(),
+        w17_file.trim_start_matches('/'),
     )
     .await;
     assert!(w17_res.is_err(), "W17: GET body drop -> error");
-    // No partial final file left behind.
-    assert!(!w17_dl.exists(), "W17: no partial final destination");
+    // Real final path absent (product F5 names it from the WebDAV display name).
+    assert!(!expected_final.exists(), "W17: final absent");
+    // No stage artifact (.<stage>- prefix) left in the dedicated dir.
+    let stage_left = std::fs::read_dir(w17_dir.path())
+        .ok()
+        .map(|mut d| {
+            d.any(|e| {
+                e.ok()
+                    .map(|x| {
+                        x.file_name()
+                            .to_string_lossy()
+                            .starts_with(".arx-download-")
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    assert!(!stage_left, "W17: no stage artifact left");
+    // Proxy evidence: exactly one GET, no retry.
+    let w17_rec = drop_proxy.record.lock().await;
+    assert_eq!(w17_rec.get_count, 1, "W17: GET count == 1 (no retry)");
+    drop(w17_rec);
     let _ = p_arc.remove_file(&w17_file).await;
     let _ = std::fs::remove_file(&w17_dl);
 
@@ -836,6 +851,12 @@ async fn physical_w1_through_w18() {
         w18_rec.put_count, 1,
         "W18: PUT count == 1 (no blind replay)"
     );
+    // Proxy observed Apache's full response -> backend committed the mutation,
+    // yet ARX never received the outcome (ambiguous).
+    assert!(
+        w18_rec.apache_response_seen,
+        "W18: proxy observed Apache response (backend committed)"
+    );
     drop(w18_rec);
     // Direct Apache verification MAY show the object exists (proves ambiguity).
     // We do not assert absence — the invariant is: truthful error + no replay.
@@ -856,13 +877,22 @@ async fn lock_resource(upstream: &str, path: &str, user: &str, pass: &str) -> Op
   <D:locktype><D:write/></D:locktype>
   <D:owner><D:href>arx-test</D:href></D:owner>
 </D:lockinfo>"#;
+    let url = format!(
+        "{}/{}/{}",
+        upstream.trim_end_matches('/'),
+        upstream
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(""),
+        path.trim_start_matches('/')
+    );
     let resp = client
-        .request(
-            reqwest::Method::from_bytes(b"LOCK").unwrap(),
-            format!("{}{}", upstream.trim_end_matches('/'), path),
-        )
+        .request(reqwest::Method::from_bytes(b"LOCK").unwrap(), url)
         .basic_auth(user, Some(pass))
         .header("Content-Type", "application/xml")
+        .header("Depth", "0")
+        .header("Timeout", "Second-3600")
         .body(body)
         .send()
         .await
@@ -879,11 +909,18 @@ async fn lock_resource(upstream: &str, path: &str, user: &str, pass: &str) -> Op
 /// Test-only UNLOCK against real Apache.
 async fn unlock_resource(upstream: &str, path: &str, token: &str, user: &str, pass: &str) {
     let client = reqwest::Client::new();
+    let url = format!(
+        "{}/{}/{}",
+        upstream.trim_end_matches('/'),
+        upstream
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(""),
+        path.trim_start_matches('/')
+    );
     let _ = client
-        .request(
-            reqwest::Method::from_bytes(b"UNLOCK").unwrap(),
-            format!("{}{}", upstream.trim_end_matches('/'), path),
-        )
+        .request(reqwest::Method::from_bytes(b"UNLOCK").unwrap(), url)
         .basic_auth(user, Some(pass))
         .header("Lock-Token", token)
         .send()

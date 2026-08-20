@@ -241,8 +241,10 @@ impl WebDavProvider {
                     "href must not carry fragment",
                 ));
             }
-            let hp = h.path();
-            return self.check_contained(root_path, hp, href);
+            // Same-origin absolute href: the server gave us an authoritative URL.
+            // Return it verbatim (raw path + query), do NOT re-encode or drop the
+            // query. Origin/creds/fragment already validated above.
+            return Ok(href.to_string());
         }
 
         // Path-absolute href: preserve raw path/query verbatim, prefix origin.
@@ -259,6 +261,13 @@ impl WebDavProvider {
 
     /// Containment + traversal check on an already-path (raw) href.
     fn check_contained(&self, root_path: &str, href_path: &str, raw: &str) -> io::Result<String> {
+        // Fragments are never part of a wire URL.
+        if raw.contains('#') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "href must not carry fragment",
+            ));
+        }
         let contained = root_path.is_empty()
             || href_path == root_path
             || href_path.starts_with(&format!("{root_path}/"));
@@ -1034,8 +1043,9 @@ pub(crate) fn parse_multistatus(bytes: &[u8]) -> io::Result<Vec<PropFindEntry>> 
                 let local = std::str::from_utf8(name.as_ref()).unwrap_or("");
                 let is_dav = match ns {
                     quick_xml::name::ResolveResult::Bound(n) => n.0 == b"DAV:",
-                    // No explicit namespace in scope => default-namespace DAV.
-                    quick_xml::name::ResolveResult::Unbound => true,
+                    // No explicit namespace => NOT DAV. Namespace-less XML must
+                    // not be mistaken for DAV protocol elements.
+                    quick_xml::name::ResolveResult::Unbound => false,
                     // Unknown prefix or error: do not treat as DAV.
                     quick_xml::name::ResolveResult::Unknown(_) => false,
                 };
@@ -1194,15 +1204,21 @@ pub(crate) fn parse_multistatus(bytes: &[u8]) -> io::Result<Vec<PropFindEntry>> 
             Event::Text(e) => {
                 if text_for.is_some() {
                     let t = e.unescape().unwrap_or_default();
-                    if text_accum.len() + t.len() <= MAX_ACCUM_TEXT {
-                        text_accum.push_str(&t);
-                    } else if text_accum.len() < MAX_ACCUM_TEXT {
-                        // Hard cap: reject rather than silently truncate.
+                    // Checked arithmetic: when current == MAX and more arrives,
+                    // reject rather than silently ignore the overflow.
+                    let next = text_accum.len().checked_add(t.len()).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "PROPFIND accumulated text exceeds cap",
+                        )
+                    })?;
+                    if next > MAX_ACCUM_TEXT {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "PROPFIND accumulated text exceeds cap",
                         ));
                     }
+                    text_accum.push_str(&t);
                 }
             }
             Event::Eof => break,
@@ -1401,5 +1417,81 @@ mod tests {
     fn wire_url_for_href_rejects_cross_origin() {
         let p = dav_provider("http://example/dav/");
         assert!(p.wire_url_for_href("http://evil/dav/file.txt").is_err());
+    }
+
+    #[test]
+    fn wire_url_for_href_preserves_query_same_origin_absolute() {
+        let p = dav_provider("http://example/dav/");
+        // authoritative absolute href keeps raw path + query verbatim.
+        let ok = p
+            .wire_url_for_href("http://example/dav/a%20b?version=7")
+            .unwrap();
+        assert_eq!(ok, "http://example/dav/a%20b?version=7");
+    }
+
+    #[test]
+    fn wire_url_for_href_preserves_query_path_absolute() {
+        let p = dav_provider("http://example/dav/");
+        let ok = p.wire_url_for_href("/dav/a%20b?version=7").unwrap();
+        assert_eq!(ok, "http://example/dav/a%20b?version=7");
+    }
+
+    #[test]
+    fn wire_url_for_href_rejects_fragment() {
+        let p = dav_provider("http://example/dav/");
+        // same-origin absolute with fragment -> rejected.
+        assert!(p.wire_url_for_href("http://example/dav/x#frag").is_err());
+        // path-absolute with fragment -> rejected.
+        assert!(p.wire_url_for_href("/dav/x#frag").is_err());
+    }
+
+    #[test]
+    fn parse_multistatus_rejects_namespace_less_xml() {
+        // Namespace-less XML is NOT DAV; must not drive protocol state.
+        let body = br#"<?xml version="1.0" encoding="utf-8"?>
+<multistatus xmlns="not-dav:">
+  <response>
+    <href>/dav/x</href>
+    <propstat><prop><displayname>x</displayname></prop></propstat>
+  </response>
+</multistatus>"#;
+        let entries = crate::vfs::webdav::parse_multistatus(body).unwrap();
+        assert!(
+            entries.is_empty(),
+            "namespace-less XML must not parse as DAV"
+        );
+    }
+
+    #[test]
+    fn parse_multistatus_accepts_default_dav_namespace() {
+        let body = br#"<?xml version="1.0" encoding="utf-8"?>
+<multistatus xmlns="DAV:">
+  <response>
+    <href>/dav/x</href>
+    <propstat><prop><displayname>x</displayname></prop></propstat>
+  </response>
+</multistatus>"#;
+        let entries = crate::vfs::webdav::parse_multistatus(body).unwrap();
+        assert_eq!(entries.len(), 1, "default DAV: namespace parsed");
+    }
+
+    #[test]
+    fn parse_multistatus_rejects_max_accum_text_plus_one() {
+        // Exactly MAX_ACCUM_TEXT bytes is allowed; one more must be rejected.
+        let big = "a".repeat(crate::vfs::webdav::MAX_ACCUM_TEXT);
+        let ok = format!(
+            "<?xml version=\"1.0\"?><multistatus xmlns=\"DAV:\"><response><href>/dav/x</href>\
+             <propstat><prop><displayname>{big}</displayname></prop></propstat></response></multistatus>"
+        );
+        assert!(crate::vfs::webdav::parse_multistatus(ok.as_bytes()).is_ok());
+        let over = format!(
+            "<?xml version=\"1.0\"?><multistatus xmlns=\"DAV:\"><response><href>/dav/x</href>\
+             <propstat><prop><displayname>{}{}</displayname></prop></propstat></response></multistatus>",
+            big, "b"
+        );
+        assert!(
+            crate::vfs::webdav::parse_multistatus(over.as_bytes()).is_err(),
+            "MAX+1 bytes must be rejected (InvalidData), not silently ignored"
+        );
     }
 }

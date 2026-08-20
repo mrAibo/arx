@@ -109,6 +109,12 @@ pub(crate) async fn download_one(
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"))?;
 
+    // 2. Stream GET into a secure temp file IN the destination directory.
+    //    NamedTempFile is the RAII owner: on drop (any error/cancel/return) the
+    //    stage is removed. We write via a tokio wrapper, then finalize.
+    let stage = tempfile::NamedTempFile::new_in(dest_dir)
+        .map_err(|e| io::Error::other(format!("stage create: {e}")))?;
+
     // cancel before GET
     if cancel.load(Ordering::Relaxed) {
         return Err(io::Error::new(
@@ -117,54 +123,22 @@ pub(crate) async fn download_one(
         ));
     }
 
-    // Create a unique temp file path in the destination directory
-    let temp_path = dest_dir.join(format!(
-        ".arx-download-{}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-        local_destination
-            .file_name()
-            .ok_or_else(|| io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "destination has no filename"
-            ))?
-            .to_string_lossy()
-    ));
-
-    // RAII cleanup guard
-    struct TempFileGuard {
-        path: std::path::PathBuf,
-    }
-    impl Drop for TempFileGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-    let _guard = TempFileGuard {
-        path: temp_path.clone(),
-    };
-
-    // Open with tokio for async streaming
-    let mut temp_file = TokioFile::options()
-        .create_new(true)
-        .write(true)
-        .open(&temp_path)
-        .await?;
-
     {
+        // Wrap the stage's std file for async streaming.
+        let mut temp_file = TokioFile::from_std(
+            stage
+                .reopen()
+                .map_err(|e| io::Error::other(format!("stage reopen: {e}")))?,
+        );
         // 3. Stream body with cancellation check between chunks.
         let max_bytes: usize = 16 * 1024 * 1024 * 1024;
         provider
             .get_stream(&source.href, max_bytes, &mut temp_file, Some(&cancel))
             .await?;
+        temp_file.flush().await?;
+        temp_file.sync_all().await?;
+        // tokio wrapper dropped here -> std file closed; NamedTempFile still owns path.
     }
-
-    temp_file.flush().await?;
-    temp_file.sync_all().await?;
-    drop(temp_file); // ensure closed before persist
 
     // pre-persist cancellation: never finalize a staged download after cancel
     if cancel.load(Ordering::Acquire) {
@@ -174,27 +148,22 @@ pub(crate) async fn download_one(
         ));
     }
 
-    // 4. Finalize: persist noclobber for Forbid, replace for Allow.
+    // 4. Finalize: real noclobber for Forbid (persist_noclobber), replace for Allow.
     if matches!(overwrite, WebDavOverwritePolicy::Forbid) {
-        // Forbid: noclobber — fail if destination exists.
-        // Use std::fs to avoid async rename issues across filesystems
-        match std::fs::rename(&temp_path, local_destination) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+        match stage.persist_noclobber(local_destination) {
+            Ok(_final) => {}
+            Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "refusing to overwrite existing destination (policy Forbid)",
                 ));
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.error),
         }
     } else {
         // Allow: replace existing destination.
-        std::fs::rename(&temp_path, local_destination)?;
+        stage.persist(local_destination).map_err(|e| e.error)?;
     }
-
-    // Guard disarmed — file moved successfully
-    std::mem::forget(_guard);
 
     // 5. Return bytes written (zero is valid).
     let size = std::fs::metadata(local_destination)
