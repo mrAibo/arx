@@ -52,14 +52,17 @@ fn product_cancel_router_splits_transfer_and_legacy_jobs() {
 
 #[test]
 fn copy_and_move_product_paths_enqueue_into_persistent_runtime() {
-    let enqueue_calls = TUI_SOURCE.matches("sync.transfers.enqueue(plan, names)").count();
+    let enqueue_calls = TUI_SOURCE
+        .matches("sync.transfers.enqueue(plan, names)")
+        .count();
     assert_eq!(
         enqueue_calls, 2,
         "Copy and Move should each enqueue exactly once through the persistent runtime"
     );
 
     assert!(
-        !TUI_SOURCE.contains("arx::transfer::executor::execute_transfer(\n                    &plan2"),
+        !TUI_SOURCE
+            .contains("arx::transfer::executor::execute_transfer(\n                    &plan2"),
         "legacy direct Copy/Move executor spawn must not return to the TUI product path"
     );
 }
