@@ -590,13 +590,14 @@ async fn physical_w1_through_w18() {
     .unwrap();
     let proxy_arc = Arc::new(proxy_provider);
 
-    // Seed remote with bytes directly on Apache (bypass proxy), then prove
-    // the overwrite policy at the PUT itself via the proxy.
+    // Seed a SEPARATE resource with OLD bytes directly on Apache (bypass proxy),
+    // then prove the overwrite policy at the PUT itself via the proxy on a
+    // FRESH name.
+    let ov_seed = format!("/{}-w15-seed.txt", run);
     let ov = format!("/{}-w15-new.txt", run);
-    let ov_name = ov.trim_start_matches('/');
     p_arc
         .write_file_bytes_if_unchanged(
-            &ov,
+            &ov_seed,
             b"OLD",
             &RemoteEditRevision::new(vec![], 0, 0, 0),
             &CancellationFlag::default(),
@@ -618,7 +619,8 @@ async fn physical_w1_through_w18() {
     assert!(conflict.is_err(), "W15: overwrite conflict rejected");
 
     // Prove: exactly 2 PUTs (no blind replay after 412), If-None-Match:*
-    // observed on the rejected PUT, and remote still holds OLD (no overwrite).
+    // observed on the rejected PUT, and remote still holds the first NEW
+    // (the 412 prevented the second write).
     let rec = proxy.record.lock().await;
     assert_eq!(rec.put_count, 2, "W15: PUT count == 2 (no blind replay)");
     assert!(
@@ -627,16 +629,20 @@ async fn physical_w1_through_w18() {
     );
     drop(rec);
 
-    // Remote OLD bytes unchanged: read directly from Apache (not proxy).
-    let remote_after = p_arc.read_all_capped(&ov, 64).await.expect("W15: read OLD");
-    assert_eq!(remote_after.bytes, b"OLD", "W15: remote OLD unchanged");
+    // Remote holds NEW (first PUT), not overwritten by the rejected second.
+    let remote_after = p_arc.read_all_capped(&ov, 64).await.expect("W15: read NEW");
+    assert_eq!(
+        remote_after.bytes, b"NEW",
+        "W15: remote NEW (not overwritten)"
+    );
     let _ = p_arc.remove_file(&ov).await;
+    let _ = p_arc.remove_file(&ov_seed).await;
 
     // W16: real Apache LOCK -> 423 on ARX mutation without token.
     // Test-only LOCK/UNLOCK directly against Apache with fixture creds.
     let lock_res = lock_resource(
         &upstream,
-        ov_name,
+        ov_seed.trim_start_matches('/'),
         p_arc.target().username.as_str(),
         &std::env::var("ARX_WEBDAV_SMOKE_PASS").unwrap(),
     )
