@@ -351,8 +351,6 @@ async fn p1_p12_real_local_transfer_queue_acceptance() {
         settled.len()
     );
 
-    println!(
-        "P8 NOT PHYSICALLY EXERCISED: Local executor has no fault injection and runtime attempt count is private"
-    );
+    println!("P8 exercised separately by transfer_queue_s3_retry_physical against real MinIO");
     println!("P9/P10 PROVIDER-SCOPED: no WebDAV/SFTP server used by this Local-only battery");
 }
