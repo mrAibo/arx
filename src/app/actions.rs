@@ -506,6 +506,8 @@ pub fn listed_entry_navigation_target(
             })
         }
         crate::vfs::EntryIdentity::S3Object(_) => None,
+        crate::vfs::EntryIdentity::WebDavObject(_)
+        | crate::vfs::EntryIdentity::WebDavCollection(_) => None,
         crate::vfs::EntryIdentity::Other
             if listed.entry.kind == crate::vfs::EntryKind::Directory
                 && matches!(
@@ -542,6 +544,7 @@ pub fn navigation_parent_target(
     use crate::vfs::{Location, S3TargetBinding};
     match current {
         Location::Local(_) | Location::Sftp { .. } | Location::Archive { .. } => current.parent(),
+        Location::WebDav { .. } => current.parent(),
         Location::S3 {
             target,
             bucket,

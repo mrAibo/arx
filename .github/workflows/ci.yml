@@ -47,3 +47,51 @@ jobs:
 
       - name: Check MSRV
         run: cargo check --locked --all-features
+
+  # Physical WebDAV acceptance (W1–W18) against a real Apache mod_dav fixture.
+  # Uses the existing test-only setup script; the chmod-0600 env file is
+  # sourced and the physical test is run in the SAME shell step so the
+  # credentials do not leak across steps. Fails (does not skip) if fixture
+  # setup or env resolution fails.
+  #
+  # Exact-SHA gate: for pull_request runs we check out the PR HEAD (not the
+  # GitHub merge ref) and assert git HEAD equals the expected PR head SHA, so
+  # the reported evidence is the real PR commit, not a synthetic merge commit.
+  webdav-physical:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # pull_request: test the PR HEAD exactly (not the merge ref).
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Exact-SHA evidence (PR head)
+        run: |
+          set -euo pipefail
+          TESTED_SHA="$(git rev-parse HEAD)"
+          echo "TESTED_SHA=$TESTED_SHA"
+          EXPECTED="${{ github.event.pull_request.head.sha }}"
+          if [ -n "$EXPECTED" ] && [ "$EXPECTED" != "$TESTED_SHA" ]; then
+            echo "::error::checked-out SHA ($TESTED_SHA) != PR head ($EXPECTED)"
+            exit 1
+          fi
+
+      - name: Provision Apache mod_dav fixture + run physical W1–W18
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          # GitHub runner already provides docker; do NOT reinstall (avoids
+          # containerd.io conflict). Bring the service up if needed.
+          sudo systemctl start docker || true
+          docker info >/dev/null 2>&1 || { echo "docker unavailable"; exit 1; }
+          source ./scripts/setup_webdav_acceptance.sh
+          set +x
+          source "$ENV_FILE"
+          cargo test --locked --lib --features physical-webdav physical_w1_through_w18 -- --nocapture

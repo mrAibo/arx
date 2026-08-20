@@ -135,6 +135,7 @@ pub fn local_executors(local: LocalToolAvailability) -> ExecutorAvailability {
         rsync: local.rsync,
         sftp: false,
         s3: false,
+        webdav: false,
     }
 }
 
@@ -148,6 +149,7 @@ pub fn local_remote_executors(
         rsync: local.ssh && local.rsync && remote.reachable && remote.rsync,
         sftp: local.ssh && local.sftp && remote.reachable && sftp_executor_available,
         s3: false,
+        webdav: false,
     }
 }
 

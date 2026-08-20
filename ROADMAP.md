@@ -40,11 +40,12 @@ Physical SFTP Remote Edit acceptance (real OpenSSH fixture, `ARX_SFTP_SMOKE_HOST
 
 ## THEN — Next Public Release = v0.17.1
 
-Patch release from current `main` (post-PACK-C reliability hardening). Release Readiness gates apply; MSRV stays 1.88. No new major features, no WebDAV/Windows/plugin/S3-scope/router changes.
+Patch release from current `main` (post-PACK-C reliability hardening + PACK E WebDAV candidate). Release Readiness gates apply; MSRV stays 1.88. No new major features, no WebDAV/Windows/plugin/S3-scope/router changes. (WebDAV MVP is a CANDIDATE in PR #157, not yet released.)
 
 ## FUTURE
 
 - S3 object-storage backend — **RELEASED as SUPPORTED MVP.** Real AWS S3 (account `715844024414`) and MinIO both passed physical acceptance (20/20 tests, immutable SHA `b5f0ee6`). Moto emulated PASS. Cloudflare R2 / Wasabi remain UNVERIFIED (best-effort only, not claimed supported).
+- WebDAV backend — **CANDIDATE (PACK E, PR #157 open).** PROPFIND/GET/PUT/DELETE/MKCOL/COPY/MOVE, Basic auth, OS-keyring/env secret. Local↔WebDAV F5 (one-file PUT/GET via the async transfer executor), F7 MKCOL, F8 delete. Apache mod_dav passed physical acceptance. Nextcloud/ownCloud UNVERIFIED. Digest/Bearer and cross-target move deferred. Not released until PR #157 merges.
 - Cross-backend Move
 - SFTP → SFTP workspace sync
 - Recursive remote delete

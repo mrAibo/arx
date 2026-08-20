@@ -597,6 +597,18 @@ fn location_parent_name(location: &Location) -> Option<(Location, String)> {
         Location::Archive { .. } => None,
         // ponytail: S3 Workspace Sync parked; legacy parent/name path invalid for S3
         Location::S3 { .. } => None,
+        Location::WebDav { target, path } => {
+            let trimmed = path.trim_end_matches('/');
+            let (parent, name) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+            let parent = if parent.is_empty() { "/" } else { parent };
+            Some((
+                Location::WebDav {
+                    target: target.clone(),
+                    path: parent.to_string(),
+                },
+                name.to_string(),
+            ))
+        }
     }
 }
 

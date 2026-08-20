@@ -7,9 +7,14 @@ pub mod local;
 pub mod s3;
 pub mod sftp;
 pub mod webdav;
+#[cfg(all(test, feature = "physical-webdav"))]
+mod webdav_acceptance;
+#[cfg(test)]
+mod webdav_tests;
 
 pub use capabilities::{Capability, CapabilitySet};
 pub use s3::{S3BucketRef, S3ObjectRef, S3PrefixRef};
+pub use webdav::{WebDavCollectionRef, WebDavObjectRef, encode_segment};
 
 // ── Provider Registry (new architecture — phased migration) ──
 // ponytail: add ProviderId + VfsProvider + Registry alongside old Location enum.
@@ -560,6 +565,9 @@ pub enum ProviderInstanceKey {
     /// Distinct from `Singleton(ProviderId::S3)` (provider class vs instance).
     // ponytail: id stored verbatim; no normalization — S3-06 already validated
     S3Target(String),
+    /// One concrete configured WebDAV target instance, keyed by its config `id`.
+    // ponytail: id stored verbatim; no normalization — validate_webdav validated
+    WebDavTarget(String),
 }
 
 #[derive(Debug, Clone)]
@@ -571,6 +579,12 @@ pub struct RegisteredProvider {
     /// client — no second client cache.
     // ponytail: same-instance alias; resolve_s3_provider populates both
     pub s3: Option<Arc<s3::S3Provider>>,
+    /// Concrete WebDAV provider when this instance is a `WebDavTarget(id)`;
+    /// `None` otherwise. For WebDAV registrations this aliases the exact
+    /// `provider` Arc (same underlying `WebDavProvider`), so the transfer path
+    /// reuses the listing client — no second client cache.
+    // ponytail: same-instance alias; resolve_webdav_provider populates both
+    pub webdav: Option<Arc<webdav::WebDavProvider>>,
 }
 
 /// Cloneable, async-safe provider registry.
@@ -593,6 +607,9 @@ pub struct ProviderRegistry {
     // ponytail: configured S3 target inventory (id -> validated config).
     // Populated at startup via register_s3_targets; never builds clients.
     s3_targets: Arc<RwLock<HashMap<String, crate::config::S3TargetConfig>>>,
+    // ponytail: configured WebDAV target inventory (id -> validated config).
+    // Populated at startup via register_webdav_targets; provider built lazily.
+    webdav_targets: Arc<RwLock<HashMap<String, crate::config::WebDavTargetConfig>>>,
 }
 
 impl ProviderRegistry {
@@ -601,6 +618,7 @@ impl ProviderRegistry {
             providers: Arc::new(RwLock::new(HashMap::new())),
             capabilities: Arc::new(RwLock::new(HashMap::new())),
             s3_targets: Arc::new(RwLock::new(HashMap::new())),
+            webdav_targets: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -619,6 +637,85 @@ impl ProviderRegistry {
         for target in targets {
             inventory.insert(target.id.clone(), target.clone());
         }
+    }
+
+    /// Install the configured WebDAV target inventory.
+    pub fn register_webdav_targets(&self, targets: &[crate::config::WebDavTargetConfig]) {
+        let mut inventory = self
+            .webdav_targets
+            .write()
+            .expect("webdav target inventory poisoned");
+        for target in targets {
+            inventory.insert(target.id.clone(), target.clone());
+        }
+    }
+
+    /// Resolve a concrete `WebDavTarget(id)` provider instance, building it on
+    /// first resolution and caching under `ProviderInstanceKey::WebDavTarget`.
+    /// Unknown target id fails factually/closed.
+    pub fn resolve_webdav_provider(
+        &self,
+        target_id: &str,
+    ) -> std::io::Result<Arc<dyn VfsProvider>> {
+        let key = ProviderInstanceKey::WebDavTarget(target_id.to_string());
+        if let Some(registered) = self
+            .providers
+            .read()
+            .expect("provider registry poisoned")
+            .get(&key)
+        {
+            return Ok(Arc::clone(&registered.provider));
+        }
+        let target = self
+            .webdav_targets
+            .read()
+            .expect("webdav target inventory poisoned")
+            .get(target_id)
+            .cloned()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "unknown WebDAV target: {}",
+                        crate::config::sanitize_diag(target_id)
+                    ),
+                )
+            })?;
+        // Ponytail/Blocker A: resolve the password through the real target-id
+        // secret path (keyring, ARX_WEBDAV_<ID>_PASSWORD fallback). `auth` is
+        // only the scheme; never treat it as a password. Fail closed if no
+        // secret is configured.
+        let password = crate::keyring::webdav_secret(&target.id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "no WebDAV secret configured for target {}",
+                    crate::config::sanitize_diag(&target.id)
+                ),
+            )
+        })?;
+        // ponytail: BOTH arcs alias the same WebDavProvider allocation — no second
+        // client cache; transfer + listing share one provider instance.
+        let webdav_provider: Arc<webdav::WebDavProvider> = Arc::new(webdav::WebDavProvider::new(
+            webdav::WebDavTarget {
+                id: target.id.clone(),
+                name: target.name.clone(),
+                url: target.url.clone(),
+                username: target.username.clone(),
+                // ponytail: only the scheme is stored here; the password is
+                // resolved per-request from the keyring keyed by id.
+                auth: target.auth.clone(),
+            },
+            password,
+        )?);
+        let provider: Arc<dyn VfsProvider> = webdav_provider.clone();
+        let mut providers = self.providers.write().expect("provider registry poisoned");
+        let registered = providers.entry(key).or_insert_with(|| RegisteredProvider {
+            provider: Arc::clone(&provider),
+            s3: None,
+            webdav: Some(webdav_provider.clone()),
+        });
+        Ok(Arc::clone(&registered.provider))
     }
 
     /// Narrow read-only view of a target's binding. `None` for unknown ids.
@@ -673,7 +770,14 @@ impl ProviderRegistry {
         self.providers
             .write()
             .expect("provider registry poisoned")
-            .insert(key, RegisteredProvider { provider, s3: None });
+            .insert(
+                key,
+                RegisteredProvider {
+                    provider,
+                    s3: None,
+                    webdav: None,
+                },
+            );
         self.capabilities
             .write()
             .expect("provider capabilities poisoned")
@@ -788,6 +892,7 @@ impl ProviderRegistry {
             Location::Archive { archive, .. } => ProviderInstanceKey::ArchiveFile(archive.clone()),
             // ponytail: concrete-instance identity; not S3 client registration
             Location::S3 { target, .. } => ProviderInstanceKey::S3Target(target.clone()),
+            Location::WebDav { target, .. } => ProviderInstanceKey::WebDavTarget(target.clone()),
         }
     }
 
@@ -830,6 +935,14 @@ impl ProviderRegistry {
                     }),
                     capabilities::ARCHIVE_CAPABILITIES,
                 ),
+                Location::WebDav { target, .. } => {
+                    let provider = self.resolve_webdav_provider(target)?;
+                    (
+                        ProviderId::WebDAV,
+                        provider,
+                        capabilities::WEBDAV_CAPABILITIES,
+                    )
+                }
                 // ponytail: S3 provider routing not wired yet (later client/registry card);
                 // fail-closed Unsupported, no client/provider construction, no bucket+prefix flatten
                 Location::S3 { .. } => {
@@ -844,6 +957,7 @@ impl ProviderRegistry {
         let registered = providers.entry(key).or_insert_with(|| RegisteredProvider {
             provider: Arc::clone(&provider),
             s3: None,
+            webdav: None,
         });
         let provider = Arc::clone(&registered.provider);
         drop(providers);
@@ -869,6 +983,7 @@ impl ProviderRegistry {
     ) -> std::io::Result<Arc<dyn VfsProvider>> {
         match loc {
             Location::S3 { target, .. } => self.resolve_s3_provider(target),
+            Location::WebDav { target, .. } => self.resolve_webdav_provider(target),
             other => Ok(self.provider_for_location(other)?.0),
         }
     }
@@ -915,6 +1030,7 @@ impl ProviderRegistry {
         let registered = providers.entry(key).or_insert_with(|| RegisteredProvider {
             provider: Arc::clone(&provider),
             s3: Some(s3_provider.clone()),
+            webdav: None,
         });
         Ok(Arc::clone(&registered.provider))
     }
@@ -1076,6 +1192,32 @@ impl ProviderRegistry {
             .cloned();
         match registered.and_then(|r| r.s3) {
             Some(s3) => Ok(s3),
+            None => Err(RegistryError::NotFound(target_id.to_string())),
+        }
+    }
+
+    /// Resolve the concrete `WebDavTarget(id)` provider for a transfer operation.
+    ///
+    /// Returns the SAME `Arc<WebDavProvider>` already registered under
+    /// `ProviderInstanceKey::WebDavTarget(target_id)` (the listing path uses the same
+    /// resolver, so the HTTP client is shared — no second client cache). Unknown
+    /// target id fails factually with `RegistryError::NotFound`.
+    // ponytail: reuses resolve_webdav_provider (list_page's resolver); no second inventory
+    pub fn webdav_provider_for_transfer(
+        &self,
+        target_id: &str,
+    ) -> Result<Arc<webdav::WebDavProvider>, RegistryError> {
+        self.resolve_webdav_provider(target_id)
+            .map_err(|_| RegistryError::NotFound(target_id.to_string()))?;
+        let key = ProviderInstanceKey::WebDavTarget(target_id.to_string());
+        let registered = self
+            .providers
+            .read()
+            .expect("provider registry poisoned")
+            .get(&key)
+            .cloned();
+        match registered.and_then(|r| r.webdav) {
+            Some(webdav) => Ok(webdav),
             None => Err(RegistryError::NotFound(target_id.to_string())),
         }
     }
@@ -1260,6 +1402,12 @@ pub enum Location {
         bucket: Option<String>,
         prefix: String,
     },
+    /// Typed WebDAV location: exact target id + logical path (verbatim).
+    // ponytail: WebDAV identity = target id + path; no bucket/prefix semantics
+    WebDav {
+        target: String,
+        path: String,
+    },
 }
 
 /// Escape terminal-control characters for safe presentation only.
@@ -1314,6 +1462,9 @@ impl fmt::Display for Location {
                     }
                 }
             },
+            Self::WebDav { target, path } => {
+                write!(f, "[WebDAV {}] {}", s3_display_safe_component(target), path)
+            }
         }
     }
 }
@@ -1326,6 +1477,7 @@ impl Location {
             Self::Sftp { .. } => ProviderId::Sftp,
             Self::Archive { .. } => ProviderId::Archive,
             Self::S3 { .. } => ProviderId::S3,
+            Self::WebDav { .. } => ProviderId::WebDAV,
         }
     }
 
@@ -1347,6 +1499,10 @@ impl Location {
             // ponytail: label is the exact target id; no config/display-name lookup
             // ponytail: S3-10 owns final label identity; temporary control-safe rep
             Self::S3 { .. } => "S3".to_string(),
+            Self::WebDav { target, path } => {
+                let last = path.rsplit('/').next().unwrap_or(path);
+                format!("{target}:{last}")
+            }
         }
     }
 
@@ -1384,6 +1540,18 @@ impl Location {
             // ponytail: S3 exact navigation uses S3BucketRef/S3PrefixRef later
             // (S3-23/24); generic child(name) must not retarget from display text
             Self::S3 { .. } => self.clone(),
+            Self::WebDav { target, path } => {
+                let base = path.trim_end_matches('/');
+                let child = if base.is_empty() || base == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{base}/{name}")
+                };
+                Self::WebDav {
+                    target: target.clone(),
+                    path: child,
+                }
+            }
         }
     }
 
@@ -1395,6 +1563,7 @@ impl Location {
             Self::Archive { inner_path, .. } => inner_path,
             // ponytail: navigation prefix component only; not object key / provider addr
             Self::S3 { prefix, .. } => prefix.as_str(),
+            Self::WebDav { path, .. } => path,
         }
     }
 
@@ -1416,6 +1585,7 @@ impl Location {
                 std::io::ErrorKind::Unsupported,
                 "S3 provider routing not implemented yet",
             )),
+            Location::WebDav { path, .. } => Ok(path.clone()),
         }
     }
 
@@ -1462,6 +1632,20 @@ impl Location {
             }
             // ponytail: S3-25 owns virtual-parent semantics; fail-closed until then
             Self::S3 { .. } => None,
+            Self::WebDav { target, path } => {
+                let current = path.trim_end_matches('/');
+                if current.is_empty() {
+                    return None;
+                }
+                let parent = current
+                    .rsplit_once('/')
+                    .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
+                    .unwrap_or("/");
+                Some(Self::WebDav {
+                    target: target.clone(),
+                    path: parent.to_string(),
+                })
+            }
         }
     }
 }
@@ -1511,6 +1695,8 @@ pub enum EntryIdentity {
     S3Object(s3::S3ObjectRef),
     S3Prefix(s3::S3PrefixRef),
     S3Bucket(s3::S3BucketRef),
+    WebDavObject(webdav::WebDavObjectRef),
+    WebDavCollection(webdav::WebDavCollectionRef),
     Other,
 }
 

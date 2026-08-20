@@ -69,6 +69,7 @@ async fn upload_bytes(registry: &ProviderRegistry, key: &str, data: &[u8]) {
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
         s3_spec: Some(spec),
+        webdav_spec: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let outcome = execute_transfer(&plan, &[key.to_string()], registry, cancel, |_| {})
@@ -95,6 +96,7 @@ async fn download_bytes(registry: &ProviderRegistry, key: &str) -> Vec<u8> {
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
         s3_spec: Some(spec),
+        webdav_spec: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let outcome = execute_transfer(&plan, &[key.to_string()], registry, cancel, |_| {})

@@ -9,7 +9,10 @@ use crate::vfs::{Location, ProviderRegistry, local::LocalFs};
 
 use super::s3_download;
 use super::s3_upload;
-use super::{S3TransferSpec, TransferIntent, TransferMethod, TransferPlan};
+use super::webdav_transfer::{
+    WebDavOverwritePolicy, download_one as webdav_download_one, upload_one as webdav_upload_one,
+};
+use super::{S3TransferSpec, TransferIntent, TransferMethod, TransferPlan, WebDavTransferSpec};
 use crate::transfer::sftp_copy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +101,49 @@ pub async fn execute_transfer(
                     s3_download::download_one(&provider, spec, cancel.clone())
                         .await
                         .map_err(TransferExecutionError::Io)?;
+                }
+            }
+            Ok(TransferOutcome {
+                completed: 1,
+                total: 1,
+            })
+        }
+        TransferMethod::WebDav => {
+            let spec =
+                plan.webdav_spec
+                    .as_ref()
+                    .ok_or_else(|| TransferExecutionError::InvalidPlan {
+                        method: plan.method,
+                        reason: "WebDAV transfer plan missing frozen spec".into(),
+                    })?;
+            let target = spec.target();
+            let provider = registry.webdav_provider_for_transfer(target).map_err(|e| {
+                TransferExecutionError::InvalidPlan {
+                    method: TransferMethod::WebDav,
+                    reason: e.to_string(),
+                }
+            })?;
+            match spec {
+                WebDavTransferSpec::UploadOne { .. } => {
+                    webdav_upload_one(
+                        &provider,
+                        spec,
+                        WebDavOverwritePolicy::Forbid,
+                        cancel.clone(),
+                        &mut on_progress,
+                    )
+                    .await
+                    .map_err(TransferExecutionError::Io)?;
+                }
+                WebDavTransferSpec::DownloadOne { .. } => {
+                    webdav_download_one(
+                        &provider,
+                        spec,
+                        WebDavOverwritePolicy::Forbid,
+                        cancel.clone(),
+                    )
+                    .await
+                    .map_err(TransferExecutionError::Io)?;
                 }
             }
             Ok(TransferOutcome {
@@ -258,6 +304,10 @@ fn endpoint_arg(
             method: TransferMethod::Rsync,
             reason: "rsync cannot address S3 locations directly".into(),
         }),
+        Location::WebDav { .. } => Err(TransferExecutionError::InvalidPlan {
+            method: TransferMethod::Rsync,
+            reason: "rsync cannot address WebDAV locations directly".into(),
+        }),
     }
 }
 
@@ -347,6 +397,7 @@ mod tests {
             intent: TransferIntent::Copy,
             method: TransferMethod::Native,
             s3_spec: None,
+            webdav_spec: None,
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let mut progress = Vec::new();
@@ -378,6 +429,7 @@ mod tests {
             intent: TransferIntent::Move,
             method: TransferMethod::Native,
             s3_spec: None,
+            webdav_spec: None,
         };
         let cancel = Arc::new(AtomicBool::new(true));
         let error = execute_transfer(
@@ -406,6 +458,7 @@ mod tests {
             intent: TransferIntent::Copy,
             method: TransferMethod::Rsync,
             s3_spec: None,
+            webdav_spec: None,
         };
         let args = build_rsync_args(&plan, Some("file.txt")).unwrap();
         let rendered = args
@@ -441,6 +494,7 @@ mod tests {
             intent: TransferIntent::Copy,
             method: TransferMethod::Rsync,
             s3_spec: None,
+            webdav_spec: None,
         };
         let cancel = Arc::new(AtomicBool::new(false));
 
@@ -465,6 +519,7 @@ mod tests {
             intent: TransferIntent::Move,
             method: TransferMethod::Rsync,
             s3_spec: None,
+            webdav_spec: None,
         };
         let cancel = Arc::new(AtomicBool::new(false));
 
@@ -507,6 +562,7 @@ mod tests {
             intent: TransferIntent::Copy,
             method,
             s3_spec,
+            webdav_spec: None,
         }
     }
 

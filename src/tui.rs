@@ -91,6 +91,9 @@ async fn event_loop(
     // Install configured S3 target inventory (offline; no AWS load/client).
     // DESIGN_S3 §10 lazy per-target model: clients appear later inside providers.
     state.registry.register_s3_targets(&config.s3.targets);
+    state
+        .registry
+        .register_webdav_targets(&config.webdav.targets);
     let (pane_loader, mut pane_load_rx, mut pane_next_page_rx) =
         PaneLoader::channel(state.registry.clone());
     let (workspace_scanner, mut workspace_scan_rx) =
@@ -5787,10 +5790,34 @@ async fn dispatch_ui_action(
                     None
                 };
 
+            // WebDAV basic transfer: a single WebDAV object paired with a Local pane.
+            let webdav_spec: Option<arx::transfer::WebDavTransferSpec> =
+                if src_provider == ProviderId::WebDAV || dst_provider == ProviderId::WebDAV {
+                    match arx::transfer::build_webdav_copy_spec(
+                        src_provider,
+                        dst_provider,
+                        &src_loc,
+                        &dst_loc,
+                        focused_listed,
+                        other_listed,
+                    ) {
+                        Ok(spec) => Some(spec),
+                        Err(msg) => {
+                            state.message = Some(msg);
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    None
+                };
+
             let mut executors =
                 arx::transfer::probe::local_executors(arx::transfer::probe::detect_local_tools());
             if s3_spec.is_some() {
                 executors.s3 = true;
+            }
+            if webdav_spec.is_some() {
+                executors.webdav = true;
             }
             let request = arx::transfer::TransferRequest {
                 source: src_loc.clone(),
@@ -5803,6 +5830,7 @@ async fn dispatch_ui_action(
                 executors,
                 delete_extraneous: false,
                 s3_spec,
+                webdav_spec,
             };
             let plan = match arx::transfer::TransferPlanner::plan(request) {
                 Ok(p) => p,
@@ -5934,6 +5962,7 @@ async fn dispatch_ui_action(
                 executors,
                 delete_extraneous: false,
                 s3_spec: None,
+                webdav_spec: None,
             };
             let plan = match arx::transfer::TransferPlanner::plan(request) {
                 Ok(p) => p,
@@ -10525,9 +10554,11 @@ mod tests {
                     rsync: false,
                     sftp: false,
                     s3: true,
+                    webdav: false,
                 },
                 delete_extraneous: false,
                 s3_spec: Some(spec),
+                webdav_spec: None,
             };
             let plan = TransferPlanner::plan(request).unwrap();
             assert_eq!(plan.method, TransferMethod::S3);
