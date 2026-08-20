@@ -49,9 +49,16 @@ async fn upload(reg: &ProviderRegistry, target: &str, key: &str, data: &[u8]) {
         webdav_spec: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
-    let out = execute_transfer(&plan, &[key.to_string()], reg, cancel, |_| {})
-        .await
-        .expect("upload");
+    let out = execute_transfer(
+        &plan,
+        &[key.to_string()],
+        reg,
+        cancel,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await
+    .expect("upload");
     assert_eq!(out.completed, 1);
     let _ = std::fs::remove_file(&tmp);
 }

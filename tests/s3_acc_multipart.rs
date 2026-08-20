@@ -88,9 +88,16 @@ async fn run_multipart_roundtrip(reg: &ProviderRegistry, target: &str) {
         webdav_spec: None,
     };
     let cancel = Arc::new(AtomicBool::new(false));
-    let out = execute_transfer(&plan, &[k_up], reg, cancel, |_| {})
-        .await
-        .expect("multipart upload");
+    let out = execute_transfer(
+        &plan,
+        &[k_up],
+        reg,
+        cancel,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await
+    .expect("multipart upload");
     assert_eq!(out.completed, 1, "multipart upload completed");
     // download + byte-exact compare (streaming, not full memory)
     let dl = std::env::temp_dir().join(format!("arx-big-dl-{}-{}", std::process::id(), hex(&key)));
@@ -110,9 +117,16 @@ async fn run_multipart_roundtrip(reg: &ProviderRegistry, target: &str) {
         webdav_spec: None,
     };
     let cancel2 = Arc::new(AtomicBool::new(false));
-    let dout = execute_transfer(&dplan, &[k_dl], reg, cancel2, |_| {})
-        .await
-        .expect("multipart download");
+    let dout = execute_transfer(
+        &dplan,
+        &[k_dl],
+        reg,
+        cancel2,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await
+    .expect("multipart download");
     assert_eq!(dout.completed, 1);
     assert_eq!(
         std::fs::metadata(&dl).unwrap().len(),
@@ -164,7 +178,15 @@ async fn run_multipart_cancel_before(reg: &ProviderRegistry, target: &str) {
     };
     // cancel already set BEFORE execute => must not create a usable object
     let cancel = Arc::new(AtomicBool::new(true));
-    let res = execute_transfer(&plan, &[k_can], reg, cancel, |_| {}).await;
+    let res = execute_transfer(
+        &plan,
+        &[k_can],
+        reg,
+        cancel,
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await;
     let _ = std::fs::remove_file(&tmp);
     // Any error is acceptable when cancelled before start; the key point is that
     // no usable object is created. (ARX may classify this as a generic cancelled

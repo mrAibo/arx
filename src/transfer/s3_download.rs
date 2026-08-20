@@ -10,7 +10,9 @@
 //! - no overwrite of an existing final path without a frozen policy
 
 use crate::transfer::S3TransferSpec;
+use crate::transfer::executor::TransferExecutionError;
 use crate::transfer::integrity::ObjectIntegrity;
+use crate::transfer_queue::TypedTransferProgress;
 use crate::vfs::s3::S3Provider;
 use crate::vfs::validate_child_name;
 use std::io;
@@ -30,7 +32,9 @@ pub(crate) async fn download_one(
     provider: &S3Provider,
     spec: &S3TransferSpec,
     cancel: Arc<AtomicBool>,
-) -> std::io::Result<DownloadOutcome> {
+    pause: crate::transfer_queue::PauseGate,
+    on_progress: &mut impl FnMut(TypedTransferProgress),
+) -> Result<DownloadOutcome, TransferExecutionError> {
     // 1. Extract download spec
     let (source, local_destination) = match spec {
         S3TransferSpec::DownloadOne {
@@ -41,7 +45,8 @@ pub(crate) async fn download_one(
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "S3TransferSpec is not DownloadOne",
-            ));
+            )
+            .into());
         }
     };
 
@@ -64,7 +69,7 @@ pub(crate) async fn download_one(
                 "local destination file name is not valid UTF-8",
             )
         })?;
-    validate_child_name(file_name)?;
+    validate_child_name(file_name).map_err(TransferExecutionError::from)?;
 
     // 3. Fail-closed identity validation BEFORE any AWS client/auth/network work
     //    - exact target id match
@@ -76,7 +81,8 @@ pub(crate) async fn download_one(
                 "S3 target mismatch: provider '{}', object '{}'",
                 provider.target.id, source.target
             ),
-        ));
+        )
+        .into());
     }
     if let Some(bound_bucket) = &provider.target.bucket
         && *bound_bucket != source.bucket
@@ -87,7 +93,8 @@ pub(crate) async fn download_one(
                 "S3 bucket escape rejected: target bound to '{}', object in '{}'",
                 bound_bucket, source.bucket
             ),
-        ));
+        )
+        .into());
     }
 
     // 4. Prepare staged file path: `.<final-name>.arx-part-<unique-id>` in same directory
@@ -104,14 +111,14 @@ pub(crate) async fn download_one(
     {
         Ok(f) => f,
         Err(e) => {
-            return Err(io::Error::new(
+            return Err(TransferExecutionError::safe_to_retry(io::Error::new(
                 e.kind(),
                 format!(
                     "failed to create staged file '{}': {}",
                     staged_path.display(),
                     e
                 ),
-            ));
+            )));
         }
     };
 
@@ -120,7 +127,7 @@ pub(crate) async fn download_one(
         Ok(c) => c,
         Err(e) => {
             let _ = remove_staged(&staged_path).await;
-            return Err(e);
+            return Err(cleanup_then_safe(&staged_path, e).await);
         }
     };
 
@@ -138,7 +145,9 @@ pub(crate) async fn download_one(
             // content_length is the expected size for post-transfer verification;
             // e_tag is recorded but not checked locally (cannot be recomputed
             // without a full re-hash of the downloaded file).
-            let size: u64 = out.content_length().unwrap_or(0).try_into().unwrap_or(0);
+            let size = out
+                .content_length()
+                .and_then(|value| u64::try_from(value).ok());
             let etag = out.e_tag().map(|s| s.to_string());
             (size, etag, out.body.into_async_read())
         }
@@ -146,7 +155,11 @@ pub(crate) async fn download_one(
             let _ = remove_staged(&staged_path).await;
             // ponytail: static label only — never interpolate the SDK error
             // (signed query / key / auth fragments can leak through it).
-            return Err(io::Error::other("S3 GetObject download failed"));
+            return Err(cleanup_then_safe(
+                &staged_path,
+                io::Error::other("S3 GetObject download failed"),
+            )
+            .await);
         }
     };
 
@@ -158,15 +171,20 @@ pub(crate) async fn download_one(
         // Cancellation check BEFORE each read
         if cancel.load(Ordering::Relaxed) {
             let _ = remove_staged(&staged_path).await;
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                format!(
-                    "download cancelled, staged file removed: {}",
-                    staged_path.display()
+            return Err(cleanup_then_safe(
+                &staged_path,
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!(
+                        "download cancelled, staged file removed: {}",
+                        staged_path.display()
+                    ),
                 ),
-            ));
+            )
+            .await);
         }
 
+        pause.checkpoint().await;
         let n = match body.read(&mut buf).await {
             Ok(0) => break, // EOF
             Ok(n) => n,
@@ -175,48 +193,63 @@ pub(crate) async fn download_one(
                 // ponytail: preserve IO kind (cancellation/EOF semantics) but
                 // use a static label — the stream error can carry body-signing
                 // details we must not surface.
-                return Err(io::Error::new(e.kind(), "S3 download stream read failed"));
+                return Err(cleanup_then_safe(
+                    &staged_path,
+                    io::Error::new(e.kind(), "S3 download stream read failed"),
+                )
+                .await);
             }
         };
 
         // Write chunk
         if let Err(e) = staged_file.write_all(&buf[..n]).await {
             let _ = remove_staged(&staged_path).await;
-            return Err(io::Error::new(
-                e.kind(),
-                format!("write to staged file failed: {}", e),
-            ));
+            return Err(cleanup_then_safe(
+                &staged_path,
+                io::Error::new(e.kind(), format!("write to staged file failed: {}", e)),
+            )
+            .await);
         }
         bytes_written += n as u64;
+        on_progress(TypedTransferProgress::Bytes {
+            completed: bytes_written,
+            total: remote_size,
+        });
     }
 
     // 9. Flush and fsync staged file
     if let Err(e) = staged_file.flush().await {
         let _ = remove_staged(&staged_path).await;
-        return Err(io::Error::new(
-            e.kind(),
-            format!("flush staged file failed: {}", e),
-        ));
+        return Err(cleanup_then_safe(
+            &staged_path,
+            io::Error::new(e.kind(), format!("flush staged file failed: {}", e)),
+        )
+        .await);
     }
     if let Err(e) = staged_file.sync_all().await {
         let _ = remove_staged(&staged_path).await;
-        return Err(io::Error::new(
-            e.kind(),
-            format!("fsync staged file failed: {}", e),
-        ));
+        return Err(cleanup_then_safe(
+            &staged_path,
+            io::Error::new(e.kind(), format!("fsync staged file failed: {}", e)),
+        )
+        .await);
     }
     drop(staged_file); // explicit close before rename
 
     // 10. Post-download cancellation check
     if cancel.load(Ordering::Relaxed) {
         let _ = remove_staged(&staged_path).await;
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            format!(
-                "download cancelled after stream, staged file removed: {}",
-                staged_path.display()
+        return Err(cleanup_then_safe(
+            &staged_path,
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!(
+                    "download cancelled after stream, staged file removed: {}",
+                    staged_path.display()
+                ),
             ),
-        ));
+        )
+        .await);
     }
 
     // 11. Fail closed if final path already exists (overwrite forbidden by default)
@@ -230,7 +263,8 @@ pub(crate) async fn download_one(
                 local_destination.display(),
                 staged_path.display()
             ),
-        ));
+        )
+        .into());
     }
 
     // 12. Atomic rename staged -> final
@@ -243,18 +277,26 @@ pub(crate) async fn download_one(
                 staged_path.display(),
                 e
             ),
-        ));
+        )
+        .into());
     }
 
     // 13. Post-transfer verification: the local final file size MUST match the
     //     remote size. This runs ONLY on the success path — every partial /
     //     cancelled / errored download returns earlier (staged file removed,
     //     Err propagated), so a partial file is never reported as verified.
-    let expected = ObjectIntegrity::new(remote_size, remote_etag);
-    verify_downloaded_object(local_destination, &expected)?;
+    verify_downloaded_object(local_destination, remote_size, bytes_written, remote_etag)
+        .map_err(TransferExecutionError::from)?;
 
     // 14. Success: return bytes physically written
     Ok(bytes_written)
+}
+
+async fn cleanup_then_safe(path: &PathBuf, error: io::Error) -> TransferExecutionError {
+    match remove_staged(path).await {
+        Ok(()) => TransferExecutionError::safe_to_retry(error),
+        Err(cleanup) => TransferExecutionError::from(cleanup),
+    }
 }
 
 /// Convenience: resolve the download local destination for a `DownloadOne` spec.
@@ -309,9 +351,13 @@ fn local_size_consistent(expected_size: u64, actual_size: u64) -> io::Result<()>
 /// rename, so a partial / cancelled download is never verified.
 fn verify_downloaded_object(
     local_path: &std::path::Path,
-    expected: &ObjectIntegrity,
+    remote_size: Option<u64>,
+    bytes_written: u64,
+    remote_etag: Option<String>,
 ) -> io::Result<()> {
     let actual = std::fs::metadata(local_path)?.len();
+    let expected_size = remote_size.unwrap_or(bytes_written);
+    let expected = ObjectIntegrity::new(expected_size, remote_etag);
     local_size_consistent(expected.size, actual)
 }
 
@@ -428,8 +474,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("obj.bin");
         std::fs::write(&path, vec![0u8; 256]).unwrap();
-        let expected = ObjectIntegrity::new(256, Some("\"abc123\"".to_string()));
-        assert!(verify_downloaded_object(&path, &expected).is_ok());
+        assert!(verify_downloaded_object(&path, Some(256), 256, None).is_ok());
     }
 
     #[test]
@@ -437,8 +482,28 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("obj.bin");
         std::fs::write(&path, vec![0u8; 256]).unwrap();
-        let expected = ObjectIntegrity::new(512, Some("\"abc123\"".to_string()));
-        assert!(verify_downloaded_object(&path, &expected).is_err());
+        assert!(verify_downloaded_object(&path, Some(512), 256, None).is_err());
+    }
+
+    #[test]
+    fn unknown_remote_size_verifies_exact_streamed_bytes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("obj.bin");
+        std::fs::write(&path, vec![0u8; 17]).unwrap();
+        assert!(verify_downloaded_object(&path, None, 17, None).is_ok());
+        assert!(verify_downloaded_object(&path, None, 16, None).is_err());
+    }
+
+    #[test]
+    fn already_exists_is_never_retry() {
+        let error = TransferExecutionError::from(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "destination exists",
+        ));
+        assert_eq!(
+            error.retry_disposition(),
+            crate::transfer_queue::RetryDisposition::NeverRetry
+        );
     }
 }
 
@@ -540,9 +605,15 @@ mod physical_acceptance {
             source: object.clone(),
             local_destination: dst.clone(),
         };
-        let got = download_one(&provider, &down_spec, Arc::new(AtomicBool::new(false)))
-            .await
-            .expect("download must succeed");
+        let got = download_one(
+            &provider,
+            &down_spec,
+            Arc::new(AtomicBool::new(false)),
+            crate::transfer_queue::PauseGate::disabled(),
+            &mut |_| {},
+        )
+        .await
+        .expect("download must succeed");
         assert_eq!(got, remote_size, "downloaded bytes must equal remote size");
 
         let local_size = std::fs::metadata(&dst).unwrap().len();

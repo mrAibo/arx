@@ -337,6 +337,7 @@ pub struct AppState {
     pub job_manager: Option<crate::jobs::JobManager>,
     pub job_events: Option<tokio::sync::mpsc::UnboundedSender<crate::jobs::JobEvent>>,
     pub show_jobs: bool,
+    pub show_transfer_center: bool,
     pub job_cursor: usize,
     // C1: directory compare
     pub show_diff: bool,
@@ -470,6 +471,7 @@ impl Default for AppState {
             job_manager: None,
             job_events: None,
             show_jobs: false,
+            show_transfer_center: false,
             job_cursor: 0,
             show_diff: false,
             cmd_input: false,

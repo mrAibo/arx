@@ -426,6 +426,8 @@ impl WebDavProvider {
         max_bytes: usize,
         sink: &mut (impl tokio::io::AsyncWrite + Unpin),
         cancel: Option<&Arc<AtomicBool>>,
+        pause: Option<&crate::transfer_queue::PauseGate>,
+        mut on_progress: impl FnMut(u64, Option<u64>),
     ) -> io::Result<u64> {
         let url = self.resolve_url(href)?;
         let req = self.auth_req(self.client.get(&url))?;
@@ -442,8 +444,12 @@ impl WebDavProvider {
             let text = read_fixed_text(resp).await;
             return Err(self.status_error("GET", status, &text));
         }
+        let total = resp.content_length();
         let mut written: u64 = 0;
         loop {
+            if let Some(pause) = pause {
+                pause.checkpoint().await;
+            }
             if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
@@ -468,7 +474,9 @@ impl WebDavProvider {
             }
             sink.write_all(&chunk).await.map_err(io::Error::other)?;
             written += chunk.len() as u64;
+            on_progress(written, total);
         }
+        on_progress(written, total);
         Ok(written)
     }
 

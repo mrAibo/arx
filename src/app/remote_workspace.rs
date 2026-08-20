@@ -319,13 +319,16 @@ impl RemoteWorkspaceState {
             JobStatus::Pending => WorkspaceSyncUxState::Queued {
                 job_id: job.id.clone(),
             },
-            JobStatus::Running => WorkspaceSyncUxState::Running {
+            JobStatus::Running | JobStatus::PausePending => WorkspaceSyncUxState::Running {
                 job_id: job.id.clone(),
             },
             JobStatus::Cancelling => WorkspaceSyncUxState::Cancelling {
                 job_id: job.id.clone(),
             },
             JobStatus::Paused => WorkspaceSyncUxState::Running {
+                job_id: job.id.clone(),
+            },
+            JobStatus::RetryWaiting => WorkspaceSyncUxState::Running {
                 job_id: job.id.clone(),
             },
             JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled => {

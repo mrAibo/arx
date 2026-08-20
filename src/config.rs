@@ -1,5 +1,10 @@
 use serde::Deserialize;
 
+// §12: single authoritative source for transfer concurrency bounds. The
+// scheduler (`transfer_queue::TransferQueueConfig`) and config validation
+// both reference these, so drift between them is impossible.
+use crate::transfer_queue::{DEFAULT_TRANSFER_CONCURRENCY, MAX_TRANSFER_CONCURRENCY};
+
 #[derive(Debug, Deserialize)]
 pub struct ArxConfig {
     #[serde(default)]
@@ -10,6 +15,44 @@ pub struct ArxConfig {
     /// WebDAV target inventory. None = no WebDAV targets configured.
     #[serde(default)]
     pub webdav: WebDavConfig,
+    /// Transfer queue tuning. Bounds/fallbacks live in `validate_transfer`.
+    #[serde(default)]
+    pub transfer: TransferConfig,
+}
+
+/// Transfer queue configuration.
+///
+/// `concurrency` bounds the number of simultaneous transfer jobs. It mirrors
+/// `transfer_queue::TransferQueueConfig` limits: `1..=8`, default `2`.
+/// Out-of-range or zero values are rejected by `validate_transfer`, which
+/// makes `load()` fall back to `ArxConfig::default()` (concurrency 2) for the
+/// whole config — consistent with the existing S3/WebDAV validation contract.
+#[derive(Debug, Deserialize)]
+pub struct TransferConfig {
+    #[serde(default = "default_transfer_concurrency")]
+    pub concurrency: usize,
+}
+
+impl Default for TransferConfig {
+    fn default() -> Self {
+        Self {
+            concurrency: DEFAULT_TRANSFER_CONCURRENCY,
+        }
+    }
+}
+
+fn default_transfer_concurrency() -> usize {
+    DEFAULT_TRANSFER_CONCURRENCY
+}
+
+impl TransferConfig {
+    pub fn resolve(&self) -> usize {
+        if (1..=MAX_TRANSFER_CONCURRENCY).contains(&self.concurrency) {
+            self.concurrency
+        } else {
+            DEFAULT_TRANSFER_CONCURRENCY
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -37,6 +80,7 @@ impl Default for ArxConfig {
             },
             s3: S3Config::default(),
             webdav: WebDavConfig::default(),
+            transfer: TransferConfig::default(),
         }
     }
 }
@@ -225,7 +269,22 @@ pub fn parse_config(content: &str) -> Result<ArxConfig, String> {
     let cfg: ArxConfig = toml::from_str(content).map_err(|e| e.to_string())?;
     validate_s3(&cfg.s3.targets)?;
     validate_webdav(&cfg.webdav.targets)?;
+    validate_transfer(&cfg.transfer)?;
     Ok(cfg)
+}
+
+/// Validate the `[transfer]` section. Out-of-range `concurrency` (zero or
+/// above `MAX_TRANSFER_CONCURRENCY`) is rejected so `load()` falls back to the
+/// default config (concurrency 2), consistent with the S3/WebDAV contract.
+pub fn validate_transfer(config: &TransferConfig) -> Result<(), String> {
+    if (1..=MAX_TRANSFER_CONCURRENCY).contains(&config.concurrency) {
+        Ok(())
+    } else {
+        Err(format!(
+            "transfer.concurrency must be between 1 and {MAX_TRANSFER_CONCURRENCY}, got {}",
+            config.concurrency
+        ))
+    }
 }
 
 fn validate_s3(targets: &[S3TargetConfig]) -> Result<(), String> {
@@ -745,5 +804,43 @@ bucket = "company-artifacts"
             cfg.s3.targets[0].bucket.as_deref(),
             Some("company-artifacts")
         );
+    }
+
+    // ---- Transfer queue config ----
+
+    #[test]
+    fn transfer_concurrency_default_is_two() {
+        let cfg = parse_config("[ui]\n").expect("valid");
+        assert_eq!(cfg.transfer.concurrency, DEFAULT_TRANSFER_CONCURRENCY);
+        assert_eq!(cfg.transfer.resolve(), DEFAULT_TRANSFER_CONCURRENCY);
+    }
+
+    #[test]
+    fn transfer_concurrency_explicit_valid() {
+        for n in [1usize, 2, 4, 8] {
+            let toml = format!("[transfer]\nconcurrency = {n}\n");
+            let cfg = parse_config(&toml).expect("valid");
+            assert_eq!(cfg.transfer.concurrency, n);
+            assert_eq!(cfg.transfer.resolve(), n);
+        }
+    }
+
+    #[test]
+    fn transfer_concurrency_zero_and_over_max_rejected() {
+        for n in [0usize, 9, 100] {
+            let toml = format!("[transfer]\nconcurrency = {n}\n");
+            assert!(
+                parse_config(&toml).is_err(),
+                "concurrency {n} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn transfer_concurrency_out_of_range_falls_back_to_default() {
+        // whole-config fallback to ArxConfig::default() keeps concurrency 2
+        let toml =
+            "[transfer]\nconcurrency = 0\n[s3]\n[[s3.targets]]\nid = \"aws\"\nname = \"AWS\"\n";
+        assert!(parse_config(toml).is_err());
     }
 }

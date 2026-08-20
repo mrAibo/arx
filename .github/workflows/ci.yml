@@ -95,3 +95,60 @@ jobs:
           set +x
           source "$ENV_FILE"
           cargo test --locked --lib --features physical-webdav physical_w1_through_w18 -- --nocapture
+
+  # Physical S3 safe-read retry (PACK G P8) against real MinIO.
+  # Drives S3TransferSpec::DownloadOne through the REAL TransferQueueRuntime
+  # with the S3 endpoint pointed at a one-shot TCP fault proxy: the first
+  # GetObject body is truncated (real transport failure), the second is a
+  # transparent pass-through. Proves the production seam
+  # (body.read error -> remove_staged -> cleanup_then_safe -> SafeToRetry)
+  # drives RetryWaiting then a successful second attempt under one JobId.
+  # Fails (does not skip) if MinIO or the test setup cannot run.
+  transfer-queue-s3-retry-physical:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Exact-SHA evidence (PR head)
+        run: |
+          set -euo pipefail
+          TESTED_SHA="$(git rev-parse HEAD)"
+          echo "TESTED_SHA=$TESTED_SHA"
+          EXPECTED="${{ github.event.pull_request.head.sha }}"
+          if [ -n "$EXPECTED" ] && [ "$EXPECTED" != "$TESTED_SHA" ]; then
+            echo "::error::checked-out SHA ($TESTED_SHA) != PR head ($EXPECTED)"
+            exit 1
+          fi
+
+      - name: Provision MinIO + run P8 safe-read retry physical
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          sudo systemctl start docker || true
+          docker info >/dev/null 2>&1 || { echo "docker unavailable"; exit 1; }
+          docker run -d --name arx-minio-p8 -p 127.0.0.1:9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data --console-address ":9001"
+          for i in $(seq 1 30); do
+            docker run --rm --network host \
+              -e MC_HOST_p=http://minioadmin:minioadmin@127.0.0.1:9000 \
+              minio/mc:latest ls p/ >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker run --rm --network host \
+            -e MC_HOST_p=http://minioadmin:minioadmin@127.0.0.1:9000 \
+            minio/mc:latest mb p/arxtest
+          export ARX_MINIO_TEST=1
+          export AWS_ENDPOINT_URL=http://127.0.0.1:9000
+          export AWS_ACCESS_KEY_ID=minioadmin
+          export AWS_SECRET_ACCESS_KEY=minioadmin
+          cargo test --locked --test transfer_queue_s3_retry_physical -- --nocapture

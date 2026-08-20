@@ -27,7 +27,7 @@ pub enum Progress {
     Percent(u8),
     Bytes {
         done: u64,
-        total: u64,
+        total: Option<u64>,
         /// Transfer rate in bytes/sec (last-second sample).
         rate: u64,
     },
@@ -46,9 +46,12 @@ impl Progress {
     pub fn percent(&self) -> Option<u8> {
         match self {
             Self::Percent(p) => Some(*p),
-            Self::Bytes { done, total, .. } if *total > 0 => {
-                Some(((((*done as u128) * 100) / (*total as u128)).min(100)) as u8)
-            }
+            Self::Bytes {
+                done,
+                total: Some(total),
+                ..
+            } if *total > 0 => Some(((((*done as u128) * 100) / (*total as u128)).min(100)) as u8),
+            Self::Bytes { total: Some(0), .. } => Some(0),
             Self::Items { done, total } if *total > 0 => {
                 Some(((done * 100) / total).min(100) as u8)
             }
@@ -72,9 +75,11 @@ impl std::fmt::Display for Progress {
             Self::Percent(p) => write!(f, "{p}%"),
             Self::Bytes { done, total, rate } => {
                 let dp = human_bytes(*done);
-                let tp = human_bytes(*total);
                 let rs = human_bytes(*rate);
-                write!(f, "{dp}/{tp} ({rs}/s)")
+                match total {
+                    Some(total) => write!(f, "{dp}/{} ({rs}/s)", human_bytes(*total)),
+                    None => write!(f, "{dp} · unknown total ({rs}/s)"),
+                }
             }
             Self::Items { done, total } => write!(f, "{done}/{total}"),
             Self::Phase { phase, percent } => match percent {
@@ -357,8 +362,10 @@ impl Job {
         match self.status {
             JobStatus::Pending => "⏳",
             JobStatus::Running => "⚡",
+            JobStatus::PausePending => "⏸",
             JobStatus::Cancelling => "⏹",
             JobStatus::Paused => "⏸",
+            JobStatus::RetryWaiting => "⟳",
             JobStatus::Completed => "✅",
             JobStatus::Failed => "❌",
             JobStatus::Cancelled => "🚫",
@@ -369,9 +376,11 @@ impl Job {
     /// for the later Transfer Center layer once rate sampling is available.
     pub fn eta(&self) -> Option<String> {
         match &self.progress {
-            JobProgress::Generic(Progress::Bytes { done, total, rate })
-                if *rate > 0 && *total > 0 =>
-            {
+            JobProgress::Generic(Progress::Bytes {
+                done,
+                total: Some(total),
+                rate,
+            }) if *rate > 0 && *total > 0 => {
                 let remaining = total.saturating_sub(*done);
                 let secs = remaining / rate;
                 if secs < 60 {
@@ -392,7 +401,10 @@ impl std::fmt::Display for Job {
         write!(f, "{} {}", self.status_icon(), self.description)?;
         if matches!(
             self.status,
-            JobStatus::Running | JobStatus::Cancelling | JobStatus::Paused
+            JobStatus::Running
+                | JobStatus::PausePending
+                | JobStatus::Cancelling
+                | JobStatus::Paused
         ) {
             write!(f, " {}", self.progress)?;
         }
@@ -425,8 +437,12 @@ pub enum JobKind {
 pub enum JobStatus {
     Pending,
     Running,
+    PausePending,
     Cancelling,
     Paused,
+    /// Waiting out bounded backoff before a safe (read-side / staged) retry.
+    /// Truthful: not Running, not terminal, not Paused.
+    RetryWaiting,
     Completed,
     Failed,
     Cancelled,
@@ -443,9 +459,17 @@ pub enum JobEvent {
     Running {
         id: String,
     },
+    PausePending {
+        id: String,
+    },
     Progress {
         id: String,
         progress: JobProgress,
+    },
+    /// Waiting out bounded retry backoff for a safe (read-side / staged)
+    /// retry. Truthful: not Running, not Paused, not terminal.
+    RetryWaiting {
+        id: String,
     },
     Completed {
         id: String,
@@ -469,7 +493,9 @@ impl JobEvent {
     pub fn id(&self) -> &str {
         match self {
             Self::Running { id }
+            | Self::PausePending { id }
             | Self::Progress { id, .. }
+            | Self::RetryWaiting { id }
             | Self::Completed { id, .. }
             | Self::Failed { id, .. }
             | Self::Paused { id }
@@ -548,7 +574,11 @@ impl JobManager {
         job.cancel.store(true, Ordering::Relaxed);
         if matches!(
             job.status,
-            JobStatus::Pending | JobStatus::Running | JobStatus::Paused
+            JobStatus::Pending
+                | JobStatus::Running
+                | JobStatus::PausePending
+                | JobStatus::Paused
+                | JobStatus::RetryWaiting
         ) {
             job.status = JobStatus::Cancelling;
         }
@@ -580,7 +610,10 @@ impl JobManager {
 
         match event {
             JobEvent::Running { .. } => {
-                if job.status == JobStatus::Pending {
+                if matches!(
+                    job.status,
+                    JobStatus::Pending | JobStatus::Paused | JobStatus::RetryWaiting
+                ) {
                     job.status = JobStatus::Running;
                     true
                 } else {
@@ -590,8 +623,31 @@ impl JobManager {
                     job.status == JobStatus::Cancelling
                 }
             }
+            JobEvent::PausePending { .. } => {
+                if matches!(job.status, JobStatus::Running | JobStatus::PausePending) {
+                    job.status = JobStatus::PausePending;
+                    true
+                } else {
+                    false
+                }
+            }
+            JobEvent::RetryWaiting { .. } => {
+                if matches!(job.status, JobStatus::Running | JobStatus::PausePending) {
+                    job.status = JobStatus::RetryWaiting;
+                    true
+                } else {
+                    false
+                }
+            }
             JobEvent::Progress { progress, .. } => {
-                if matches!(job.status, JobStatus::Running | JobStatus::Cancelling) {
+                // RetryWaiting means no active I/O is occurring; a Progress
+                // event arriving then is stale (e.g. in-flight before the
+                // failure that triggered backoff). Reject it so the snapshot
+                // stays byte-for-byte stable across the wait.
+                if matches!(
+                    job.status,
+                    JobStatus::Running | JobStatus::PausePending | JobStatus::Cancelling
+                ) {
                     job.progress = progress.clone();
                     true
                 } else {
@@ -599,7 +655,7 @@ impl JobManager {
                 }
             }
             JobEvent::Paused { .. } => {
-                if job.status == JobStatus::Running {
+                if matches!(job.status, JobStatus::Pending | JobStatus::PausePending) {
                     job.status = JobStatus::Paused;
                     true
                 } else {
@@ -1071,6 +1127,56 @@ impl TransferTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_byte_total_keeps_done_and_rate_without_percent_or_eta() {
+        let progress = Progress::Bytes {
+            done: 4096,
+            total: None,
+            rate: 1024,
+        };
+        assert_eq!(progress.percent(), None);
+        assert!(progress.to_string().contains("4.0 KB · unknown total"));
+        let mut job = Job::new("j".into(), "transfer".into(), JobKind::Transfer, None, None);
+        job.progress = JobProgress::Generic(progress);
+        assert_eq!(job.eta(), None);
+    }
+
+    #[test]
+    fn real_zero_byte_total_is_distinguishable() {
+        let progress = Progress::Bytes {
+            done: 0,
+            total: Some(0),
+            rate: 0,
+        };
+        assert_eq!(progress.percent(), Some(0));
+        assert!(progress.to_string().contains("0 B/0 B"));
+    }
+
+    #[test]
+    fn completion_while_pause_pending_wins() {
+        let manager = JobManager::new();
+        let job = manager.create_job("t", JobKind::Transfer, "transfer", None, None);
+        assert!(manager.apply_event(&JobEvent::Running { id: job.id.clone() }));
+        assert!(manager.apply_event(&JobEvent::PausePending { id: job.id.clone() }));
+        assert!(manager.apply_event(&JobEvent::Completed {
+            id: job.id.clone(),
+            result: JobResult::generic("done", 1),
+        }));
+        assert_eq!(manager.get(&job.id).unwrap().status, JobStatus::Completed);
+        assert!(!manager.apply_event(&JobEvent::Paused { id: job.id.clone() }));
+    }
+
+    #[test]
+    fn cancelling_pause_pending_rejects_fake_paused() {
+        let manager = JobManager::new();
+        let job = manager.create_job("t", JobKind::Transfer, "transfer", None, None);
+        manager.apply_event(&JobEvent::Running { id: job.id.clone() });
+        manager.apply_event(&JobEvent::PausePending { id: job.id.clone() });
+        assert!(manager.cancel(&job.id));
+        assert_eq!(manager.get(&job.id).unwrap().status, JobStatus::Cancelling);
+        assert!(!manager.apply_event(&JobEvent::Paused { id: job.id.clone() }));
+    }
     use std::thread;
 
     fn manager_job(manager: &JobManager) -> Job {
