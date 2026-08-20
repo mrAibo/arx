@@ -605,8 +605,8 @@ async fn physical_w1_through_w18() {
         .await
         .expect("W15: seed OLD on Apache");
 
-    // Local NEW file.
-    let ov_local = std::env::temp_dir().join(format!("{}-w15-local.txt", run));
+    // Local NEW file (basename must match the upload entry name).
+    let ov_local = std::env::temp_dir().join(format!("{}-w15-new.txt", run));
     std::fs::write(&ov_local, b"NEW").expect("W15: write local NEW");
 
     let ov_name = ov.trim_start_matches('/');
@@ -829,7 +829,7 @@ async fn physical_w1_through_w18() {
     .unwrap();
     let w18_arc = Arc::new(w18_provider);
     let w18_file = format!("/{}-w18.txt", run);
-    let w18_local = std::env::temp_dir().join(format!("{}-w18-local.txt", run));
+    let w18_local = std::env::temp_dir().join(w18_file.trim_start_matches('/'));
     std::fs::write(&w18_local, b"w18-payload").expect("W18: write local");
     let w18_dst = Location::WebDav {
         target: "accept".into(),
