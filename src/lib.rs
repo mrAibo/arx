@@ -14,6 +14,7 @@ pub mod services;
 pub mod terminal;
 pub mod transfer;
 pub mod transfer_queue;
+pub mod transfer_queue_runtime;
 pub mod vfs;
 pub mod workspace_sync;
 pub mod workspace_sync_execution;
