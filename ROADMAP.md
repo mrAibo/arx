@@ -2,56 +2,91 @@
 
 ## CURRENT — Product Truth
 
-ARX **v0.17.0 released 2026-08-16** (SHA `32a7e78`). Documentation and product positioning reflect the actual runtime. Remote Workspace is the hero workflow. SFTP F3/F4 and the SSH Host Manager (F12) are implemented. The S3 backend is physically accepted against real AWS S3 (`715844024414`) and MinIO. Keybindings match runtime truth.
+ARX **v0.17.1 is the released reliability baseline**. PACK C hardening is shipped, and PACK E WebDAV has since merged into `main` via **PR #157** (merge SHA `c0cd992661b013c73f1872ce2b541cc12ea0f9d7`). The next public release is **v0.18.0**, which promotes the merged WebDAV Basic-auth MVP as a supported capability.
+
+WebDAV release truth:
+
+- **Apache mod_dav:** PHYSICAL PASS, W1–W18.
+- **Auth:** Basic only for the MVP; Digest/Bearer are DEFERRED.
+- **Nextcloud / ownCloud:** UNVERIFIED; no physical-certification claim.
+- **F3:** bounded preview supported.
+- **F5:** one-file Local ↔ WebDAV transfer supported.
+- **F7 / F8:** MKCOL and non-recursive delete supported.
+- **F4 remote edit:** unsupported.
+- **Cross-target WebDAV move:** unsupported.
+- Authoritative raw href identity, no-clobber transfer semantics, and no blind retry of ambiguous mutations are part of the accepted WebDAV safety contract.
+
+The S3 backend remains physically accepted against real AWS S3 and MinIO. SFTP Remote Edit and the SSH Host Manager remain part of the released baseline. MSRV stays **Rust 1.88**.
 
 ## RELEASED — v0.17.0 (2026-08-16)
 
-The Release Readiness gates below were completed and **v0.17.0 was published**:
+The v0.17.0 Release Readiness gates completed and the release was published:
 
-- Cargo.toml version / tag / release line resolved (v0.17.0)
-- MSRV verified at Rust 1.88 against CI toolchain
-- Release workflow hardened: checksums, quality gates, smoke
-- Supported artifact matrix frozen (Linux x86_64 binary + source)
-- Release notes and install/doc truth published
-- Tagged and published
+- Cargo version / tag / release line resolved.
+- MSRV verified at Rust 1.88.
+- Release workflow hardened with checksums, quality gates, and packaged-binary smoke.
+- Supported artifact matrix frozen to Linux x86_64 binary + source.
+- Release notes and installation truth published.
 
-## THEN — Next Public Release
+## RELEASED — v0.17.1
 
-Release from current main after Product Truth and Release Readiness gates pass.
+v0.17.1 is the historical reliability/hardening release over v0.17.0. It did **not** ship WebDAV as a release feature.
 
-## PACK C — reliability hardening (MERGED)
+PACK C landed in `main` via **PR #155** (merge SHA `6e4b5fbb`) and delivered:
 
-PACK C post-v0.17.0 hardening landed in `main` via **PR #155** (merged 2026-08-18, merge SHA `6e4b5fbb`). Issues **#47–#53 are CLOSED**.
+- **Reliability:** transport-only connection invalidation (#47), bounded pooled-session health probe (#48).
+- **Cleanup:** dead RemoteEditState variants (#49), double-lock removed (#52).
+- **Safety testing:** deterministic fault-injection suite (#50), writable non-sticky parent policy (#53).
+- **Architecture:** Remote Edit lifecycle integrated with Job Manager (#51), typed phases/outcomes, lane-isolated failure handling.
 
-Delivered:
+Physical SFTP Remote Edit acceptance included:
 
-- **Reliability:** transport-only connection invalidation (#47), bounded pooled-session health probe (#48)
-- **Cleanup:** dead RemoteEditState variants (#49), double-lock removed (#52)
-- **Safety testing:** deterministic fault-injection suite (#50), writable non-sticky parent policy (#53)
-- **Architecture:** Remote Edit lifecycle integrated with Job Manager (#51), typed phases/outcomes, lane-isolated failure handling
+- **E1–E12** safety matrix — PASS.
+- **fault/race** — PASS.
+- **pool-health** (real sshd, reuse / stale-reconnect / no-replay) — PASS.
+- **TUI lifecycle** (shared JobManager + job_events) — PASS.
+- artifact audit: **0** partial-upload (`.arx-part-*`) fragments leaked.
 
-Physical SFTP Remote Edit acceptance (real OpenSSH fixture, `ARX_SFTP_SMOKE_HOST`):
+## PACK E — WebDAV MVP (MERGED)
 
-- **E1–E12** safety matrix — PASS
-- **fault/race** — PASS
-- **pool-health** (real sshd, reuse / stale-reconnect / no-replay) — PASS
-- **TUI lifecycle** (shared JobManager + job_events) — PASS
-- artifact audit: **0** partial-upload (`.arx-part-*`) fragments leaked
+PACK E merged via **PR #157** at merge SHA `c0cd992661b013c73f1872ce2b541cc12ea0f9d7`.
 
-## THEN — Next Public Release = v0.17.1
+Delivered MVP surface:
 
-Patch release from current `main` (post-PACK-C reliability hardening + PACK E WebDAV candidate). Release Readiness gates apply; MSRV stays 1.88. No new major features, no WebDAV/Windows/plugin/S3-scope/router changes. (WebDAV MVP is a CANDIDATE in PR #157, not yet released.)
+- PROPFIND / GET / PUT / DELETE / MKCOL / COPY / MOVE.
+- HTTP Basic auth with OS-keyring / environment secret resolution; no plaintext password in config.
+- bounded F3 preview.
+- one-file Local ↔ WebDAV F5 path.
+- authoritative raw-href identity and strict DAV namespace / propstat parsing.
+- atomic remote no-clobber via `If-None-Match: *`.
+- local staged download with real noclobber finalization.
+- automatic retry disabled for ambiguous mutations.
+- dedicated `webdav-physical` CI gate.
+- Apache mod_dav physical acceptance **W1–W18 PASS**.
+
+Not claimed by PACK E:
+
+- Digest/Bearer authentication.
+- WebDAV F4 remote edit.
+- recursive WebDAV transfer/delete.
+- cross-target WebDAV move.
+- Nextcloud / ownCloud physical certification.
+
+## THEN — Next Public Release = v0.18.0
+
+v0.18.0 is the WebDAV release pack over the v0.17.1 reliability baseline. It is a **minor release** because WebDAV is a new supported backend capability. Release Readiness requires the standard quality/MSRV/build/package gates plus exact-SHA `webdav-physical` W1–W18 acceptance. No new feature development belongs in this release pack.
 
 ## FUTURE
 
-- S3 object-storage backend — **RELEASED as SUPPORTED MVP.** Real AWS S3 (account `715844024414`) and MinIO both passed physical acceptance (20/20 tests, immutable SHA `b5f0ee6`). Moto emulated PASS. Cloudflare R2 / Wasabi remain UNVERIFIED (best-effort only, not claimed supported).
-- WebDAV backend — **CANDIDATE (PACK E, PR #157 open).** PROPFIND/GET/PUT/DELETE/MKCOL/COPY/MOVE, Basic auth, OS-keyring/env secret. Local↔WebDAV F5 (one-file PUT/GET via the async transfer executor), F7 MKCOL, F8 delete. Apache mod_dav passed physical acceptance. Nextcloud/ownCloud UNVERIFIED. Digest/Bearer and cross-target move deferred. Not released until PR #157 merges.
-- Cross-backend Move
-- SFTP → SFTP workspace sync
-- Recursive remote delete
-- Binary remote editing
-- Plugin system (Lua/WASM)
-- Broader platform support (aarch64, macOS, Windows)
+- S3 object-storage backend — **RELEASED as SUPPORTED MVP.** Real AWS S3 (account `715844024414`) and MinIO passed physical acceptance (20/20 tests, immutable SHA `b5f0ee6`). Moto emulated PASS. Cloudflare R2 / Wasabi remain UNVERIFIED (best-effort only, not claimed supported).
+- WebDAV post-MVP — Digest/Bearer auth, F4 remote edit, recursive transfers, cross-target move, and Nextcloud/ownCloud physical certification remain future work.
+- Transfer Queue / richer transfer orchestration.
+- Cross-backend Move.
+- SFTP → SFTP workspace sync.
+- Recursive remote delete.
+- Binary remote editing.
+- Plugin system (Lua/WASM).
+- Broader platform support (aarch64, macOS, Windows).
 
 ### Storage Inspector / Disk Usage
 
