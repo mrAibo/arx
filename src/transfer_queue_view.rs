@@ -217,10 +217,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let job = transfer_job(&manager);
 
-        assert!(manager.publish_event(
-            &tx,
-            JobEvent::Running { id: job.id.clone() },
-        ));
+        assert!(manager.publish_event(&tx, JobEvent::Running { id: job.id.clone() },));
         assert!(manager.publish_event(
             &tx,
             JobEvent::Progress {
