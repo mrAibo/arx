@@ -79,7 +79,9 @@ pub async fn start_proxy(upstream_url: &str, mode: ProxyMode) -> std::io::Result
     });
 
     Ok(TestProxy {
-        listen_addr: format!("http://127.0.0.1:{}/", listen_port),
+        // Include the upstream DAV root path so the client's hrefs land inside
+        // Apache's DavRoot without the proxy rewriting request paths.
+        listen_addr: format!("http://127.0.0.1:{}/dav/", listen_port),
         record,
     })
 }
