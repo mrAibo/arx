@@ -287,7 +287,10 @@ fn job_progress(
     rate: &mut TransferRateEstimator,
 ) -> JobProgress {
     match method {
-        TransferMethod::S3 | TransferMethod::WebDav => {
+        // Current WebDAV upload callbacks report bytes. Downloads do not yet
+        // expose streaming progress and therefore stay indeterminate until the
+        // executor/provider progress seam is widened later in PACK G.
+        TransferMethod::WebDav => {
             let done = u64::try_from(progress.completed).unwrap_or(u64::MAX);
             let total = u64::try_from(progress.total).unwrap_or(u64::MAX);
             let bytes_per_second = rate.observe_at(Instant::now(), done).unwrap_or(0);
@@ -297,10 +300,14 @@ fn job_progress(
                 rate: bytes_per_second,
             })
         }
+        // Native/rsync/SFTP callbacks are item counts. S3 upload callbacks are
+        // currently part counts (including 1/1 for a single PUT), not bytes.
+        // Do not fabricate byte speed/ETA from those values.
         TransferMethod::Native
         | TransferMethod::Rsync
         | TransferMethod::Sftp
-        | TransferMethod::Scp => JobProgress::Generic(Progress::Items {
+        | TransferMethod::Scp
+        | TransferMethod::S3 => JobProgress::Generic(Progress::Items {
             done: progress.completed,
             total: progress.total,
         }),
