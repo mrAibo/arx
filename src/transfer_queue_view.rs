@@ -166,7 +166,10 @@ mod tests {
                 cancelling: 0,
             }
         );
-        assert_eq!(transfer_status_bar(&snapshot).as_deref(), Some("[2 queued]"));
+        assert_eq!(
+            transfer_status_bar(&snapshot).as_deref(),
+            Some("[2 queued]")
+        );
     }
 
     #[test]
