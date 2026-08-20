@@ -609,10 +609,11 @@ impl JobManager {
                 }
             }
             JobEvent::Progress { progress, .. } => {
-                if matches!(
-                    job.status,
-                    JobStatus::Running | JobStatus::Cancelling | JobStatus::RetryWaiting
-                ) {
+                // RetryWaiting means no active I/O is occurring; a Progress
+                // event arriving then is stale (e.g. in-flight before the
+                // failure that triggered backoff). Reject it so the snapshot
+                // stays byte-for-byte stable across the wait.
+                if matches!(job.status, JobStatus::Running | JobStatus::Cancelling) {
                     job.progress = progress.clone();
                     true
                 } else {

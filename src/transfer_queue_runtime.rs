@@ -142,6 +142,13 @@ impl TransferQueueRuntime {
         }
     }
 
+    /// Read-only access to the shared `JobManager` for product-path tests and
+    /// observers. The runtime remains the only place that mutates transfer
+    /// jobs; this never hands out a second lifecycle owner.
+    pub fn manager(&self) -> &JobManager {
+        &self.manager
+    }
+
     fn pump(&self) {
         let starts = {
             let mut state = self.lock_state();
@@ -296,22 +303,25 @@ impl TransferQueueRuntime {
                 {
                     let runtime = self.clone();
                     let job_id = job_id.to_string();
-                    let work = {
-                        let state = self.lock_state();
-                        state.work.get(&job_id).cloned()
-                    };
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
-                        let Some(work) = work else {
-                            runtime.terminalize(&job_id);
-                            return;
+                        // §8: a cancel during RetryWaiting must not resurrect
+                        // the job. Only re-arm if the scheduler still holds it
+                        // in RetryWaiting; otherwise the work is gone/cancelled.
+                        let rearm = {
+                            let state = runtime.lock_state();
+                            matches!(
+                                state.core.state(&job_id),
+                                Some(SchedulerState::RetryWaiting)
+                            )
                         };
-                        {
-                            let mut state = runtime.lock_state();
-                            let _ = state.core.release_retry(&job_id);
+                        if rearm {
+                            {
+                                let mut state = runtime.lock_state();
+                                let _ = state.core.release_retry(&job_id);
+                            }
+                            runtime.pump();
                         }
-                        runtime.pump();
-                        let _ = &work;
                     });
                 }
                 self.pump();

@@ -1,5 +1,10 @@
 use serde::Deserialize;
 
+// §12: single authoritative source for transfer concurrency bounds. The
+// scheduler (`transfer_queue::TransferQueueConfig`) and config validation
+// both reference these, so drift between them is impossible.
+use crate::transfer_queue::{DEFAULT_TRANSFER_CONCURRENCY, MAX_TRANSFER_CONCURRENCY};
+
 #[derive(Debug, Deserialize)]
 pub struct ArxConfig {
     #[serde(default)]
@@ -35,9 +40,6 @@ impl Default for TransferConfig {
         }
     }
 }
-
-pub const DEFAULT_TRANSFER_CONCURRENCY: usize = 2;
-pub const MAX_TRANSFER_CONCURRENCY: usize = 8;
 
 fn default_transfer_concurrency() -> usize {
     DEFAULT_TRANSFER_CONCURRENCY

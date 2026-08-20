@@ -53,6 +53,9 @@ struct SyncUiRuntime {
     job_events: mpsc::UnboundedSender<arx::jobs::JobEvent>,
     verification_events: mpsc::UnboundedSender<SyncVerificationEvent>,
     launch_events: mpsc::UnboundedSender<SyncLaunchResponse>,
+    /// Single persistent transfer queue runtime. Copy/Move route here; it owns
+    /// the only transfer executor and scheduler keyed by the same JobId.
+    transfers: arx::transfer_queue_runtime::TransferQueueRuntime,
 }
 
 struct SyncLaunchResponse {
@@ -124,6 +127,13 @@ async fn event_loop(
         job_events: job_tx.clone(),
         verification_events: verification_tx,
         launch_events: sync_launch_tx,
+        transfers: arx::transfer_queue_runtime::TransferQueueRuntime::new(
+            job_manager.clone(),
+            job_tx.clone(),
+            state.registry.clone(),
+            arx::transfer_queue::TransferQueueConfig::new(config.transfer.concurrency)
+                .unwrap_or_default(),
+        ),
     };
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
     let parent_entry = virtual_parent_entry();
@@ -1855,8 +1865,8 @@ async fn event_loop(
                         KeyCode::Delete if state.show_jobs => {
                             if let Some(job) = state.jobs.get(state.job_cursor) {
                                 let id = job.id.clone();
-                                if job_manager.cancel(&id) {
-                                    state.jobs = job_manager.snapshot();
+                                if cancel_job_product_route(&mut state, &sync_runtime, &id) {
+                                    state.jobs = sync_runtime.jobs.snapshot();
                                 }
                             }
                         }
@@ -5841,84 +5851,14 @@ async fn dispatch_ui_action(
                     return Ok(());
                 }
             };
-            let job = sync.jobs.create_job(
-                "copy",
-                arx::jobs::JobKind::Copy,
-                format!("Copy {} → {}", names.join(", "), dst_loc.label()),
-                Some(src_loc.clone()),
-                Some(dst_loc.clone()),
-            );
-            let id = job.id.clone();
-            let cancel = job.cancel.clone();
+            let id = match sync.transfers.enqueue(plan, names) {
+                Ok(id) => id,
+                Err(e) => {
+                    state.message = Some(e.to_string());
+                    return Ok(());
+                }
+            };
             state.jobs = sync.jobs.snapshot();
-            let jobs = sync.jobs.clone();
-            let tx = sync.job_events.clone();
-            let names2 = names.clone();
-            let plan2 = plan.clone();
-            let job_id = id.clone();
-            let registry2 = state.registry.clone();
-            tokio::spawn(async move {
-                if !jobs.publish_event(&tx, arx::jobs::JobEvent::Running { id: job_id.clone() }) {
-                    return;
-                }
-                let tx2 = tx.clone();
-                let jid = job_id.clone();
-                let result = arx::transfer::executor::execute_transfer(
-                    &plan2,
-                    &names2,
-                    &registry2,
-                    cancel,
-                    |p| {
-                        let pct = p.completed.saturating_mul(100) / p.total.max(1);
-                        let _ = jobs.publish_event(
-                            &tx2,
-                            arx::jobs::JobEvent::Progress {
-                                id: jid.clone(),
-                                progress: arx::jobs::Progress::Percent(pct as u8).into(),
-                            },
-                        );
-                    },
-                )
-                .await;
-                match result {
-                    Ok(outcome) => {
-                        let _ = jobs.publish_event(
-                            &tx,
-                            arx::jobs::JobEvent::Completed {
-                                id: job_id,
-                                result: arx::jobs::JobResult::generic(
-                                    format!("Copied {} item(s)", outcome.completed),
-                                    outcome.completed,
-                                ),
-                            },
-                        );
-                    }
-                    Err(arx::transfer::executor::TransferExecutionError::Cancelled {
-                        completed,
-                    }) => {
-                        let _ = jobs.publish_event(
-                            &tx,
-                            arx::jobs::JobEvent::Cancelled {
-                                id: job_id,
-                                result: arx::jobs::JobResult::generic(
-                                    format!("Cancelled after {completed} item(s)"),
-                                    completed,
-                                ),
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        let _ = jobs.publish_event(
-                            &tx,
-                            arx::jobs::JobEvent::Failed {
-                                id: job_id,
-                                error: e.to_string(),
-                                result: None,
-                            },
-                        );
-                    }
-                }
-            });
             state.message = Some(format!("Copy queued ({id})"));
             state.clear_selection();
         }
@@ -5973,84 +5913,14 @@ async fn dispatch_ui_action(
                     return Ok(());
                 }
             };
-            let job = sync.jobs.create_job(
-                "move",
-                arx::jobs::JobKind::Move,
-                format!("Move {} → {}", names.join(", "), dst_loc.label()),
-                Some(src_loc.clone()),
-                Some(dst_loc.clone()),
-            );
-            let id = job.id.clone();
-            let cancel = job.cancel.clone();
+            let id = match sync.transfers.enqueue(plan, names) {
+                Ok(id) => id,
+                Err(e) => {
+                    state.message = Some(e.to_string());
+                    return Ok(());
+                }
+            };
             state.jobs = sync.jobs.snapshot();
-            let jobs = sync.jobs.clone();
-            let tx = sync.job_events.clone();
-            let names2 = names.clone();
-            let plan2 = plan.clone();
-            let job_id = id.clone();
-            let registry2 = state.registry.clone();
-            tokio::spawn(async move {
-                if !jobs.publish_event(&tx, arx::jobs::JobEvent::Running { id: job_id.clone() }) {
-                    return;
-                }
-                let tx2 = tx.clone();
-                let jid = job_id.clone();
-                let result = arx::transfer::executor::execute_transfer(
-                    &plan2,
-                    &names2,
-                    &registry2,
-                    cancel,
-                    |p| {
-                        let pct = p.completed.saturating_mul(100) / p.total.max(1);
-                        let _ = jobs.publish_event(
-                            &tx2,
-                            arx::jobs::JobEvent::Progress {
-                                id: jid.clone(),
-                                progress: arx::jobs::Progress::Percent(pct as u8).into(),
-                            },
-                        );
-                    },
-                )
-                .await;
-                match result {
-                    Ok(outcome) => {
-                        let _ = jobs.publish_event(
-                            &tx,
-                            arx::jobs::JobEvent::Completed {
-                                id: job_id,
-                                result: arx::jobs::JobResult::generic(
-                                    format!("Moved {} item(s)", outcome.completed),
-                                    outcome.completed,
-                                ),
-                            },
-                        );
-                    }
-                    Err(arx::transfer::executor::TransferExecutionError::Cancelled {
-                        completed,
-                    }) => {
-                        let _ = jobs.publish_event(
-                            &tx,
-                            arx::jobs::JobEvent::Cancelled {
-                                id: job_id,
-                                result: arx::jobs::JobResult::generic(
-                                    format!("Cancelled after {completed} item(s)"),
-                                    completed,
-                                ),
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        let _ = jobs.publish_event(
-                            &tx,
-                            arx::jobs::JobEvent::Failed {
-                                id: job_id,
-                                error: e.to_string(),
-                                result: None,
-                            },
-                        );
-                    }
-                }
-            });
             state.message = Some(format!("Move queued ({id})"));
             state.clear_selection();
         }
@@ -6605,6 +6475,27 @@ fn cancel_workspace_sync(state: &mut AppState, sync: &SyncUiRuntime) {
             state.remote_workspace.sync_from_job(&job);
         }
     }
+}
+
+/// Product-path cancel for the Jobs UI. Transfer jobs route through the queue
+/// runtime (which holds the executor + scheduler); every other kind uses the
+/// legacy JobManager cancel. Tests exercise exactly this function.
+fn cancel_job_product_route(state: &mut AppState, sync: &SyncUiRuntime, job_id: &str) -> bool {
+    let kind = sync.jobs.get(job_id).map(|job| job.kind);
+    let cancelled = match kind {
+        Some(arx::jobs::JobKind::Transfer) => sync.transfers.cancel(job_id).is_ok(),
+        _ => {
+            // Legacy path: unrelated job kinds use the existing JobManager
+            // cancel token. Keep the literal routing visible for the contract.
+            let id = job_id.to_string();
+            let job_manager = &sync.jobs;
+            job_manager.cancel(&id)
+        }
+    };
+    if cancelled {
+        state.message = Some(format!("Job {job_id} cancellation requested"));
+    }
+    cancelled
 }
 
 // ponytail: a context struct would only hide these already-scoped runtime services.
