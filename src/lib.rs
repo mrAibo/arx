@@ -15,6 +15,7 @@ pub mod terminal;
 pub mod transfer;
 pub mod transfer_queue;
 pub mod transfer_queue_runtime;
+pub mod transfer_queue_view;
 pub mod transfer_retry;
 pub mod vfs;
 pub mod workspace_sync;
