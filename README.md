@@ -51,8 +51,8 @@ Download the archive and SHA256SUMS from the [latest GitHub Release](https://git
 sha256sum -c SHA256SUMS
 
 # Extract
-tar xzf arx-v0.17.0-x86_64-unknown-linux-gnu.tar.gz
-cd arx-v0.17.0-x86_64-unknown-linux-gnu
+tar xzf arx-v0.18.0-x86_64-unknown-linux-gnu.tar.gz
+cd arx-v0.18.0-x86_64-unknown-linux-gnu
 
 # Place on PATH
 sudo install -m 755 arx /usr/local/bin/arx
@@ -108,12 +108,12 @@ of truth.
 
 | Key | Action |
 |-----|--------|
-| **F3** | View — Local: full preview; SFTP: bounded text (1 MiB / 500 lines); **S3: bounded object preview (where supported)** |
-| **F4** | Edit — Local: configured editor; SFTP: conflict-safe UTF-8 text edit, full-file only, binary/NUL refused; **S3: disabled** |
-| **F5** | Copy — Local↔Local, Local↔SFTP (SFTP→SFTP unsupported); **S3: Local↔S3 and S3→Local single-object copy (no S3→S3, no SFTP↔S3)** |
-| **F6** | Move — Local↔Local only; **S3: disabled** |
-| **F7** | Create directory — Local + SFTP; **S3: creates a prefix marker (not a POSIX directory / bucket)** |
-| **F8** | Delete — Local: trash; SFTP: permanent confirmed delete (no recursive remote delete); **S3: exact single-object or proven-empty marker delete (no recursive prefix delete, no bucket delete)** |
+| **F3** | View — Local: full preview; SFTP: bounded text (1 MiB / 500 lines); S3: bounded object preview where supported; **WebDAV: bounded one-file preview** |
+| **F4** | Edit — Local: configured editor; SFTP: conflict-safe UTF-8 text edit, full-file only, binary/NUL refused; **S3 and WebDAV: disabled** |
+| **F5** | Copy — Local↔Local, Local↔SFTP (SFTP→SFTP unsupported); S3: Local↔S3 single-object copy; **WebDAV: Local↔WebDAV one-file copy**. No SFTP↔cloud or cross-target WebDAV transfer claim |
+| **F6** | Move — Local↔Local product path. **S3 disabled; cross-target WebDAV move unsupported** |
+| **F7** | Create directory — Local + SFTP; S3: prefix marker (not a POSIX directory / bucket); **WebDAV: MKCOL** |
+| **F8** | Delete — Local: trash; SFTP: permanent confirmed delete (no recursive remote delete); S3: exact single-object or proven-empty marker delete; **WebDAV: permanent non-recursive resource delete** |
 | Shift+F6 | Rename |
 | Ctrl+U | Swap panes |
 | Ctrl+X C / L / O / S | chmod / hardlink / chown / symlink |
@@ -218,7 +218,7 @@ Menu entries appear in Command Center (Ctrl+P).
 | Host Center (F9) | ✅ |
 | Extension colors, heatmap, git status bar | ✅ |
 | S3 object-storage backend | ✅ AWS + MinIO PHYSICAL PASS (SUPPORTED MVP); Moto EMULATED PASS; R2/Wasabi UNVERIFIED (best-effort) |
-| WebDAV backend | CANDIDATE (PACK E, PR #157 open) — PROPFIND/GET/PUT/DELETE/MKCOL/COPY/MOVE, Basic auth, keyring/env secret |
+| WebDAV backend | ✅ **SUPPORTED MVP** — Apache mod_dav PHYSICAL PASS (W1–W18); Basic auth only; Nextcloud/ownCloud UNVERIFIED |
 
 ## S3 object storage
 
@@ -235,30 +235,44 @@ Wasabi are **unverified — best-effort only, not claimed supported.**
 
 ## WebDAV backend
 
-Production `VfsProvider` over `reqwest` + `quick-xml`. Real DAV semantics,
-no plaintext password in config, no hand-rolled XML string-splitting.
+Production `VfsProvider` over `reqwest` + `quick-xml`. The v0.18.0 MVP uses real DAV
+semantics, authoritative raw-href identity, bounded parsing/preview, no plaintext
+password in config, and no blind retry of ambiguous mutations.
+
+Physical support status:
+
+| Backend | Status |
+|---------|--------|
+| Apache mod_dav | ✅ PHYSICAL PASS — W1–W18, SUPPORTED MVP |
+| Nextcloud | ⚠️ UNVERIFIED — no physical-certification claim |
+| ownCloud | ⚠️ UNVERIFIED — no physical-certification claim |
 
 ```toml
 # ~/.config/arx/arx.toml
 [[webdav.targets]]
-id = "nextcloud"
-name = "Nextcloud"
-url = "https://cloud.example.com/remote.php/dav/files/me/"
+id = "dav"
+name = "WebDAV server"
+url = "https://dav.example.com/files/"
 username = "me"
-# password resolved from OS keyring (id "nextcloud") or ARX_WEBDAV_NEXTCLOUD_PASSWORD;
+# password resolved from OS keyring (id "dav") or ARX_WEBDAV_DAV_PASSWORD;
 # never stored in this file
 ```
 
-Capabilities: List / Read / F3 (bounded text preview) / Write (F5 one-file
-Local↔WebDAV PUT) / Mkdir (F7 MKCOL) / Delete (F8) / ServerSideCopy within one
-target (F5/F6 COPY/MOVE with `Overwrite: F`). F4 (remote edit) and F6 (move)
-across targets stay disabled — no server-agnostic compare-and-swap or
-cross-target move.
+Capabilities in the MVP: List / Read / F3 bounded preview / Write through one-file
+F5 Local↔WebDAV / Mkdir (F7 MKCOL) / Delete (F8) / server-side COPY/MOVE within the
+provider seam where the product path permits it. **F4 remote edit is unsupported.**
+Cross-target WebDAV move is unsupported, and recursive WebDAV transfer/delete is not
+claimed.
 
-Auth: HTTP Basic only (MVP). Digest/Bearer deferred. Secrets come from the OS
-keyring (`secret-tool`/macOS/Windows) keyed by target `id`, or the
-`ARX_WEBDAV_<ID>_PASSWORD` env var; config holds neither. URLs are redacted
-(`user:***@`) in diagnostics; passwords never reach logs.
+Auth: **HTTP Basic only** for the MVP. Digest/Bearer are deferred. Secrets come from
+the OS keyring keyed by target `id`, or the `ARX_WEBDAV_<ID>_PASSWORD` environment
+variable; config holds neither. URLs are redacted in diagnostics and passwords never
+reach logs.
+
+Transfer safety: remote overwrite-forbid uses `If-None-Match: *`; local downloads
+stage into a temporary file in the destination directory and finalize with real
+noclobber semantics. Automatic HTTP retries are disabled so an ambiguous mutation is
+reported as an error rather than blindly replayed.
 
 ## SSH Host Manager (F12)
 
@@ -320,12 +334,12 @@ implement listing, metadata, bounded reads, exact-length reads, and
 write-back via immutable revision. Capability sets gate action
 availability — F4 only shows when both Read and Write are present **and** the
 provider policy allows editing. S3 has Read+Write but F4 stays intentionally
-disabled (no generic edit path yet), so availability is capability **and**
-provider-policy gated, not capability-only.
+disabled; WebDAV F4 is likewise intentionally unsupported in the MVP.
 
 **Transfer Stack:** `TransferPlanner` builds a frozen plan from a
-`TransferRequest`. The planner picks native, rsync, or SFTP streaming.
-No plan mutates after dispatch.
+`TransferRequest`. The planner picks native, rsync, SFTP streaming, S3, or WebDAV
+execution according to the source/destination pair and capabilities. No plan mutates
+after dispatch.
 
 **SFTP:** Connection pooling per host. Ambiguous transport failures
 invalidate the session; definitive protocol errors don't. SFTP copies
@@ -333,7 +347,8 @@ use transactional staging (temp → backup → commit → rollback).
 
 **Safety:** SFTP copies stage to temp first. Destructive sync requires
 Preview. Cancel leaves source untouched. Host key verification uses the
-user's OpenSSH. Logs don't leak credentials.
+user's OpenSSH. WebDAV overwrite-forbid is atomic at the HTTP/file-finalization
+boundaries. Logs don't leak credentials.
 
 ## Development
 
