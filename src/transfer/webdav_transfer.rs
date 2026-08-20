@@ -123,22 +123,25 @@ pub(crate) async fn download_one(
         ));
     }
 
-    {
+    let written = {
         // Wrap the stage's std file for async streaming.
         let mut temp_file = TokioFile::from_std(
             stage
                 .reopen()
                 .map_err(|e| io::Error::other(format!("stage reopen: {e}")))?,
         );
-        // 3. Stream body with cancellation check between chunks.
+        // 3. Stream body with cancellation check between chunks. The provider
+        // returns the exact cumulative byte count written to the sink; preserve
+        // that fact instead of reconstructing it later from best-effort metadata.
         let max_bytes: usize = 16 * 1024 * 1024 * 1024;
-        provider
+        let written = provider
             .get_stream(&source.href, max_bytes, &mut temp_file, Some(&cancel))
             .await?;
         temp_file.flush().await?;
         temp_file.sync_all().await?;
         // tokio wrapper dropped here -> std file closed; NamedTempFile still owns path.
-    }
+        written
+    };
 
     // pre-persist cancellation: never finalize a staged download after cancel
     if cancel.load(Ordering::Acquire) {
@@ -165,11 +168,18 @@ pub(crate) async fn download_one(
         stage.persist(local_destination).map_err(|e| e.error)?;
     }
 
-    // 5. Return bytes written (zero is valid).
-    let size = std::fs::metadata(local_destination)
-        .map(|m| m.len())
-        .unwrap_or(0) as u64;
-    Ok(size)
+    // 5. Verify the committed final file still matches the exact streamed-byte
+    // outcome. A metadata/stat failure after persist is a factual post-commit
+    // error, never a successful synthetic `0 bytes` result. Zero remains valid
+    // only when both the stream and final file are actually zero bytes.
+    let final_size = std::fs::metadata(local_destination)?.len();
+    if final_size != written {
+        return Err(io::Error::other(
+            "WebDAV downloaded object verification failed: final size differs from streamed bytes",
+        ));
+    }
+
+    Ok(written)
 }
 
 #[cfg(test)]
