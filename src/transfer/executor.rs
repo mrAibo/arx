@@ -124,17 +124,13 @@ pub async fn execute_transfer(
         TransferMethod::Native => execute_native(plan, names, cancel, &mut on_progress).await,
         TransferMethod::Rsync => execute_rsync(plan, names, cancel, &mut on_progress).await,
         TransferMethod::Sftp => {
-            // ponytail: Copy reads remote data (safe to replay locally); Move
-            // performs a remote rename/commit whose outcome may be partially
-            // applied, so its failure is ambiguous and never auto-replayed.
-            let disposition = if plan.intent == TransferIntent::Move {
-                crate::transfer_queue::RetryDisposition::AmbiguousMutation
-            } else {
-                crate::transfer_queue::RetryDisposition::SafeToRetry
-            };
-            sftp_copy::execute_sftp_copy(plan, names, cancel, &mut on_progress)
-                .await
-                .map_err(|e| e.with_disposition(disposition))
+            // Fail closed until the SFTP implementation exposes the actual
+            // transfer/commit phase on every failure. `Copy` is not enough to
+            // prove restart safety: uploads have remote stage/backup/rename
+            // boundaries and downloads have local finalization boundaries.
+            // Raw provider/executor errors therefore keep their own typed
+            // disposition; unclassified I/O remains NeverRetry.
+            sftp_copy::execute_sftp_copy(plan, names, cancel, &mut on_progress).await
         }
         TransferMethod::Scp => Err(TransferExecutionError::InvalidPlan {
             method: plan.method,
@@ -172,9 +168,15 @@ pub async fn execute_transfer(
                     .map_err(TransferExecutionError::ambiguous)?;
                 }
                 S3TransferSpec::DownloadOne { .. } => {
+                    // The current download core returns plain io::Error across
+                    // both staged/read phases and local commit/post-verify
+                    // phases. Until those phases are typed explicitly, a
+                    // whole-function SafeToRetry wrapper is unsafe. Default to
+                    // NeverRetry and let the provider restore SafeToRetry only
+                    // on proven pre-finalization failures.
                     s3_download::download_one(&provider, spec, cancel.clone())
                         .await
-                        .map_err(TransferExecutionError::safe_to_retry)?;
+                        .map_err(TransferExecutionError::from)?;
                 }
             }
             Ok(TransferOutcome {
@@ -210,6 +212,10 @@ pub async fn execute_transfer(
                     .map_err(TransferExecutionError::ambiguous)?;
                 }
                 WebDavTransferSpec::DownloadOne { .. } => {
+                    // As with S3 download, plain io::Error currently crosses
+                    // both staged-read and local persist/post-commit phases.
+                    // Keep it NeverRetry until the phase itself is encoded in
+                    // the error rather than inferred from the operation name.
                     webdav_download_one(
                         &provider,
                         spec,
@@ -217,7 +223,7 @@ pub async fn execute_transfer(
                         cancel.clone(),
                     )
                     .await
-                    .map_err(TransferExecutionError::safe_to_retry)?;
+                    .map_err(TransferExecutionError::from)?;
                 }
             }
             Ok(TransferOutcome {
@@ -714,7 +720,9 @@ mod tests {
 
     // Routing proof for download: registered target resolves; the S3 arm
     // dispatches into download_one, which fails locally (nonexistent destination
-    // parent) before any GetObject network work.
+    // parent) before any GetObject network work. The phase is not yet typed by
+    // the provider, so the executor must fail closed instead of guessing that
+    // the whole download is safely replayable.
     #[tokio::test]
     async fn s3_download_arm_dispatches_to_download_core() {
         let registry = ProviderRegistry::new();
@@ -732,6 +740,10 @@ mod tests {
         let err = execute_transfer(&plan, &[], &registry, cancel, |_| {})
             .await
             .unwrap_err();
-        assert!(matches!(err, TransferExecutionError::Io { .. }));
+        assert!(matches!(&err, TransferExecutionError::Io { .. }));
+        assert_eq!(
+            err.retry_disposition(),
+            crate::transfer_queue::RetryDisposition::NeverRetry
+        );
     }
 }
