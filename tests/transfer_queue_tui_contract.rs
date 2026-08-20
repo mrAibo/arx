@@ -82,3 +82,23 @@ fn pause_resume_controls_wired_for_transfer_jobs() {
     assert!(handler.contains("sync.transfers.request_pause("));
     assert!(handler.contains("sync.transfers.resume("));
 }
+
+#[test]
+fn status_bar_wires_authoritative_transfer_status_helper() {
+    // Issue #15: the product footer must render real progress/rate via the
+    // authoritative `transfer_status_bar` helper, not a counts-only summary().
+    // The footer lives inside the main `render(` function (not render_jobs etc).
+    let render = function_block("render(")
+        .lines()
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        render.contains("transfer_status_bar(&sync.jobs.snapshot())"),
+        "footer must call transfer_status_bar with the JobManager snapshot"
+    );
+    assert!(
+        !render.contains("transfers: {} running, {} waiting, {} paused"),
+        "footer must not regress to counts-only presentation"
+    );
+}

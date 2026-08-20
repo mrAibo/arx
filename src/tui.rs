@@ -3761,7 +3761,13 @@ fn render(
     };
     let git_info = state.git_status.as_str();
     let msg_hint = message.map(|m| format!(" | {m}")).unwrap_or_default();
-    let transfer_summary = sync.transfers.summary();
+    // Status line — lean, no duplicate path info.
+    // Issue #15: real transfer progress/rate comes from the authoritative
+    // presentation helper (never a counts-only summary). It returns None when
+    // there are no active transfers, so no "0 running" clutter.
+    let transfer_status = arx::transfer_queue_view::transfer_status_bar(&sync.jobs.snapshot())
+        .map(|status| format!(" | transfers {status}"))
+        .unwrap_or_default();
 
     // Workspace Ribbon — provider-truthful identity + workflow phase
     let ribbon_text = workspace_ribbon_text(state);
@@ -3771,14 +3777,11 @@ fn render(
     )));
     frame.render_widget(ribbon, chunks[1]);
 
-    // Status line — lean, no duplicate path info
     let status = Paragraph::new(Line::from(format!(
-        "ARX v{} | sel: {} | transfers: {} running, {} waiting, {} paused |{hint}{msg_hint}{git_info}",
+        "ARX v{} | sel: {}{} |{hint}{msg_hint}{git_info}",
         env!("CARGO_PKG_VERSION"),
         selection_count,
-        transfer_summary.running,
-        transfer_summary.waiting,
-        transfer_summary.paused,
+        transfer_status,
     )))
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(status, chunks[2]);
@@ -4954,7 +4957,7 @@ fn render_transfer_center(
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Transfer Center (Ctrl+T: close) "),
+            .title(" Transfer Center (Ctrl+Y: close) "),
     );
     frame.render_widget(list, popup_area);
 }
