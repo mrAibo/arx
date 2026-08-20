@@ -158,12 +158,9 @@ impl TransferQueueRuntime {
         };
 
         for (job_id, work) in starts {
-            let _ = self.manager.publish_event(
-                &self.events,
-                JobEvent::Running {
-                    id: job_id.clone(),
-                },
-            );
+            let _ = self
+                .manager
+                .publish_event(&self.events, JobEvent::Running { id: job_id.clone() });
 
             let runtime = self.clone();
             tokio::spawn(async move {
