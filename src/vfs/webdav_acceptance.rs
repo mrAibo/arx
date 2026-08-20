@@ -610,12 +610,14 @@ async fn physical_w1_through_w18() {
     std::fs::write(&ov_local, b"NEW").expect("W15: write local NEW");
 
     // Exactly ONE product F5 upload (Local -> WebDAV) via the proxy.
+    // Destination is the root collection; the F5 derives the exact href
+    // `/run-w15.txt` from the source file name, matching the seeded resource.
     let conflict = run_f5(
         &proxy_reg,
         Location::Local(ov_local.parent().unwrap().to_path_buf()),
         Location::WebDav {
             target: "accept".into(),
-            path: ov.clone(),
+            path: root.clone(),
         },
         None,
         Some(&ListedEntry {
