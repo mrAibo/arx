@@ -45,6 +45,9 @@ mod tests {
     #[test]
     fn future_attempt_counts_remain_capped() {
         assert_eq!(retry_backoff(6, 8), Some(TRANSFER_RETRY_MAX_DELAY));
-        assert_eq!(retry_backoff(u8::MAX, u8::MAX), Some(TRANSFER_RETRY_MAX_DELAY));
+        assert_eq!(
+            retry_backoff(u8::MAX, u8::MAX),
+            Some(TRANSFER_RETRY_MAX_DELAY)
+        );
     }
 }
