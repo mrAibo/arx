@@ -164,8 +164,8 @@ async fn run_f5(
 // ponytail: one combined physical suite that walks the canonical W1–W18 matrix
 // using a unique run namespace. Splitting into 18 `#[tokio::test]`s would need
 // 18 independent fixtures; a single ordered suite against one real server is
-// the minimal honest physical proof. W16/W17/W18 need a deterministic fault
-// proxy in front of Apache; they are asserted as deferred here, not faked.
+// the minimal honest physical proof. W15/W17/W18 use the deterministic test
+// proxy; W16 uses real Apache mod_dav_lock and must execute without a skip path.
 #[tokio::test(flavor = "multi_thread")]
 async fn physical_w1_through_w18() {
     let Some(p) = target() else {
@@ -669,12 +669,12 @@ async fn physical_w1_through_w18() {
         .expect("W16: seed");
     let token = lock_resource(
         &upstream,
-        w16_path.trim_start_matches('/'),
+        &w16_path,
         p_arc.target().username.as_str(),
         &std::env::var("ARX_WEBDAV_SMOKE_PASS").unwrap(),
     )
     .await
-    .expect("W16: LOCK accepted (mod_dav_lock loaded)");
+    .expect("W16: LOCK existing resource");
     // ARX mutation WITHOUT the token must be rejected (423 / PermissionDenied).
     let mut_w = p_arc
         .write_file_bytes_if_unchanged(
@@ -685,28 +685,36 @@ async fn physical_w1_through_w18() {
             None,
         )
         .await;
-    let kind = mut_w.as_ref().err().map(|e| e.kind());
+    let error = mut_w.expect_err("W16: locked mutation must fail");
     assert_eq!(
-        kind,
-        Some(io::ErrorKind::PermissionDenied),
-        "W16: mutation under lock without token -> PermissionDenied"
+        error.kind(),
+        io::ErrorKind::PermissionDenied,
+        "W16: 423 Locked must map to PermissionDenied"
+    );
+    assert!(
+        error.to_string().contains("423"),
+        "W16: error must preserve the 423 Locked status"
     );
     // Original bytes unchanged.
     let after = p_arc
         .read_all_capped(&w16_path, 64)
         .await
-        .expect("W16: read");
+        .expect("W16: read original");
     assert_eq!(after.bytes, b"before", "W16: original bytes unchanged");
-    // Cleanup: UNLOCK so the fixture is not left locked.
+    // Cleanup: UNLOCK must succeed before removing the resource.
     unlock_resource(
         &upstream,
-        w16_path.trim_start_matches('/'),
+        &w16_path,
         &token,
         p_arc.target().username.as_str(),
         &std::env::var("ARX_WEBDAV_SMOKE_PASS").unwrap(),
     )
-    .await;
-    let _ = p_arc.remove_file(&w16_path).await;
+    .await
+    .expect("W16: UNLOCK");
+    p_arc
+        .remove_file(&w16_path)
+        .await
+        .expect("W16: cleanup remove_file");
 
     // W17: GET body drop via proxy -> GET count == 1, error, no retry.
     let drop_proxy = webdav_acceptance_proxy::start_proxy(
@@ -871,28 +879,28 @@ async fn physical_w1_through_w18() {
     eprintln!("physical W1–W18 PASSED for run {}", run);
 }
 
-/// Test-only LOCK against real Apache (fixture creds). Returns the Lock-Token
-/// if the server supports locking, else None. Never logs the token.
-async fn lock_resource(upstream: &str, path: &str, user: &str, pass: &str) -> Option<String> {
+/// Join the fixture DAV root and a resource path with exactly one slash.
+fn fixture_resource_url(upstream: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        upstream.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+/// Test-only LOCK against a seeded resource on real Apache. The fixture loads
+/// mod_dav_lock, so failure is a physical-test failure, not a skip condition.
+async fn lock_resource(upstream: &str, path: &str, user: &str, pass: &str) -> io::Result<String> {
     let client = reqwest::Client::new();
+    let url = fixture_resource_url(upstream, path);
     let body = r#"<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
   <D:lockscope><D:exclusive/></D:lockscope>
   <D:locktype><D:write/></D:locktype>
   <D:owner><D:href>arx-test</D:href></D:owner>
 </D:lockinfo>"#;
-    let url = format!(
-        "{}/{}/{}",
-        upstream.trim_end_matches('/'),
-        upstream
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or(""),
-        path.trim_start_matches('/')
-    );
     let resp = client
-        .request(reqwest::Method::from_bytes(b"LOCK").unwrap(), url)
+        .request(reqwest::Method::from_bytes(b"LOCK").unwrap(), &url)
         .basic_auth(user, Some(pass))
         .header("Content-Type", "application/xml")
         .header("Depth", "0")
@@ -900,33 +908,58 @@ async fn lock_resource(upstream: &str, path: &str, user: &str, pass: &str) -> Op
         .body(body)
         .send()
         .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
+        .map_err(|e| io::Error::other(format!("W16 LOCK transport error: {e}")))?;
+    let status = resp.status();
+    if status != reqwest::StatusCode::OK {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(io::Error::other(format!(
+            "W16 LOCK expected 200 for existing resource, got {status}: {}",
+            body.trim()
+        )));
     }
     resp.headers()
         .get("Lock-Token")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::other("W16 LOCK response missing Lock-Token"))
 }
 
-/// Test-only UNLOCK against real Apache.
-async fn unlock_resource(upstream: &str, path: &str, token: &str, user: &str, pass: &str) {
+/// Test-only UNLOCK against real Apache; the response must be 204 No Content.
+async fn unlock_resource(
+    upstream: &str,
+    path: &str,
+    token: &str,
+    user: &str,
+    pass: &str,
+) -> io::Result<()> {
     let client = reqwest::Client::new();
-    let url = format!(
-        "{}/{}/{}",
-        upstream.trim_end_matches('/'),
-        upstream
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or(""),
-        path.trim_start_matches('/')
-    );
-    let _ = client
-        .request(reqwest::Method::from_bytes(b"UNLOCK").unwrap(), url)
+    let url = fixture_resource_url(upstream, path);
+    let resp = client
+        .request(reqwest::Method::from_bytes(b"UNLOCK").unwrap(), &url)
         .basic_auth(user, Some(pass))
         .header("Lock-Token", token)
         .send()
-        .await;
+        .await
+        .map_err(|e| io::Error::other(format!("W16 UNLOCK transport error: {e}")))?;
+    let status = resp.status();
+    if status != reqwest::StatusCode::NO_CONTENT {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(io::Error::other(format!(
+            "W16 UNLOCK expected 204, got {status}: {}",
+            body.trim()
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn fixture_resource_url_joins_with_exactly_one_slash() {
+    assert_eq!(
+        fixture_resource_url("http://127.0.0.1:1234/dav/", "/run-w16.txt"),
+        "http://127.0.0.1:1234/dav/run-w16.txt"
+    );
+    assert_eq!(
+        fixture_resource_url("http://127.0.0.1:1234/dav", "run-w16.txt"),
+        "http://127.0.0.1:1234/dav/run-w16.txt"
+    );
 }
