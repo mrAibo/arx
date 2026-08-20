@@ -158,35 +158,32 @@ async fn handle_conn(
         }
         ProxyMode::DropGetBody => {
             if method.eq_ignore_ascii_case("GET") {
-                // Forward upstream response headers, then one body chunk, then
-                // close the ARX-facing socket to simulate a mid-body drop.
-                let mut resp = vec![0u8; 64 * 1024];
+                // Fault injection: drop the body. Consume the upstream response
+                // head (so Apache closes cleanly), then hand ARX a response that
+                // promises a large body and is abruptly cut -> early EOF error.
+                let mut resp_head = vec![0u8; 64 * 1024];
                 let mut got = 0usize;
                 loop {
-                    if got >= resp.len() {
+                    if got >= resp_head.len() {
                         break;
                     }
-                    match upstream.read(&mut resp[got..]).await {
+                    match upstream.read(&mut resp_head[got..]).await {
                         Ok(n) if n > 0 => {
                             got += n;
-                            if resp[..got].windows(4).any(|w| &w[..4] == b"\r\n\r\n") {
+                            if resp_head[..got].windows(4).any(|w| &w[..4] == b"\r\n\r\n") {
                                 break;
                             }
                         }
                         _ => break,
                     }
                 }
-                let _ = client.write_all(&resp[..got]).await;
-                // One small body chunk, then drop.
-                let mut body = [0u8; 16];
-                let n = upstream.read(&mut body).await;
-                match n {
-                    Ok(n) if n > 0 => {
-                        let _ = client.write_all(&body[..n]).await;
-                    }
-                    _ => {}
-                }
-                // Close ARX side; leave upstream to timeout.
+                // Drop the upstream side; we won't forward its body.
+                let _ = upstream.shutdown().await;
+                // Craft a response promising more bytes than we deliver.
+                let crafted = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n";
+                let _ = client.write_all(crafted).await;
+                // Send a fragment, then abruptly close (no clean chunk terminator).
+                let _ = client.write_all(b"partial-").await;
                 let _ = client.shutdown().await;
             } else {
                 pipe(&mut client, &mut upstream).await;
