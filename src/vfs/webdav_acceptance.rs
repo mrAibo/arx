@@ -577,18 +577,24 @@ async fn physical_w1_through_w18() {
 
     // Build a provider + registry pointing at the PROXY (not real Apache) so we
     // can observe ARX's exact HTTP behavior.
-    let proxy_provider = WebDavProvider::new(
-        WebDavTarget {
-            id: "accept".into(),
-            name: "accept".into(),
-            url: proxy_url.clone(),
-            username: p_arc.target().username.clone(),
-            auth: "basic".into(),
-        },
-        std::env::var("ARX_WEBDAV_SMOKE_PASS").unwrap(),
-    )
-    .unwrap();
-    let proxy_arc = Arc::new(proxy_provider);
+    // Build proxy providers pointing at the PROXY (not real Apache) so we can
+    // observe ARX's exact HTTP behavior. Each call gets a FRESH provider (fresh
+    // reqwest client => fresh connection pool) so keep-alive pipelining does
+    // not collapse two PUTs onto one proxied TCP connection.
+    let mk_proxy = || {
+        WebDavProvider::new(
+            WebDavTarget {
+                id: "accept".into(),
+                name: "accept".into(),
+                url: proxy_url.clone(),
+                username: p_arc.target().username.clone(),
+                auth: "basic".into(),
+            },
+            std::env::var("ARX_WEBDAV_SMOKE_PASS").unwrap(),
+        )
+        .unwrap()
+    };
+    let proxy_arc = Arc::new(mk_proxy());
 
     // Seed a SEPARATE resource with OLD bytes directly on Apache (bypass proxy),
     // then prove the overwrite policy at the PUT itself via the proxy on a
@@ -613,7 +619,8 @@ async fn physical_w1_through_w18() {
         .expect("W15: first PUT via proxy");
 
     // Second PUT to the SAME url with Forbid => If-None-Match:* => 412.
-    let conflict = proxy_arc
+    // Fresh provider => fresh connection so the proxy records it as a second PUT.
+    let conflict = Arc::new(mk_proxy())
         .put_with_policy(&ov, b"NEW2", crate::transfer::WebDavOverwritePolicy::Forbid)
         .await;
     assert!(conflict.is_err(), "W15: overwrite conflict rejected");
