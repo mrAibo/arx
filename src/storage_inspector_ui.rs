@@ -321,9 +321,14 @@ fn rows_for_snapshot(snapshot: &UsageScanResult, ui: &StorageInspectorUiState) -
             .collect::<Vec<_>>(),
     };
 
-    sort_rows(&mut rows, ui.sort);
     if ui.view == StorageView::TopFiles {
+        // Select the true top-N by size on the selected basis, THEN apply the
+        // presentation sort inside that retained set.
+        sort_rows(&mut rows, StorageSort::Size);
         rows.truncate(TOP_FILES_LIMIT);
+        sort_rows(&mut rows, ui.sort);
+    } else {
+        sort_rows(&mut rows, ui.sort);
     }
     rows
 }
@@ -599,6 +604,7 @@ mod tests {
     use crate::storage_inspector::{UsageScanOutcome, UsageTotals};
     use crate::storage_inspector_snapshot::StorageScanSnapshotStore;
     use crate::vfs::Location;
+    use crossterm::event::KeyModifiers;
     use tokio::sync::mpsc;
 
     fn record(
@@ -717,11 +723,7 @@ mod tests {
         };
         let rows = rows_for_snapshot(&scan, &ui);
         assert_eq!(rows[0].path, PathBuf::from("/root/a/deep"));
-        assert!(
-            !rows
-                .iter()
-                .any(|row| row.path == PathBuf::from("/root/dup"))
-        );
+        assert!(!rows.iter().any(|row| row.path == Path::new("/root/dup")));
     }
 
     #[test]
@@ -829,5 +831,241 @@ mod tests {
             "Storage Inspector is available for local paths only"
         );
         assert_eq!(state.active_overlay(), None);
+    }
+
+    #[test]
+    fn top_files_returns_true_top_n_by_size_not_alphabetical_first_20() {
+        // More than TOP_FILES_LIMIT regular files; one tiny lexicographically
+        // early file would appear in an alphabetical first-20 selection.
+        let mut scan = snapshot(UsageScanOutcome::Complete);
+        let tiny = record("/root/aaaa-tiny", UsageKind::File, 1, 1, 1);
+        scan.records.push(tiny);
+        for i in 0..30 {
+            let path = format!("/root/file-{i:02}");
+            let bytes = 1_000u128 + i as u128 * 10;
+            scan.records
+                .push(record(&path, UsageKind::File, bytes, bytes, 1));
+        }
+        let ui = StorageInspectorUiState {
+            root: Some(PathBuf::from("/root")),
+            current_dir: Some(PathBuf::from("/root")),
+            view: StorageView::TopFiles,
+            basis: StorageSizeBasis::Allocated,
+            sort: StorageSort::Name,
+            ..StorageInspectorUiState::default()
+        };
+        let rows = rows_for_snapshot(&scan, &ui);
+        assert_eq!(rows.len(), TOP_FILES_LIMIT);
+        // The tiny lexicographically-early file must be excluded.
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.path == Path::new("/root/aaaa-tiny"))
+        );
+        // The retained set must be Name-sorted (display sort applied after size top-N).
+        for pair in rows.windows(2) {
+            assert!(pair[0].name().to_lowercase() <= pair[1].name().to_lowercase());
+        }
+        // The largest files by allocated bytes are retained.
+        assert!(
+            rows.iter()
+                .any(|row| row.path == Path::new("/root/file-29"))
+        );
+    }
+
+    #[test]
+    fn k1_esc_closes_overlay_without_cancelling_running_scan() {
+        let mut state = AppState::default();
+        let manager = JobManager::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let job = manager.create_job(
+            "storage",
+            JobKind::StorageScan,
+            "scan",
+            Some(Location::Local(PathBuf::from("/root"))),
+            None,
+        );
+        assert!(manager.publish_event(&tx, crate::jobs::JobEvent::Running { id: job.id.clone() }));
+        assert!(
+            !manager
+                .cancel_token(&job.id)
+                .unwrap()
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        state.job_manager = Some(manager.clone());
+        state.jobs = manager.snapshot();
+        state.storage_inspector.job_id = Some(job.id.clone());
+        state.open_overlay(OverlayKind::StorageInspector);
+        assert_eq!(state.active_overlay(), Some(OverlayKind::StorageInspector));
+
+        handle_storage_inspector_key(
+            &mut state,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+
+        assert_eq!(state.active_overlay(), None);
+        assert!(
+            !manager
+                .cancel_token(&job.id)
+                .unwrap()
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(!manager.get(&job.id).unwrap().status.is_terminal());
+    }
+
+    #[test]
+    fn k2_view_controls_toggle_basis_sort_and_view() {
+        let mut state = AppState::default();
+        state.storage_inspector.basis = StorageSizeBasis::Allocated;
+        state.storage_inspector.sort = StorageSort::Size;
+        state.storage_inspector.view = StorageView::Directory;
+
+        handle_storage_inspector_key(
+            &mut state,
+            crossterm::event::KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+        );
+        assert_eq!(state.storage_inspector.basis, StorageSizeBasis::Logical);
+
+        handle_storage_inspector_key(
+            &mut state,
+            crossterm::event::KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        assert_eq!(state.storage_inspector.sort, StorageSort::Name);
+
+        handle_storage_inspector_key(
+            &mut state,
+            crossterm::event::KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        );
+        assert_eq!(state.storage_inspector.view, StorageView::TopFiles);
+    }
+
+    #[test]
+    fn k3_cancel_requests_cancellation_of_running_scan() {
+        let mut state = AppState::default();
+        let manager = JobManager::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let job = manager.create_job(
+            "storage",
+            JobKind::StorageScan,
+            "scan",
+            Some(Location::Local(PathBuf::from("/root"))),
+            None,
+        );
+        assert!(manager.publish_event(&tx, crate::jobs::JobEvent::Running { id: job.id.clone() }));
+        state.job_manager = Some(manager.clone());
+        state.jobs = manager.snapshot();
+        state.storage_inspector.job_id = Some(job.id.clone());
+
+        handle_storage_inspector_key(
+            &mut state,
+            crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
+
+        assert!(manager.get(&job.id).unwrap().status == JobStatus::Cancelling);
+        assert!(
+            manager
+                .cancel_token(&job.id)
+                .unwrap()
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn k4_drill_down_and_back_never_escapes_root() {
+        let mut state = AppState::default();
+        let scan = snapshot(UsageScanOutcome::Complete);
+        let store = StorageScanSnapshotStore::new();
+        let id = "k4-scan".to_string();
+        store.insert(id.clone(), scan);
+        state.storage_scan_snapshots = store;
+        state.storage_inspector.job_id = Some(id);
+        state.storage_inspector.root = Some(PathBuf::from("/root"));
+        state.storage_inspector.current_dir = Some(PathBuf::from("/root"));
+        state.storage_inspector.view = StorageView::Directory;
+        let child_index = visible_rows(&state)
+            .iter()
+            .position(|row| row.path == Path::new("/root/a"))
+            .expect("child /root/a visible");
+        state.storage_inspector.cursor = child_index;
+
+        handle_storage_inspector_key(
+            &mut state,
+            crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            state.storage_inspector.current_dir,
+            Some(PathBuf::from("/root/a"))
+        );
+
+        handle_storage_inspector_key(
+            &mut state,
+            crossterm::event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            state.storage_inspector.current_dir,
+            Some(PathBuf::from("/root"))
+        );
+
+        handle_storage_inspector_key(
+            &mut state,
+            crossterm::event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            state.storage_inspector.current_dir,
+            Some(PathBuf::from("/root"))
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_lifecycle_evicts_old_completed_on_new_scan() {
+        // A completed old scan snapshot and a current job exist.
+        let store = StorageScanSnapshotStore::new();
+
+        let mut state = AppState::default();
+        let manager = JobManager::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let old_job = manager.create_job(
+            "storage",
+            JobKind::StorageScan,
+            "scan",
+            Some(Location::Local(PathBuf::from("/root"))),
+            None,
+        );
+        let old_id = old_job.id.clone();
+        store.insert(old_id.clone(), snapshot(UsageScanOutcome::Complete));
+        assert!(manager.publish_event(
+            &tx,
+            crate::jobs::JobEvent::Completed {
+                id: old_job.id.clone(),
+                result: JobResult::StorageScan(crate::storage_inspector_job::StorageScanSummary {
+                    root: PathBuf::from("/root"),
+                    outcome: UsageScanOutcome::Complete,
+                    totals: UsageTotals::default(),
+                }),
+            },
+        ));
+        state.job_manager = Some(manager.clone());
+        state.jobs = manager.snapshot();
+        state.storage_scan_snapshots = store.clone();
+        state.storage_inspector.job_id = Some(old_job.id.clone());
+
+        // Closing the overlay with Esc does NOT delete the current snapshot.
+        state.open_overlay(OverlayKind::StorageInspector);
+        handle_storage_inspector_key(
+            &mut state,
+            crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(state.storage_scan_snapshots.contains(&old_job.id));
+        assert_eq!(state.active_overlay(), None);
+
+        // Starting the next local scan removes the previous completed snapshot.
+        let temp = tempfile::tempdir().unwrap();
+        state.left.location = Location::Local(temp.path().to_path_buf());
+        state.active = crate::app::Pane::Left;
+        state.job_events = Some(tx);
+        let new_id = launch_storage_inspector(&mut state).expect("next local launch");
+        assert_ne!(new_id, old_job.id);
+        assert!(!state.storage_scan_snapshots.contains(&old_job.id));
+        assert_eq!(state.storage_inspector.job_id, Some(new_id.clone()));
     }
 }
