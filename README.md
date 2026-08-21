@@ -49,22 +49,43 @@ cargo install --git https://github.com/mrAibo/arx
 arx
 ```
 
-### Binary release (Linux x86_64)
+### Release packages (Linux x86_64)
 
-Download the archive and SHA256SUMS from the [latest GitHub Release](https://github.com/mrAibo/arx/releases/latest).
+Download the artifact for your system and `SHA256SUMS` from the
+[latest GitHub Release](https://github.com/mrAibo/arx/releases/latest). When a
+release contains a native `.deb` or `.rpm`, prefer that package; the tarball
+remains the universal Linux x86_64 fallback.
+
+Verify the release files you downloaded:
 
 ```bash
-# Verify checksum
-sha256sum -c SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+```
 
-# Extract
-tar xzf arx-v0.19.0-x86_64-unknown-linux-gnu.tar.gz
-cd arx-v0.19.0-x86_64-unknown-linux-gnu
+Set `VERSION` to the release version (without the leading `v`), then install:
 
-# Place on PATH
-sudo install -m 755 arx /usr/local/bin/arx
+```bash
+VERSION=x.y.z
+
+# Debian / Ubuntu
+sudo apt install "./arx_${VERSION}_amd64.deb"
+
+# Fedora / RHEL-family systems
+sudo dnf install "./arx-${VERSION}-1.x86_64.rpm"
+```
+
+Or use the portable tarball:
+
+```bash
+VERSION=x.y.z
+DIR="arx-v${VERSION}-x86_64-unknown-linux-gnu"
+tar xzf "${DIR}.tar.gz"
+sudo install -m 755 "${DIR}/arx" /usr/local/bin/arx
 arx --version
 ```
+
+Release bundles include the ARX MIT license and a generated third-party license
+report. Native packages install the documentation under `/usr/share/doc/arx`.
 
 Preview features use `bat`, `chafa`, `pdftotext`, `ffprobe`, and archive utilities when available. No other packages are required for the published binary.
 
