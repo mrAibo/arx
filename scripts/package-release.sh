@@ -29,6 +29,7 @@ fail() {
 [ -s "$THIRD_PARTY" ] || fail "third-party license report missing/empty: $THIRD_PARTY"
 [ -f packaging/arx.spec ] || fail "RPM spec not found: packaging/arx.spec"
 command -v dpkg-deb >/dev/null || fail "dpkg-deb is required"
+command -v dpkg-shlibdeps >/dev/null || fail "dpkg-shlibdeps is required"
 command -v rpmbuild >/dev/null || fail "rpmbuild is required"
 command -v rpm >/dev/null || fail "rpm is required"
 
@@ -66,7 +67,10 @@ tar \
     | gzip -n > "$OUTDIR_ABS/$ARCHIVE_FILE"
 rm -rf "$OUTDIR_ABS/$ARCHIVE_NAME"
 
-# Debian package
+# Debian package. dpkg-shlibdeps derives package/version requirements from
+# the exact ELF instead of maintaining a hand-written shared-library list.
+SHLIB_DEPS="$(dpkg-shlibdeps -O -e"$BINARY_ABS" 2>/dev/null | sed -n 's/^shlibs:Depends=//p')"
+[ -n "$SHLIB_DEPS" ] || fail "dpkg-shlibdeps returned no runtime dependencies"
 DEB_ROOT="$OUTDIR_ABS/.deb-root"
 mkdir -p "$DEB_ROOT/DEBIAN" "$DEB_ROOT/usr/bin" "$DEB_ROOT/usr/share/doc/arx"
 install -m 0755 "$BINARY_ABS" "$DEB_ROOT/usr/bin/arx"
@@ -82,7 +86,7 @@ Priority: optional
 Architecture: amd64
 Installed-Size: $INSTALLED_SIZE
 Maintainer: ARX maintainers <noreply@example.invalid>
-Depends: libc6 (>= 2.35), libgcc-s1
+Depends: $SHLIB_DEPS
 Homepage: https://github.com/mrAibo/arx
 Description: Terminal commander for local and remote workspaces
  ARX is a Linux terminal commander for local and remote workspaces with
@@ -116,6 +120,8 @@ rm -rf "$RPM_TOP"
 
 echo "=== tar contents ==="
 tar tzf "$OUTDIR_ABS/$ARCHIVE_FILE"
+echo "=== deb metadata ==="
+dpkg-deb --field "$OUTDIR_ABS/$DEB_FILE" Package Version Architecture Depends
 echo "=== deb contents ==="
 dpkg-deb --contents "$OUTDIR_ABS/$DEB_FILE"
 echo "=== rpm contents ==="
