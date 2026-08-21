@@ -753,10 +753,7 @@ mod tests {
             Some(Location::Local(PathBuf::from("/root"))),
             None,
         );
-        assert!(manager.publish_event(
-            &tx,
-            crate::jobs::JobEvent::Running { id: job.id.clone() }
-        ));
+        assert!(manager.publish_event(&tx, crate::jobs::JobEvent::Running { id: job.id.clone() }));
         assert!(manager.publish_event(
             &tx,
             crate::jobs::JobEvent::Completed {
@@ -809,10 +806,7 @@ mod tests {
         assert_eq!(scans[0].id, id);
 
         for _ in 0..2_000 {
-            if manager
-                .get(&id)
-                .is_some_and(|job| job.status.is_terminal())
-            {
+            if manager.get(&id).is_some_and(|job| job.status.is_terminal()) {
                 break;
             }
             let _ = rx.try_recv();
