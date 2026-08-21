@@ -47,6 +47,7 @@ rm -rf \
     "$OUTDIR_ABS/$DEB_FILE" \
     "$OUTDIR_ABS/$RPM_FILE" \
     "$OUTDIR_ABS/$SUMS_FILE" \
+    "$OUTDIR_ABS/.deb-meta" \
     "$OUTDIR_ABS/.deb-root" \
     "$OUTDIR_ABS/.rpmbuild"
 
@@ -69,8 +70,24 @@ rm -rf "$OUTDIR_ABS/$ARCHIVE_NAME"
 
 # Debian package. dpkg-shlibdeps derives package/version requirements from
 # the exact ELF instead of maintaining a hand-written shared-library list.
-SHLIB_DEPS="$(dpkg-shlibdeps -O -e"$BINARY_ABS" 2>/dev/null | sed -n 's/^shlibs:Depends=//p')"
+DEB_META="$OUTDIR_ABS/.deb-meta"
+mkdir -p "$DEB_META/debian"
+cat > "$DEB_META/debian/control" <<'EOF'
+Source: arx
+Section: utils
+Priority: optional
+Maintainer: ARX maintainers <noreply@example.invalid>
+Standards-Version: 4.6.2
+
+Package: arx
+Architecture: amd64
+Description: Terminal commander for local and remote workspaces
+ ARX Linux release package.
+EOF
+SHLIB_DEPS="$(cd "$DEB_META" && dpkg-shlibdeps -O -e"$BINARY_ABS" | sed -n 's/^shlibs:Depends=//p')"
+rm -rf "$DEB_META"
 [ -n "$SHLIB_DEPS" ] || fail "dpkg-shlibdeps returned no runtime dependencies"
+
 DEB_ROOT="$OUTDIR_ABS/.deb-root"
 mkdir -p "$DEB_ROOT/DEBIAN" "$DEB_ROOT/usr/bin" "$DEB_ROOT/usr/share/doc/arx"
 install -m 0755 "$BINARY_ABS" "$DEB_ROOT/usr/bin/arx"
