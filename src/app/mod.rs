@@ -339,6 +339,12 @@ pub struct AppState {
     pub show_jobs: bool,
     pub show_transfer_center: bool,
     pub job_cursor: usize,
+    #[cfg(target_os = "linux")]
+    pub show_storage_inspector: bool,
+    #[cfg(target_os = "linux")]
+    pub storage_inspector: crate::storage_inspector_ui::StorageInspectorUiState,
+    #[cfg(target_os = "linux")]
+    pub storage_scan_snapshots: crate::storage_inspector_snapshot::StorageScanSnapshotStore,
     // C1: directory compare
     pub show_diff: bool,
     // C2: command input
@@ -473,6 +479,13 @@ impl Default for AppState {
             show_jobs: false,
             show_transfer_center: false,
             job_cursor: 0,
+            #[cfg(target_os = "linux")]
+            show_storage_inspector: false,
+            #[cfg(target_os = "linux")]
+            storage_inspector: crate::storage_inspector_ui::StorageInspectorUiState::default(),
+            #[cfg(target_os = "linux")]
+            storage_scan_snapshots:
+                crate::storage_inspector_snapshot::StorageScanSnapshotStore::default(),
             show_diff: false,
             cmd_input: false,
             cmd: String::new(),
