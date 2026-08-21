@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ARX third-party licenses</title>
+  <style>
+    body { font-family: sans-serif; max-width: 72rem; margin: 2rem auto; padding: 0 1rem; }
+    pre { white-space: pre-wrap; border: 1px solid #999; padding: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>ARX third-party licenses</h1>
+  <p>This file is generated from the Cargo dependency graph for the Linux release target.</p>
+  {{#each licenses}}
+  <section>
+    <h2>{{name}}</h2>
+    <p>Used by:</p>
+    <ul>
+      {{#each used_by}}
+      <li>{{crate.name}} {{crate.version}}</li>
+      {{/each}}
+    </ul>
+    <pre>{{text}}</pre>
+  </section>
+  {{/each}}
+</body>
+</html>
