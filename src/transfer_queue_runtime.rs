@@ -34,6 +34,15 @@ pub struct TransferQueueSummary {
     pub paused: usize,
 }
 
+/// Narrow read-only view of one job's scheduler truth, exposed to the Transfer
+/// Center detail pane. Derived entirely from existing `TransferQueueCore` state;
+/// never mutates the queue or pumps the scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferRuntimeJobInfo {
+    pub scheduler_state: SchedulerState,
+    pub attempts_started: u8,
+}
+
 #[derive(Debug, Clone)]
 struct TransferWork {
     plan: TransferPlan,
@@ -186,6 +195,20 @@ impl TransferQueueRuntime {
             waiting: state.core.waiting_count(),
             paused: state.core.parked_count(),
         }
+    }
+
+    pub fn config(&self) -> TransferQueueConfig {
+        self.lock_state().core.config()
+    }
+
+    /// Read-only snapshot of a job's scheduler truth. Never mutates the queue,
+    /// pumps the scheduler, touches the cancel token, or publishes events.
+    pub fn inspect_job(&self, job_id: &str) -> Option<TransferRuntimeJobInfo> {
+        let state = self.lock_state();
+        Some(TransferRuntimeJobInfo {
+            scheduler_state: state.core.state(job_id)?,
+            attempts_started: state.core.attempts_started(job_id)?,
+        })
     }
 
     /// Read-only access to the shared `JobManager` for product-path tests and
@@ -778,5 +801,31 @@ mod tests {
 
         assert!(runtime.lock_tasks().is_empty());
         assert!(runtime.lock_timers().is_empty());
+    }
+
+    #[test]
+    fn config_accessor_reports_configured_truth() {
+        let runtime = runtime();
+        assert_eq!(runtime.config().concurrency(), 1);
+        assert!(runtime.config().max_total_attempts() >= 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inspect_job_is_read_only_and_reports_core_truth() {
+        let runtime = runtime();
+        let id = runtime.enqueue(plan(), vec!["a".into()]).unwrap();
+
+        // Unknown id is absent; no crash.
+        assert_eq!(runtime.inspect_job("does-not-exist"), None);
+
+        // Known id resolves to existing scheduler truth.
+        let first = runtime.inspect_job(&id);
+        assert!(first.is_some());
+        // Read-only + deterministic: repeated calls agree, core unchanged.
+        assert_eq!(first, runtime.inspect_job(&id));
+        assert_eq!(
+            runtime.lock_state().core.attempts_started(&id),
+            Some(first.unwrap().attempts_started)
+        );
     }
 }

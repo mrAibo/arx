@@ -153,12 +153,25 @@ fn visible_ids(state: &AppState) -> Vec<String> {
         .collect()
 }
 
+/// A Transfer Center action key must be a plain character: no Ctrl or Alt
+/// modifier. This keeps Ctrl+C/Ctrl+P etc. from accidentally cancelling or
+/// pausing transfers.
+fn is_plain_char(key: &KeyEvent, expected: char) -> bool {
+    key.code == KeyCode::Char(expected)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
 fn selected_job<'a>(state: &'a AppState, visible_ids: &[String]) -> Option<&'a Job> {
     let id = state
         .transfer_center
         .selected_job_id
         .as_deref()
-        .or_else(|| visible_ids.get(state.transfer_center.cursor).map(String::as_str))?;
+        .or_else(|| {
+            visible_ids
+                .get(state.transfer_center.cursor)
+                .map(String::as_str)
+        })?;
     state
         .jobs
         .iter()
@@ -193,8 +206,8 @@ pub fn handle_transfer_center_key(
                 state.transfer_center.filter.label()
             ));
         }
-        KeyCode::Char('p') => control_pause_or_resume(state, runtime),
-        KeyCode::Char('c') => control_cancel(state, runtime),
+        KeyCode::Char('p') if is_plain_char(&key, 'p') => control_pause_or_resume(state, runtime),
+        KeyCode::Char('c') if is_plain_char(&key, 'c') => control_cancel(state, runtime),
         _ => {}
     }
 }
@@ -249,7 +262,9 @@ fn control_cancel(state: &mut AppState, runtime: &TransferQueueRuntime) {
     }
 
     let feedback = match runtime.cancel(&job.id) {
-        Ok(CancelAction::TerminalizeWithoutExecution) => "Transfer cancelled before execution".into(),
+        Ok(CancelAction::TerminalizeWithoutExecution) => {
+            "Transfer cancelled before execution".into()
+        }
         Ok(CancelAction::SignalActiveExecution) => "Transfer cancellation requested".into(),
         Ok(CancelAction::AlreadyFinished) => "Transfer is already finished".into(),
         Err(error) => format!("Cancel unavailable: {error}"),
@@ -354,19 +369,21 @@ pub fn render_transfer_center(
     let footer = if feedback.is_empty() {
         "j/k move · f filter · p pause/resume · c cancel · Ctrl+Y/Esc close".to_string()
     } else {
-        format!(
-            "j/k move · f filter · p pause/resume · c cancel · Ctrl+Y/Esc close\n{feedback}"
-        )
+        format!("j/k move · f filter · p pause/resume · c cancel · Ctrl+Y/Esc close\n{feedback}")
     };
-    frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: true }), vertical[2]);
+    frame.render_widget(
+        Paragraph::new(footer).wrap(Wrap { trim: true }),
+        vertical[2],
+    );
 }
 
 fn render_list_row(job: &Job) -> String {
     let mut parts = vec![
         format!("{:<11}", status_label(job.status)),
         safe_text(&job.id),
+        safe_text(&job.description),
     ];
-    if !matches!(job.progress, JobProgress::Generic(Progress::Indeterminate))
+    if !matches!(&job.progress, JobProgress::Generic(Progress::Indeterminate))
         && !job.status.is_terminal()
     {
         parts.push(safe_text(&job.progress.to_string()));
@@ -383,7 +400,10 @@ fn render_job_detail(job: &Job, runtime: &TransferQueueRuntime) -> Vec<Line<'sta
         lines.push(detail_line("Source", safe_text(&source.to_string())));
     }
     if let Some(destination) = job.display_destination() {
-        lines.push(detail_line("Destination", safe_text(&destination.to_string())));
+        lines.push(detail_line(
+            "Destination",
+            safe_text(&destination.to_string()),
+        ));
     }
 
     lines.push(detail_line("Progress", progress_detail(job)));
@@ -434,7 +454,11 @@ fn progress_detail(job: &Job) -> String {
             let mut parts = Vec::new();
             match total {
                 Some(total) => {
-                    parts.push(format!("{} / {}", format_bytes(*done), format_bytes(*total)));
+                    parts.push(format!(
+                        "{} / {}",
+                        format_bytes(*done),
+                        format_bytes(*total)
+                    ));
                     if *total > 0 {
                         let percent = (((*done as u128) * 100) / (*total as u128)).min(100);
                         parts.push(format!("{percent}%"));
@@ -590,11 +614,17 @@ mod tests {
         let jobs = manager.snapshot();
 
         let active = visible_transfer_jobs(&jobs, TransferCenterFilter::Active);
-        assert_eq!(active.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(), [a.id]);
+        assert_eq!(
+            active.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+            [a.id.as_str()]
+        );
 
         let history = visible_transfer_jobs(&jobs, TransferCenterFilter::History);
         assert_eq!(
-            history.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+            history
+                .iter()
+                .map(|job| job.id.as_str())
+                .collect::<Vec<_>>(),
             [c.id.as_str(), b.id.as_str()]
         );
 
@@ -614,7 +644,9 @@ mod tests {
         }
         let jobs = manager.snapshot();
         assert_eq!(
-            jobs.iter().filter(|job| job.kind == JobKind::Transfer).count(),
+            jobs.iter()
+                .filter(|job| job.kind == JobKind::Transfer)
+                .count(),
             TRANSFER_HISTORY_LIMIT + 7
         );
         assert_eq!(
@@ -626,7 +658,11 @@ mod tests {
     #[test]
     fn selection_tracks_job_id_and_clamps_when_view_changes() {
         let mut ui = TransferCenterUiState::default();
-        let ids = vec!["transfer-1".into(), "transfer-2".into(), "transfer-3".into()];
+        let ids = vec![
+            "transfer-1".into(),
+            "transfer-2".into(),
+            "transfer-3".into(),
+        ];
         ui.reconcile(&ids);
         ui.move_down(&ids);
         assert_eq!(ui.selected_job_id.as_deref(), Some("transfer-2"));
@@ -725,11 +761,31 @@ mod tests {
         for status in [JobStatus::Pending, JobStatus::Running, JobStatus::Paused] {
             assert!(!status.is_terminal());
         }
-        for status in [JobStatus::Completed, JobStatus::Failed, JobStatus::Cancelled] {
+        for status in [
+            JobStatus::Completed,
+            JobStatus::Failed,
+            JobStatus::Cancelled,
+        ] {
             assert!(status.is_terminal());
         }
         assert_eq!(status_label(JobStatus::RetryWaiting), "RETRY WAIT");
         assert_eq!(status_label(JobStatus::PausePending), "PAUSING");
         assert_eq!(status_label(JobStatus::Cancelling), "CANCELLING");
+    }
+
+    #[test]
+    fn plain_c_is_an_action_candidate_but_ctrl_c_is_not() {
+        let plain = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        let ctrl = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(is_plain_char(&plain, 'c'));
+        assert!(!is_plain_char(&ctrl, 'c'));
+    }
+
+    #[test]
+    fn plain_p_is_an_action_candidate_but_ctrl_p_is_not() {
+        let plain = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE);
+        let ctrl = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert!(is_plain_char(&plain, 'p'));
+        assert!(!is_plain_char(&ctrl, 'p'));
     }
 }
