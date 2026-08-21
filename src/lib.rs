@@ -17,6 +17,8 @@ pub mod storage_inspector;
 pub mod storage_inspector_job;
 #[cfg(target_os = "linux")]
 pub mod storage_inspector_snapshot;
+#[cfg(target_os = "linux")]
+pub mod storage_inspector_ui;
 pub mod terminal;
 pub mod transfer;
 pub mod transfer_queue;
