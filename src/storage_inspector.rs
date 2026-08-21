@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::thread;
 
-use dua_core::{Options as WalkMetadataOptions, Order, walk};
+use dua_core::{Order, walk};
 
 const PROGRESS_EVERY_ENTRIES: u64 = 32;
 const LINUX_STAT_BLOCK_BYTES: u64 = 512;
@@ -142,7 +142,6 @@ pub fn scan_local_with_progress(
         root,
         threads,
         Order::ParentFirst,
-        WalkMetadataOptions::default(),
         move |entry| {
             if descend_cancel.load(AtomicOrdering::Relaxed) {
                 return false;
