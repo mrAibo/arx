@@ -4,7 +4,7 @@
 //! maintaining a second recursive directory walker inside ARX. ARX owns the
 //! accounting, cancellation, result truth and later JobManager/TUI integration.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ use dua_core::{Options as WalkMetadataOptions, Order, walk};
 
 const PROGRESS_EVERY_ENTRIES: u64 = 32;
 const LINUX_STAT_BLOCK_BYTES: u64 = 512;
+const MAX_SCAN_THREADS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageKind {
@@ -77,10 +78,17 @@ pub struct UsageRecord {
     pub path: PathBuf,
     pub depth: usize,
     pub kind: UsageKind,
-    /// Zero for an already-counted hard-link duplicate.
+    /// Bytes owned by this entry only. Zero for an already-counted hard-link duplicate.
     pub logical_bytes: u64,
-    /// Zero for an already-counted hard-link duplicate.
+    /// Bytes owned by this entry only. Zero for an already-counted hard-link duplicate.
     pub allocated_bytes: u64,
+    /// This entry plus all retained descendants. For a regular file this equals
+    /// `logical_bytes`; for a directory it is the drill-down subtree total.
+    pub subtree_logical_bytes: u128,
+    /// This entry plus all retained descendants using allocated/on-disk bytes.
+    pub subtree_allocated_bytes: u128,
+    /// Number of retained records in this entry's subtree, including itself.
+    pub subtree_entries: u64,
     pub hardlink_duplicate: bool,
     /// Metadata failed for this entry, so byte values are not authoritative.
     pub metadata_error: bool,
@@ -99,7 +107,8 @@ pub struct UsageScanResult {
     pub root: PathBuf,
     pub outcome: UsageScanOutcome,
     pub totals: UsageTotals,
-    /// Parent-first records suitable for a later interactive drill-down tree.
+    /// Parent-first records with rolled-up subtree totals, suitable for a later
+    /// interactive drill-down tree.
     pub records: Vec<UsageRecord>,
     /// Largest unique regular files, ordered by allocated bytes descending,
     /// then apparent bytes descending, then path ascending.
@@ -206,6 +215,9 @@ pub fn scan_local_with_progress(
                     kind,
                     logical_bytes: 0,
                     allocated_bytes: 0,
+                    subtree_logical_bytes: 0,
+                    subtree_allocated_bytes: 0,
+                    subtree_entries: 1,
                     hardlink_duplicate: false,
                     metadata_error: true,
                 });
@@ -243,12 +255,17 @@ pub fn scan_local_with_progress(
             kind,
             logical_bytes,
             allocated_bytes,
+            subtree_logical_bytes: u128::from(logical_bytes),
+            subtree_allocated_bytes: u128::from(allocated_bytes),
+            subtree_entries: 1,
             hardlink_duplicate,
             metadata_error: false,
         });
 
         maybe_report_progress(&totals, &mut on_progress);
     }
+
+    roll_up_subtree_totals(&mut records);
 
     let outcome = if cancelled || cancel.load(AtomicOrdering::Relaxed) {
         UsageScanOutcome::Cancelled
@@ -297,12 +314,14 @@ pub fn scan_local(
 }
 
 fn resolved_threads(requested: usize) -> usize {
-    if requested > 0 {
-        return requested;
-    }
-    thread::available_parallelism()
+    let detected = thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1)
+        .unwrap_or(1);
+    if requested == 0 {
+        detected.min(MAX_SCAN_THREADS)
+    } else {
+        requested.min(MAX_SCAN_THREADS).max(1)
+    }
 }
 
 fn maybe_report_progress(
@@ -311,6 +330,38 @@ fn maybe_report_progress(
 ) {
     if totals.entries_seen % PROGRESS_EVERY_ENTRIES == 0 {
         on_progress(&UsageScanProgress::from(totals));
+    }
+}
+
+fn roll_up_subtree_totals(records: &mut [UsageRecord]) {
+    let by_path = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| (record.path.clone(), index))
+        .collect::<HashMap<_, _>>();
+
+    for child_index in (0..records.len()).rev() {
+        let Some(parent_path) = records[child_index].path.parent() else {
+            continue;
+        };
+        let Some(&parent_index) = by_path.get(parent_path) else {
+            continue;
+        };
+        if parent_index == child_index {
+            continue;
+        }
+
+        let child_logical = records[child_index].subtree_logical_bytes;
+        let child_allocated = records[child_index].subtree_allocated_bytes;
+        let child_entries = records[child_index].subtree_entries;
+        let parent = &mut records[parent_index];
+        parent.subtree_logical_bytes = parent
+            .subtree_logical_bytes
+            .saturating_add(child_logical);
+        parent.subtree_allocated_bytes = parent
+            .subtree_allocated_bytes
+            .saturating_add(child_allocated);
+        parent.subtree_entries = parent.subtree_entries.saturating_add(child_entries);
     }
 }
 
@@ -351,6 +402,7 @@ mod tests {
         assert_eq!(record.kind, UsageKind::File);
         assert_eq!(record.logical_bytes, 8192);
         assert!(record.allocated_bytes > 0);
+        assert_eq!(record.subtree_logical_bytes, 8192);
         assert_eq!(result.outcome, UsageScanOutcome::Complete);
     }
 
@@ -442,6 +494,28 @@ mod tests {
     }
 
     #[test]
+    fn directory_record_contains_rolled_up_subtree_totals() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("child");
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join("payload.bin"), vec![7_u8; 2048]).unwrap();
+
+        let result = scan_local(root.path(), &UsageScanOptions::default(), no_cancel()).unwrap();
+        let child_record = result
+            .records
+            .iter()
+            .find(|record| record.path == child)
+            .unwrap();
+
+        assert_eq!(child_record.kind, UsageKind::Directory);
+        assert_eq!(child_record.subtree_entries, 2);
+        assert!(
+            child_record.subtree_logical_bytes
+                >= u128::from(child_record.logical_bytes) + 2048
+        );
+    }
+
+    #[test]
     fn top_files_are_deterministic_for_equal_sizes() {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("b.bin"), vec![1_u8; 4096]).unwrap();
@@ -458,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_returns_partial_cancelled_truth() {
+    fn cancellation_returns_cancelled_truth() {
         let root = tempfile::tempdir().unwrap();
         for index in 0..512 {
             let mut file = fs::File::create(root.path().join(format!("file-{index:04}.bin"))).unwrap();
@@ -494,5 +568,12 @@ mod tests {
 
         let result = scan_local(root.path(), &options, no_cancel()).unwrap();
         assert!(result.top_files.is_empty());
+    }
+
+    #[test]
+    fn scan_thread_count_is_bounded() {
+        assert_eq!(resolved_threads(usize::MAX), MAX_SCAN_THREADS);
+        assert!(resolved_threads(0) >= 1);
+        assert!(resolved_threads(0) <= MAX_SCAN_THREADS);
     }
 }
