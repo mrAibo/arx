@@ -108,6 +108,8 @@ pub fn transfer_status_bar(jobs: &[Job]) -> Option<String> {
         JobProgress::Generic(Progress::Indeterminate)
         | JobProgress::WorkspaceSync(_)
         | JobProgress::RemoteEdit(_) => {}
+        #[cfg(target_os = "linux")]
+        JobProgress::StorageScan(_) => {}
     }
 
     if !detail.is_empty() {

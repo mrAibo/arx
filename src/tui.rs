@@ -4171,6 +4171,8 @@ fn render_sync_job_lines(
             }
         }
         Some(arx::jobs::JobResult::RemoteEdit(_)) => {}
+        #[cfg(target_os = "linux")]
+        Some(arx::jobs::JobResult::StorageScan(_)) => {}
         Some(arx::jobs::JobResult::Generic { .. }) | None => {}
     }
 
@@ -5487,6 +5489,8 @@ fn handle_job_event(ev: &arx::jobs::JobEvent, state: &mut AppState) -> bool {
                     outcome.transferred_bytes
                 ),
                 arx::jobs::JobResult::RemoteEdit(_) => format!("Remote edit job {id} completed"),
+                #[cfg(target_os = "linux")]
+                arx::jobs::JobResult::StorageScan(_) => format!("Job {id} completed"),
             });
             true
         }
@@ -5504,6 +5508,8 @@ fn handle_job_event(ev: &arx::jobs::JobEvent, state: &mut AppState) -> bool {
                     outcome.completed.len()
                 ),
                 arx::jobs::JobResult::RemoteEdit(_) => format!("Remote edit job {id} cancelled"),
+                #[cfg(target_os = "linux")]
+                arx::jobs::JobResult::StorageScan(_) => format!("Job {id} cancelled"),
             });
             true
         }

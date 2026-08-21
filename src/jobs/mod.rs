@@ -18,6 +18,15 @@ use crate::workspace_sync_verification::{
     SyncVerificationStatus,
 };
 
+#[cfg(target_os = "linux")]
+use crate::storage_inspector::{UsageScanOptions, scan_local_with_progress};
+#[cfg(target_os = "linux")]
+use crate::storage_inspector_job::{StorageScanProgress, StorageScanSummary};
+#[cfg(target_os = "linux")]
+use crate::storage_inspector_snapshot::StorageScanSnapshotStore;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+
 // ── Generic progress model ──
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -141,6 +150,8 @@ pub enum JobProgress {
     Generic(Progress),
     WorkspaceSync(SyncJobProgress),
     RemoteEdit(RemoteEditPhase),
+    #[cfg(target_os = "linux")]
+    StorageScan(StorageScanProgress),
 }
 
 impl std::fmt::Display for RemoteEditPhase {
@@ -165,6 +176,8 @@ impl JobProgress {
             Self::Generic(progress) => progress.percent(),
             Self::WorkspaceSync(progress) => progress.percent(),
             Self::RemoteEdit(_) => None,
+            #[cfg(target_os = "linux")]
+            Self::StorageScan(_) => None,
         }
     }
 }
@@ -194,6 +207,28 @@ impl std::fmt::Display for JobProgress {
                 human_bytes(progress.total_bytes)
             ),
             Self::RemoteEdit(phase) => phase.fmt(f),
+            #[cfg(target_os = "linux")]
+            Self::StorageScan(progress) => {
+                // Observed truth only: no percent, no ETA, no fabricated total.
+                if progress.errors > 0 {
+                    write!(
+                        f,
+                        "{} items · {} logical · {} allocated · {} errors",
+                        progress.entries_seen,
+                        human_bytes(progress.logical_bytes as u64),
+                        human_bytes(progress.allocated_bytes as u64),
+                        progress.errors
+                    )
+                } else {
+                    write!(
+                        f,
+                        "{} items · {} logical · {} allocated",
+                        progress.entries_seen,
+                        human_bytes(progress.logical_bytes as u64),
+                        human_bytes(progress.allocated_bytes as u64)
+                    )
+                }
+            }
         }
     }
 }
@@ -206,6 +241,8 @@ pub enum JobResult {
     },
     WorkspaceSync(SyncExecutionOutcome),
     RemoteEdit(RemoteEditOutcome),
+    #[cfg(target_os = "linux")]
+    StorageScan(StorageScanSummary),
 }
 
 /// Typed terminal truth for a remote-edit session. Never string-encoded:
@@ -269,6 +306,8 @@ impl JobResult {
             Self::Generic { message, .. } => message.as_deref(),
             Self::WorkspaceSync(_) => None,
             Self::RemoteEdit(_) => None,
+            #[cfg(target_os = "linux")]
+            Self::StorageScan(_) => None,
         }
     }
 }
@@ -430,6 +469,8 @@ pub enum JobKind {
     /// First-class remote-edit session job (SFTP atomic write-back).
     /// Carries typed terminal outcome via `JobResult`, never string-encoded.
     RemoteEdit,
+    #[cfg(target_os = "linux")]
+    StorageScan,
     Custom(String),
 }
 
@@ -978,6 +1019,123 @@ impl JobManager {
     }
 }
 
+impl JobManager {
+    /// Spawn one Local Storage Inspector scan job. The filesystem traversal runs
+    /// on a blocking worker via `spawn_blocking`; the tokio task only bridges
+    /// progress/terminal events into the single JobManager event path.
+    #[cfg(target_os = "linux")]
+    pub fn spawn_storage_scan(
+        &self,
+        root: PathBuf,
+        options: UsageScanOptions,
+        events: mpsc::UnboundedSender<JobEvent>,
+        snapshots: StorageScanSnapshotStore,
+    ) -> String {
+        let description = format!("Storage scan {}", root.display());
+        let job = self.create_job(
+            "storage",
+            JobKind::StorageScan,
+            description,
+            Some(Location::Local(root.clone())),
+            None,
+        );
+        let id = job.id.clone();
+        let cancel = job.cancel.clone();
+        let manager = self.clone();
+        let worker_id = id.clone();
+
+        publish(
+            &manager,
+            &events,
+            JobEvent::Running {
+                id: worker_id.clone(),
+            },
+        );
+
+        tokio::spawn(async move {
+            let manager_for_worker = manager.clone();
+            let events_for_worker = events.clone();
+            let worker_id_for_progress = worker_id.clone();
+            let result = tokio::task::spawn_blocking({
+                let root = root.clone();
+                let cancel = cancel.clone();
+                let options = options.clone();
+                let manager = manager_for_worker;
+                let events = events_for_worker;
+                let id = worker_id_for_progress;
+                move || {
+                    scan_local_with_progress(
+                        &root,
+                        &options,
+                        cancel,
+                        |progress: &crate::storage_inspector::UsageScanProgress| {
+                            publish(
+                                &manager,
+                                &events,
+                                JobEvent::Progress {
+                                    id: id.clone(),
+                                    progress: JobProgress::StorageScan(StorageScanProgress::from(
+                                        progress,
+                                    )),
+                                },
+                            );
+                        },
+                    )
+                }
+            })
+            .await;
+
+            match result {
+                Ok(Ok(scan)) => {
+                    let summary = StorageScanSummary::from(&scan);
+                    snapshots.insert(worker_id.clone(), scan);
+                    // Partial is a successful traversal with incomplete evidence;
+                    // it is Completed, never Failed. A Cancelled traversal is a
+                    // Cancelled job event, preserving the truthful outcome.
+                    let event = match summary.outcome {
+                        crate::storage_inspector::UsageScanOutcome::Cancelled => {
+                            JobEvent::Cancelled {
+                                id: worker_id,
+                                result: JobResult::StorageScan(summary),
+                            }
+                        }
+                        _ => JobEvent::Completed {
+                            id: worker_id,
+                            result: JobResult::StorageScan(summary),
+                        },
+                    };
+                    publish(&manager, &events, event);
+                }
+                Ok(Err(error)) => {
+                    publish(
+                        &manager,
+                        &events,
+                        JobEvent::Failed {
+                            id: worker_id,
+                            error: error.to_string(),
+                            result: None,
+                        },
+                    );
+                }
+                Err(join_error) => {
+                    publish(
+                        &manager,
+                        &events,
+                        JobEvent::Failed {
+                            id: worker_id,
+                            // Truthful join failure; never fabricate a scan result.
+                            error: format!("storage scan worker failed: {join_error}"),
+                            result: None,
+                        },
+                    );
+                }
+            }
+        });
+
+        id
+    }
+}
+
 fn publish(
     manager: &JobManager,
     events: &mpsc::UnboundedSender<JobEvent>,
@@ -1373,5 +1531,321 @@ mod tests {
             },
             _ => panic!("expected Cancelled"),
         }
+    }
+
+    // ── Local Storage Inspector integration (Linux only) ──
+
+    #[cfg(target_os = "linux")]
+    async fn drain_until_terminal(
+        manager: &JobManager,
+        id: &str,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<JobEvent>,
+    ) -> JobEvent {
+        for _ in 0..10_000 {
+            match rx.try_recv().ok() {
+                Some(
+                    ev @ (JobEvent::Completed { .. }
+                    | JobEvent::Failed { .. }
+                    | JobEvent::Cancelled { .. }),
+                ) if ev.id() == id => {
+                    return ev;
+                }
+                Some(_) => continue,
+                None => {
+                    if manager
+                        .get(id)
+                        .map(|j| j.status.is_terminal())
+                        .unwrap_or(false)
+                    {
+                        let job = manager.get(id).unwrap();
+                        return match job.status {
+                            JobStatus::Completed => JobEvent::Completed {
+                                id: id.into(),
+                                result: job.result.unwrap(),
+                            },
+                            JobStatus::Failed => JobEvent::Failed {
+                                id: id.into(),
+                                error: job.error.unwrap_or_default(),
+                                result: None,
+                            },
+                            JobStatus::Cancelled => JobEvent::Cancelled {
+                                id: id.into(),
+                                result: job.result.unwrap(),
+                            },
+                            _ => unreachable!(),
+                        };
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    continue;
+                }
+            }
+        }
+        panic!("storage scan {id} did not reach a terminal event");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn j1_storage_scan_is_first_class_job_kind() {
+        use crate::storage_inspector::UsageScanOptions;
+        use crate::storage_inspector_snapshot::StorageScanSnapshotStore;
+
+        let manager = JobManager::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = manager.spawn_storage_scan(
+            std::env::temp_dir(),
+            UsageScanOptions::default(),
+            tx,
+            StorageScanSnapshotStore::new(),
+        );
+        assert_eq!(manager.get(&id).unwrap().kind, JobKind::StorageScan);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn j2_storage_scan_progress_is_typed() {
+        let progress = JobProgress::StorageScan(StorageScanProgress {
+            entries_seen: 12,
+            logical_bytes: 4096,
+            allocated_bytes: 2048,
+            errors: 0,
+        });
+        match progress {
+            JobProgress::StorageScan(_) => {}
+            _ => panic!("expected typed StorageScan progress"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn j3_storage_scan_progress_percent_is_none() {
+        let progress = JobProgress::StorageScan(StorageScanProgress {
+            entries_seen: 12,
+            logical_bytes: 4096,
+            allocated_bytes: 2048,
+            errors: 3,
+        });
+        assert_eq!(progress.percent(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn j4_storage_scan_terminal_result_is_typed_summary() {
+        let result = JobResult::StorageScan(StorageScanSummary {
+            root: std::path::PathBuf::from("/"),
+            outcome: crate::storage_inspector::UsageScanOutcome::Complete,
+            totals: crate::storage_inspector::UsageTotals::default(),
+        });
+        match result {
+            JobResult::StorageScan(_) => {}
+            _ => panic!("expected typed StorageScan summary"),
+        }
+        assert_eq!(result.message(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn j5_spawn_storage_scan_reaches_terminal_complete() {
+        use crate::storage_inspector::UsageScanOptions;
+        use crate::storage_inspector_snapshot::StorageScanSnapshotStore;
+
+        let manager = JobManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let root = tempfile::tempdir().unwrap().keep();
+        let snapshots = StorageScanSnapshotStore::new();
+        let id = manager.spawn_storage_scan(
+            root.clone(),
+            UsageScanOptions::default(),
+            tx,
+            snapshots.clone(),
+        );
+        let terminal = drain_until_terminal(&manager, &id, &mut rx).await;
+        match terminal {
+            JobEvent::Completed { result, .. } => match result {
+                JobResult::StorageScan(summary) => {
+                    assert!(summary.is_complete() || summary.is_partial());
+                    assert_eq!(summary.root, root);
+                }
+                _ => panic!("expected StorageScan summary"),
+            },
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert!(snapshots.contains(&id));
+        assert_eq!(manager.get(&id).unwrap().status, JobStatus::Completed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn j6_partial_completed_not_failed_errors_retained() {
+        use crate::storage_inspector::UsageScanOptions;
+        use crate::storage_inspector_snapshot::StorageScanSnapshotStore;
+
+        let manager = JobManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let root = tempfile::tempdir().unwrap().keep();
+        // A directory we cannot read induces traversal errors -> Partial.
+        let sealed = root.join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        std::fs::write(sealed.join("f"), b"x").unwrap();
+        let _ =
+            std::fs::set_permissions(&sealed, std::os::unix::fs::PermissionsExt::from_mode(0o000));
+
+        let snapshots = StorageScanSnapshotStore::new();
+        let id = manager.spawn_storage_scan(
+            root.clone(),
+            UsageScanOptions::default(),
+            tx,
+            snapshots.clone(),
+        );
+        let terminal = drain_until_terminal(&manager, &id, &mut rx).await;
+        match terminal {
+            JobEvent::Completed { result, .. } => match result {
+                JobResult::StorageScan(summary) => {
+                    assert!(summary.is_partial());
+                    assert_eq!(summary.totals.errors, 1);
+                }
+                _ => panic!("expected StorageScan summary"),
+            },
+            JobEvent::Failed { .. } => panic!("Partial must not become Failed"),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        let _ =
+            std::fs::set_permissions(&sealed, std::os::unix::fs::PermissionsExt::from_mode(0o755));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn j7_cancelled_reaches_cancelled() {
+        use crate::storage_inspector::UsageScanOptions;
+        use crate::storage_inspector_snapshot::StorageScanSnapshotStore;
+
+        let manager = JobManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let root = tempfile::tempdir().unwrap().keep();
+        for i in 0..200 {
+            let d = root.join(format!("d{i}"));
+            std::fs::create_dir(&d).unwrap();
+            for j in 0..50 {
+                std::fs::write(d.join(format!("f{j}")), b"x").unwrap();
+            }
+        }
+        let snapshots = StorageScanSnapshotStore::new();
+        let id = manager.spawn_storage_scan(
+            root.clone(),
+            UsageScanOptions::default(),
+            tx,
+            snapshots.clone(),
+        );
+        assert!(manager.cancel(&id));
+        let terminal = drain_until_terminal(&manager, &id, &mut rx).await;
+        match terminal {
+            JobEvent::Cancelled { result, .. } => match result {
+                JobResult::StorageScan(summary) => assert!(summary.is_cancelled()),
+                _ => panic!("expected StorageScan summary"),
+            },
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn j8_same_jobmanager_cancellation_token() {
+        use crate::storage_inspector::UsageScanOptions;
+        use crate::storage_inspector_snapshot::StorageScanSnapshotStore;
+
+        let manager = JobManager::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = manager.spawn_storage_scan(
+            std::env::temp_dir(),
+            UsageScanOptions::default(),
+            tx,
+            StorageScanSnapshotStore::new(),
+        );
+        let token = manager.cancel_token(&id).expect("token");
+        assert!(!token.load(std::sync::atomic::Ordering::Relaxed));
+        token.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(manager.cancel(&id));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn j9_full_result_outside_job_result_in_store() {
+        use crate::storage_inspector::UsageScanOptions;
+        use crate::storage_inspector_snapshot::StorageScanSnapshotStore;
+
+        let manager = JobManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let root = tempfile::tempdir().unwrap().keep();
+        std::fs::write(root.join("a"), b"hello").unwrap();
+        let snapshots = StorageScanSnapshotStore::new();
+        let id = manager.spawn_storage_scan(
+            root.clone(),
+            UsageScanOptions::default(),
+            tx,
+            snapshots.clone(),
+        );
+        let terminal = drain_until_terminal(&manager, &id, &mut rx).await;
+        match terminal {
+            JobEvent::Completed { result, .. } => match result {
+                JobResult::StorageScan(_) => {}
+                _ => panic!("expected StorageScan summary (no records in JobResult)"),
+            },
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert!(snapshots.contains(&id));
+        let stored = snapshots.get(&id).expect("snapshot present");
+        assert!(!stored.records.is_empty() || stored.root == root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn j10_progress_events_contain_observed_truth() {
+        use crate::storage_inspector::UsageScanOptions;
+        use crate::storage_inspector_snapshot::StorageScanSnapshotStore;
+
+        let manager = JobManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let root = tempfile::tempdir().unwrap().keep();
+        std::fs::write(root.join("b"), b"data").unwrap();
+        let snapshots = StorageScanSnapshotStore::new();
+        let id = manager.spawn_storage_scan(
+            root.clone(),
+            UsageScanOptions::default(),
+            tx,
+            snapshots.clone(),
+        );
+        let terminal = drain_until_terminal(&manager, &id, &mut rx).await;
+        match terminal {
+            JobEvent::Completed { result, .. } => match result {
+                JobResult::StorageScan(summary) => {
+                    assert_eq!(summary.root, root);
+                    assert!(summary.totals.entries_seen >= 1);
+                }
+                _ => panic!("expected StorageScan summary"),
+            },
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn j11_worker_terminates_no_detached_scan() {
+        use crate::storage_inspector::UsageScanOptions;
+        use crate::storage_inspector_snapshot::StorageScanSnapshotStore;
+
+        let manager = JobManager::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let root = tempfile::tempdir().unwrap().keep();
+        let snapshots = StorageScanSnapshotStore::new();
+        let id = manager.spawn_storage_scan(
+            root.clone(),
+            UsageScanOptions::default(),
+            tx,
+            snapshots.clone(),
+        );
+        let _terminal = drain_until_terminal(&manager, &id, &mut rx).await;
+        let job = manager.get(&id).unwrap();
+        assert!(job.status.is_terminal());
+        assert_ne!(job.status, JobStatus::Running);
+        assert_ne!(job.status, JobStatus::Pending);
     }
 }
