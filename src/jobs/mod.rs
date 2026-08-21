@@ -114,6 +114,14 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn human_bytes_u128(n: u128) -> String {
+    match u64::try_from(n) {
+        Ok(value) => human_bytes(value),
+        Err(_) => format!("{n} B"),
+    }
+}
+
 // ── Structured job progress/results ──
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -210,13 +218,14 @@ impl std::fmt::Display for JobProgress {
             #[cfg(target_os = "linux")]
             Self::StorageScan(progress) => {
                 // Observed truth only: no percent, no ETA, no fabricated total.
+                // u128 accounting must not be narrowed to u64 (would wrap truth > u64::MAX).
                 if progress.errors > 0 {
                     write!(
                         f,
                         "{} items · {} logical · {} allocated · {} errors",
                         progress.entries_seen,
-                        human_bytes(progress.logical_bytes as u64),
-                        human_bytes(progress.allocated_bytes as u64),
+                        human_bytes_u128(progress.logical_bytes),
+                        human_bytes_u128(progress.allocated_bytes),
                         progress.errors
                     )
                 } else {
@@ -224,8 +233,8 @@ impl std::fmt::Display for JobProgress {
                         f,
                         "{} items · {} logical · {} allocated",
                         progress.entries_seen,
-                        human_bytes(progress.logical_bytes as u64),
-                        human_bytes(progress.allocated_bytes as u64)
+                        human_bytes_u128(progress.logical_bytes),
+                        human_bytes_u128(progress.allocated_bytes)
                     )
                 }
             }
@@ -1584,20 +1593,20 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn j1_storage_scan_is_first_class_job_kind() {
-        use crate::storage_inspector::UsageScanOptions;
-        use crate::storage_inspector_snapshot::StorageScanSnapshotStore;
-
+    #[test]
+    fn j1_storage_scan_is_first_class_job_kind() {
+        // J1 only proves StorageScan is a first-class JobKind.
+        // No background worker, no filesystem scan.
         let manager = JobManager::new();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let id = manager.spawn_storage_scan(
-            std::env::temp_dir(),
-            UsageScanOptions::default(),
-            tx,
-            StorageScanSnapshotStore::new(),
+        let job = manager.create_job(
+            "storage",
+            JobKind::StorageScan,
+            "Storage scan /",
+            Some(crate::vfs::Location::Local(std::path::PathBuf::from("/"))),
+            None,
         );
-        assert_eq!(manager.get(&id).unwrap().kind, JobKind::StorageScan);
+        assert_eq!(job.kind, JobKind::StorageScan);
+        assert_eq!(manager.get(&job.id).unwrap().kind, JobKind::StorageScan);
     }
 
     #[cfg(target_os = "linux")]
@@ -1642,6 +1651,24 @@ mod tests {
         assert_eq!(result.message(), None);
     }
 
+    // Regression: u128 StorageScan display must not narrow/wrap observed truth.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn storage_scan_progress_display_keeps_u128_truth() {
+        let progress = JobProgress::StorageScan(StorageScanProgress {
+            entries_seen: 1,
+            logical_bytes: u128::from(u64::MAX) + 1,
+            allocated_bytes: u128::from(u64::MAX) + 1,
+            errors: 0,
+        });
+        let rendered = format!("{progress}");
+        assert!(
+            rendered.contains("18446744073709551616 B"),
+            "u128 > u64::MAX must render as raw bytes, got: {rendered}"
+        );
+        assert!(!rendered.contains("0 B"), "must not wrap to 0 B");
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn j5_spawn_storage_scan_reaches_terminal_complete() {
@@ -1650,7 +1677,9 @@ mod tests {
 
         let manager = JobManager::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let root = tempfile::tempdir().unwrap().keep();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        // Isolated empty tree must complete fully (Partial is not acceptable here).
         let snapshots = StorageScanSnapshotStore::new();
         let id = manager.spawn_storage_scan(
             root.clone(),
@@ -1662,7 +1691,10 @@ mod tests {
         match terminal {
             JobEvent::Completed { result, .. } => match result {
                 JobResult::StorageScan(summary) => {
-                    assert!(summary.is_complete() || summary.is_partial());
+                    assert!(
+                        summary.is_complete(),
+                        "J5 requires Complete, got {summary:?}"
+                    );
                     assert_eq!(summary.root, root);
                 }
                 _ => panic!("expected StorageScan summary"),
@@ -1681,7 +1713,8 @@ mod tests {
 
         let manager = JobManager::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let root = tempfile::tempdir().unwrap().keep();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         // A directory we cannot read induces traversal errors -> Partial.
         let sealed = root.join("sealed");
         std::fs::create_dir(&sealed).unwrap();
@@ -1697,6 +1730,9 @@ mod tests {
             snapshots.clone(),
         );
         let terminal = drain_until_terminal(&manager, &id, &mut rx).await;
+        // Restore permissions FIRST so TempDir cleanup can succeed.
+        let _ =
+            std::fs::set_permissions(&sealed, std::os::unix::fs::PermissionsExt::from_mode(0o755));
         match terminal {
             JobEvent::Completed { result, .. } => match result {
                 JobResult::StorageScan(summary) => {
@@ -1708,8 +1744,6 @@ mod tests {
             JobEvent::Failed { .. } => panic!("Partial must not become Failed"),
             other => panic!("expected Completed, got {other:?}"),
         }
-        let _ =
-            std::fs::set_permissions(&sealed, std::os::unix::fs::PermissionsExt::from_mode(0o755));
     }
 
     #[cfg(target_os = "linux")]
@@ -1720,7 +1754,8 @@ mod tests {
 
         let manager = JobManager::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let root = tempfile::tempdir().unwrap().keep();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         for i in 0..200 {
             let d = root.join(format!("d{i}"));
             std::fs::create_dir(&d).unwrap();
@@ -1753,17 +1788,34 @@ mod tests {
         use crate::storage_inspector_snapshot::StorageScanSnapshotStore;
 
         let manager = JobManager::new();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let snapshots = StorageScanSnapshotStore::new();
         let id = manager.spawn_storage_scan(
-            std::env::temp_dir(),
+            root.clone(),
             UsageScanOptions::default(),
             tx,
-            StorageScanSnapshotStore::new(),
+            snapshots.clone(),
         );
+        // The token handed out by JobManager MUST be the exact same Arc the job owns.
         let token = manager.cancel_token(&id).expect("token");
+        let job = manager.get(&id).expect("job");
+        assert!(
+            std::sync::Arc::ptr_eq(&token, &job.cancel),
+            "cancel token must be the JobManager-owned Arc, not a second flag"
+        );
         assert!(!token.load(std::sync::atomic::Ordering::Relaxed));
-        token.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Cancel through JobManager; the worker should observe and terminate Cancelled.
         assert!(manager.cancel(&id));
+        let terminal = drain_until_terminal(&manager, &id, &mut rx).await;
+        match terminal {
+            JobEvent::Cancelled { result, .. } => match result {
+                JobResult::StorageScan(summary) => assert!(summary.is_cancelled()),
+                _ => panic!("expected StorageScan summary"),
+            },
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1774,7 +1826,8 @@ mod tests {
 
         let manager = JobManager::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let root = tempfile::tempdir().unwrap().keep();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         std::fs::write(root.join("a"), b"hello").unwrap();
         let snapshots = StorageScanSnapshotStore::new();
         let id = manager.spawn_storage_scan(
@@ -1784,6 +1837,7 @@ mod tests {
             snapshots.clone(),
         );
         let terminal = drain_until_terminal(&manager, &id, &mut rx).await;
+        // JobResult must carry ONLY the compact summary, never the records vector.
         match terminal {
             JobEvent::Completed { result, .. } => match result {
                 JobResult::StorageScan(_) => {}
@@ -1793,7 +1847,9 @@ mod tests {
         }
         assert!(snapshots.contains(&id));
         let stored = snapshots.get(&id).expect("snapshot present");
-        assert!(!stored.records.is_empty() || stored.root == root);
+        // The full UsageScanResult lives only in the snapshot store.
+        assert!(stored.records.iter().any(|r| r.path == root.join("a")));
+        assert_eq!(stored.root, root);
     }
 
     #[cfg(target_os = "linux")]
@@ -1804,7 +1860,8 @@ mod tests {
 
         let manager = JobManager::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let root = tempfile::tempdir().unwrap().keep();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         std::fs::write(root.join("b"), b"data").unwrap();
         let snapshots = StorageScanSnapshotStore::new();
         let id = manager.spawn_storage_scan(
@@ -1813,17 +1870,66 @@ mod tests {
             tx,
             snapshots.clone(),
         );
-        let terminal = drain_until_terminal(&manager, &id, &mut rx).await;
-        match terminal {
-            JobEvent::Completed { result, .. } => match result {
-                JobResult::StorageScan(summary) => {
-                    assert_eq!(summary.root, root);
-                    assert!(summary.totals.entries_seen >= 1);
+        // Collect StorageScan progress events for this job id.
+        let mut last_progress: Option<StorageScanProgress> = None;
+        let mut saw_terminal = false;
+        for _ in 0..10_000 {
+            match rx.try_recv() {
+                Ok(JobEvent::Progress {
+                    id: ev_id,
+                    progress,
+                }) => {
+                    if ev_id == id
+                        && let JobProgress::StorageScan(p) = progress
+                    {
+                        last_progress = Some(p);
+                    }
                 }
-                _ => panic!("expected StorageScan summary"),
-            },
-            other => panic!("expected Completed, got {other:?}"),
+                Ok(
+                    ev @ (JobEvent::Completed { .. }
+                    | JobEvent::Failed { .. }
+                    | JobEvent::Cancelled { .. }),
+                ) if ev.id() == id => {
+                    saw_terminal = true;
+                    let summary = match &ev {
+                        JobEvent::Completed {
+                            result: JobResult::StorageScan(s),
+                            ..
+                        }
+                        | JobEvent::Cancelled {
+                            result: JobResult::StorageScan(s),
+                            ..
+                        } => s.clone(),
+                        _ => panic!("expected StorageScan summary in terminal event"),
+                    };
+                    // Final observed progress must agree with terminal summary totals.
+                    let p = last_progress
+                        .clone()
+                        .expect("at least one StorageScan progress event");
+                    assert_eq!(p.entries_seen, summary.totals.entries_seen);
+                    assert_eq!(p.logical_bytes, summary.totals.logical_bytes);
+                    assert_eq!(p.allocated_bytes, summary.totals.allocated_bytes);
+                    assert_eq!(p.errors, summary.totals.errors);
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    if manager
+                        .get(&id)
+                        .map(|j| j.status.is_terminal())
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            }
         }
+        assert!(saw_terminal, "scan did not reach terminal");
+        assert!(
+            last_progress.is_some(),
+            "J10 requires an observed StorageScan progress event"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1834,7 +1940,8 @@ mod tests {
 
         let manager = JobManager::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let root = tempfile::tempdir().unwrap().keep();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         let snapshots = StorageScanSnapshotStore::new();
         let id = manager.spawn_storage_scan(
             root.clone(),
