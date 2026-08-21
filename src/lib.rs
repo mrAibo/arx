@@ -11,6 +11,8 @@ pub mod plugins;
 pub mod process;
 pub mod remote;
 pub mod services;
+#[cfg(target_os = "linux")]
+pub mod storage_inspector;
 pub mod terminal;
 pub mod transfer;
 pub mod transfer_queue;
