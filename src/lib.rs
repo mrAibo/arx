@@ -25,6 +25,7 @@ pub mod storage_inspector_snapshot;
 pub mod storage_inspector_ui;
 pub mod terminal;
 pub mod transfer;
+pub mod transfer_center_ui;
 pub mod transfer_queue;
 pub mod transfer_queue_runtime;
 pub mod transfer_queue_view;
