@@ -138,29 +138,24 @@ pub fn scan_local_with_progress(
     let max_depth = options.max_depth;
     let descend_cancel = Arc::clone(&cancel);
 
-    let walker = walk(
-        root,
-        threads,
-        Order::ParentFirst,
-        move |entry| {
-            if descend_cancel.load(AtomicOrdering::Relaxed) {
-                return false;
-            }
-            if max_depth.is_some_and(|limit| entry.depth >= limit) {
-                return false;
-            }
-            if !same_filesystem {
-                return true;
-            }
-            // Fail closed: when filesystem identity is unavailable, do not
-            // schedule descendants across an unproven boundary.
-            entry
-                .metadata
-                .as_ref()
-                .map(|metadata| metadata.dev() == root_device)
-                .unwrap_or(false)
-        },
-    );
+    let walker = walk(root, threads, Order::ParentFirst, move |entry| {
+        if descend_cancel.load(AtomicOrdering::Relaxed) {
+            return false;
+        }
+        if max_depth.is_some_and(|limit| entry.depth >= limit) {
+            return false;
+        }
+        if !same_filesystem {
+            return true;
+        }
+        // Fail closed: when filesystem identity is unavailable, do not
+        // schedule descendants across an unproven boundary.
+        entry
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.dev() == root_device)
+            .unwrap_or(false)
+    });
 
     let mut totals = UsageTotals::default();
     let mut records = Vec::new();
@@ -197,9 +192,7 @@ pub fn scan_local_with_progress(
 
         match kind {
             UsageKind::File => totals.files = totals.files.saturating_add(1),
-            UsageKind::Directory => {
-                totals.directories = totals.directories.saturating_add(1)
-            }
+            UsageKind::Directory => totals.directories = totals.directories.saturating_add(1),
             UsageKind::Symlink => totals.symlinks = totals.symlinks.saturating_add(1),
             UsageKind::Other => totals.other = totals.other.saturating_add(1),
         }
@@ -277,9 +270,7 @@ pub fn scan_local_with_progress(
     let mut top_files = records
         .iter()
         .filter(|record| {
-            record.kind == UsageKind::File
-                && !record.hardlink_duplicate
-                && !record.metadata_error
+            record.kind == UsageKind::File && !record.hardlink_duplicate && !record.metadata_error
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -319,15 +310,12 @@ fn resolved_threads(requested: usize) -> usize {
     if requested == 0 {
         detected.min(MAX_SCAN_THREADS)
     } else {
-        requested.min(MAX_SCAN_THREADS).max(1)
+        requested.clamp(1, MAX_SCAN_THREADS)
     }
 }
 
-fn maybe_report_progress(
-    totals: &UsageTotals,
-    on_progress: &mut impl FnMut(&UsageScanProgress),
-) {
-    if totals.entries_seen % PROGRESS_EVERY_ENTRIES == 0 {
+fn maybe_report_progress(totals: &UsageTotals, on_progress: &mut impl FnMut(&UsageScanProgress)) {
+    if totals.entries_seen.is_multiple_of(PROGRESS_EVERY_ENTRIES) {
         on_progress(&UsageScanProgress::from(totals));
     }
 }
@@ -354,9 +342,7 @@ fn roll_up_subtree_totals(records: &mut [UsageRecord]) {
         let child_allocated = records[child_index].subtree_allocated_bytes;
         let child_entries = records[child_index].subtree_entries;
         let parent = &mut records[parent_index];
-        parent.subtree_logical_bytes = parent
-            .subtree_logical_bytes
-            .saturating_add(child_logical);
+        parent.subtree_logical_bytes = parent.subtree_logical_bytes.saturating_add(child_logical);
         parent.subtree_allocated_bytes = parent
             .subtree_allocated_bytes
             .saturating_add(child_allocated);
@@ -444,7 +430,12 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(pair.len(), 2);
-        assert_eq!(pair.iter().filter(|record| record.hardlink_duplicate).count(), 1);
+        assert_eq!(
+            pair.iter()
+                .filter(|record| record.hardlink_duplicate)
+                .count(),
+            1
+        );
         assert_eq!(result.totals.hardlink_duplicates, 1);
         assert_eq!(
             pair.iter().map(|record| record.logical_bytes).sum::<u64>(),
@@ -464,10 +455,12 @@ mod tests {
         assert!(result.records.iter().any(|record| {
             record.path == root.path().join("linked-dir") && record.kind == UsageKind::Symlink
         }));
-        assert!(!result
-            .records
-            .iter()
-            .any(|record| record.path.ends_with("secret.txt")));
+        assert!(
+            !result
+                .records
+                .iter()
+                .any(|record| record.path.ends_with("secret.txt"))
+        );
     }
 
     #[test]
@@ -482,14 +475,18 @@ mod tests {
         };
         let result = scan_local(root.path(), &options, no_cancel()).unwrap();
 
-        assert!(result
-            .records
-            .iter()
-            .any(|record| record.path == root.path().join("level1")));
-        assert!(!result
-            .records
-            .iter()
-            .any(|record| record.path.ends_with("hidden.txt")));
+        assert!(
+            result
+                .records
+                .iter()
+                .any(|record| record.path == root.path().join("level1"))
+        );
+        assert!(
+            !result
+                .records
+                .iter()
+                .any(|record| record.path.ends_with("hidden.txt"))
+        );
     }
 
     #[test]
@@ -509,8 +506,7 @@ mod tests {
         assert_eq!(child_record.kind, UsageKind::Directory);
         assert_eq!(child_record.subtree_entries, 2);
         assert!(
-            child_record.subtree_logical_bytes
-                >= u128::from(child_record.logical_bytes) + 2048
+            child_record.subtree_logical_bytes >= u128::from(child_record.logical_bytes) + 2048
         );
     }
 
@@ -534,7 +530,8 @@ mod tests {
     fn cancellation_returns_cancelled_truth() {
         let root = tempfile::tempdir().unwrap();
         for index in 0..512 {
-            let mut file = fs::File::create(root.path().join(format!("file-{index:04}.bin"))).unwrap();
+            let mut file =
+                fs::File::create(root.path().join(format!("file-{index:04}.bin"))).unwrap();
             file.write_all(b"x").unwrap();
         }
 
