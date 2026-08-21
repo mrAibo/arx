@@ -3,7 +3,7 @@
 //! The scanner and JobManager remain the sources of runtime truth. This module
 //! owns only presentation state and immutable snapshot drill-down behavior.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -166,11 +166,13 @@ pub fn launch_storage_inspector(state: &mut AppState) -> Result<String, String> 
         .clone()
         .ok_or_else(|| "Storage Inspector: job event channel is not bound".to_string())?;
 
-    if let Some(id) = state.storage_inspector.job_id.as_deref()
-        && manager.get(id).is_some_and(|job| !job.status.is_terminal())
+    if let Some(id) = state.storage_inspector.job_id.clone()
+        && manager
+            .get(&id)
+            .is_some_and(|job| !job.status.is_terminal())
     {
         state.open_overlay(OverlayKind::StorageInspector);
-        return Ok(id.to_string());
+        return Ok(id);
     }
 
     if let Some(old_id) = state.storage_inspector.job_id.take() {
@@ -300,10 +302,7 @@ fn visible_rows(state: &AppState) -> Vec<StorageRow> {
     rows_for_snapshot(&snapshot, &state.storage_inspector)
 }
 
-fn rows_for_snapshot(
-    snapshot: &UsageScanResult,
-    ui: &StorageInspectorUiState,
-) -> Vec<StorageRow> {
+fn rows_for_snapshot(snapshot: &UsageScanResult, ui: &StorageInspectorUiState) -> Vec<StorageRow> {
     let mut rows = match ui.view {
         StorageView::Directory => {
             let current = ui.current_dir.as_deref().unwrap_or(snapshot.root.as_path());
@@ -400,7 +399,10 @@ fn render_header(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let (status, progress) = storage_status(state);
     let text = vec![
         Line::from(vec![
-            Span::styled(format!("{status}  "), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{status}  "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw(progress),
         ]),
         Line::from(format!("root: {root}")),
@@ -532,9 +534,9 @@ fn render_body(frame: &mut ratatui::Frame, area: Rect, state: &mut AppState) {
 
     let mut list_state = ListState::default();
     list_state.select(Some(state.storage_inspector.cursor));
-    let list = List::new(items).highlight_symbol("› ").highlight_style(
-        Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
-    );
+    let list = List::new(items)
+        .highlight_symbol("› ")
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED));
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
@@ -572,6 +574,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 fn format_bytes_u128(bytes: u128) -> String {
+    let Ok(bytes) = u64::try_from(bytes) else {
+        return format!("{bytes} B");
+    };
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
     if bytes < 1024 {
         return format!("{bytes} B");
@@ -582,18 +587,16 @@ fn format_bytes_u128(bytes: u128) -> String {
         value /= 1024.0;
         unit += 1;
     }
-    if value.is_finite() {
-        format!("{value:.1} {}", UNITS[unit])
-    } else {
-        format!("{bytes} B")
-    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::jobs::{JobKind, JobManager};
-    use crate::storage_inspector::{UsageTotals, UsageScanOutcome};
+    use crate::storage_inspector::{UsageScanOutcome, UsageTotals};
     use crate::storage_inspector_snapshot::StorageScanSnapshotStore;
     use crate::vfs::Location;
     use tokio::sync::mpsc;
@@ -628,7 +631,11 @@ mod tests {
                 allocated_bytes: 8_000,
                 files: 3,
                 directories: 3,
-                errors: usize::from(outcome == UsageScanOutcome::Partial) as u64,
+                errors: if outcome == UsageScanOutcome::Partial {
+                    1
+                } else {
+                    0
+                },
                 entries_seen: 6,
                 ..UsageTotals::default()
             },
@@ -710,7 +717,11 @@ mod tests {
         };
         let rows = rows_for_snapshot(&scan, &ui);
         assert_eq!(rows[0].path, PathBuf::from("/root/a/deep"));
-        assert!(!rows.iter().any(|row| row.path == PathBuf::from("/root/dup")));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.path == PathBuf::from("/root/dup"))
+        );
     }
 
     #[test]
@@ -719,9 +730,15 @@ mod tests {
         state.storage_inspector.root = Some(PathBuf::from("/root"));
         state.storage_inspector.current_dir = Some(PathBuf::from("/root/a"));
         go_to_parent(&mut state);
-        assert_eq!(state.storage_inspector.current_dir, Some(PathBuf::from("/root")));
+        assert_eq!(
+            state.storage_inspector.current_dir,
+            Some(PathBuf::from("/root"))
+        );
         go_to_parent(&mut state);
-        assert_eq!(state.storage_inspector.current_dir, Some(PathBuf::from("/root")));
+        assert_eq!(
+            state.storage_inspector.current_dir,
+            Some(PathBuf::from("/root"))
+        );
     }
 
     #[test]
@@ -736,7 +753,10 @@ mod tests {
             Some(Location::Local(PathBuf::from("/root"))),
             None,
         );
-        assert!(manager.publish_event(&tx, crate::jobs::JobEvent::Running { id: job.id.clone() }));
+        assert!(manager.publish_event(
+            &tx,
+            crate::jobs::JobEvent::Running { id: job.id.clone() }
+        ));
         assert!(manager.publish_event(
             &tx,
             crate::jobs::JobEvent::Completed {
@@ -744,7 +764,11 @@ mod tests {
                 result: JobResult::StorageScan(crate::storage_inspector_job::StorageScanSummary {
                     root: PathBuf::from("/root"),
                     outcome: UsageScanOutcome::Partial,
-                    totals: UsageTotals { errors: 2, entries_seen: 5, ..UsageTotals::default() },
+                    totals: UsageTotals {
+                        errors: 2,
+                        entries_seen: 5,
+                        ..UsageTotals::default()
+                    },
                 }),
             },
         ));
@@ -754,6 +778,12 @@ mod tests {
         assert_eq!(label, "PARTIAL");
         assert!(detail.contains("2 errors"));
         assert!(detail.contains("incomplete"));
+    }
+
+    #[test]
+    fn wide_u128_formatting_never_wraps() {
+        let wide = u128::from(u64::MAX) + 1;
+        assert_eq!(format_bytes_u128(wide), "18446744073709551616 B");
     }
 
     #[tokio::test]
@@ -779,7 +809,10 @@ mod tests {
         assert_eq!(scans[0].id, id);
 
         for _ in 0..2_000 {
-            if manager.get(&id).is_some_and(|job| job.status.is_terminal()) {
+            if manager
+                .get(&id)
+                .is_some_and(|job| job.status.is_terminal())
+            {
                 break;
             }
             let _ = rx.try_recv();
@@ -797,7 +830,10 @@ mod tests {
         };
         state.active = crate::app::Pane::Left;
         let result = launch_storage_inspector(&mut state);
-        assert_eq!(result.unwrap_err(), "Storage Inspector is available for local paths only");
+        assert_eq!(
+            result.unwrap_err(),
+            "Storage Inspector is available for local paths only"
+        );
         assert_eq!(state.active_overlay(), None);
     }
 }
