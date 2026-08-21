@@ -6,9 +6,7 @@
 
 use std::path::PathBuf;
 
-use crate::storage_inspector::{
-    UsageScanOutcome, UsageScanProgress, UsageScanResult, UsageTotals,
-};
+use crate::storage_inspector::{UsageScanOutcome, UsageScanProgress, UsageScanResult, UsageTotals};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StorageScanProgress {
