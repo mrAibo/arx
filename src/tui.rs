@@ -958,6 +958,12 @@ async fn event_loop(
                         continue;
                     }
 
+                    #[cfg(target_os = "linux")]
+                    if state.show_storage_inspector {
+                        arx::storage_inspector_ui::handle_storage_inspector_key(&mut state, key);
+                        continue;
+                    }
+
                     // Bookmarks mode
                     if state.show_bookmarks {
                         match key.code {
@@ -1444,6 +1450,21 @@ async fn event_loop(
                             continue;
                         }
                         KeyResolution::Unhandled => {}
+                    }
+
+                    #[cfg(target_os = "linux")]
+                    if key.code == KeyCode::Char('u')
+                        && key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
+                    {
+                        match arx::storage_inspector_ui::launch_storage_inspector(&mut state) {
+                            Ok(id) => {
+                                state.message = Some(format!("Storage Inspector: {id}"));
+                            }
+                            Err(message) => {
+                                state.message = Some(message);
+                            }
+                        }
+                        continue;
                     }
 
                     // Handle tree-filter Backspace before borrowing the active pane.
@@ -3663,6 +3684,11 @@ fn render(
         render_transfer_center(frame, area, &sync.transfers);
     }
 
+    #[cfg(target_os = "linux")]
+    if state.show_storage_inspector {
+        arx::storage_inspector_ui::render_storage_inspector(frame, area, state);
+    }
+
     // User menu overlay
     if state.show_menu {
         render_menu(frame, area, state);
@@ -4171,6 +4197,8 @@ fn render_sync_job_lines(
             }
         }
         Some(arx::jobs::JobResult::RemoteEdit(_)) => {}
+        #[cfg(target_os = "linux")]
+        Some(arx::jobs::JobResult::StorageScan(_)) => {}
         Some(arx::jobs::JobResult::Generic { .. }) | None => {}
     }
 
@@ -4433,6 +4461,7 @@ fn help_full_lines() -> Vec<Line<'static>> {
         Line::from("  Backspace          Parent directory"),
         Line::from("  Ctrl+G             Go to path"),
         Line::from("  Ctrl+U             Swap panes"),
+        Line::from("  Alt+U              Storage Inspector (local, read-only)"),
         Line::from("  Alt+O              Sync other pane to active"),
         Line::from("  Alt+Down           Go back in directory history"),
         Line::from("  Alt+/              Recursive file search (find)"),
@@ -5477,35 +5506,87 @@ fn observe_verified_sync_success(state: &mut AppState, job: &arx::jobs::Job) {
 fn handle_job_event(ev: &arx::jobs::JobEvent, state: &mut AppState) -> bool {
     match ev {
         arx::jobs::JobEvent::Completed { id, result } => {
-            state.message = Some(match result {
-                arx::jobs::JobResult::Generic { message, .. } => message
-                    .clone()
-                    .unwrap_or_else(|| format!("Job {id} completed")),
-                arx::jobs::JobResult::WorkspaceSync(outcome) => format!(
-                    "Sync completed: {} physical step(s), {} bytes",
-                    outcome.completed.len(),
-                    outcome.transferred_bytes
-                ),
-                arx::jobs::JobResult::RemoteEdit(_) => format!("Remote edit job {id} completed"),
-            });
-            true
+            match result {
+                arx::jobs::JobResult::Generic { message, .. } => {
+                    state.message = Some(
+                        message
+                            .clone()
+                            .unwrap_or_else(|| format!("Job {id} completed")),
+                    );
+                    true
+                }
+                arx::jobs::JobResult::WorkspaceSync(outcome) => {
+                    state.message = Some(format!(
+                        "Sync completed: {} physical step(s), {} bytes",
+                        outcome.completed.len(),
+                        outcome.transferred_bytes
+                    ));
+                    true
+                }
+                arx::jobs::JobResult::RemoteEdit(_) => {
+                    state.message = Some(format!("Remote edit job {id} completed"));
+                    true
+                }
+                #[cfg(target_os = "linux")]
+                arx::jobs::JobResult::StorageScan(summary) => {
+                    // Read-only scan: truthful message, never refresh panes.
+                    state.message = Some(match summary.outcome {
+                        arx::storage_inspector::UsageScanOutcome::Complete => {
+                            "Storage scan completed".to_string()
+                        }
+                        arx::storage_inspector::UsageScanOutcome::Partial => {
+                            format!("Storage scan partial: {} error(s)", summary.totals.errors)
+                        }
+                        arx::storage_inspector::UsageScanOutcome::Cancelled => {
+                            "Storage scan cancelled".to_string()
+                        }
+                    });
+                    false
+                }
+            }
         }
         arx::jobs::JobEvent::Failed { error, .. } => {
             state.message = Some(error.clone());
             true
         }
         arx::jobs::JobEvent::Cancelled { id, result } => {
-            state.message = Some(match result {
-                arx::jobs::JobResult::Generic { message, .. } => message
-                    .clone()
-                    .unwrap_or_else(|| format!("Job {id} cancelled")),
-                arx::jobs::JobResult::WorkspaceSync(outcome) => format!(
-                    "Sync cancelled after {} completed physical step(s)",
-                    outcome.completed.len()
-                ),
-                arx::jobs::JobResult::RemoteEdit(_) => format!("Remote edit job {id} cancelled"),
-            });
-            true
+            match result {
+                arx::jobs::JobResult::Generic { message, .. } => {
+                    state.message = Some(
+                        message
+                            .clone()
+                            .unwrap_or_else(|| format!("Job {id} cancelled")),
+                    );
+                    true
+                }
+                arx::jobs::JobResult::WorkspaceSync(outcome) => {
+                    state.message = Some(format!(
+                        "Sync cancelled after {} completed physical step(s)",
+                        outcome.completed.len()
+                    ));
+                    true
+                }
+                arx::jobs::JobResult::RemoteEdit(_) => {
+                    state.message = Some(format!("Remote edit job {id} cancelled"));
+                    true
+                }
+                #[cfg(target_os = "linux")]
+                arx::jobs::JobResult::StorageScan(summary) => {
+                    // Read-only scan: truthful message, never refresh panes.
+                    state.message = Some(match summary.outcome {
+                        arx::storage_inspector::UsageScanOutcome::Complete => {
+                            "Storage scan completed".to_string()
+                        }
+                        arx::storage_inspector::UsageScanOutcome::Partial => {
+                            format!("Storage scan partial: {} error(s)", summary.totals.errors)
+                        }
+                        arx::storage_inspector::UsageScanOutcome::Cancelled => {
+                            "Storage scan cancelled".to_string()
+                        }
+                    });
+                    false
+                }
+            }
         }
         arx::jobs::JobEvent::Running { .. }
         | arx::jobs::JobEvent::PausePending { .. }
@@ -6859,14 +6940,14 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
                 vec!["No SSH hosts discovered".into()]
             } else {
                 lines
-            };
+            }
         }
         EffectEvent::TreeLines { lines } => {
             state.tree_lines = if lines.is_empty() {
                 vec!["(empty)".into()]
             } else {
                 lines
-            };
+            }
         }
         EffectEvent::PathOpened { path } => {
             state.message = Some(format!("Opened {}", path.display()));

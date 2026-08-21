@@ -20,6 +20,7 @@ pub enum OverlayKind {
     CommandCenter,
     Tree,
     Infrastructure,
+    StorageInspector,
     ContextMenu,
     SyncPreview,
     SshHosts,
@@ -52,6 +53,8 @@ impl AppState {
             Some(OverlayKind::Tree)
         } else if self.show_infra {
             Some(OverlayKind::Infrastructure)
+        } else if self.show_storage_inspector {
+            Some(OverlayKind::StorageInspector)
         } else if self.remote_workspace.preview_open {
             Some(OverlayKind::SyncPreview)
         } else if self.show_context_menu {
@@ -76,6 +79,7 @@ impl AppState {
         self.show_command_center = false;
         self.show_tree = false;
         self.show_infra = false;
+        self.show_storage_inspector = false;
         self.show_context_menu = false;
         self.show_ssh_hosts = false;
     }
@@ -116,6 +120,7 @@ impl AppState {
             }
             OverlayKind::Tree => self.show_tree = true,
             OverlayKind::Infrastructure => self.show_infra = true,
+            OverlayKind::StorageInspector => self.show_storage_inspector = true,
             OverlayKind::ContextMenu => self.show_context_menu = true,
             OverlayKind::SshHosts => {
                 self.show_ssh_hosts = true;
@@ -179,6 +184,18 @@ mod tests {
         state.toggle_overlay(OverlayKind::Hosts);
         assert_eq!(state.active_overlay(), Some(OverlayKind::Hosts));
         state.toggle_overlay(OverlayKind::Hosts);
+        assert_eq!(state.active_overlay(), None);
+    }
+
+    #[test]
+    fn storage_inspector_is_exclusive_overlay() {
+        let mut state = AppState::default();
+        state.open_overlay(OverlayKind::Jobs);
+        state.open_overlay(OverlayKind::StorageInspector);
+        assert_eq!(state.active_overlay(), Some(OverlayKind::StorageInspector));
+        assert!(state.show_storage_inspector);
+        assert!(!state.show_jobs);
+        state.close_overlay(OverlayKind::StorageInspector);
         assert_eq!(state.active_overlay(), None);
     }
 
