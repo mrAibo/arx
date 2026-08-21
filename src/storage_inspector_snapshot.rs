@@ -106,7 +106,10 @@ mod tests {
         store.insert("storage-1", result("/tmp/new"));
 
         assert_eq!(store.len(), 2);
-        assert_eq!(store.get("storage-1").unwrap().root, PathBuf::from("/tmp/new"));
+        assert_eq!(
+            store.get("storage-1").unwrap().root,
+            PathBuf::from("/tmp/new")
+        );
         assert_eq!(
             store.get("storage-2").unwrap().root,
             PathBuf::from("/tmp/other")
