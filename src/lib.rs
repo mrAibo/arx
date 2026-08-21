@@ -14,6 +14,8 @@ pub mod services;
 #[cfg(target_os = "linux")]
 pub mod storage_inspector;
 #[cfg(target_os = "linux")]
+pub mod storage_inspector_job;
+#[cfg(target_os = "linux")]
 pub mod storage_inspector_snapshot;
 pub mod terminal;
 pub mod transfer;
