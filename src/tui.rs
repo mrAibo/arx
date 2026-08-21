@@ -964,6 +964,12 @@ async fn event_loop(
                         continue;
                     }
 
+                    #[cfg(target_os = "linux")]
+                    if state.show_filesystems {
+                        arx::filesystem_usage_ui::handle_filesystems_key(&mut state, key);
+                        continue;
+                    }
+
                     // Bookmarks mode
                     if state.show_bookmarks {
                         match key.code {
@@ -1459,6 +1465,21 @@ async fn event_loop(
                         match arx::storage_inspector_ui::launch_storage_inspector(&mut state) {
                             Ok(id) => {
                                 state.message = Some(format!("Storage Inspector: {id}"));
+                            }
+                            Err(message) => {
+                                state.message = Some(message);
+                            }
+                        }
+                        continue;
+                    }
+
+                    #[cfg(target_os = "linux")]
+                    if key.code == KeyCode::Char('d')
+                        && key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
+                    {
+                        match arx::filesystem_usage_ui::launch_filesystems(&mut state) {
+                            Ok(()) => {
+                                state.message = Some("Filesystems refreshed".into());
                             }
                             Err(message) => {
                                 state.message = Some(message);
@@ -3689,6 +3710,11 @@ fn render(
         arx::storage_inspector_ui::render_storage_inspector(frame, area, state);
     }
 
+    #[cfg(target_os = "linux")]
+    if state.show_filesystems {
+        arx::filesystem_usage_ui::render_filesystems(frame, area, state);
+    }
+
     // User menu overlay
     if state.show_menu {
         render_menu(frame, area, state);
@@ -4462,6 +4488,7 @@ fn help_full_lines() -> Vec<Line<'static>> {
         Line::from("  Ctrl+G             Go to path"),
         Line::from("  Ctrl+U             Swap panes"),
         Line::from("  Alt+U              Storage Inspector (local, read-only)"),
+        Line::from("  Alt+D              Filesystems (df++, read-only)"),
         Line::from("  Alt+O              Sync other pane to active"),
         Line::from("  Alt+Down           Go back in directory history"),
         Line::from("  Alt+/              Recursive file search (find)"),

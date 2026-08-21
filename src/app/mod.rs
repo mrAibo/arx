@@ -345,6 +345,10 @@ pub struct AppState {
     pub storage_inspector: crate::storage_inspector_ui::StorageInspectorUiState,
     #[cfg(target_os = "linux")]
     pub storage_scan_snapshots: crate::storage_inspector_snapshot::StorageScanSnapshotStore,
+    #[cfg(target_os = "linux")]
+    pub show_filesystems: bool,
+    #[cfg(target_os = "linux")]
+    pub filesystems: crate::filesystem_usage_ui::FilesystemUiState,
     // C1: directory compare
     pub show_diff: bool,
     // C2: command input
@@ -486,6 +490,10 @@ impl Default for AppState {
             #[cfg(target_os = "linux")]
             storage_scan_snapshots:
                 crate::storage_inspector_snapshot::StorageScanSnapshotStore::default(),
+            #[cfg(target_os = "linux")]
+            show_filesystems: false,
+            #[cfg(target_os = "linux")]
+            filesystems: crate::filesystem_usage_ui::FilesystemUiState::default(),
             show_diff: false,
             cmd_input: false,
             cmd: String::new(),

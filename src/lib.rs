@@ -2,6 +2,10 @@ pub mod app;
 pub mod config;
 pub mod effect_dispatcher;
 pub mod effects;
+#[cfg(target_os = "linux")]
+pub mod filesystem_usage;
+#[cfg(target_os = "linux")]
+pub mod filesystem_usage_ui;
 pub mod input;
 pub mod jobs;
 pub mod journal;

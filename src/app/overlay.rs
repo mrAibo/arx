@@ -21,6 +21,7 @@ pub enum OverlayKind {
     Tree,
     Infrastructure,
     StorageInspector,
+    Filesystems,
     ContextMenu,
     SyncPreview,
     SshHosts,
@@ -55,6 +56,8 @@ impl AppState {
             Some(OverlayKind::Infrastructure)
         } else if self.show_storage_inspector {
             Some(OverlayKind::StorageInspector)
+        } else if self.show_filesystems {
+            Some(OverlayKind::Filesystems)
         } else if self.remote_workspace.preview_open {
             Some(OverlayKind::SyncPreview)
         } else if self.show_context_menu {
@@ -80,6 +83,7 @@ impl AppState {
         self.show_tree = false;
         self.show_infra = false;
         self.show_storage_inspector = false;
+        self.show_filesystems = false;
         self.show_context_menu = false;
         self.show_ssh_hosts = false;
     }
@@ -121,6 +125,7 @@ impl AppState {
             OverlayKind::Tree => self.show_tree = true,
             OverlayKind::Infrastructure => self.show_infra = true,
             OverlayKind::StorageInspector => self.show_storage_inspector = true,
+            OverlayKind::Filesystems => self.show_filesystems = true,
             OverlayKind::ContextMenu => self.show_context_menu = true,
             OverlayKind::SshHosts => {
                 self.show_ssh_hosts = true;
@@ -196,6 +201,18 @@ mod tests {
         assert!(state.show_storage_inspector);
         assert!(!state.show_jobs);
         state.close_overlay(OverlayKind::StorageInspector);
+        assert_eq!(state.active_overlay(), None);
+    }
+
+    #[test]
+    fn filesystems_is_exclusive_overlay() {
+        let mut state = AppState::default();
+        state.open_overlay(OverlayKind::StorageInspector);
+        state.open_overlay(OverlayKind::Filesystems);
+        assert_eq!(state.active_overlay(), Some(OverlayKind::Filesystems));
+        assert!(state.show_filesystems);
+        assert!(!state.show_storage_inspector);
+        state.close_overlay(OverlayKind::Filesystems);
         assert_eq!(state.active_overlay(), None);
     }
 
