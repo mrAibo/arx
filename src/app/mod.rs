@@ -338,6 +338,7 @@ pub struct AppState {
     pub job_events: Option<tokio::sync::mpsc::UnboundedSender<crate::jobs::JobEvent>>,
     pub show_jobs: bool,
     pub show_transfer_center: bool,
+    pub transfer_center: crate::transfer_center_ui::TransferCenterUiState,
     pub job_cursor: usize,
     #[cfg(target_os = "linux")]
     pub show_storage_inspector: bool,
@@ -482,6 +483,7 @@ impl Default for AppState {
             job_events: None,
             show_jobs: false,
             show_transfer_center: false,
+            transfer_center: crate::transfer_center_ui::TransferCenterUiState::default(),
             job_cursor: 0,
             #[cfg(target_os = "linux")]
             show_storage_inspector: false,

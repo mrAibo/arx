@@ -1305,13 +1305,11 @@ async fn event_loop(
                     }
 
                     if state.show_transfer_center {
-                        match key.code {
-                            KeyCode::Esc => state.close_overlay(OverlayKind::TransferCenter),
-                            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                state.toggle_overlay(OverlayKind::TransferCenter);
-                            }
-                            _ => {}
-                        }
+                        arx::transfer_center_ui::handle_transfer_center_key(
+                            &mut state,
+                            &sync_runtime.transfers,
+                            key,
+                        );
                         continue;
                     }
 
@@ -3702,7 +3700,7 @@ fn render(
     }
 
     if state.show_transfer_center {
-        render_transfer_center(frame, area, &sync.transfers);
+        arx::transfer_center_ui::render_transfer_center(frame, area, state, &sync.transfers);
     }
 
     #[cfg(target_os = "linux")]
@@ -4969,53 +4967,6 @@ fn render_jobs(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
         )
         .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
     frame.render_stateful_widget(list, popup_area, &mut list_state);
-}
-
-fn render_transfer_center(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    transfers: &arx::transfer_queue_runtime::TransferQueueRuntime,
-) {
-    let popup_area = centered_rect(70, 70, area);
-    frame.render_widget(Clear, popup_area);
-
-    let items: Vec<ListItem> = transfers
-        .manager()
-        .snapshot()
-        .into_iter()
-        .filter(|job| job.kind == arx::jobs::JobKind::Transfer)
-        .map(|job| {
-            let id: String = job.id.chars().take(12).collect();
-            let status = match job.status {
-                arx::jobs::JobStatus::Pending => "waiting",
-                arx::jobs::JobStatus::Running => "running",
-                arx::jobs::JobStatus::PausePending => "pause pending",
-                arx::jobs::JobStatus::Cancelling => "cancelling",
-                arx::jobs::JobStatus::Paused => "paused",
-                arx::jobs::JobStatus::RetryWaiting => "retry waiting",
-                arx::jobs::JobStatus::Completed => "completed",
-                arx::jobs::JobStatus::Failed => "failed",
-                arx::jobs::JobStatus::Cancelled => "cancelled",
-            };
-            let percent = job
-                .progress
-                .percent()
-                .map_or_else(|| "--".into(), |percent| format!("{percent}%"));
-            ListItem::new(Line::from(format!("  {id:<12} {status:<15} {percent}")))
-        })
-        .collect();
-    let items = if items.is_empty() {
-        vec![ListItem::new(Line::from("  No transfer jobs."))]
-    } else {
-        items
-    };
-
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Transfer Center (Ctrl+Y: close) "),
-    );
-    frame.render_widget(list, popup_area);
 }
 
 fn render_menu(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
