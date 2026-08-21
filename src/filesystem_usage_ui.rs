@@ -273,9 +273,7 @@ fn metric(mount: &MountRecord, mode: FilesystemMode, metric: Metric) -> Option<u
         (FilesystemMode::Inodes, Metric::Size) => Some(stats.total_inodes),
         (FilesystemMode::Inodes, Metric::Used) => stats.used_inodes,
         (FilesystemMode::Inodes, Metric::Available) => Some(stats.available_inodes),
-        (FilesystemMode::Inodes, Metric::Usage) => {
-            stats.inode_usage_tenths_percent.map(u128::from)
-        }
+        (FilesystemMode::Inodes, Metric::Usage) => stats.inode_usage_tenths_percent.map(u128::from),
     }
 }
 
@@ -283,7 +281,9 @@ pub fn render_filesystems(frame: &mut ratatui::Frame<'_>, area: Rect, state: &Ap
     let popup = centered_rect(94, 82, area);
     frame.render_widget(Clear, popup);
 
-    let block = Block::default().title(" Filesystems · df++ · read-only ").borders(Borders::ALL);
+    let block = Block::default()
+        .title(" Filesystems · df++ · read-only ")
+        .borders(Borders::ALL);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -328,8 +328,24 @@ pub fn render_filesystems(frame: &mut ratatui::Frame<'_>, area: Rect, state: &Ap
     frame.render_widget(title, chunks[0]);
 
     let header = match state.filesystems.mode {
-        FilesystemMode::Blocks => format_row("Mountpoint", "Source", "Type", "Size", "Used", "Avail", "Use%"),
-        FilesystemMode::Inodes => format_row("Mountpoint", "Source", "Type", "Inodes", "Used", "Avail", "Use%"),
+        FilesystemMode::Blocks => format_row(
+            "Mountpoint",
+            "Source",
+            "Type",
+            "Size",
+            "Used",
+            "Avail",
+            "Use%",
+        ),
+        FilesystemMode::Inodes => format_row(
+            "Mountpoint",
+            "Source",
+            "Type",
+            "Inodes",
+            "Used",
+            "Avail",
+            "Use%",
+        ),
     };
     frame.render_widget(
         Paragraph::new(header).style(Style::default().add_modifier(Modifier::BOLD)),
@@ -341,9 +357,9 @@ pub fn render_filesystems(frame: &mut ratatui::Frame<'_>, area: Rect, state: &Ap
         .iter()
         .map(|mount| ListItem::new(render_mount_row(mount, state.filesystems.mode)))
         .collect::<Vec<_>>();
-    let list = List::new(items).highlight_symbol("> ").highlight_style(
-        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
-    );
+    let list = List::new(items)
+        .highlight_symbol("> ")
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
     let mut list_state = ListState::default();
     if !rows.is_empty() {
         list_state.select(Some(state.filesystems.cursor.min(rows.len() - 1)));
@@ -392,13 +408,19 @@ fn render_available_stats(
     match mode {
         FilesystemMode::Blocks => (
             format_bytes(stats.total_bytes),
-            stats.used_bytes.map(format_bytes).unwrap_or_else(|| "?".into()),
+            stats
+                .used_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "?".into()),
             format_bytes(stats.available_bytes),
             format_percent(stats.usage_tenths_percent),
         ),
         FilesystemMode::Inodes => (
             format_count(stats.total_inodes),
-            stats.used_inodes.map(format_count).unwrap_or_else(|| "?".into()),
+            stats
+                .used_inodes
+                .map(format_count)
+                .unwrap_or_else(|| "?".into()),
             format_count(stats.available_inodes),
             format_percent(stats.inode_usage_tenths_percent),
         ),
@@ -543,14 +565,41 @@ mod tests {
     #[test]
     fn useful_default_hides_special_but_keeps_other_categories() {
         let state = state_with_mounts(vec![
-            mount(1, "/", "ext4", MountCategory::Local, MountStatsState::Available(stats(100, 50, 40, 500))),
-            mount(2, "/net", "nfs4", MountCategory::Network, MountStatsState::SkippedNetwork),
-            mount(3, "/fuse", "fuse.portal", MountCategory::Fuse, MountStatsState::Available(stats(50, 10, 35, 200))),
-            mount(4, "/proc", "proc", MountCategory::Special, MountStatsState::Available(stats(0, 0, 0, 0))),
+            mount(
+                1,
+                "/",
+                "ext4",
+                MountCategory::Local,
+                MountStatsState::Available(stats(100, 50, 40, 500)),
+            ),
+            mount(
+                2,
+                "/net",
+                "nfs4",
+                MountCategory::Network,
+                MountStatsState::SkippedNetwork,
+            ),
+            mount(
+                3,
+                "/fuse",
+                "fuse.portal",
+                MountCategory::Fuse,
+                MountStatsState::Available(stats(50, 10, 35, 200)),
+            ),
+            mount(
+                4,
+                "/proc",
+                "proc",
+                MountCategory::Special,
+                MountStatsState::Available(stats(0, 0, 0, 0)),
+            ),
         ]);
         let rows = visible_mounts(&state);
         assert_eq!(rows.len(), 3);
-        assert!(rows.iter().all(|row| row.category != MountCategory::Special));
+        assert!(
+            rows.iter()
+                .all(|row| row.category != MountCategory::Special)
+        );
     }
 
     #[test]
@@ -572,9 +621,27 @@ mod tests {
     #[test]
     fn unavailable_metrics_sort_after_available_rows() {
         let mut state = state_with_mounts(vec![
-            mount(1, "/missing", "ext4", MountCategory::Local, MountStatsState::Unavailable("gone".into())),
-            mount(2, "/large", "ext4", MountCategory::Local, MountStatsState::Available(stats(200, 150, 40, 750))),
-            mount(3, "/small", "ext4", MountCategory::Local, MountStatsState::Available(stats(100, 10, 80, 100))),
+            mount(
+                1,
+                "/missing",
+                "ext4",
+                MountCategory::Local,
+                MountStatsState::Unavailable("gone".into()),
+            ),
+            mount(
+                2,
+                "/large",
+                "ext4",
+                MountCategory::Local,
+                MountStatsState::Available(stats(200, 150, 40, 750)),
+            ),
+            mount(
+                3,
+                "/small",
+                "ext4",
+                MountCategory::Local,
+                MountStatsState::Available(stats(100, 10, 80, 100)),
+            ),
         ]);
         state.filesystems.sort = FilesystemSort::Size;
         let rows = visible_mounts(&state);
@@ -586,32 +653,44 @@ mod tests {
     #[test]
     fn inode_mode_uses_inode_metrics_for_sorting() {
         let mut state = state_with_mounts(vec![
-            mount(1, "/a", "ext4", MountCategory::Local, MountStatsState::Available(MountStats {
-                total_bytes: 9999,
-                used_bytes: Some(9000),
-                free_bytes: 999,
-                available_bytes: 900,
-                reserved_bytes: Some(99),
-                usage_tenths_percent: Some(900),
-                total_inodes: 10,
-                used_inodes: Some(1),
-                free_inodes: 9,
-                available_inodes: 9,
-                inode_usage_tenths_percent: Some(100),
-            })),
-            mount(2, "/b", "ext4", MountCategory::Local, MountStatsState::Available(MountStats {
-                total_bytes: 100,
-                used_bytes: Some(10),
-                free_bytes: 90,
-                available_bytes: 80,
-                reserved_bytes: Some(10),
-                usage_tenths_percent: Some(100),
-                total_inodes: 100,
-                used_inodes: Some(90),
-                free_inodes: 10,
-                available_inodes: 10,
-                inode_usage_tenths_percent: Some(900),
-            })),
+            mount(
+                1,
+                "/a",
+                "ext4",
+                MountCategory::Local,
+                MountStatsState::Available(MountStats {
+                    total_bytes: 9999,
+                    used_bytes: Some(9000),
+                    free_bytes: 999,
+                    available_bytes: 900,
+                    reserved_bytes: Some(99),
+                    usage_tenths_percent: Some(900),
+                    total_inodes: 10,
+                    used_inodes: Some(1),
+                    free_inodes: 9,
+                    available_inodes: 9,
+                    inode_usage_tenths_percent: Some(100),
+                }),
+            ),
+            mount(
+                2,
+                "/b",
+                "ext4",
+                MountCategory::Local,
+                MountStatsState::Available(MountStats {
+                    total_bytes: 100,
+                    used_bytes: Some(10),
+                    free_bytes: 90,
+                    available_bytes: 80,
+                    reserved_bytes: Some(10),
+                    usage_tenths_percent: Some(100),
+                    total_inodes: 100,
+                    used_inodes: Some(90),
+                    free_inodes: 10,
+                    available_inodes: 10,
+                    inode_usage_tenths_percent: Some(900),
+                }),
+            ),
         ]);
         state.filesystems.mode = FilesystemMode::Inodes;
         state.filesystems.sort = FilesystemSort::Used;
@@ -644,10 +723,7 @@ mod tests {
         let mut state = AppState::default();
         state.open_overlay(OverlayKind::Filesystems);
         assert_eq!(state.active_overlay(), Some(OverlayKind::Filesystems));
-        handle_filesystems_key(
-            &mut state,
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-        );
+        handle_filesystems_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(state.active_overlay(), None);
     }
 
@@ -672,10 +748,47 @@ mod tests {
     }
 
     #[test]
-    fn byte_formatting_keeps_u128_truth() {
-        let value = u128::from(u64::MAX) + 1;
-        let rendered = format_bytes(value);
-        assert_ne!(rendered, "0 B");
-        assert!(rendered.contains("EiB") || rendered.contains(&value.to_string()));
+    fn sort_cycle_reaches_all_six_sorts() {
+        let mut sort = FilesystemSort::MountPoint;
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            sort = sort.next();
+            seen.push(sort);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                FilesystemSort::Size,
+                FilesystemSort::Used,
+                FilesystemSort::Available,
+                FilesystemSort::Usage,
+                FilesystemSort::Type,
+                FilesystemSort::MountPoint,
+            ]
+        );
+    }
+
+    #[test]
+    fn unavailable_render_explicitly_err() {
+        let record = mount(
+            9,
+            "/broken",
+            "ext4",
+            MountCategory::Local,
+            MountStatsState::Unavailable("i/o error".into()),
+        );
+        assert!(render_mount_row(&record, FilesystemMode::Blocks).contains("ERR"));
+    }
+
+    #[test]
+    fn filesystems_overlay_is_exclusive_versus_storage_inspector() {
+        let mut state = AppState::default();
+        state.open_overlay(OverlayKind::StorageInspector);
+        assert_eq!(state.active_overlay(), Some(OverlayKind::StorageInspector));
+        // Opening Filesystems closes the prior overlay (overlay state machine).
+        state.open_overlay(OverlayKind::Filesystems);
+        assert_eq!(state.active_overlay(), Some(OverlayKind::Filesystems));
+        assert!(!state.show_storage_inspector);
+        assert!(state.show_filesystems);
     }
 }

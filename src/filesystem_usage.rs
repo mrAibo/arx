@@ -337,12 +337,17 @@ fn decode_mount_field(field: &[u8]) -> Vec<u8> {
         if field[index] == b'\\' && index + 3 < field.len() {
             let digits = &field[index + 1..index + 4];
             if digits.iter().all(|digit| (b'0'..=b'7').contains(digit)) {
-                let value = (digits[0] - b'0') * 64
-                    + (digits[1] - b'0') * 8
-                    + (digits[2] - b'0');
-                decoded.push(value);
-                index += 4;
-                continue;
+                // Compute in u16 so a syntactically-octal but >255 sequence
+                // (e.g. \777) cannot wrap. Decode only when it fits a byte;
+                // otherwise preserve the original bytes verbatim.
+                let value = u16::from(digits[0] - b'0') * 64
+                    + u16::from(digits[1] - b'0') * 8
+                    + u16::from(digits[2] - b'0');
+                if let Ok(byte) = u8::try_from(value) {
+                    decoded.push(byte);
+                    index += 4;
+                    continue;
+                }
             }
         }
         decoded.push(field[index]);
@@ -431,14 +436,14 @@ fn statvfs_mount_point(path: &Path) -> Result<MountStats, String> {
     let raw = unsafe { raw.assume_init() };
 
     Ok(MountStats::from_counts(RawStatCounts {
-        block_size: raw.f_bsize as u64,
-        fragment_size: raw.f_frsize as u64,
-        blocks: raw.f_blocks as u64,
-        blocks_free: raw.f_bfree as u64,
-        blocks_available: raw.f_bavail as u64,
-        files: raw.f_files as u64,
-        files_free: raw.f_ffree as u64,
-        files_available: raw.f_favail as u64,
+        block_size: raw.f_bsize,
+        fragment_size: raw.f_frsize,
+        blocks: raw.f_blocks,
+        blocks_free: raw.f_bfree,
+        blocks_available: raw.f_bavail,
+        files: raw.f_files,
+        files_free: raw.f_ffree,
+        files_available: raw.f_favail,
     }))
 }
 
@@ -456,7 +461,8 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
-    const SIMPLE: &[u8] = b"36 25 8:1 / / rw,relatime shared:1 master:2 - ext4 /dev/sda1 rw,errors=remount-ro\n";
+    const SIMPLE: &[u8] =
+        b"36 25 8:1 / / rw,relatime shared:1 master:2 - ext4 /dev/sda1 rw,errors=remount-ro\n";
 
     fn stats() -> MountStats {
         MountStats::from_counts(RawStatCounts {
@@ -487,7 +493,8 @@ mod tests {
 
     #[test]
     fn parser_decodes_procfs_octal_escapes() {
-        let input = b"1 0 0:1 /root\\040dir /mnt\\011tab\\012line\\134slash rw - ext4 /dev/a\\040b rw\n";
+        let input =
+            b"1 0 0:1 /root\\040dir /mnt\\011tab\\012line\\134slash rw - ext4 /dev/a\\040b rw\n";
         let (mounts, errors) = parse_mountinfo(input);
         assert!(errors.is_empty());
         assert_eq!(mounts.len(), 1);
@@ -519,8 +526,14 @@ mod tests {
         let input = b"1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n2 0 8:1 / /b rw - ext4 /dev/sda1 rw\n";
         let snapshot = collect_mount_snapshot_from_bytes_with_probe(input, |_| Ok(stats()));
         assert_eq!(snapshot.mounts.len(), 2);
-        assert_eq!(snapshot.mounts[0].info.mount_source, snapshot.mounts[1].info.mount_source);
-        assert_ne!(snapshot.mounts[0].info.mount_point, snapshot.mounts[1].info.mount_point);
+        assert_eq!(
+            snapshot.mounts[0].info.mount_source,
+            snapshot.mounts[1].info.mount_source
+        );
+        assert_ne!(
+            snapshot.mounts[0].info.mount_point,
+            snapshot.mounts[1].info.mount_point
+        );
     }
 
     #[test]
@@ -543,7 +556,10 @@ mod tests {
             Ok(stats())
         });
         assert_eq!(calls.get(), 0);
-        assert!(matches!(snapshot.mounts[0].stats, MountStatsState::SkippedAutoFs));
+        assert!(matches!(
+            snapshot.mounts[0].stats,
+            MountStatsState::SkippedAutoFs
+        ));
     }
 
     #[test]
@@ -556,7 +572,10 @@ mod tests {
         });
         assert_eq!(calls.get(), 0);
         assert_eq!(snapshot.mounts.len(), 1);
-        assert!(matches!(snapshot.mounts[0].stats, MountStatsState::SkippedNetwork));
+        assert!(matches!(
+            snapshot.mounts[0].stats,
+            MountStatsState::SkippedNetwork
+        ));
     }
 
     #[test]
@@ -645,6 +664,25 @@ mod tests {
             &snapshot.mounts[0].stats,
             MountStatsState::Unavailable(error) if error == "permission denied"
         ));
+    }
+
+    #[test]
+    fn out_of_range_octal_escape_is_preserved_not_decoded() {
+        // \777 is syntactically octal but > 255; it must not wrap to 0xFF nor
+        // panic. procfs itself would not emit this, but the decoder must be
+        // defensive and preserve bytes verbatim.
+        let input = b"1 0 0:1 /root\\777name /mnt\\777mp rw - ext4 /dev/a rw\n";
+        let (mounts, errors) = parse_mountinfo(input);
+        assert!(errors.is_empty());
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(
+            mounts[0].root.as_os_str().as_bytes(),
+            b"/root\\777name".as_slice()
+        );
+        assert_eq!(
+            mounts[0].mount_point.as_os_str().as_bytes(),
+            b"/mnt\\777mp".as_slice()
+        );
     }
 
     #[test]
