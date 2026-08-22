@@ -6,8 +6,8 @@ behind provider interfaces instead of being special-cased directly in the TUI.
 
 ## Architectural rules
 
-1. The TUI does not own filesystem, SSH/SFTP, S3, WebDAV, rsync, or archive mutation
-   semantics.
+1. The TUI does not own filesystem, SSH/SFTP, S3, WebDAV, rsync, archive, or typed Quick
+   Action mutation semantics.
 2. Long-running work is represented as a Job or a correlated Effect; the render state
    is never a second source of lifecycle truth.
 3. When a system tool already owns a mature operation, ARX may use it behind a typed
@@ -26,6 +26,9 @@ behind provider interfaces instead of being special-cased directly in the TUI.
 10. User extensibility stays narrow: `arx.menu` may define admin commands, but ARX does
     not carry an embedded Lua/WASM runtime unless a future concrete product contract
     justifies one.
+11. Built-in Quick Actions are typed product actions, not shell aliases: provider
+    availability, frozen targets, cancellation, mutation boundaries, and terminal
+    outcomes are explicit.
 
 ## Layering
 
@@ -71,8 +74,8 @@ browser actions do not fall through underneath them.
 
 | Pattern | Used for | Lifecycle truth |
 |---|---|---|
-| **Effects** | Correlated interactive async work such as Preview and Remote Edit requests | Effect lane / request id |
-| **Services** | Process/system integration and bounded request/result operations | Typed service result |
+| **Effects** | Correlated interactive async work such as Preview, Remote Edit, and Quick Action requests | Effect lane / request id |
+| **Services** | Process/system integration and bounded request/result operations, including `QuickActionService` | Typed service result |
 | **Jobs** | Transfers, workspace sync, storage scans, and other long-running job work | Single runtime `JobManager` |
 
 `EffectDispatcher` uses dedicated lanes with monotonically changing request identity,
@@ -82,6 +85,41 @@ cannot silently overwrite newer UI intent.
 Remote Edit lifecycle integration with the runtime JobManager is implemented. It is
 not a deferred architecture item: observers publish into the same manager/channel that
 drives Jobs and the render snapshot.
+
+## Typed local Quick Actions
+
+PACK O adds three built-in local-only actions through the same shared
+`Action` / `ActionId` / `ACTION_CATALOG` / availability model used by Command Center:
+
+- **Compute SHA-256** — focused/selected regular files are hashed in Rust with `sha2`
+  inside a blocking worker. Filenames remain data, never shell syntax.
+- **Touch file** — the prompt freezes the Local directory, accepts exactly one child
+  name, rejects traversal/absolute paths, opens with `O_NOFOLLOW`, verifies the opened
+  target is a regular file, and applies `futimens` to that exact descriptor. Cancellation
+  is honored before the create/open mutation boundary; after that boundary ARX finishes
+  and reports the real terminal outcome.
+- **Compress to tar.gz** — the prompt freezes the Local directory and selected/focused
+  names. `QuickActionService` invokes system `tar` through typed argv, places `--`
+  before user filenames, sets `kill_on_drop(true)`, races execution against the
+  cancellation token with `tokio::select!`, stages in the destination directory, and
+  finalizes with `persist_noclobber`.
+
+All three actions fail closed outside `ProviderId::Local`; there is no attempt to map
+local shell/filesystem semantics onto SFTP, Archive, S3, or WebDAV. Touch and Compress
+prompts reuse the existing command-input buffer but own a typed frozen prompt state, so
+pane/selection changes cannot silently retarget an operation after it starts.
+
+`EffectLane::QuickAction` owns correlated execution. A second Quick Action is rejected
+while one is pending. Terminal results are accepted even if the user navigated away;
+Touch/Compress completion paths refresh only panes that are still at the frozen origin.
+Quit requests cancellation and remains blocked until the lane reports a safe terminal
+outcome. SHA-256 is cooperatively cancellable; the tar subprocess is killed on dropped
+execution. Control characters in filenames, paths, and tool errors are escaped before
+presentation while printable Unicode remains intact.
+
+This is a typed built-in feature boundary, not a plugin or arbitrary command runtime.
+The only external tool in the three actions is system `tar`; if it is unavailable ARX
+returns a typed `ToolUnavailable` failure.
 
 ## Environment and extension boundaries
 
@@ -262,10 +300,10 @@ artifacts without rebuilding Rust code.
 ```text
 src/
 ├── main.rs / tui.rs
-├── app/                    # AppState, action availability, overlay state
+├── app/                    # AppState, action availability, typed prompt/overlay state
 ├── input/                  # Keymap, command/hint discovery
 ├── effects.rs / effect_dispatcher.rs
-├── services/               # typed service/controller boundaries
+├── services/               # typed service/controller boundaries, QuickActionService
 ├── jobs/                   # runtime JobManager and typed job truth
 ├── transfer/               # plans and transfer executors
 ├── transfer_queue_runtime.rs
@@ -276,7 +314,7 @@ src/
 ├── filesystem_usage_ui.rs
 ├── vfs/                    # Local / SFTP / Archive / S3 / WebDAV providers
 ├── remote/                 # SSH host/config transport integration
-├── process/                # process / Remote Edit integration
+├── process/                # process / Remote Edit / Effect service routing
 ├── config.rs
 └── terminal.rs             # embedded PTY terminal
 ```
@@ -291,6 +329,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
 cargo +1.88 check --locked --all-features
 ```
+
+PACK O additionally exercises typed Quick Action availability/discovery, SHA-256 known
+vectors, Touch no-follow/pre-mutation cancellation behavior, control-safe presentation,
+and real system-`tar` archive/noclobber behavior on Linux.
 
 Physical CI additionally exercises the accepted WebDAV path and Transfer Queue real
 MinIO safe-read retry path. Release CI separately validates third-party licensing,

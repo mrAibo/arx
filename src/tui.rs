@@ -2,8 +2,8 @@ use crate::tui_terminal::TuiTerminalSession;
 use arx::app::InputContext;
 use arx::app::{
     Action, ActionAvailability, ActionContext, ActionId, AppState, CommandItem, CommandKind,
-    CommandTarget, OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SessionCallout,
-    SortMode, WorkspaceSyncUxState, action_availability, action_meta,
+    CommandTarget, OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, QuickActionPrompt,
+    SessionCallout, SortMode, WorkspaceSyncUxState, action_availability, action_meta,
     build_command_items_with_file_context, listed_entry_navigation_target,
     navigation_parent_target,
 };
@@ -15,8 +15,9 @@ use arx::input::{ContextHint, KeyResolution, KeyRouter, command_bar_rows, contex
 use arx::services::{
     DesktopService, FileInfoService, GitService, MutationError, MutationService,
     PaneListingContinuation, PaneLoadPurpose, PaneLoadResponse, PaneLoader, PaneNextPageResponse,
-    SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions, WorkspaceScanResponse,
-    WorkspaceScanner, WorkspaceSyncController,
+    QuickActionFailureKind, QuickActionKind, QuickActionOutcome, QuickActionRequest, SyncLaunchId,
+    WorkspaceScanError, WorkspaceScanOptions, WorkspaceScanResponse, WorkspaceScanner,
+    WorkspaceSyncController,
 };
 use arx::vfs::{
     Entry, EntryIdentity, EntryKind, ListedEntry, Location, ProviderId, ProviderRegistry,
@@ -711,6 +712,8 @@ async fn event_loop(
                                 state.glob_input = false;
                                 state.go_input = false;
                                 state.cmd_input = false;
+                                state.pending_mkdir_location = None;
+                                state.pending_quick_action_prompt = None;
                             }
                             KeyCode::Enter => {
                                 if state.glob_input && !state.filter.is_empty() {
@@ -768,11 +771,54 @@ async fn event_loop(
                                 }
                                 if state.cmd_input {
                                     let command = std::mem::take(&mut state.cmd);
+                                    let pending_quick_action =
+                                        std::mem::take(&mut state.pending_quick_action_prompt);
                                     let pending_mkdir =
                                         std::mem::take(&mut state.pending_mkdir_location);
                                     state.cmd_input = false;
                                     if command.is_empty() {
                                         state.message = Some(": command cancelled".into());
+                                    } else if let Some(prompt) = pending_quick_action {
+                                        if state.pending_effect(EffectLane::QuickAction).is_some() {
+                                            state.message = Some(
+                                                "Another Quick Action is still in progress".into(),
+                                            );
+                                            continue;
+                                        }
+
+                                        let (request, location, status) = match prompt {
+                                            QuickActionPrompt::Touch { dir } => {
+                                                let location = Location::Local(dir.clone());
+                                                (
+                                                    QuickActionRequest::Touch {
+                                                        dir,
+                                                        name: command,
+                                                    },
+                                                    location,
+                                                    "Touching file…",
+                                                )
+                                            }
+                                            QuickActionPrompt::CompressTarGz { dir, names } => {
+                                                let location = Location::Local(dir.clone());
+                                                (
+                                                    QuickActionRequest::CompressTarGz {
+                                                        dir,
+                                                        names,
+                                                        output_name: command,
+                                                    },
+                                                    location,
+                                                    "Compressing to tar.gz…",
+                                                )
+                                            }
+                                        };
+
+                                        let id = effect_dispatcher.dispatch(
+                                            EffectLane::QuickAction,
+                                            EffectScope::Location(location),
+                                            Effect::QuickAction { request },
+                                        );
+                                        state.register_effect(EffectLane::QuickAction, id);
+                                        state.message = Some(status.into());
                                     } else if let Some(loc) = pending_mkdir {
                                         let name = command;
                                         // Validate child name — reject empty, ".", "..", "/", NUL.
@@ -2024,6 +2070,8 @@ async fn event_loop(
                         }
                         // :: command input
                         KeyCode::Char(':') => {
+                            state.pending_mkdir_location = None;
+                            state.pending_quick_action_prompt = None;
                             state.cmd.clear();
                             state.cmd_input = true;
                         }
@@ -3797,7 +3845,11 @@ fn render(
     let pane = state.active_pane();
     let selection_count = state.selection_count(state.active, &pane.location);
     let hint = if state.cmd_input {
-        format!(" :{}_", state.cmd)
+        if let Some(prompt) = state.pending_quick_action_prompt.as_ref() {
+            format!("{}{}_", prompt.label(), state.cmd)
+        } else {
+            format!(" :{}_", state.cmd)
+        }
     } else if state.go_input {
         format!(" go: {}_", state.filter)
     } else if state.glob_input {
@@ -5579,13 +5631,20 @@ fn toggle_hosts_overlay(state: &mut AppState) {
 }
 
 fn request_quit(state: &mut AppState, effect_dispatcher: &EffectDispatcher) {
-    let cancellation_requested = state
-        .pending_effect(EffectLane::RemoteEdit)
-        .is_some_and(|id| effect_dispatcher.cancel(id));
+    let mut cancellation_requested = false;
+    for lane in [EffectLane::RemoteEdit, EffectLane::QuickAction] {
+        if state
+            .pending_effect(lane)
+            .is_some_and(|id| effect_dispatcher.cancel(id))
+        {
+            cancellation_requested = true;
+        }
+    }
+
     state.apply(Action::Quit);
+
     if cancellation_requested {
-        state.message =
-            Some("Remote edit cancellation requested — waiting for safe cleanup".into());
+        state.message = Some("Cancellation requested — waiting for a safe terminal outcome".into());
     }
 }
 
@@ -5630,6 +5689,82 @@ fn build_s3_copy_spec(
             local_source: local_path.join(filename),
             destination,
         })
+    }
+}
+
+fn display_safe_text(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\n' => safe.push_str("\\n"),
+            '\r' => safe.push_str("\\r"),
+            '\t' => safe.push_str("\\t"),
+            ch if ch.is_control() => {
+                safe.push_str(&format!("\\u{{{:x}}}", ch as u32));
+            }
+            ch => safe.push(ch),
+        }
+    }
+    safe
+}
+
+fn collect_quick_action_names(
+    state: &AppState,
+    focused: Option<&Entry>,
+    active_entries: &[&Entry],
+    files_only: bool,
+) -> Result<Vec<String>, String> {
+    let location = &state.active_pane().location;
+    let names = if let Some(selected) = state.selection_names(state.active, location) {
+        selected.iter().cloned().collect::<Vec<_>>()
+    } else if let Some(entry) = focused {
+        vec![entry.name.clone()]
+    } else {
+        return Err("Select a file or directory first".into());
+    };
+
+    for name in &names {
+        let Some(entry) = active_entries
+            .iter()
+            .copied()
+            .find(|entry| entry.name.as_str() == name.as_str())
+        else {
+            return Err(format!("Selection is stale: {}", display_safe_text(name)));
+        };
+
+        if files_only && entry.kind != EntryKind::File {
+            return Err(format!(
+                "SHA-256 requires regular files; {} is not a regular file",
+                display_safe_text(name)
+            ));
+        }
+    }
+
+    Ok(names)
+}
+
+fn quick_action_refresh_location(event: &EffectEvent, scope: &EffectScope) -> Option<Location> {
+    let may_have_mutated = match event {
+        EffectEvent::QuickActionFinished { result } => match result {
+            Ok(QuickActionOutcome::Touched { .. }) | Ok(QuickActionOutcome::Compressed { .. }) => {
+                true
+            }
+            Ok(QuickActionOutcome::Sha256 { .. }) => false,
+            Err(failure) => matches!(
+                failure.action,
+                QuickActionKind::Touch | QuickActionKind::CompressTarGz
+            ),
+        },
+        _ => false,
+    };
+
+    if !may_have_mutated {
+        return None;
+    }
+
+    match scope {
+        EffectScope::Location(location) => Some(location.clone()),
+        EffectScope::Global | EffectScope::Workspace { .. } => None,
     }
 }
 
@@ -5694,6 +5829,79 @@ async fn dispatch_ui_action(
         }
         Action::ToggleSelect => {
             toggle_selection_and_advance(state, focused, visible_count);
+        }
+        Action::ComputeSha256 => {
+            if state.pending_effect(EffectLane::QuickAction).is_some() {
+                state.message = Some("Another Quick Action is still in progress".into());
+                return Ok(());
+            }
+
+            let Location::Local(dir) = state.active_pane().location.clone() else {
+                state.message = Some("Quick Actions are currently local-only".into());
+                return Ok(());
+            };
+
+            let names = match collect_quick_action_names(state, focused, active_entries, true) {
+                Ok(names) => names,
+                Err(message) => {
+                    state.message = Some(message);
+                    return Ok(());
+                }
+            };
+
+            let location = Location::Local(dir.clone());
+            let id = effect_dispatcher.dispatch(
+                EffectLane::QuickAction,
+                EffectScope::Location(location),
+                Effect::QuickAction {
+                    request: QuickActionRequest::Sha256 { dir, names },
+                },
+            );
+            state.register_effect(EffectLane::QuickAction, id);
+            state.message = Some("Computing SHA-256…".into());
+        }
+        Action::TouchFile => {
+            if state.pending_effect(EffectLane::QuickAction).is_some() {
+                state.message = Some("Another Quick Action is still in progress".into());
+                return Ok(());
+            }
+
+            let Location::Local(dir) = state.active_pane().location.clone() else {
+                state.message = Some("Quick Actions are currently local-only".into());
+                return Ok(());
+            };
+
+            state.pending_mkdir_location = None;
+            state.pending_quick_action_prompt = Some(QuickActionPrompt::Touch { dir });
+            state.cmd.clear();
+            state.cmd_input = true;
+            state.message = Some("Touch file: enter child name".into());
+        }
+        Action::CompressTarGz => {
+            if state.pending_effect(EffectLane::QuickAction).is_some() {
+                state.message = Some("Another Quick Action is still in progress".into());
+                return Ok(());
+            }
+
+            let Location::Local(dir) = state.active_pane().location.clone() else {
+                state.message = Some("Quick Actions are currently local-only".into());
+                return Ok(());
+            };
+
+            let names = match collect_quick_action_names(state, focused, active_entries, false) {
+                Ok(names) => names,
+                Err(message) => {
+                    state.message = Some(message);
+                    return Ok(());
+                }
+            };
+
+            state.pending_mkdir_location = None;
+            state.pending_quick_action_prompt =
+                Some(QuickActionPrompt::CompressTarGz { dir, names });
+            state.cmd = "archive.tar.gz".into();
+            state.cmd_input = true;
+            state.message = Some("Compress: enter output tar.gz name".into());
         }
         Action::ViewFile => {
             let Some(listed) = focused_listed.filter(|listed| listed.entry.kind == EntryKind::File)
@@ -6081,6 +6289,7 @@ async fn dispatch_ui_action(
             state.clear_selection();
         }
         Action::Mkdir => {
+            state.pending_quick_action_prompt = None;
             let provider_id = state.active_pane().location.provider_id();
             if provider_id == arx::vfs::ProviderId::Sftp {
                 // SFTP: use provider-backed mkdir via frozen location
@@ -6930,6 +7139,43 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
         EffectEvent::PathOpened { path } => {
             state.message = Some(format!("Opened {}", path.display()));
         }
+        EffectEvent::QuickActionFinished { result } => match result {
+            Ok(QuickActionOutcome::Sha256 { checksums, .. }) => {
+                let count = checksums.len();
+                state.viewer_content = checksums
+                    .into_iter()
+                    .map(|checksum| {
+                        format!("{}  {}", checksum.sha256, display_safe_text(&checksum.name))
+                    })
+                    .collect();
+                state.viewer_scroll = 0;
+                state.message = Some(format!("SHA-256 computed for {count} file(s)"));
+            }
+            Ok(QuickActionOutcome::Touched { path }) => {
+                state.message = Some(format!(
+                    "Touched {}",
+                    display_safe_text(path.to_string_lossy().as_ref())
+                ));
+            }
+            Ok(QuickActionOutcome::Compressed { path, entries }) => {
+                state.message = Some(format!(
+                    "Created {} from {entries} entr{}",
+                    display_safe_text(path.to_string_lossy().as_ref()),
+                    if entries == 1 { "y" } else { "ies" }
+                ));
+            }
+            Err(failure) => {
+                if failure.kind == QuickActionFailureKind::Cancelled {
+                    state.message = Some(format!("{} cancelled", failure.action.label()));
+                } else {
+                    state.message = Some(format!(
+                        "{} failed: {}",
+                        failure.action.label(),
+                        display_safe_text(&failure.message)
+                    ));
+                }
+            }
+        },
         EffectEvent::Downloaded { session } => {
             let download_name = &session.name;
             state.message = Some(format!("Downloaded: {download_name}"));
@@ -7108,6 +7354,7 @@ fn handle_effect_response(
     if !state.accepts_effect(response.id, response.lane, &response.scope) {
         return;
     }
+    let quick_action_refresh = quick_action_refresh_location(&response.event, &response.scope);
     let refresh_origin = if matches!(
         &response.event,
         EffectEvent::WrittenBack { .. } | EffectEvent::WrittenBackWarning { .. }
@@ -7129,6 +7376,14 @@ fn handle_effect_response(
         && pane_still_at_location(state, pane, &location)
     {
         schedule_pane_load(pane_loader, state, pane);
+    }
+
+    if let Some(location) = quick_action_refresh {
+        for pane in [Pane::Left, Pane::Right] {
+            if pane_still_at_location(state, pane, &location) {
+                schedule_pane_load(pane_loader, state, pane);
+            }
+        }
     }
 
     match response.lane {
@@ -10642,5 +10897,76 @@ mod tests {
             identity: EntryIdentity::Other,
         };
         assert!(VisiblePaneRow::Listed(&listed).listed().is_some());
+    }
+}
+
+#[cfg(test)]
+mod pack_o_quick_action_tests {
+    use super::*;
+
+    #[test]
+    fn display_safe_text_escapes_controls_but_preserves_unicode() {
+        assert_eq!(
+            display_safe_text("a\nb\tc\rd\u{1b}ü"),
+            "a\\nb\\tc\\rd\\u{1b}ü"
+        );
+    }
+
+    #[test]
+    fn sha_name_collection_rejects_directory_and_stale_selection() {
+        let state = AppState::default();
+        let directory = Entry {
+            name: "dir".into(),
+            kind: EntryKind::Directory,
+            size: None,
+            modified_unix_ms: None,
+        };
+        let entries = [&directory];
+
+        let error =
+            collect_quick_action_names(&state, Some(&directory), &entries, true).unwrap_err();
+        assert!(error.contains("requires regular files"));
+
+        let mut state = AppState::default();
+        let location = state.active_pane().location.clone();
+        state.toggle_selection(state.active, &location, "missing\nname");
+
+        let file = Entry {
+            name: "present".into(),
+            kind: EntryKind::File,
+            size: Some(1),
+            modified_unix_ms: None,
+        };
+        let entries = [&file];
+
+        let error = collect_quick_action_names(&state, Some(&file), &entries, true).unwrap_err();
+        assert!(error.contains("Selection is stale"));
+        assert!(error.contains("missing\\nname"));
+        assert!(!error.contains("missing\nname"));
+    }
+
+    #[test]
+    fn sha_result_presentation_escapes_filename_controls() {
+        let mut state = AppState::default();
+
+        apply_effect_event(
+            &mut state,
+            EffectLane::QuickAction,
+            EffectEvent::QuickActionFinished {
+                result: Ok(QuickActionOutcome::Sha256 {
+                    dir: PathBuf::from("/tmp"),
+                    checksums: vec![arx::services::ChecksumResult {
+                        name: "bad\nname ü".into(),
+                        sha256: "abc123".into(),
+                    }],
+                }),
+            },
+        );
+
+        assert_eq!(
+            state.viewer_content,
+            vec!["abc123  bad\\nname ü".to_string()]
+        );
+        assert_eq!(state.viewer_scroll, 0);
     }
 }

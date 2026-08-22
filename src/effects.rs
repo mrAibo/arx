@@ -4,6 +4,7 @@
 /// such as `ProcessService` is allowed to perform the external operation.
 use std::path::PathBuf;
 
+use crate::services::{QuickActionFailure, QuickActionOutcome, QuickActionRequest};
 use crate::vfs::{ListedEntry, Location, RemoteEditProgressFn, RemoteEditSession};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,9 @@ pub enum Effect {
     PreviewLocation {
         location: Location,
         listed: ListedEntry,
+    },
+    QuickAction {
+        request: QuickActionRequest,
     },
     /// Download a remote file to a secure temp directory for editing.
     DownloadRemoteFile {
@@ -108,6 +112,9 @@ pub enum EffectEvent {
     },
     PathOpened {
         path: PathBuf,
+    },
+    QuickActionFinished {
+        result: Result<QuickActionOutcome, QuickActionFailure>,
     },
     /// Remote file downloaded to temp path for editing.
     Downloaded {

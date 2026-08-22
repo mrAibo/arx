@@ -12,7 +12,7 @@ use tokio::process::Command;
 use crate::effects::{Effect, EffectEvent, ProgressSlot};
 use crate::services::{
     DesktopService, DiffService, FileInfoService, InfrastructureService, PreviewService,
-    TreeService, preview,
+    QuickActionService, TreeService, preview,
 };
 use crate::vfs::{
     CancellationFlag, MAX_REMOTE_EDIT_BYTES, ProviderRegistry, RemoteEditSession, RemoteEditState,
@@ -163,6 +163,10 @@ impl ProcessService {
             | Effect::TreeSnapshot { .. }
             | Effect::PreviewFile { .. }
             | Effect::OpenPath { .. }) => Self::execute(e).await,
+
+            Effect::QuickAction { request } => EffectEvent::QuickActionFinished {
+                result: QuickActionService::execute(request, cancellation).await,
+            },
 
             Effect::PreviewLocation { location, listed } => {
                 let name = &listed.entry.name;

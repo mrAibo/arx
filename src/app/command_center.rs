@@ -418,3 +418,31 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod pack_o_quick_action_tests {
+    use super::*;
+
+    #[test]
+    fn quick_actions_are_typed_command_center_actions() {
+        let state = AppState::default();
+
+        let cases = [
+            ("sha-256", Action::ComputeSha256),
+            ("touch file", Action::TouchFile),
+            ("compress", Action::CompressTarGz),
+        ];
+
+        for (query, action) in cases {
+            let items =
+                build_command_items_with_file_context(query, &state, Some(EntryKind::File), true);
+
+            let item = items
+                .iter()
+                .find(|item| item.target == CommandTarget::Action(action))
+                .unwrap_or_else(|| panic!("{action:?} missing from Command Center"));
+
+            assert!(item.availability.is_available());
+        }
+    }
+}

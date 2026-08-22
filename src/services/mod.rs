@@ -6,6 +6,7 @@ mod infrastructure;
 mod mutation;
 mod pane_loader;
 pub mod preview;
+mod quick_actions;
 mod tree;
 mod workspace_scanner;
 mod workspace_sync_controller;
@@ -21,6 +22,10 @@ pub use pane_loader::{
     PaneLoader, PaneNextPageResponse, PanePageRequestId,
 };
 pub use preview::{PreviewService, format_bounded_preview};
+pub use quick_actions::{
+    ChecksumResult, QuickActionFailure, QuickActionFailureKind, QuickActionKind,
+    QuickActionOutcome, QuickActionRequest, QuickActionService,
+};
 pub use tree::TreeService;
 pub use workspace_scanner::scan_workspace;
 pub use workspace_scanner::{

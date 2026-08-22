@@ -163,6 +163,28 @@ fn copy_pair_supported(active: ProviderId, passive: ProviderId) -> bool {
 
 pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailability {
     match id {
+        ActionId::ComputeSha256 | ActionId::TouchFile | ActionId::CompressTarGz
+            if ctx.active_provider != ProviderId::Local =>
+        {
+            ActionAvailability::Disabled {
+                reason: "Quick Actions are currently local-only".into(),
+            }
+        }
+        ActionId::ComputeSha256
+            if ctx.selection_count == 0 && ctx.focused_kind != Some(EntryKind::File) =>
+        {
+            ActionAvailability::Disabled {
+                reason: "Select a regular file to hash".into(),
+            }
+        }
+        ActionId::ComputeSha256 => ActionAvailability::Available,
+        ActionId::TouchFile => ActionAvailability::Available,
+        ActionId::CompressTarGz if ctx.selection_count == 0 && ctx.focused_kind.is_none() => {
+            ActionAvailability::Disabled {
+                reason: "Select a file or directory to compress".into(),
+            }
+        }
+        ActionId::CompressTarGz => ActionAvailability::Available,
         ActionId::BeginSymlink => {
             require_active_capability(ctx, Capability::Symlink, "Symbolic links")
         }
@@ -226,10 +248,9 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
                     reason: "Select a file or directory to copy".into(),
                 }
             } else if copy_pair_supported(ctx.active_provider, ctx.passive_provider) {
-                // TransferPlanner supports exactly Local→Local, Local→SFTP,
-                // and SFTP→Local. Every other pair (any S3 side, Archive,
-                // SFTP→SFTP, WebDAV) is disabled because the planner cannot
-                // execute it.
+                // copy_pair_supported is the exact executable Copy surface:
+                // Local↔Local, Local↔SFTP and Local↔S3. Other provider pairs
+                // remain disabled until their planners are implemented safely.
                 ActionAvailability::Available
             } else {
                 ActionAvailability::Disabled {
@@ -1188,5 +1209,58 @@ mod tests {
             action_availability(ActionId::EditFile, &ctx),
             ActionAvailability::Disabled { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod pack_o_quick_action_tests {
+    use super::*;
+
+    #[test]
+    fn quick_actions_fail_closed_on_remote_provider() {
+        let mut state = AppState::default();
+        state.left.location = Location::Sftp {
+            host: "demo".into(),
+            path: "/tmp".into(),
+        };
+
+        let ctx = ActionContext::from_state(&state).with_file_context(Some(EntryKind::File), true);
+
+        for action in [
+            ActionId::ComputeSha256,
+            ActionId::TouchFile,
+            ActionId::CompressTarGz,
+        ] {
+            let availability = action_availability(action, &ctx);
+            assert!(
+                !availability.is_available(),
+                "{action:?} must be local-only"
+            );
+            assert_eq!(
+                availability.reason(),
+                Some("Quick Actions are currently local-only")
+            );
+        }
+    }
+
+    #[test]
+    fn local_quick_action_target_rules_are_explicit() {
+        let state = AppState::default();
+
+        let file = ActionContext::from_state(&state).with_file_context(Some(EntryKind::File), true);
+        assert!(action_availability(ActionId::ComputeSha256, &file).is_available());
+        assert!(action_availability(ActionId::TouchFile, &file).is_available());
+        assert!(action_availability(ActionId::CompressTarGz, &file).is_available());
+
+        let directory =
+            ActionContext::from_state(&state).with_file_context(Some(EntryKind::Directory), true);
+        assert!(!action_availability(ActionId::ComputeSha256, &directory).is_available());
+        assert!(action_availability(ActionId::TouchFile, &directory).is_available());
+        assert!(action_availability(ActionId::CompressTarGz, &directory).is_available());
+
+        let empty = ActionContext::from_state(&state).with_file_context(None, true);
+        assert!(action_availability(ActionId::TouchFile, &empty).is_available());
+        assert!(!action_availability(ActionId::ComputeSha256, &empty).is_available());
+        assert!(!action_availability(ActionId::CompressTarGz, &empty).is_available());
     }
 }

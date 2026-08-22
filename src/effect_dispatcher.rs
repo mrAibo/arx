@@ -19,6 +19,7 @@ pub struct EffectId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EffectLane {
     GlobalProcess,
+    QuickAction,
     TmuxDiscovery,
     GitStatus,
     Preview,

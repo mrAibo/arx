@@ -49,7 +49,9 @@ equivalent); ARX does not create an X11 tunnel after login.
 
 ### From source
 
-Rust 1.88+ and system OpenSSH are required.
+Rust 1.88+ and system OpenSSH are required. The built-in **Compress to tar.gz** Quick
+Action additionally requires a system `tar` executable; SHA-256 and Touch do not use a
+shell command.
 
 ```bash
 cargo install --git https://github.com/mrAibo/arx
@@ -94,7 +96,10 @@ arx --version
 Release bundles include the ARX MIT license and a generated third-party license
 report. Native packages install the documentation under `/usr/share/doc/arx`.
 
-Preview features use `bat`, `chafa`, `pdftotext`, `ffprobe`, and archive utilities when available. No other packages are required for the published binary.
+Preview features use `bat`, `chafa`, `pdftotext`, `ffprobe`, and archive utilities when
+available. These helpers are optional. **Compress to tar.gz** specifically requires
+system `tar`; if it is unavailable ARX reports that fact instead of falling back to a
+shell-string implementation.
 
 ## 60-second Remote Workspace workflow
 
@@ -255,7 +260,7 @@ extension mechanism. ARX does not ship an embedded Lua or WASM plugin runtime.
 | ~/.ssh/config parsing (aliases, ProxyJump, keys) | ✅ |
 | Managed SSH Host Manager (F12: add/edit/delete/test/identity/open) | ✅ |
 | Command Center (Ctrl+P) — fuzzy search | ✅ |
-| Quick Actions — mkdir/chmod/symlink + user menu shipped; typed compress/touch/SHA-256 remain #9 | ⚠️ Partial |
+| Quick Actions — typed local SHA-256 / Touch / Compress to tar.gz plus mkdir/chmod/symlink; user menu remains the separate extension surface | ✅ |
 | Preview engine — chafa, pdftotext, ffprobe, 7z, bat | ✅ |
 | Background jobs with progress | ✅ |
 | Embedded Terminal (Ctrl+X T) | ✅ |
@@ -273,6 +278,24 @@ extension mechanism. ARX does not ship an embedded Lua or WASM plugin runtime.
 
 The partial rows above are intentionally explicit. They reflect the current shared
 Action Catalog/runtime rather than old issue titles or prototype code.
+
+## Typed local Quick Actions
+
+Quick Actions are built-in typed actions discovered through **Ctrl+P Command Center**;
+they do not consume a new global shortcut namespace and they fail closed outside a
+Local pane.
+
+- **Compute SHA-256** hashes the focused or selected regular file(s) in Rust and keeps
+  each digest associated with its exact filename.
+- **Touch file** prompts for one child name, rejects traversal/absolute names and uses
+  `O_NOFOLLOW` plus `futimens` on the exact opened regular file.
+- **Compress to tar.gz** freezes the selected/focused entry names, invokes system `tar`
+  with typed argv and `--` before filenames, stages in the destination directory, and
+  finalizes with noclobber semantics so an existing archive is never replaced.
+
+Long work runs through a dedicated correlated Effect lane rather than blocking the TUI.
+Quit requests cancellation and waits for a terminal outcome. Filenames and tool errors
+are escaped for control characters before presentation while printable Unicode is kept.
 
 ## Transfer Queue
 
@@ -399,7 +422,7 @@ TUI ──▶ Input / Keymap
  VFS    Process  Executors
 ```
 
-Async interactive work uses correlated Effects (Preview, RemoteEdit).
+Async interactive work uses correlated Effects (Preview, RemoteEdit, QuickAction).
 Transfers, sync, storage scans, and job-oriented mutations use the Job Manager.
 
 ```
@@ -442,8 +465,9 @@ use transactional staging (temp → backup → commit → rollback).
 **Safety:** SFTP copies stage to temp first. Destructive sync requires
 Preview. Cancel leaves source untouched. Host key verification uses the
 user's OpenSSH. WebDAV overwrite-forbid is atomic at the HTTP/file-finalization
-boundaries. Transfer retries are phase-aware and never blindly replay ambiguous
-mutations. Logs don't leak credentials.
+boundaries. Typed Quick Actions do not interpolate filenames into shell strings;
+archive creation stages and finalizes noclobber. Transfer retries are phase-aware and
+never blindly replay ambiguous mutations. Logs don't leak credentials.
 
 ## Development
 
