@@ -133,7 +133,7 @@ The patch must not touch keymaps, commander hitbox helpers, provider/VFS contrac
 
 ## Audit checkpoint
 
-The code patch for the next run is not being issued until every mutation/result/cancellation seam above is represented in one compile-complete change set. This checkpoint exists specifically to avoid another mechanical runner cycle caused by an artificial step boundary or an unconsumed enum variant.
+The complete graph audit is finished. No further code should be added to this branch before the deterministic O6+O7 integration run. The next runner must implement the full atomic patch scope above and verify every changed file plus all compile/test gates before committing.
 
 ## Next step
 
