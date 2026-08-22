@@ -162,7 +162,7 @@ of truth.
 
 | Key | Action |
 |-----|--------|
-| Ctrl+P | Command Center — fuzzy search hosts, bookmarks, history, quick actions |
+| Ctrl+P | Command Center — fuzzy search actions, hosts, bookmarks, history, and user-menu commands |
 | F9 | Remote Hosts |
 | Ctrl+B | Bookmarks |
 | Ctrl+J | Job queue with progress and transfer Pause/Resume/Cancel |
@@ -249,14 +249,14 @@ Menu entries appear in Command Center (Ctrl+P).
 | ~/.ssh/config parsing (aliases, ProxyJump, keys) | ✅ |
 | Managed SSH Host Manager (F12: add/edit/delete/test/identity/open) | ✅ |
 | Command Center (Ctrl+P) — fuzzy search | ✅ |
-| Quick Actions — compress, chmod, touch, mkdir, symlink, sha256 | ✅ |
+| Quick Actions — mkdir/chmod/symlink + user menu shipped; typed compress/touch/SHA-256 remain #9 | ⚠️ Partial |
 | Preview engine — chafa, pdftotext, ffprobe, 7z, bat | ✅ |
 | Background jobs with progress | ✅ |
 | Embedded Terminal (Ctrl+X T) | ✅ |
-| tmux sessions (Command Center) | ✅ |
-| Mouse — right-click menu, drag multi-select, scroll | ✅ |
+| tmux/screen integration — tmux discovery/attach shipped; screen discovery/lifecycle remain #7 | ⚠️ Partial |
+| Mouse — right-click + drag-select shipped; pane wheel/Shift+Click/context availability remain #10 | ⚠️ Partial |
 | Directory diff + content diff (Ctrl+D) | ✅ |
-| Split pane toggle (Ctrl+\\\\) | ✅ |
+| Split panes — vertical split/focus shipped; horizontal/resize/explicit close remain #16 | ⚠️ Partial |
 | MC-style Ctrl+X prefix (symlink, hardlink, chmod, chown) | ✅ |
 | User menu with custom scripts | ✅ |
 | Host Center (F9) | ✅ |
@@ -264,6 +264,10 @@ Menu entries appear in Command Center (Ctrl+P).
 | S3 object-storage backend | ✅ AWS + MinIO PHYSICAL PASS (SUPPORTED MVP); Moto EMULATED PASS; R2/Wasabi UNVERIFIED (best-effort) |
 | WebDAV backend | ✅ **SUPPORTED MVP** — Apache mod_dav PHYSICAL PASS (W1–W18); Basic auth only; Nextcloud/ownCloud UNVERIFIED |
 | Native Linux release packages | ✅ tar.gz + `.deb` + `.rpm`, one validated ELF + SHA256SUMS |
+
+The partial rows above are intentionally explicit. They reflect the current shared
+Action Catalog/runtime rather than old issue titles or prototype code. PACK M tracks
+the reconciliation in #174.
 
 ## Transfer Queue
 
