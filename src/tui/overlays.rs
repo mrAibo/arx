@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use arx::app::{AppState, CommandKind};
 
-use super::centered_rect;
+use super::{centered_rect, centered_rect_lines};
 
 pub(super) fn render_session_callout(frame: &mut Frame, area: Rect, text: &str) {
     frame.render_widget(
@@ -250,7 +250,7 @@ pub(super) fn render_bookmarks(frame: &mut Frame, area: Rect, state: &AppState) 
 pub(super) fn render_infrastructure_center(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let lines = &state.infrastructure_lines;
     let h = (lines.len().max(1) + 3).min(30) as u16;
-    let popup = centered_rect(80, h, area);
+    let popup = centered_rect_lines(80, h, area);
     frame.render_widget(Clear, popup);
     let items: Vec<ListItem> = lines.iter().map(|l| ListItem::new(l.as_str())).collect();
     let list = ratatui::widgets::List::new(items)
@@ -266,7 +266,7 @@ pub(super) fn render_infrastructure_center(frame: &mut Frame, area: Rect, state:
 pub(super) fn render_smart_tree(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let tl = &state.tree_lines;
     let h = (tl.len().max(1) + 3).min(30) as u16;
-    let popup = centered_rect(80, h, area);
+    let popup = centered_rect_lines(80, h, area);
     frame.render_widget(Clear, popup);
     let items: Vec<ListItem> = tl.iter().map(|l| ListItem::new(l.as_str())).collect();
     let title = format!(
@@ -281,7 +281,7 @@ pub(super) fn render_smart_tree(frame: &mut Frame, area: Rect, state: &mut AppSt
 
 pub(super) fn render_command_center(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let h = (state.command_matches.len().max(1) + 3).min(20) as u16;
-    let popup = centered_rect(70, h, area);
+    let popup = centered_rect_lines(70, h, area);
     frame.render_widget(Clear, popup);
     let items: Vec<ListItem> = state
         .command_matches
@@ -317,7 +317,7 @@ pub(super) fn render_command_center(frame: &mut Frame, area: Rect, state: &mut A
 }
 
 pub(super) fn render_context_menu(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(18, 7, area);
+    let popup = centered_rect_lines(18, 8, area);
     frame.render_widget(Clear, popup);
     let items: Vec<ListItem> = [
         "Copy   F5",
