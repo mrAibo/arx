@@ -15,7 +15,7 @@ Decompose `src/tui.rs` incrementally so rendering, feature orchestration, input 
 
 ## Sequence
 
-- [ ] P0 — characterization baseline for the seams that move first
+- [x] P0 — characterization baseline for the seams that move first
 - [ ] P1 — pure presentation-model extraction into `src/tui/` submodules
 - [ ] P2 — frame/render-only extraction
 - [ ] P3 — feature-controller extraction in independently green slices
@@ -24,30 +24,35 @@ Decompose `src/tui.rs` incrementally so rendering, feature orchestration, input 
 - [ ] P6 — thin runtime/event-loop composition root
 - [ ] P7 — docs/final exact-head acceptance and PACK P closure
 
-## First transaction: P0 + P1a
+## Completed: P0 + P1a
 
-The first code PR is deliberately narrow.
+The first code transaction was deliberately narrow and is complete.
 
-### P0 characterization
+PR #186 accepted exact head `43f70e8eb535c0eab7a658b7368a3970a131540a` with CI #644 / run `32589046943` fully green: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance.
 
-Add semantic tests before moving the first presentation helpers. Pin representative behavior for:
+Squash merge on `main`: `32f649816adb3e04b0d9f415ac352601a9b699a4`.
 
-- workspace ribbon phase/text in commander, differences, preview/running/verifying and terminal verification states;
-- provider identity used by the ribbon, including provider-native S3/WebDAV display truth where applicable;
-- session callout text and its embed/suppress rule;
-- existing footer/command-bar tests remain unchanged and green;
-- existing Quick Action / Remote Edit safe-quit tests remain unchanged and green;
-- existing S3 fail-closed selection/identity regressions remain unchanged and green.
+P0 added semantic characterization for the workspace ribbon while existing session-callout, footer/command-bar, Quick Action / Remote Edit safety, and S3 identity/selection regressions remained green.
 
-Avoid enormous full-screen golden snapshots in this first slice. Prefer direct semantic assertions against the existing output-model helpers so later moves can prove behavior identity without coupling tests to terminal padding.
+P1a created `src/tui/presentation.rs` and moved only the workspace ribbon and session-callout presentation model. Frame rendering, routing, Action dispatch, Effect/Job handling, provider execution, and feature-controller ownership remained in `src/tui.rs`.
 
-### P1a extraction
+P1 remains open because additional presentation-only seams may still move as later rendering slices expose them.
 
-Retain `src/tui.rs` as the module/composition root and create a child module under `src/tui/`. Move only presentation-model helpers with no backend/process/job mutation authority.
+## Active transaction: P2a leaf overlays
 
-Initial candidates are the workspace ribbon and session-callout presentation helpers. Do not move the event loop, Action dispatch, Effect handling, Job handling, provider execution, key routing, or frame rendering in P1a.
+Tracked by #187.
 
-The extraction is allowed to use `pub(super)` only where the parent `tui` module needs the helper. Do not create a public library API.
+Extract only leaf frame/render helpers into `src/tui/overlays.rs`:
+
+- `render_session_callout`
+- `render_help`
+- `help_full_lines`
+- `render_viewer`
+- `render_bookmarks`
+
+This transaction may preserve the existing `help_scroll` clamp mutation because it is UI-only state. It must not move or change `render()` itself, pane rendering/state, command-bar hitboxes, Which-Key, sync-preview rendering, Hosts/SSH orchestration, event routing, Action dispatch, Effect/Job handling, or provider behavior.
+
+Use focused semantic/render characterization rather than whole-screen golden snapshots.
 
 ## Acceptance
 
@@ -55,6 +60,7 @@ Every extraction must pass locally and on exact PR head:
 
 ```bash
 cargo fmt --check
+cargo check --locked --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
 cargo +1.88 check --locked --all-features
