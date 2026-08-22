@@ -133,7 +133,7 @@ The patch must not touch keymaps, commander hitbox helpers, provider/VFS contrac
 
 ## Audit checkpoint
 
-The complete graph audit is finished. No further code should be added to this branch before the deterministic O6+O7 integration run. The next runner must implement the full atomic patch scope above and verify every changed file plus all compile/test gates before committing.
+The complete graph audit is finished. The next repository mutation must be the deterministic O6+O7 implementation run itself; no further documentation-only head movement is needed before that run. The runner is expected to pin the PR head obtained immediately before execution.
 
 ## Next step
 
