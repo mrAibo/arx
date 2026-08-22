@@ -9810,6 +9810,144 @@ mod tests {
     }
 
     #[test]
+    fn leaf_overlay_session_callout_render_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render_session_callout(f, f.area(), "✓ characterization");
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let text = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_owned())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(text.contains("✓ characterization"));
+    }
+
+    #[test]
+    fn leaf_overlay_help_scroll_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Phase 1 — bottom clamp characterization (render_help unchanged).
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            help_scroll: usize::MAX,
+            ..Default::default()
+        };
+
+        terminal
+            .draw(|f| render_help(f, f.area(), &mut state))
+            .unwrap();
+        assert!(state.help_scroll != usize::MAX);
+
+        let bottom = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_owned())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(bottom.contains("Help"));
+        assert!(bottom.contains("q/Esc/F1:close"));
+
+        // Phase 2 — top content reachable at scroll 0.
+        state.help_scroll = 0;
+        let backend2 = TestBackend::new(120, 24);
+        let mut terminal2 = Terminal::new(backend2).unwrap();
+        terminal2
+            .draw(|f| render_help(f, f.area(), &mut state))
+            .unwrap();
+        assert_eq!(state.help_scroll, 0);
+
+        let top = terminal2
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_owned())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(top.contains("ARX Help"));
+    }
+
+    #[test]
+    fn leaf_overlay_viewer_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            viewer_content: vec!["alpha".into(), "beta".into(), "gamma".into()],
+            viewer_scroll: 1,
+            ..Default::default()
+        };
+
+        terminal
+            .draw(|f| render_viewer(f, f.area(), &state))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let text = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_owned())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(text.contains("View (3 lines, 33%)"));
+        assert!(text.contains("1/2 | j/k:scroll q/Esc:close"));
+        assert!(text.contains("beta"));
+    }
+
+    #[test]
+    fn leaf_overlay_bookmarks_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            bookmarks: vec![
+                Location::Local("/tmp/one".into()),
+                Location::Local("/tmp/two".into()),
+            ],
+            bookmark_cursor: 1,
+            ..Default::default()
+        };
+
+        terminal
+            .draw(|f| render_bookmarks(f, f.area(), &state))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let text = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_owned())
+            .collect::<Vec<_>>()
+            .join("");
+
+        let first = Location::Local("/tmp/one".into()).to_string();
+        let second = Location::Local("/tmp/two".into()).to_string();
+        assert!(text.contains(&first), "first location not displayed");
+        assert!(
+            text.contains(&format!("> {second}")),
+            "second location not displayed with cursor marker"
+        );
+    }
+
+    #[test]
     fn workspace_ribbon_commander_and_direction_characterization() {
         let mut state = AppState::default();
 
