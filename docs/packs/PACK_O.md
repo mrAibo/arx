@@ -112,6 +112,10 @@ The next code run must close the whole existing type/lifecycle graph in one patc
 13. Cargo.lock may only add the existing direct `sha2` root dependency; no version/checksum/package churn.
 14. Tests must cover local-only availability, Command Center discovery, mutation-result acceptance after navigation, Quit blocking, control-character escaping and the Touch pre-mutation cancellation boundary.
 
+## Audit checkpoint
+
+The code patch for the next run is not being issued until every mutation/result/cancellation seam above is represented in one compile-complete change set. This checkpoint exists specifically to avoid another mechanical runner cycle caused by an artificial step boundary or an unconsumed enum variant.
+
 ## Next step
 
 Build one deterministic O6+O7 integration runner against the new documentation-only exact head. It may touch `src/tui.rs`, but only for the minimal PACK O wiring listed above; no function extraction, module movement, renderer refactor, input architecture refactor or other PACK P work is allowed. The runner must apply all code changes transactionally, run `cargo fmt` and an initial all-features compile before any commit, then run the full O8 gates before push.
