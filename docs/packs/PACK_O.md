@@ -53,6 +53,19 @@ The earlier Draft runs CI #620 / Release #91 were intentionally non-authoritativ
 
 Only exact-head green runs after O6–O9 are completed count as acceptance evidence.
 
+## O6 execution log
+
+### Attempt 1 — hard stop, no code commit
+
+The first deterministic O6 runner started from exact head `de2982999a09d943584d7d746d785ab979f978b2` and correctly stopped before formatting/check/test/commit because one `src/app/mod.rs` anchor matched zero times. Hermes restored the worktree to the exact clean starting head; no partial code changes were committed or pushed.
+
+Two defects were identified in the runner itself:
+
+1. the `accepts_effect` comment anchor used `conflict/resolution information`, while the repository text is `conflict or recovery instructions`;
+2. the replacement guard for `Action::Quit` omitted the required `||` between the RemoteEdit and QuickAction pending-effect conditions.
+
+Both defects are in the runner specification, not in repository code. O6 remains unchecked until the corrected deterministic runner completes all gates and pushes one clean integration commit.
+
 ## Next step
 
-O6: complete the non-TUI integration first. The large `src/tui.rs` patch remains a separate O7 step so compile failures can be attributed precisely and the later PACK P refactor is not mixed into this feature PR.
+Re-run O6 from the new documentation-only exact head with the two runner defects corrected. The large `src/tui.rs` patch remains a separate O7 step so compile failures can be attributed precisely and the later PACK P refactor is not mixed into this feature PR.
