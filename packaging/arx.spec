@@ -5,6 +5,7 @@
 # Keep the package payload exact. rpmbuild otherwise injects a /usr/lib/.build-id
 # symlink that is outside ARX's executable/docs release contract.
 %global _build_id_links none
+# Release CI independently verifies the extracted RPM file/symlink manifest.
 
 Name:           arx
 Version:        %{arx_version}
