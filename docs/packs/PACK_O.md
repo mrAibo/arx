@@ -9,6 +9,7 @@ This file is the live implementation record for PACK O and PR #179. It is update
 - PACK O branch: `feat/pack-o-typed-quick-actions`
 - Handoff merge brought into the branch at `6b6e8f91bb8c90bead805009af78469e03527610`
 - Tracking: #9, #178, PR #179
+- Exact documentation/audit head before the next code run: `59d5f4874cf15ba78904d50585db42df2a3ff0a3`
 
 ## Scope
 
@@ -118,4 +119,4 @@ The code patch for the next run is not being issued until every mutation/result/
 
 ## Next step
 
-Build one deterministic O6+O7 integration runner against the new documentation-only exact head. It may touch `src/tui.rs`, but only for the minimal PACK O wiring listed above; no function extraction, module movement, renderer refactor, input architecture refactor or other PACK P work is allowed. The runner must apply all code changes transactionally, run `cargo fmt` and an initial all-features compile before any commit, then run the full O8 gates before push.
+Build one deterministic O6+O7 integration runner against the exact head recorded in Baseline. It may touch `src/tui.rs`, but only for the minimal PACK O wiring listed above; no function extraction, module movement, renderer refactor, input architecture refactor or other PACK P work is allowed. The runner must apply all code changes transactionally, run `cargo fmt` and an initial all-features compile before any commit, then run the full O8 gates before push.
