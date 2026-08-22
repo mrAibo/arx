@@ -33,6 +33,8 @@ pub use command_center::{
 };
 mod overlay;
 pub use overlay::OverlayKind;
+mod quick_action_prompt;
+pub use quick_action_prompt::QuickActionPrompt;
 mod remote_workspace;
 pub use remote_workspace::RemoteWorkspaceState;
 mod workspace_sync_ux;
@@ -357,6 +359,8 @@ pub struct AppState {
     pub cmd: String,
     /// Frozen location for provider-backed mkdir (SFTP). Cleared on cancel/submit.
     pub pending_mkdir_location: Option<Location>,
+    /// Frozen local Quick Action prompt context.
+    pub pending_quick_action_prompt: Option<QuickActionPrompt>,
     /// Pending remote delete plan awaiting user confirmation.
     pub pending_delete: Option<RemoteDeletePlan>,
     /// Ctrl+X prefix for MC-style key combos
@@ -500,6 +504,7 @@ impl Default for AppState {
             cmd_input: false,
             cmd: String::new(),
             pending_mkdir_location: None,
+            pending_quick_action_prompt: None,
             pending_delete: None,
             cmd_prefix: false,
             pending_remote_edit_session: None,
@@ -737,7 +742,7 @@ impl AppState {
 
         // A mutation result must never be discarded merely because the user
         // navigated away; it may carry conflict or recovery instructions.
-        if lane == EffectLane::RemoteEdit {
+        if matches!(lane, EffectLane::RemoteEdit | EffectLane::QuickAction) {
             return true;
         }
 
@@ -764,8 +769,13 @@ impl AppState {
 
     pub fn apply(&mut self, action: Action) {
         match action {
-            Action::Quit if self.pending_effects.contains_key(&EffectLane::RemoteEdit) => {
-                self.message = Some("Remote edit in progress — wait for a safe outcome".into());
+            Action::Quit
+                if [EffectLane::RemoteEdit, EffectLane::QuickAction]
+                    .into_iter()
+                    .any(|lane| self.pending_effects.contains_key(&lane)) =>
+            {
+                self.message =
+                    Some("Operation in progress — wait for a safe cancellation outcome".into());
             }
             Action::Quit => self.should_quit = true,
             Action::SwitchPane => {
@@ -1263,7 +1273,13 @@ mod tests {
         state.register_effect(EffectLane::RemoteEdit, EffectId(9));
         state.apply(Action::Quit);
         assert!(!state.should_quit);
-        assert!(state.message.as_deref().unwrap().contains("Remote edit"));
+        assert!(
+            state
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("safe cancellation outcome")
+        );
 
         state.finish_effect(EffectLane::RemoteEdit, EffectId(9));
         state.apply(Action::Quit);
@@ -1554,5 +1570,39 @@ mod tests {
         // Left continuation must not validate via Right's generation/location
         let left_as_right = cont(42, loc_l);
         assert!(!state.accepts_pane_listing_continuation(Pane::Right, &left_as_right));
+    }
+}
+
+#[cfg(test)]
+mod pack_o_quick_action_tests {
+    use super::*;
+
+    #[test]
+    fn quick_action_terminal_result_survives_navigation() {
+        let mut state = AppState::default();
+        let origin = state.left.location.clone();
+        let id = EffectId(9001);
+
+        state.register_effect(EffectLane::QuickAction, id);
+        state.left.location = Location::Local("/tmp/elsewhere-left".into());
+        state.right.location = Location::Local("/tmp/elsewhere-right".into());
+
+        assert!(state.accepts_effect(id, EffectLane::QuickAction, &EffectScope::Location(origin),));
+    }
+
+    #[test]
+    fn quit_waits_for_quick_action_terminal_result() {
+        let mut state = AppState::default();
+        state.register_effect(EffectLane::QuickAction, EffectId(9002));
+
+        state.apply(Action::Quit);
+
+        assert!(!state.should_quit);
+        assert!(
+            state
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("safe cancellation outcome"))
+        );
     }
 }

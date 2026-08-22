@@ -46,8 +46,8 @@ No TUI architecture rewrite, plugin runtime, remote/cloud Quick Actions, arbitra
 - [x] O3 — implement safe Touch worker and tests
 - [x] O4 — implement typed tar.gz worker with staged noclobber finalization and tests
 - [x] O5 — add `EffectLane::QuickAction`, typed Effect/Event variants and frozen prompt type
-- [ ] O6+O7 — atomic compile-complete integration closure: ProcessService + Action/Catalog + Availability + AppState + TUI dispatch/prompt/result/refresh/safe Quit + service cancellation corrections
-- [ ] O8 — reconcile Cargo.lock and run full local `cargo fmt`, `cargo check --locked --all-features`, Clippy/tests and Rust 1.88 gate
+- [x] O6+O7 — atomic compile-complete integration closure: ProcessService + Action/Catalog + Availability + AppState + TUI dispatch/prompt/result/refresh/safe Quit + service cancellation corrections
+- [x] O8 — reconcile Cargo.lock and run full local `cargo fmt`, `cargo check --locked --all-features`, Clippy/tests and Rust 1.88 gate
 - [ ] O9 — update README/ROADMAP/ARCHITECTURE and this file to shipped truth
 - [ ] O10 — exact-head CI + Release validation, review final diff, Ready, merge, close #9/#178
 
@@ -149,6 +149,14 @@ The patch must not touch keymaps, commander hitbox helpers, provider/VFS contrac
 
 The complete graph audit is finished. The remaining known blocker is a single stale pre-existing test assertion in `src/app/mod.rs`; the implementation graph itself reached the full test suite with all other tests green. The next repository mutation should keep the atomic implementation unchanged and add only that one expectation update before rerunning the complete gates.
 
+### Atomic O6+O7 integration — completed
+
+The former non-TUI O6 / TUI O7 boundary was replaced by one compile-complete integration transaction. The completed run wired ProcessService, the shared Action/Catalog/Availability model, AppState mutation ownership, typed Command Center discovery, frozen prompt submission, QuickAction result presentation, mutation refresh and safe Quit cancellation in one commit.
+
+The same run corrected the Touch cancellation commit boundary, made the external `tar` child kill-on-drop and cancellation-aware, reconciled Cargo.lock without package/version/checksum churn, physically exercised system tar on Linux, and passed fmt, locked all-feature checks, Clippy with warnings denied, the full locked all-feature test suite, and Rust 1.88 MSRV check.
+
+No PACK P TUI decomposition, keymap change, provider-contract change, plugin runtime, new shortcut, or remote Quick Action was included.
+
 ## Next step
 
-Re-run the same atomic O6+O7 integration runner with the already-approved corrected TUI import anchors and one additional deterministic replacement in `src/app/mod.rs`: update `quit_waits_for_remote_edit_outcome` from asserting `contains("Remote edit")` to asserting `contains("safe cancellation outcome")`. Keep every other implementation line, scope guard, Cargo.lock rule and acceptance gate unchanged, and pin the exact PR #179 head immediately before execution.
+O9: update README.md, ROADMAP.md and ARCHITECTURE.md to shipped PACK O truth, then independently review the complete PR diff before exact-head CI/Release acceptance.

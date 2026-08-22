@@ -214,9 +214,8 @@ impl QuickActionService {
             validate_child_name(&name)?;
             let path = dir.join(&name);
             let file = open_regular_nofollow(&path, true)?;
-            if cancellation.is_cancelled() {
-                return Err(QuickActionError::Cancelled);
-            }
+            // Mutation boundary crossed: opening with create may already have
+            // created the file. From here ARX finishes and reports real outcome.
             // SAFETY: `file` owns a valid open fd for a verified regular file.
             // A null times pointer asks futimens(2) to set atime/mtime to now.
             let rc = unsafe { libc::futimens(file.as_raw_fd(), std::ptr::null()) };
@@ -254,21 +253,27 @@ impl QuickActionService {
         let staged = tempfile::NamedTempFile::new_in(&dir)?;
         let staged_path = staged.path().to_path_buf();
 
-        let output = tokio::process::Command::new("tar")
+        let mut command = tokio::process::Command::new("tar");
+        command
+            .kill_on_drop(true)
             .current_dir(&dir)
             .arg("-czf")
             .arg(&staged_path)
             .arg("--")
-            .args(&names)
-            .output()
-            .await
-            .map_err(|error| {
+            .args(&names);
+
+        let output = tokio::select! {
+            result = command.output() => result.map_err(|error| {
                 if error.kind() == io::ErrorKind::NotFound {
                     QuickActionError::ToolUnavailable("tar".into())
                 } else {
                     QuickActionError::Io(error)
                 }
-            })?;
+            })?,
+            _ = cancellation.cancelled() => {
+                return Err(QuickActionError::Cancelled);
+            }
+        };
 
         if !output.status.success() {
             let stderr = bounded_stderr(&output.stderr);
@@ -424,7 +429,30 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
-        assert_eq!(std::fs::read(dir.path().join("target")).unwrap(), b"unchanged");
+        assert_eq!(
+            std::fs::read(dir.path().join("target")).unwrap(),
+            b"unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_touch_does_not_create_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancellation = CancellationFlag::default();
+        cancellation.cancel();
+
+        let result = QuickActionService::execute(
+            QuickActionRequest::Touch {
+                dir: dir.path().to_path_buf(),
+                name: "must-not-exist.txt".into(),
+            },
+            &cancellation,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(result.kind, QuickActionFailureKind::Cancelled);
+        assert!(!dir.path().join("must-not-exist.txt").exists());
     }
 
     #[tokio::test]

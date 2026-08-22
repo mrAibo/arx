@@ -3,7 +3,7 @@ use super::{AppState, Pane};
 /// Stable identifiers for user-visible application actions.
 ///
 /// `ActionId` deliberately contains no payload. It is safe to use from the
-/// command palette, keymap, Which-Key/help UI, configuration, and plugins.
+/// command palette, keymap, Which-Key/help UI, configuration, and other presentation layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActionId {
     Quit,
@@ -20,6 +20,9 @@ pub enum ActionId {
     Move,
     Mkdir,
     Delete,
+    ComputeSha256,
+    TouchFile,
+    CompressTarGz,
     ListTmuxSessions,
     Refresh,
     OpenCommandCenter,
@@ -67,6 +70,9 @@ pub enum Action {
     Move,
     Mkdir,
     Delete,
+    ComputeSha256,
+    TouchFile,
+    CompressTarGz,
     ListTmuxSessions,
     Refresh,
     OpenCommandCenter,
@@ -111,6 +117,9 @@ impl Action {
             Self::Move => ActionId::Move,
             Self::Mkdir => ActionId::Mkdir,
             Self::Delete => ActionId::Delete,
+            Self::ComputeSha256 => ActionId::ComputeSha256,
+            Self::TouchFile => ActionId::TouchFile,
+            Self::CompressTarGz => ActionId::CompressTarGz,
             Self::ListTmuxSessions => ActionId::ListTmuxSessions,
             Self::Refresh => ActionId::Refresh,
             Self::OpenCommandCenter => ActionId::OpenCommandCenter,
@@ -155,6 +164,9 @@ pub const ALL_ACTIONS: &[Action] = &[
     Action::Move,
     Action::Mkdir,
     Action::Delete,
+    Action::ComputeSha256,
+    Action::TouchFile,
+    Action::CompressTarGz,
     Action::ListTmuxSessions,
     Action::Refresh,
     Action::OpenCommandCenter,
@@ -294,6 +306,27 @@ pub const ACTION_CATALOG: &[ActionMeta] = &[
         description: "Delete the selected items using the provider's safe delete flow",
         category: ActionCategory::Files,
         destructive: true,
+    },
+    ActionMeta {
+        id: ActionId::ComputeSha256,
+        label: "Compute SHA-256",
+        description: "Hash focused or selected local regular files",
+        category: ActionCategory::Files,
+        destructive: false,
+    },
+    ActionMeta {
+        id: ActionId::TouchFile,
+        label: "Touch file",
+        description: "Create or update a local regular file timestamp",
+        category: ActionCategory::Files,
+        destructive: false,
+    },
+    ActionMeta {
+        id: ActionId::CompressTarGz,
+        label: "Compress to tar.gz",
+        description: "Create a noclobber tar.gz from focused or selected local entries",
+        category: ActionCategory::Files,
+        destructive: false,
     },
     ActionMeta {
         id: ActionId::ListTmuxSessions,
