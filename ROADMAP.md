@@ -2,137 +2,148 @@
 
 ## CURRENT — Product Truth
 
-ARX **v0.18.0 is the released baseline**. PACK G Transfer Queue has since merged into
-`main` via **PR #159** (merge SHA
-`b5890aec0b424fa5fe9f1b67e84f42a7b62d73de`) and issue **#15 is CLOSED**.
-The next public release is **v0.19.0**, which promotes the merged Transfer Queue as a
-released product capability without adding new provider combinations or platform work.
+ARX **v0.20.0** is the current release line. It promotes the already-merged storage,
+transfer-control, and Linux packaging work built on the v0.19.0 Transfer Queue
+baseline. PACK L is release-readiness/publication only; it does not introduce new
+runtime behavior.
 
-Current backend truth:
+Current product truth:
 
-- **SFTP:** released baseline with Remote Edit, SSH Host Manager, transactional copy,
-  and physical safety acceptance retained.
+- **Platform:** Linux only; published target is Linux x86_64. Native Windows support is
+  not planned.
+- **MSRV:** Rust 1.88.
+- **SFTP:** Remote Edit, SSH Host Manager, transactional copy, and existing physical
+  safety acceptance retained.
 - **S3:** AWS S3 + MinIO PHYSICAL PASS / SUPPORTED MVP; Moto EMULATED PASS;
   Cloudflare R2 / Wasabi remain UNVERIFIED best-effort targets.
 - **WebDAV:** Apache mod_dav PHYSICAL PASS, W1–W18; Basic auth only; Nextcloud /
   ownCloud remain UNVERIFIED.
-- **Transfer Queue:** merged and physically accepted, including real MinIO safe-read
-  retry coverage.
-- **MSRV:** Rust 1.88.
-- **Platform:** Linux only. Native Windows support is not planned; issue #17 is closed
-  as `not planned`.
+- **Transfer Queue:** bounded FIFO runtime, truthful progress/rate/ETA where known,
+  safe retry, cooperative pause/resume/cancel, and owned shutdown.
+- **Transfer Center v2:** keyboard-first Active / History / All views with selected-job
+  detail and controls routed to the existing TransferQueueRuntime.
+- **Storage Inspector (`Alt+U`):** Linux-local, read-only `du++`-style scan with
+  logical/allocated byte truth, hard-link handling, drill-down/top files, partial/error
+  evidence, and JobManager cancellation.
+- **Filesystems (`Alt+D`):** Linux-local, read-only `df++`-style mount/capacity/inode
+  view with explicit unavailable/autofs truth and manual refresh.
+- **Distribution:** GitHub Release is the single publication path; Linux x86_64 ships
+  tar.gz, `.deb`, `.rpm`, and one `SHA256SUMS`, all produced from one validated ELF.
 
 ## RELEASED — v0.17.0 (2026-08-16)
 
-The v0.17.0 Release Readiness gates completed and the release was published:
+Release-readiness established the Linux x86_64 publication baseline:
 
-- Cargo version / tag / release line resolved.
-- MSRV verified at Rust 1.88.
-- Release workflow hardened with checksums, quality gates, and packaged-binary smoke.
-- Supported artifact matrix frozen to Linux x86_64 binary + source.
-- Release notes and installation truth published.
+- Rust 1.88 MSRV gate.
+- checksums, quality gates, and packaged-binary smoke.
+- release notes and installation truth.
 
 ## RELEASED — v0.17.1
 
-v0.17.1 is the historical reliability/hardening release over v0.17.0. It did **not**
-ship WebDAV as a release feature.
+Historical SFTP Remote Edit reliability/hardening release over v0.17.0. PACK C merged
+via PR #155 and delivered transport-only invalidation, bounded pooled-session health
+checks, deterministic fault/race coverage, safer writable-parent policy, and
+JobManager-integrated Remote Edit lifecycle.
 
-PACK C landed in `main` via **PR #155** (merge SHA `6e4b5fbb`) and delivered:
-
-- **Reliability:** transport-only connection invalidation (#47), bounded pooled-session
-  health probe (#48).
-- **Cleanup:** dead RemoteEditState variants (#49), double-lock removed (#52).
-- **Safety testing:** deterministic fault-injection suite (#50), writable non-sticky
-  parent policy (#53).
-- **Architecture:** Remote Edit lifecycle integrated with Job Manager (#51), typed
-  phases/outcomes, lane-isolated failure handling.
-
-Physical SFTP Remote Edit acceptance included:
-
-- **E1–E12** safety matrix — PASS.
-- **fault/race** — PASS.
-- **pool-health** (real sshd, reuse / stale-reconnect / no-replay) — PASS.
-- **TUI lifecycle** (shared JobManager + job_events) — PASS.
-- artifact audit: **0** partial-upload (`.arx-part-*`) fragments leaked.
+Physical acceptance included E1–E12, pool-health, fault/race, TUI lifecycle, and zero
+leaked `.arx-part-*` partial-upload artifacts on accepted paths.
 
 ## RELEASED — v0.18.0
 
-v0.18.0 is the WebDAV release over the v0.17.1 reliability baseline.
+The WebDAV release over the v0.17.1 reliability baseline. PACK E merged via PR #157.
 
-PACK E merged via **PR #157** and delivered:
+Delivered:
 
-- PROPFIND / GET / PUT / DELETE / MKCOL / COPY / MOVE.
-- HTTP Basic auth with OS-keyring / environment secret resolution; no plaintext
-  password in config.
-- bounded F3 preview.
-- one-file Local ↔ WebDAV F5 path.
-- authoritative raw-href identity and strict DAV namespace / propstat parsing.
+- PROPFIND / GET / PUT / DELETE / MKCOL / COPY / MOVE provider semantics.
+- HTTP Basic auth with OS-keyring / environment secret resolution.
+- bounded F3 preview and one-file Local ↔ WebDAV F5 copy.
+- authoritative raw-href identity and strict DAV namespace/propstat parsing.
 - atomic remote no-clobber via `If-None-Match: *`.
 - local staged download with real noclobber finalization.
 - no blind retry of ambiguous mutations.
-- dedicated `webdav-physical` CI gate.
-- Apache mod_dav physical acceptance **W1–W18 PASS**.
+- Apache mod_dav W1–W18 PHYSICAL PASS.
 
-Not claimed by the WebDAV MVP:
+Not claimed: Digest/Bearer auth, WebDAV F4 remote edit, recursive WebDAV
+transfer/delete, cross-target WebDAV move, or Nextcloud/ownCloud physical
+certification.
 
-- Digest/Bearer authentication.
-- WebDAV F4 remote edit.
-- recursive WebDAV transfer/delete.
-- cross-target WebDAV move.
-- Nextcloud / ownCloud physical certification.
+## RELEASED — v0.19.0 (2026-08-21)
 
-## PACK G — Transfer Queue (MERGED)
+v0.19.0 is the Transfer Queue release, tag target
+`092c3013e29ba70e083634ff50df36a794056f1d`.
 
-PACK G merged via **PR #159** at merge SHA
-`b5890aec0b424fa5fe9f1b67e84f42a7b62d73de`; issue **#15 is CLOSED**.
-
-Delivered product surface:
+Delivered:
 
 - one persistent bounded FIFO `TransferQueueRuntime`.
-- default concurrency **N=2**, configurable through `[transfer] concurrency` in the
-  range **1..=8**.
+- default concurrency N=2, configurable in the range 1..=8.
 - background Copy/Move orchestration for already-supported TransferPlanner paths.
 - one JobManager lifecycle truth for queue/run/pause/cancel/retry/completion.
-- truthful status-bar percentage, byte rate, and ETA where known; unknown total stays
-  unknown instead of becoming zero.
-- **Ctrl+Y Transfer Center** and Jobs Pause/Resume/Cancel integration.
-- cooperative same-task Pause/Resume with `PausePending`, same JobId and same attempt.
-- bounded automatic retry, maximum **3 total attempts**, only for `SafeToRetry`.
-- `AmbiguousMutation` / `RecoveryRequired` outcomes are never blindly replayed.
-- worker and retry-timer ownership with joined shutdown.
+- truthful status-bar percentage, byte rate, and ETA only where known.
+- cooperative same-task Pause/Resume with `PausePending`, same JobId, same attempt.
+- bounded automatic retry, maximum 3 total attempts, only for `SafeToRetry`.
+- `AmbiguousMutation` / `RecoveryRequired` outcomes never blindly replayed.
+- workers/retry timers owned and joined at shutdown.
 
-Physical acceptance:
+Physical acceptance covered Local queue/runtime behavior, real MinIO safe-read retry,
+WebDAV ambiguous mutation evidence, and SFTP commit/rename ambiguity policy.
 
-- **P1–P7, P11–P12:** real Local filesystem queue/runtime behavior PASS.
-- **P8:** real MinIO `GetObject` body-fault path PASS; first read fails after staged
-  cleanup, queue enters `RetryWaiting`, second GET succeeds byte-exact, GET count=2.
-- **P9:** WebDAV ambiguous PUT provider evidence + queue one-shot policy PASS.
-- **P10:** SFTP commit/rename ambiguity provider evidence + queue one-shot policy PASS.
-- post-merge CI on `b5890aec...` passed `quality`, `msrv`, `webdav-physical`, and
-  `transfer-queue-s3-retry-physical`.
+## RELEASED — v0.20.0
 
-## THEN — Next Public Release = v0.19.0
+v0.20.0 consolidates four already-merged product packs into one release.
 
-v0.19.0 is the **Transfer Queue release** over the v0.18.0 WebDAV baseline. It is a
-minor release because it adds a substantial user-facing transfer-orchestration
-capability.
+### PACK I — Storage Inspector / Filesystems
 
-Release Readiness requires:
+- **I1** merged via PR #162: Linux Local Storage Inspector core using `dua-core` for
+  parallel traversal; logical vs allocated bytes, symlink no-follow, hard-link
+  de-duplication, top-N, depth/same-filesystem policy, truthful errors/cancellation.
+- **I2** merged via PR #164: one `StorageScan` JobManager lifecycle plus read-only
+  drill-down TUI; no second job runtime and no destructive cleanup actions.
+- **I3** merged via PR #166: Linux `/proc/self/mountinfo` + `statvfs` filesystem view;
+  block/inode modes, deterministic sort/filter, explicit unavailable/autofs states,
+  manual refresh only.
 
-- version / lockfile / README / roadmap / release-notes truth only;
-- no production feature edits;
-- exact-SHA `quality` success;
-- exact-SHA Rust 1.88 `msrv` success;
-- exact-SHA `webdav-physical` W1–W18 success;
-- exact-SHA `transfer-queue-s3-retry-physical` success;
-- release-workflow package / checksum / packaged-binary smoke success.
+### PACK J — Transfer Center UX v2
+
+Merged via PR #168 at `f95b601745a093a29cff1f05b463616ecca37f6e`.
+
+- Ctrl+Y overlay owns input while open.
+- Active / History / All filters with deterministic cursor clamping.
+- compact list plus selected-job lifecycle/progress/scheduler/attempt detail.
+- Pause/Resume/Cancel call the existing TransferQueueRuntime; UI does not fabricate
+  JobManager transitions.
+- terminal history presentation is bounded without changing JobManager retention.
+
+### PACK K — Native Linux packages
+
+Merged via PR #171 at `b4e14ee25a4b7be88f5c0330eaf14509c55023e7`.
+
+- tar.gz, Debian `.deb`, and RPM `.rpm` from the **same validated release ELF**.
+- no rebuild between package formats or between validate and publish.
+- exact package payload manifests; unexpected files/symlinks fail closed.
+- RPM build-id payload injection disabled so the package stays inside the declared
+  executable/docs contract.
+- Debian runtime dependencies derived from the exact ELF with `dpkg-shlibdeps`.
+- `cargo-about` generated `THIRD_PARTY_LICENSES.html` included in every package.
+- one `SHA256SUMS` covers all three published package artifacts.
+
+## RELEASE PROCESS POLICY
+
+A release candidate must keep runtime code frozen and change only release truth unless
+a newly discovered blocker requires a separately reviewed fix. Before tagging:
+
+- Cargo version and root Cargo.lock version match the intended tag.
+- README, ROADMAP, and `docs/releases/vX.Y.Z.md` describe the same product truth.
+- exact-head quality / Rust 1.88 MSRV / physical provider gates are green.
+- Release validation builds once and validates third-party notices, tar/deb/rpm exact
+  payloads, metadata, ELF identity, checksums, and artifact upload.
+- tag targets the accepted merge SHA; publication reuses validated artifacts without a
+  rebuild.
 
 ## PLATFORM POLICY
 
-ARX remains intentionally **Linux-only**. The current published artifact is Linux
-x86_64. Native Windows work is not planned, and issue #17 was closed accordingly.
-Future platform effort, if any, should stay within Linux (for example additional Linux
-architectures) rather than expanding to a separate Windows product surface.
+ARX remains intentionally **Linux-only**. Future platform effort, if useful, should
+stay within Linux (for example additional architectures) rather than creating a
+separate Windows product surface.
 
 ## FUTURE
 
@@ -143,59 +154,13 @@ architectures) rather than expanding to a separate Windows product surface.
 - Recursive remote delete.
 - Binary remote editing.
 - Plugin system (Lua/WASM).
-- Additional Linux packaging/architectures where useful.
+- Additional Linux architectures and, if justified, signed package-repository
+  distribution.
 
-### Storage Inspector / Disk Usage
+### S3 Inspector and Analytics (POST-MVP)
 
-#### A. Filesystem Overview ("df++")
-
-Future fields:
-
-- device / filesystem
-- mount
-- filesystem type
-- total
-- used
-- available
-- usage %
-- inode total / used / free where supported
-- read-only state
-- provider / evidence
-
-#### B. Usage Analyzer ("du++")
-
-Future capabilities:
-
-- recursive subtree size
-- logical / apparent bytes
-- allocated bytes where supported
-- file count
-- directory count
-- top-N largest
-- depth control
-- same-filesystem policy
-- symlink policy
-- hard-link handling
-- permission errors
-- progress
-- cancellation
-- partial / inconclusive result
-
-Execution rule: potentially expensive recursive scans are background Jobs. No blocking
-full-tree scan from pane render.
-
-Provider rule:
-
-- **Local:** native filesystem information.
-- **SFTP / remote:** expose filesystem stats only when the transport/provider can prove
-  them; otherwise `Unsupported`.
-- **S3:** object-storage usage model, not POSIX `df`. Use object bytes/count and explicit
-  evidence source.
-
-#### S3 Inspector and Analytics (POST-MVP)
-
-- Read-only Object Inspector (Ctrl+I) and Bucket Inspector for S3.
-- Usage Analytics with explicit evidence source (LiveScan / StorageLens / Inventory /
+- Read-only Object Inspector and Bucket Inspector for S3.
+- Usage analytics with explicit evidence source (LiveScan / StorageLens / Inventory /
   OtherProvider / Unavailable) and as-of freshness.
-- Behavioral inspiration only: AWS S3 Console, duf, dust, dua, gdu. No source copied;
-  no dependencies added.
+- S3 remains an object-storage usage model, not POSIX `df`; never fabricate filesystem
+  capacity semantics for providers that cannot prove them.
