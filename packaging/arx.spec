@@ -2,6 +2,9 @@
 # The Rust binary is already validated before packaging. Do not let rpmbuild
 # strip or otherwise rewrite it; package smoke verifies byte-for-byte identity.
 %global __strip /bin/true
+# Keep the package payload exact. rpmbuild otherwise injects a /usr/lib/.build-id
+# symlink that is outside ARX's executable/docs release contract.
+%global _build_id_links none
 
 Name:           arx
 Version:        %{arx_version}
