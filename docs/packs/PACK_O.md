@@ -100,6 +100,14 @@ The first atomic O6+O7 runner was pre-scanned from exact head `1ea627354089e51e2
 
 GitHub independently confirmed the exact current import blocks. The correction is purely additive and behavior-preserving: add `QuickActionPrompt` to the existing `arx::app` import list and add `QuickActionFailureKind`, `QuickActionKind`, `QuickActionOutcome`, and `QuickActionRequest` to the existing `arx::services` import list. No implementation, architecture, scope, or lifecycle rule changes. Hermes stopped and restored the exact clean starting tree; no commit/push occurred.
 
+### Atomic integration full-test gate — hard stop, no code commit
+
+After the two import anchors were corrected, the atomic O6+O7 patch reached the full locked all-feature test suite. Formatting, unlocked and locked all-feature `cargo check`, Cargo.lock reconciliation, focused PACK O tests, the physical system-tar test and 921 tests all passed. Exactly one pre-existing test failed: `app::tests::quit_waits_for_remote_edit_outcome`.
+
+The failure is caused directly by the intentional PACK O AppState lifecycle change. The old RemoteEdit-only Quit guard emitted `Remote edit in progress — wait for a safe outcome`, while PACK O now uses one guard for both `EffectLane::RemoteEdit` and `EffectLane::QuickAction` with the message `Operation in progress — wait for a safe cancellation outcome`. The existing test still asserted that the message contains `Remote edit`, so its expectation became stale when the message contract was generalized. GitHub independently confirmed that exact assertion in `src/app/mod.rs`.
+
+This is not an implementation regression and no behavior should be reverted. The minimal completion is to update that one existing assertion in the already-authorized `src/app/mod.rs` file so it verifies the generalized contract (`safe cancellation outcome`, matching the new QuickAction companion test). Hermes correctly stopped rather than editing a test outside the supplied deterministic patch. No commit/push occurred.
+
 ## Pre-integration audit before the next code run
 
 The next code run must close the whole existing type/lifecycle graph in one patch. The audit found these mandatory points:
@@ -139,8 +147,8 @@ The patch must not touch keymaps, commander hitbox helpers, provider/VFS contrac
 
 ## Audit checkpoint
 
-The complete graph audit is finished. The next repository mutation must be the deterministic O6+O7 implementation run itself; no further documentation-only head movement is needed before that run. The runner is expected to pin the PR head obtained immediately before execution.
+The complete graph audit is finished. The remaining known blocker is a single stale pre-existing test assertion in `src/app/mod.rs`; the implementation graph itself reached the full test suite with all other tests green. The next repository mutation should keep the atomic implementation unchanged and add only that one expectation update before rerunning the complete gates.
 
 ## Next step
 
-Re-run the same atomic O6+O7 integration runner with only the two independently verified additive `src/tui.rs` import anchors corrected. All other patch text, scope guards, behavioral contracts and gates remain unchanged. Pin the new exact PR #179 head immediately before execution.
+Re-run the same atomic O6+O7 integration runner with the already-approved corrected TUI import anchors and one additional deterministic replacement in `src/app/mod.rs`: update `quit_waits_for_remote_edit_outcome` from asserting `contains("Remote edit")` to asserting `contains("safe cancellation outcome")`. Keep every other implementation line, scope guard, Cargo.lock rule and acceptance gate unchanged, and pin the exact PR #179 head immediately before execution.
