@@ -23,6 +23,8 @@ Verify the real result.
 - **Truthful background jobs.** Queued, running, pause-pending, paused,
   cancelling, cancelled, retry-waiting, failed, completed, and verification
   remain separate states.
+- **Read-only storage visibility.** Inspect local directory usage and Linux
+  mounted filesystems without turning observability into cleanup or mount mutation.
 - **Verification after execution.** A completed job does not automatically
   mean the two roots are synchronized. ARX rescans both and reports
   `Synchronized`, `DifferencesRemain`, or `Inconclusive`.
@@ -164,7 +166,9 @@ of truth.
 | F9 | Remote Hosts |
 | Ctrl+B | Bookmarks |
 | Ctrl+J | Job queue with progress and transfer Pause/Resume/Cancel |
-| Ctrl+Y | Transfer Center — active transfer queue and truthful progress |
+| Ctrl+Y | Transfer Center — Active/History/All views plus runtime Pause/Resume/Cancel |
+| Alt+U | Local Storage Inspector — read-only directory usage scan and drill-down |
+| Alt+D | Filesystems — read-only Linux mount/capacity/inode view |
 | Ctrl+O | Drop to subshell |
 | Ctrl+R | Refresh panes |
 | : | Run shell command |
@@ -236,6 +240,9 @@ Menu entries appear in Command Center (Ctrl+P).
 | Remote Workspace — compare → preview → execute → verify | ✅ |
 | Transfer planner — native / rsync / SFTP streaming | ✅ |
 | Transfer Queue — bounded FIFO, default N=2 (1..=8), progress/rate/ETA, Pause/Resume/Cancel, safe retry ≤3 total attempts | ✅ |
+| Transfer Center v2 — Active/History/All, selected-job detail, runtime-owned controls | ✅ |
+| Local Storage Inspector (`Alt+U`) — logical/allocated usage, drill-down, top files, partial/cancel truth | ✅ Linux read-only |
+| Filesystems (`Alt+D`) — mount usage, capacity/inodes, sort/filter, unavailable/autofs truth | ✅ Linux read-only |
 | Transactional SFTP copy with rollback | ✅ |
 | SFTP F3 bounded text preview | ✅ |
 | SFTP F4 conflict-safe text editing | ✅ |
@@ -256,6 +263,7 @@ Menu entries appear in Command Center (Ctrl+P).
 | Extension colors, heatmap, git status bar | ✅ |
 | S3 object-storage backend | ✅ AWS + MinIO PHYSICAL PASS (SUPPORTED MVP); Moto EMULATED PASS; R2/Wasabi UNVERIFIED (best-effort) |
 | WebDAV backend | ✅ **SUPPORTED MVP** — Apache mod_dav PHYSICAL PASS (W1–W18); Basic auth only; Nextcloud/ownCloud UNVERIFIED |
+| Native Linux release packages | ✅ tar.gz + `.deb` + `.rpm`, one validated ELF + SHA256SUMS |
 
 ## Transfer Queue
 
@@ -270,6 +278,30 @@ checkpoint. Cancel affects the selected transfer without cancelling unrelated wo
 Automatic retry is bounded to at most 3 total attempts and is allowed only for errors
 classified `SafeToRetry`; ambiguous remote mutations and recovery-required outcomes
 are never blindly replayed.
+
+Transfer Center v2 is a keyboard-first control surface over that same runtime. Its
+Active, History, and All views do not create a second scheduler or lifecycle model;
+controls call the existing queue runtime and terminal jobs remain immutable history.
+
+## Storage inspection
+
+ARX v0.20 adds two Linux-native, read-only storage views. Neither one performs cleanup,
+delete, mount, remount, quota, or resize operations.
+
+**Alt+U — Local Storage Inspector (`du++`).** Starts a background StorageScan job for
+the active local directory. The scan keeps logical/apparent bytes separate from
+allocated/on-disk bytes, avoids following symlinks, de-duplicates hard links, supports
+drill-down and top-file views, and exposes partial/error/cancelled outcomes instead of
+pretending an incomplete scan is exact. Expensive traversal stays off the UI thread and
+uses the existing JobManager cancellation path.
+
+**Alt+D — Filesystems (`df++`).** Reads Linux mount topology and filesystem statistics
+into a sortable/filterable overlay with total/used/available capacity and inode views.
+Autofs is not probed by the default snapshot, inaccessible mounts remain visible with an
+unavailable state, and refresh is explicit rather than periodic background polling.
+
+These views are local-Linux observability features. They do not claim SFTP/S3/WebDAV
+capacity semantics where the provider cannot prove them.
 
 ## S3 object storage
 
@@ -359,7 +391,7 @@ TUI ──▶ Input / Keymap
 ```
 
 Async interactive work uses correlated Effects (Preview, RemoteEdit).
-Transfers, sync, and job-oriented mutations use the Job Manager.
+Transfers, sync, storage scans, and job-oriented mutations use the Job Manager.
 
 ```
 arx/
