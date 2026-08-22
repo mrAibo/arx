@@ -4,7 +4,7 @@
 
 ARX **v0.20.0** is the current release line. It promotes the already-merged storage,
 transfer-control, and Linux packaging work built on the v0.19.0 Transfer Queue
-baseline. PACK L is release-readiness/publication only; it does not introduce new
+baseline. PACK L was release-readiness/publication only; it did not introduce new
 runtime behavior.
 
 Current product truth:
@@ -37,7 +37,7 @@ Current product truth:
 Backlog truth after PACK M/PACK N reconciliation:
 
 - **Quick Actions:** Command Center, user `arx.menu`, mkdir/chmod/symlink are shipped;
-  typed compress/touch/SHA-256 actions remain in #9.
+  typed compress/touch/SHA-256 actions are active work in #178 / PR #179 and tracked by #9.
 - **tmux/screen:** tmux discovery + attach are shipped; screen discovery and attach
   lifecycle hardening remain in #7.
 - **Mouse:** right-click and drag-selection are shipped; pane-wheel scrolling,
@@ -46,6 +46,36 @@ Backlog truth after PACK M/PACK N reconciliation:
   and explicit close semantics remain in #16.
 - **WebDAV:** the supported Apache mod_dav MVP is shipped; #13 tracks only post-MVP
   auth/interoperability/recursive-operation work.
+
+## ACTIVE DEVELOPMENT SEQUENCE — PACK O → P → Q → R
+
+The canonical continuation document is [`docs/DEVELOPMENT_HANDOFF.md`](docs/DEVELOPMENT_HANDOFF.md).
+The architecture sequence is tracked by umbrella issue **#180**.
+
+The approved order is strict:
+
+1. **PACK O — typed local Quick Actions.** Finish #178 / PR #179 independently. Ship
+   SHA-256, Touch file, and Compress to tar.gz through typed Action/Availability/Effect
+   boundaries. Do not mix a TUI architecture rewrite into #179.
+2. **PACK P — TUI decomposition.** Behavior-preserving decomposition of the >10k-line
+   `src/tui.rs` composition bottleneck: characterization tests, rendering extraction,
+   feature controllers, keyboard/mouse routing, Effect/Job response handling, then a
+   thin runtime/event loop. No product features and no public plugin API.
+3. **PACK Q — VFS convergence.** Finish the phased ProviderRegistry migration by
+   removing duplicate execution authority. Preserve `Location` as typed identity/address
+   where useful; make `ProviderRegistry` the execution authority and `CapabilitySet`
+   the capability truth.
+4. **PACK R — internal feature/command registration.** Introduce only the smallest
+   internal registration layer proven necessary after P/Q. Migrate Quick Actions,
+   Storage Inspector, and SSH Host Manager as proof consumers. Do not freeze a broad
+   public `FeatureModule` plugin trait prematurely.
+5. **External plugin decision gate.** No Lua/WASM/`.so` runtime is scheduled. Evaluate
+   external plugins only after PACK R and only if real demand exists. Manifest
+   permissions without real OS/runtime enforcement are not a security boundary.
+
+GitHub state and exact SHAs are authoritative over stale chat summaries or cached
+reviews. A new development session should read the handoff document, this roadmap,
+issue #180, and the current state of #178/#179 before changing code.
 
 ## RELEASED — v0.17.0 (2026-08-16)
 
@@ -163,10 +193,11 @@ stays partial until #9 actually ships them.
 
 ## PACK N — LEAN RUNTIME HARDENING
 
-PACK N is tracked by #176 and PR #177. It intentionally removes unsupported runtime
-surface rather than adding a new subsystem.
+PACK N was tracked by #176 and merged through PR #177 at
+`eec15d91d264a40760b6772135de516d40f1b95c`. It intentionally removed unsupported
+runtime surface rather than adding a new subsystem.
 
-Delivered by the PACK N candidate:
+Delivered:
 
 - #5 X11 hardening: removed the startup heuristic that guessed
   `DISPLAY=localhost:0.0` whenever `SSH_CLIENT` existed. ARX now leaves DISPLAY and
@@ -178,7 +209,7 @@ Delivered by the PACK N candidate:
 - no WASM runtime, general plugin API, terminal-brand detection, or new feature surface
   was introduced.
 
-After acceptance/merge, #5 and #11 are complete under this lean-policy decision.
+#5, #11, and #176 are complete under this lean-policy decision.
 
 ## RELEASE PROCESS POLICY
 
@@ -202,11 +233,14 @@ subjects when they connect to an ARX process running on Linux; that does not cha
 platform policy. ARX consumes the environment established by that session and does not
 invent X11 forwarding state.
 
-## FUTURE
+## FUTURE PRODUCT BACKLOG
 
-Near-term product follow-ups:
+Architecture packs P/Q/R take precedence after PACK O because they reduce the current
+composition and dispatch bottlenecks. The product backlog remains active and should not
+be lost during those refactors.
 
-- #9 Quick Actions completion: typed compress, touch, and SHA-256 actions.
+Near-term product follow-ups after the architecture sequence:
+
 - #7 tmux/screen follow-up: screen discovery and real-terminal attach/detach lifecycle.
 - #10 mouse follow-up: pane wheel, Shift+Click range selection, context availability.
 - #16 split-pane follow-up: horizontal mode, resize, explicit close semantics.
