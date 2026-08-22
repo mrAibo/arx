@@ -94,6 +94,12 @@ Attempt 4 started from exact head `57a203c66fdbce574355639914b29b7b9f6ac6be`. Th
 
 `cargo check --all-features` then correctly failed because the exhaustive `apply_effect_event` match in `src/tui.rs` did not yet cover `EffectEvent::QuickActionFinished`. This is not a new implementation bug: it proves the former O6/O7 split itself was unsatisfiable. O6 added the producer-side `ProcessService` consumer for `Effect::QuickAction`, while the Event consumer was explicitly deferred to O7 and `src/tui.rs` was forbidden. Hermes restored the tree clean and made no commit/push.
 
+### Atomic integration import scan — hard stop, no code commit
+
+The first atomic O6+O7 runner was pre-scanned from exact head `1ea627354089e51e2b62c762cd8a96285c2f6baf` before mutation. Every source anchor in sections 1–6 and TUI sections 8–14 matched, including the commander-mapping protection. Only the two additive `src/tui.rs` import-block anchors were stale because the import lists had been refactored earlier.
+
+GitHub independently confirmed the exact current import blocks. The correction is purely additive and behavior-preserving: add `QuickActionPrompt` to the existing `arx::app` import list and add `QuickActionFailureKind`, `QuickActionKind`, `QuickActionOutcome`, and `QuickActionRequest` to the existing `arx::services` import list. No implementation, architecture, scope, or lifecycle rule changes. Hermes stopped and restored the exact clean starting tree; no commit/push occurred.
+
 ## Pre-integration audit before the next code run
 
 The next code run must close the whole existing type/lifecycle graph in one patch. The audit found these mandatory points:
@@ -137,4 +143,4 @@ The complete graph audit is finished. The next repository mutation must be the d
 
 ## Next step
 
-Build one deterministic O6+O7 integration runner against the PR #179 exact head fetched immediately before execution. It may touch `src/tui.rs`, but only for the minimal PACK O wiring listed above; no function extraction, module movement, renderer refactor, input architecture refactor or other PACK P work is allowed. The runner must apply all code changes transactionally, run `cargo fmt` and an initial all-features compile before any commit, then run the full O8 gates before push.
+Re-run the same atomic O6+O7 integration runner with only the two independently verified additive `src/tui.rs` import anchors corrected. All other patch text, scope guards, behavioral contracts and gates remain unchanged. Pin the new exact PR #179 head immediately before execution.
