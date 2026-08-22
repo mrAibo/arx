@@ -27,10 +27,14 @@ Current product truth:
   evidence, and JobManager cancellation.
 - **Filesystems (`Alt+D`):** Linux-local, read-only `df++`-style mount/capacity/inode
   view with explicit unavailable/autofs truth and manual refresh.
+- **SSH/X11 environment:** ARX inherits the process/session environment and never
+  synthesizes `DISPLAY`; X11 forwarding must be established by the SSH client/session.
+- **User extension surface:** `arx.menu` is the supported lightweight mechanism; the
+  unwired embedded Lua prototype/runtime has been removed and WASM is not product scope.
 - **Distribution:** GitHub Release is the single publication path; Linux x86_64 ships
   tar.gz, `.deb`, `.rpm`, and one `SHA256SUMS`, all produced from one validated ELF.
 
-Backlog truth after PACK M reconciliation:
+Backlog truth after PACK M/PACK N reconciliation:
 
 - **Quick Actions:** Command Center, user `arx.menu`, mkdir/chmod/symlink are shipped;
   typed compress/touch/SHA-256 actions remain in #9.
@@ -40,12 +44,8 @@ Backlog truth after PACK M reconciliation:
   Shift+Click range selection, and provider-aware context availability remain in #10.
 - **Split panes:** the vertical split/focus model is shipped; horizontal mode, resize,
   and explicit close semantics remain in #16.
-- **X11 over Windows SSH clients:** this is Linux remote-session interoperability, not
-  native Windows support. The current DISPLAY fallback needs hardening and physical
-  verification under #5.
-- **Plugins:** `mlua` + `src/plugins` are an unwired prototype, not a supported plugin
-  API. #11 is the decision gate to remove it or productize a deliberately narrow Lua
-  surface; WASM is not committed scope.
+- **WebDAV:** the supported Apache mod_dav MVP is shipped; #13 tracks only post-MVP
+  auth/interoperability/recursive-operation work.
 
 ## RELEASED — v0.17.0 (2026-08-16)
 
@@ -145,7 +145,7 @@ Merged via PR #171 at `b4e14ee25a4b7be88f5c0330eaf14509c55023e7`.
 
 ## PACK M — BACKLOG RECONCILIATION
 
-PACK M is tracked by #174 and changes repository truth only; it adds no runtime
+PACK M was tracked by #174 and changed repository truth only; it added no runtime
 behavior.
 
 Reconciled against the v0.20.0 tree:
@@ -154,12 +154,31 @@ Reconciled against the v0.20.0 tree:
 - #41 Embedded Terminal through Action/Command Center — **closed completed**; PR #43
   delivered the requested shared Action Catalog / Command Center path.
 - #14 Lua plugin issue — **closed duplicate** of canonical plugin decision #11.
-- #5, #7, #9, #10, #11, #13, and #16 were rewritten so they describe only work that
-  remains rather than features already present in v0.20.0.
+- #5, #7, #9, #10, #11, #13, and #16 were rewritten so they described only work that
+  remained rather than features already present in v0.20.0.
 
 The reconciliation also found a README overclaim: compress/touch/SHA-256 are not
 present as typed built-in Quick Actions in the current Action Catalog. Documentation
-must stay partial until #9 actually ships them.
+stays partial until #9 actually ships them.
+
+## PACK N — LEAN RUNTIME HARDENING
+
+PACK N is tracked by #176 and PR #177. It intentionally removes unsupported runtime
+surface rather than adding a new subsystem.
+
+Delivered by the PACK N candidate:
+
+- #5 X11 hardening: removed the startup heuristic that guessed
+  `DISPLAY=localhost:0.0` whenever `SSH_CLIENT` existed. ARX now leaves DISPLAY and
+  forwarding ownership entirely with the established session environment.
+- #11 plugin decision, path A: removed the unwired `src/plugins` prototype, removed
+  `pub mod plugins`, removed `mlua`, and pruned the orphaned Lua runtime subtree from
+  `Cargo.lock` without dependency-version/checksum churn.
+- `arx.menu` remains the supported lightweight admin-defined command extension path.
+- no WASM runtime, general plugin API, terminal-brand detection, or new feature surface
+  was introduced.
+
+After acceptance/merge, #5 and #11 are complete under this lean-policy decision.
 
 ## RELEASE PROCESS POLICY
 
@@ -180,20 +199,17 @@ ARX remains intentionally **Linux-only**. Future platform effort, if useful, sho
 stay within Linux (for example additional architectures) rather than creating a
 separate Windows product surface. Windows SSH clients may still be interoperability
 subjects when they connect to an ARX process running on Linux; that does not change the
-platform policy.
+platform policy. ARX consumes the environment established by that session and does not
+invent X11 forwarding state.
 
 ## FUTURE
 
-Near-term truth/hardening:
+Near-term product follow-ups:
 
-- #5 X11 forwarding hardening: remove unsafe DISPLAY guessing and accept only proven
-  remote-session behavior.
 - #9 Quick Actions completion: typed compress, touch, and SHA-256 actions.
 - #7 tmux/screen follow-up: screen discovery and real-terminal attach/detach lifecycle.
 - #10 mouse follow-up: pane wheel, Shift+Click range selection, context availability.
 - #16 split-pane follow-up: horizontal mode, resize, explicit close semantics.
-- #11 plugin decision: prefer removing the unwired Lua prototype unless a concrete
-  admin workflow justifies a narrow sandboxed API. WASM is not committed scope.
 
 Provider/transfer follow-ups:
 

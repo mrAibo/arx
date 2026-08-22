@@ -21,6 +21,11 @@ behind provider interfaces instead of being special-cased directly in the TUI.
    success.
 8. Storage inspection is observability-only: it does not imply cleanup, mount, quota,
    resize, or delete authority.
+9. Process/session environment is authoritative. ARX inherits variables such as
+   `DISPLAY` and never synthesizes SSH/X11 forwarding state.
+10. User extensibility stays narrow: `arx.menu` may define admin commands, but ARX does
+    not carry an embedded Lua/WASM runtime unless a future concrete product contract
+    justifies one.
 
 ## Layering
 
@@ -77,6 +82,18 @@ cannot silently overwrite newer UI intent.
 Remote Edit lifecycle integration with the runtime JobManager is implemented. It is
 not a deferred architecture item: observers publish into the same manager/channel that
 drives Jobs and the render snapshot.
+
+## Environment and extension boundaries
+
+ARX does not establish an SSH X11 forwarding channel and does not infer one from
+terminal-brand or `SSH_CLIENT` heuristics. If an SSH client/server session established
+forwarding, the resulting `DISPLAY` is inherited unchanged by ARX and child processes.
+If `DISPLAY` is absent, ARX leaves it absent.
+
+The supported lightweight admin extension surface is `~/.config/arx/arx.menu`, whose
+entries are exposed through Command Center. PACK N removed the previously unwired Lua
+prototype and `mlua` runtime. There is no supported Lua or WASM plugin API in the
+current architecture.
 
 ## Provider layer
 

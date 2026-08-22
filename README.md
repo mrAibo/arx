@@ -40,6 +40,11 @@ ARX is intentionally a **Linux application**. The published binary target is
 Linux x86_64. Native Windows support is not planned; the project stays focused
 on Linux terminal workflows instead of broadening the platform surface.
 
+When ARX runs inside an SSH session, the session environment is authoritative.
+ARX preserves an existing `DISPLAY` but never synthesizes one. X11 forwarding must
+already be established by the SSH client/session (`ssh -X/-Y` or the client-specific
+equivalent); ARX does not create an X11 tunnel after login.
+
 ## Quick start
 
 ### From source
@@ -229,7 +234,8 @@ t  "Tar home"  tar czf /tmp/home.tgz ~/
 t  "Disk usage"  df -h
 ```
 
-Menu entries appear in Command Center (Ctrl+P).
+Menu entries appear in Command Center (Ctrl+P). This is ARX's supported lightweight
+extension mechanism. ARX does not ship an embedded Lua or WASM plugin runtime.
 
 ## Features
 
@@ -258,7 +264,7 @@ Menu entries appear in Command Center (Ctrl+P).
 | Directory diff + content diff (Ctrl+D) | ✅ |
 | Split panes — vertical split/focus shipped; horizontal/resize/explicit close remain #16 | ⚠️ Partial |
 | MC-style Ctrl+X prefix (symlink, hardlink, chmod, chown) | ✅ |
-| User menu with custom scripts | ✅ |
+| User extensions — `arx.menu`; no embedded Lua/WASM runtime | ✅ Lean |
 | Host Center (F9) | ✅ |
 | Extension colors, heatmap, git status bar | ✅ |
 | S3 object-storage backend | ✅ AWS + MinIO PHYSICAL PASS (SUPPORTED MVP); Moto EMULATED PASS; R2/Wasabi UNVERIFIED (best-effort) |
@@ -266,8 +272,7 @@ Menu entries appear in Command Center (Ctrl+P).
 | Native Linux release packages | ✅ tar.gz + `.deb` + `.rpm`, one validated ELF + SHA256SUMS |
 
 The partial rows above are intentionally explicit. They reflect the current shared
-Action Catalog/runtime rather than old issue titles or prototype code. PACK M tracks
-the reconciliation in #174.
+Action Catalog/runtime rather than old issue titles or prototype code.
 
 ## Transfer Queue
 

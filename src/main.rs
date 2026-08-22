@@ -16,13 +16,9 @@ struct Cli {
 #[tokio::main]
 async fn main() {
     let _cli = Cli::parse();
-    // ponytail: auto-set DISPLAY for Windows SSH clients (PuTTY/RoyalTS/Xshell)
-    if std::env::var("DISPLAY").is_err() && std::env::var("SSH_CLIENT").is_ok() {
-        // SAFETY: single-threaded at startup, no concurrent env access
-        unsafe {
-            std::env::set_var("DISPLAY", "localhost:0.0");
-        }
-    }
+    // X11 forwarding is session-owned. If the SSH client/server established
+    // forwarding, DISPLAY is already present and is inherited unchanged by ARX and
+    // child processes. If it is absent, ARX must not invent a display endpoint.
     let config = arx::config::load();
     tui::run(config).await.expect("TUI exited with error");
 }
