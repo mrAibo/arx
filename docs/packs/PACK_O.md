@@ -49,7 +49,7 @@ No TUI architecture rewrite, plugin runtime, remote/cloud Quick Actions, arbitra
 - [x] O6+O7 — atomic compile-complete integration closure: ProcessService + Action/Catalog + Availability + AppState + TUI dispatch/prompt/result/refresh/safe Quit + service cancellation corrections
 - [x] O8 — reconcile Cargo.lock and run full local `cargo fmt`, `cargo check --locked --all-features`, Clippy/tests and Rust 1.88 gate
 - [x] O9 — update README/ROADMAP/ARCHITECTURE and this file to shipped truth
-- [ ] O10 — exact-head CI + Release validation, review final diff, Ready, merge, close #9/#178
+- [x] O10 — exact-head CI + Release validation, review final diff, Ready, merge, close #9/#178
 
 ### Why O6 and O7 are now atomic
 
@@ -66,7 +66,7 @@ The compile-complete code head `f95f3e282f9fc6f2f5b5f34e517025c22f35a503` then p
 - CI #638 / run `32582910535` — **success**: quality, Rust 1.88 MSRV, WebDAV physical, and MinIO transfer-queue retry physical jobs all green.
 - Release #107 / run `32582910537` — **success**: release validation completed successfully.
 
-Those runs prove the code/fmt state before O9. Because O9 changes the branch head, O10 still requires fresh exact-head CI and Release validation on the final documentation head before merge.
+Those runs proved the code/fmt state before O9. Final exact-head O10 acceptance and merge evidence are recorded below.
 
 ## O6 execution log
 
@@ -156,6 +156,15 @@ README, ROADMAP, and ARCHITECTURE now describe the resulting PACK O product trut
 - Quick Actions use the shared Action/Catalog/Availability model and dedicated Effect lane;
 - PACK P is the next architecture pack after PACK O.
 
-## Next step
+## O10 final acceptance — completed
 
-O10: review the final PR diff on the O9 head, require fresh exact-head CI and Release validation, mark PR #179 Ready only after both are green, squash-merge with the expected head SHA pinned, then close #9 and #178 with acceptance evidence.
+Final accepted PR head: `b9e76caa4bc7d57279d1fbad5ac630e25786b0a1`.
+
+- CI #639 / run `32584082080` — **success**: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO transfer-queue safe-read retry physical acceptance.
+- Release #108 / run `32584082070` — **success**: fmt/clippy/full tests/MSRV, single release build, third-party license report, tar/deb/rpm packaging, exact package payload + packaged-binary identity/smoke validation, checksums, and validated artifact upload.
+- Final independent diff review confirmed the expected 17-file PACK O scope and a one-line Cargo.lock root dependency addition for `sha2 0.10.9`, with no package/version/checksum churn.
+- PR #179 was marked Ready only after both exact-head workflows were green and was squash-merged with the expected head SHA pinned.
+- Squash merge SHA: `f11901817f65b1666e3d51cbc64030c2b0a27901`.
+- #9 and #178 were closed as completed with acceptance evidence.
+
+PACK O is complete. The next architecture batch is PACK P: behavior-preserving TUI decomposition.
