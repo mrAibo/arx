@@ -7,13 +7,8 @@ use std::path::PathBuf;
 /// the user later changes panes or selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuickActionPrompt {
-    Touch {
-        dir: PathBuf,
-    },
-    CompressTarGz {
-        dir: PathBuf,
-        names: Vec<String>,
-    },
+    Touch { dir: PathBuf },
+    CompressTarGz { dir: PathBuf, names: Vec<String> },
 }
 
 impl QuickActionPrompt {
