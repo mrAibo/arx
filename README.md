@@ -97,7 +97,7 @@ Preview features use `bat`, `chafa`, `pdftotext`, `ffprobe`, and archive utiliti
 3. Press **Ctrl+X P** — Preview workspace sync. Review the frozen plan
    before anything is queued.
 4. Keep the default Update mode. Press **Enter** to execute.
-5. The sync runs through the Job Manager in the background. Esc hides
+5. The sync runs through the Job Manager in the background; Esc hides
    the overlay without cancelling; Ctrl+J opens Jobs.
 6. After execution reaches Completed, ARX performs a separate
    post-sync verification scan.
@@ -145,7 +145,7 @@ of truth.
 | Shift+F6 | Rename |
 | Ctrl+U | Swap panes |
 | Ctrl+X C / L / O / S | chmod / hardlink / chown / symlink |
-| Ctrl+\\\\ | Toggle split pane |
+| Ctrl+\\ | Toggle split pane |
 
 ### View & Preview
 
@@ -249,7 +249,7 @@ Menu entries appear in Command Center (Ctrl+P).
 | tmux sessions (Command Center) | ✅ |
 | Mouse — right-click menu, drag multi-select, scroll | ✅ |
 | Directory diff + content diff (Ctrl+D) | ✅ |
-| Split pane toggle (Ctrl+\\\\) | ✅ |
+| Split pane toggle (Ctrl+\\) | ✅ |
 | MC-style Ctrl+X prefix (symlink, hardlink, chmod, chown) | ✅ |
 | User menu with custom scripts | ✅ |
 | Host Center (F9) | ✅ |
@@ -402,18 +402,7 @@ use transactional staging (temp → backup → commit → rollback).
 Preview. Cancel leaves source untouched. Host key verification uses the
 user's OpenSSH. WebDAV overwrite-forbid is atomic at the HTTP/file-finalization
 boundaries. Transfer retries are phase-aware and never blindly replay ambiguous
-mutations. Logs don't leak credentials.
-
-## Development
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-cargo run
-```
-
-Full Rust test suite, clippy-clean, CI on ubuntu-latest.
+mutations. Logs redact credentials and sensitive URL components.
 
 ## License
 
