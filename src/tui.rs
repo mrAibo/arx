@@ -6988,7 +6988,9 @@ fn selection_or_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arx::app::{Action, InputContext};
+    use arx::app::{
+        Action, ActionAvailability, CommandItem, CommandKind, CommandTarget, InputContext,
+    };
     use arx::input::{KeyBinding, KeyStroke, Keymap};
     use arx::jobs::{Job, JobKind, JobResult, JobStatus};
     use arx::process::ProcessService;
@@ -9585,6 +9587,134 @@ mod tests {
         }));
         job.verification = Some(verification_snapshot(plan_id, verification_status));
         job
+    }
+
+    #[test]
+    fn utility_overlay_infrastructure_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(160, 140);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            infrastructure_lines: vec!["infra-alpha".into(), "infra-beta".into()],
+            ..Default::default()
+        };
+
+        terminal
+            .draw(|f| render_infrastructure_center(f, f.area(), &mut state))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let text = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(text.contains("Infrastructure Center"));
+        assert!(text.contains("Ctrl+I toggle"));
+        assert!(text.contains("infra-alpha"));
+    }
+
+    #[test]
+    fn utility_overlay_smart_tree_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(160, 140);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            tree_lines: vec!["tree-root".into(), "tree-child".into()],
+            tree_filter: "needle".into(),
+            ..Default::default()
+        };
+
+        terminal
+            .draw(|f| render_smart_tree(f, f.area(), &mut state))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let text = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(text.contains("ARX Smart Tree"));
+        assert!(text.contains(":needle_"));
+        assert!(text.contains("Ctrl+T toggle"));
+        assert!(text.contains("tree-child"));
+    }
+
+    #[test]
+    fn utility_overlay_command_center_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(160, 140);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            filter: "needle".into(),
+            command_matches: vec![CommandItem {
+                title: "Blocked Demo".into(),
+                subtitle: Some("example subtitle".into()),
+                kind: CommandKind::UserCommand,
+                target: CommandTarget::ShellCommand("demo".into()),
+                score: 0,
+                availability: ActionAvailability::Disabled {
+                    reason: "characterization reason".into(),
+                },
+            }],
+            ..Default::default()
+        };
+
+        terminal
+            .draw(|f| render_command_center(f, f.area(), &mut state))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let text = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(text.contains("ARX Command Center"));
+        assert!(text.contains(":needle_"));
+        assert!(text.contains("[COMMAND] Blocked Demo"));
+        assert!(text.contains("example subtitle"));
+        assert!(text.contains("unavailable: characterization reason"));
+    }
+
+    #[test]
+    fn utility_overlay_context_menu_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(160, 140);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| render_context_menu(f, f.area())).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let text = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(text.contains("Menu"));
+        assert!(text.contains("Copy   F5"));
+        assert!(text.contains("Move   F6"));
+        assert!(text.contains("Mkdir  F7"));
+        assert!(text.contains("Delete F8"));
+        assert!(text.contains("View   F3"));
+        assert!(text.contains("Edit   F4"));
     }
 
     #[test]
