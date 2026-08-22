@@ -26,11 +26,15 @@ No TUI architecture rewrite, plugin runtime, remote/cloud Quick Actions, arbitra
 - filenames are never interpolated into `sh -c`
 - SHA-256 is computed in Rust
 - Touch uses `O_NOFOLLOW` and an opened regular-file descriptor
+- Touch cancellation is honored only before the open/create mutation boundary; once open/create succeeds, ARX finishes and reports the real terminal outcome instead of claiming a clean cancellation after a possible mutation
 - tar.gz uses typed argv with `--` before user filenames
+- tar subprocess cancellation uses `kill_on_drop(true)` plus cancellation-aware `tokio::select!`
 - archive finalization is staged and noclobber
 - long work runs off the TUI thread through the Effect lane
-- Quick Action mutation/results remain accepted even after pane navigation
-- Quit requests cooperative cancellation and waits for the Quick Action result before exiting
+- Quick Action results remain accepted even after pane navigation
+- Touch/Compress terminal results trigger a refresh for any pane still at the frozen origin, including failure paths that may have crossed a physical mutation boundary before a late error
+- all filename/path/tool-error presentation escapes control characters while preserving printable Unicode
+- Quit requests cooperative cancellation and waits for the Quick Action terminal result before allowing exit
 - Rust MSRV stays 1.88
 
 ## Progress
@@ -41,17 +45,22 @@ No TUI architecture rewrite, plugin runtime, remote/cloud Quick Actions, arbitra
 - [x] O3 — implement safe Touch worker and tests
 - [x] O4 — implement typed tar.gz worker with staged noclobber finalization and tests
 - [x] O5 — add `EffectLane::QuickAction`, typed Effect/Event variants and frozen prompt type
-- [ ] O6 — wire `ProcessService`, Action/ActionId/Catalog, Availability and AppState lifecycle
-- [ ] O7 — wire TUI dispatch, prompt submission, result presentation, refresh and safe Quit cancellation
-- [ ] O8 — reconcile Cargo.lock and run local `cargo fmt`, `cargo check --locked --all-features`, Clippy/tests
+- [ ] O6+O7 — atomic compile-complete integration closure: ProcessService + Action/Catalog + Availability + AppState + TUI dispatch/prompt/result/refresh/safe Quit + service cancellation corrections
+- [ ] O8 — reconcile Cargo.lock and run full local `cargo fmt`, `cargo check --locked --all-features`, Clippy/tests and Rust 1.88 gate
 - [ ] O9 — update README/ROADMAP/ARCHITECTURE and this file to shipped truth
 - [ ] O10 — exact-head CI + Release validation, review final diff, Ready, merge, close #9/#178
+
+### Why O6 and O7 are now atomic
+
+The original plan tried to make O6 a green non-TUI checkpoint and reserve `src/tui.rs` for O7. That boundary is structurally invalid on this branch: O5 already introduced both `Effect::QuickAction` and `EffectEvent::QuickActionFinished`. `ProcessService` must consume the Effect and the exhaustive TUI `EffectEvent` match must consume the Event before the crate can compile. Therefore there is no meaningful compile-complete state between those two consumers.
+
+PACK O does **not** turn this into a TUI refactor. The only change is the transaction boundary: core wiring and the minimal existing-TUI wiring land in one integration commit. PACK P remains the separate behavior-preserving TUI decomposition pack after PACK O merges.
 
 ## Current known CI state
 
 The earlier Draft runs CI #620 / Release #91 were intentionally non-authoritative because integration was incomplete. CI #620 stopped first on rustfmt in `src/services/quick_actions.rs`; that run must not be used as final PACK O evidence.
 
-Only exact-head green runs after O6–O9 are completed count as acceptance evidence.
+Only exact-head green runs after O6+O7–O9 are completed count as acceptance evidence.
 
 ## O6 execution log
 
@@ -64,20 +73,45 @@ Two defects were identified in the runner itself:
 1. the `accepts_effect` comment anchor used `conflict/resolution information`, while the repository text is `conflict or recovery instructions`;
 2. the replacement guard for `Action::Quit` omitted the required `||` between the RemoteEdit and QuickAction pending-effect conditions.
 
-Both defects are in the runner specification, not in repository code. O6 remains unchecked until the corrected deterministic runner completes all gates and pushes one clean integration commit.
+Both defects were in the runner specification, not repository code.
 
 ### Attempt 2 — hard stop, no code commit
 
 The second deterministic runner started from exact head `642301c60632030dfd48ad7058a0dcd2d2899331`. The corrected code-only `accepts_effect` anchor matched and all deterministic replacements applied, but the generated `Action::Quit` guard still lacked the `||` token at execution time. `cargo fmt` therefore failed at Rust parsing before `cargo check`, tests, commit, or push. Hermes restored the worktree clean to the exact starting head.
 
-No repository code defect was discovered in Attempt 2. The failure remained in the runner text itself. To remove this class of failure, Attempt 3 must not inject the entire multi-line Quit arm. It must replace only the existing one-line guard condition with a single explicit Rust expression containing `||`, and assert that exact expression exists before formatting.
+No repository code defect was discovered in Attempt 2. The failure remained in the runner text itself.
 
 ### Attempt 3 — hard stop, no code commit
 
 The third deterministic runner started from exact head `bcbe5447676c9715631f377a2344f6c2c8323400`. All anchors matched, the generated `RemoteEdit || QuickAction` Quit guard was proven before formatting, and `cargo fmt` plus `diff --check` succeeded. The run then stopped on the file-scope contract because the local Hermes worktree did not have `src/app/quick_action_prompt.rs` materialized even though `src/app/mod.rs` references that module.
 
-GitHub repository truth was checked independently after the stop: `src/app/quick_action_prompt.rs` is already a tracked file in PR #179 at head `bcbe5447676c9715631f377a2344f6c2c8323400`, with blob `c900d19a484f95ac7e98bb94da590e22ffd98eb9`, and is listed by GitHub among PR #179 changed files. Therefore Attempt 3 did not discover a missing repository artifact. It exposed a local worktree materialization mismatch in the Hermes checkout. No O6 code was committed or pushed.
+GitHub repository truth was checked independently after the stop: `src/app/quick_action_prompt.rs` is already a tracked file in PR #179 with blob `c900d19a484f95ac7e98bb94da590e22ffd98eb9`. Attempt 3 therefore exposed a local worktree materialization mismatch, not a missing repository artifact. No O6 code was committed or pushed.
+
+### Attempt 4 — hard stop, no code commit; architecture boundary corrected
+
+Attempt 4 started from exact head `57a203c66fdbce574355639914b29b7b9f6ac6be`. The materialization preflight proved `src/app/quick_action_prompt.rs` is tracked at the expected blob and restored it without changing repository state. All O6 anchors then matched, the generated Quit guard was valid, `cargo fmt`, `git diff --check`, the code-scope guard and the narrow Cargo.lock reconciliation all passed.
+
+`cargo check --all-features` then correctly failed because the exhaustive `apply_effect_event` match in `src/tui.rs` did not yet cover `EffectEvent::QuickActionFinished`. This is not a new implementation bug: it proves the former O6/O7 split itself was unsatisfiable. O6 added the producer-side `ProcessService` consumer for `Effect::QuickAction`, while the Event consumer was explicitly deferred to O7 and `src/tui.rs` was forbidden. Hermes restored the tree clean and made no commit/push.
+
+## Pre-integration audit before the next code run
+
+The next code run must close the whole existing type/lifecycle graph in one patch. The audit found these mandatory points:
+
+1. `ProcessService::execute_with_registry_cancellable` handles `Effect::QuickAction` with the real cancellation flag.
+2. ActionId/Action/ALL_ACTIONS/ACTION_CATALOG contain SHA-256, Touch and Compress; shared Availability is local-only and target-aware.
+3. AppState exports/stores the frozen QuickAction prompt, accepts QuickAction mutation results after navigation, and blocks Quit while RemoteEdit or QuickAction is pending.
+4. `dispatch_ui_action` rejects a second QuickAction, freezes the Local directory + current selected/focused names, and never introduces a new global shortcut.
+5. Command-input Escape clears both mkdir and QuickAction pending prompts; generic `:` clears stale typed prompt ownership before becoming a shell command prompt.
+6. Touch/Compress prompt submit dispatches a typed `Effect::QuickAction`; SHA dispatches directly.
+7. `request_quit` cancels both RemoteEdit and QuickAction lanes and leaves AppState blocked until terminal response.
+8. `apply_effect_event` handles every `QuickActionFinished` outcome with control-safe presentation; SHA opens viewer lines, mutation actions return concise status.
+9. `handle_effect_response` refreshes any pane still at the frozen origin for **all** Touch/Compress terminal results, including failures that may have crossed a mutation boundary; SHA never refreshes.
+10. `QuickActionService::touch_local` must not return `Cancelled` after `open(...create...)` may already have mutated the directory. Cancellation is checked before that boundary only.
+11. `QuickActionService::compress_tar_gz_local` uses a `kill_on_drop(true)` tar command and `tokio::select!` against `CancellationFlag::cancelled()` so quit cannot orphan tar.
+12. The existing commander hitbox helpers `action_id_to_action` / `action_to_id` stay unchanged: Quick Actions have no new keybinding and Command Center already executes typed `CommandTarget::Action` directly.
+13. Cargo.lock may only add the existing direct `sha2` root dependency; no version/checksum/package churn.
+14. Tests must cover local-only availability, Command Center discovery, mutation-result acceptance after navigation, Quit blocking, control-character escaping and the Touch pre-mutation cancellation boundary.
 
 ## Next step
 
-Attempt 4 must first prove that the expected commit tree contains `src/app/quick_action_prompt.rs`, then materialize that exact tracked path with `git checkout --ignore-skip-worktree-bits <expected-sha> -- src/app/quick_action_prompt.rs` if it is absent locally, verify the resulting blob against `c900d19a484f95ac7e98bb94da590e22ffd98eb9`, and require a clean worktree before applying O6. The prompt file is already part of O5 and must remain unchanged/un-staged during O6. `src/tui.rs` remains out of scope until O7.
+Build one deterministic O6+O7 integration runner against the new documentation-only exact head. It may touch `src/tui.rs`, but only for the minimal PACK O wiring listed above; no function extraction, module movement, renderer refactor, input architecture refactor or other PACK P work is allowed. The runner must apply all code changes transactionally, run `cargo fmt` and an initial all-features compile before any commit, then run the full O8 gates before push.
