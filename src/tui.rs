@@ -2994,6 +2994,95 @@ fn s3_f3_routes_to_preview(location: &Location) -> bool {
     matches!(location.provider_id(), ProviderId::Sftp | ProviderId::S3)
 }
 
+fn render_infrastructure_center(frame: &mut ratatui::Frame, area: Rect, state: &mut AppState) {
+    let lines = &state.infrastructure_lines;
+    let h = (lines.len().max(1) + 3).min(30) as u16;
+    let popup = centered_rect(80, h, area);
+    frame.render_widget(Clear, popup);
+    let items: Vec<ListItem> = lines.iter().map(|l| ListItem::new(l.as_str())).collect();
+    let list = ratatui::widgets::List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Infrastructure Center — Ctrl+I toggle "),
+        )
+        .highlight_style(Style::default().fg(Color::Cyan));
+    frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
+}
+
+fn render_smart_tree(frame: &mut ratatui::Frame, area: Rect, state: &mut AppState) {
+    let tl = &state.tree_lines;
+    let h = (tl.len().max(1) + 3).min(30) as u16;
+    let popup = centered_rect(80, h, area);
+    frame.render_widget(Clear, popup);
+    let items: Vec<ListItem> = tl.iter().map(|l| ListItem::new(l.as_str())).collect();
+    let title = format!(
+        " ARX Smart Tree — :{}_ | Ctrl+T toggle, Esc close ",
+        state.tree_filter
+    );
+    let list = ratatui::widgets::List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().fg(Color::Green));
+    frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
+}
+
+fn render_command_center(frame: &mut ratatui::Frame, area: Rect, state: &mut AppState) {
+    let h = (state.command_matches.len().max(1) + 3).min(20) as u16;
+    let popup = centered_rect(70, h, area);
+    frame.render_widget(Clear, popup);
+    let items: Vec<ListItem> = state
+        .command_matches
+        .iter()
+        .map(|item| {
+            let style = if !item.availability.is_available() {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                match item.kind {
+                    CommandKind::Action => Style::default().fg(Color::Cyan),
+                    CommandKind::Host => Style::default().fg(Color::Green),
+                    CommandKind::Bookmark => Style::default().fg(Color::Magenta),
+                    CommandKind::History => Style::default(),
+                    CommandKind::Session => Style::default().fg(Color::Yellow),
+                    CommandKind::UserCommand => Style::default().fg(Color::Blue),
+                }
+            };
+            let line = match item.availability.reason() {
+                Some(reason) => format!("{}  —  unavailable: {reason}", item.display_line()),
+                None => item.display_line(),
+            };
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let list = ratatui::widgets::List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " ARX Command Center — :{}_ | bat chafa pdftotext ffprobe 7z ",
+            state.filter
+        )))
+        .highlight_style(Style::default().fg(Color::Yellow));
+    frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
+}
+
+fn render_context_menu(frame: &mut ratatui::Frame, area: Rect) {
+    let popup = centered_rect(18, 7, area);
+    frame.render_widget(Clear, popup);
+    let items: Vec<ListItem> = [
+        "Copy   F5",
+        "Move   F6",
+        "Mkdir  F7",
+        "Delete F8",
+        "View   F3",
+        "Edit   F4",
+    ]
+    .iter()
+    .map(|s| ListItem::new(*s))
+    .collect();
+    let list = ratatui::widgets::List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(" Menu "))
+        .highlight_style(Style::default().fg(Color::Yellow));
+    frame.render_widget(list, popup);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render(
     frame: &mut ratatui::Frame,
@@ -3263,96 +3352,20 @@ fn render(
         }
     }
 
-    // Infrastructure Center overlay (Ctrl+I)
     if state.show_infra {
-        let lines = &state.infrastructure_lines;
-        let h = (lines.len().max(1) + 3).min(30) as u16;
-        let popup = centered_rect(80, h, area);
-        frame.render_widget(Clear, popup);
-        let items: Vec<ListItem> = lines.iter().map(|l| ListItem::new(l.as_str())).collect();
-        let list = ratatui::widgets::List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Infrastructure Center — Ctrl+I toggle "),
-            )
-            .highlight_style(Style::default().fg(Color::Cyan));
-        frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
+        render_infrastructure_center(frame, area, state);
     }
-    // Smart Tree overlay (Ctrl+T)
+
     if state.show_tree {
-        let tl = &state.tree_lines;
-        let h = (tl.len().max(1) + 3).min(30) as u16;
-        let popup = centered_rect(80, h, area);
-        frame.render_widget(Clear, popup);
-        let items: Vec<ListItem> = tl.iter().map(|l| ListItem::new(l.as_str())).collect();
-        let title = format!(
-            " ARX Smart Tree — :{}_ | Ctrl+T toggle, Esc close ",
-            state.tree_filter
-        );
-        let list = ratatui::widgets::List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .highlight_style(Style::default().fg(Color::Green));
-        frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
+        render_smart_tree(frame, area, state);
     }
-    // Command Center overlay (Ctrl+P)
+
     if state.show_command_center {
-        let h = (state.command_matches.len().max(1) + 3).min(20) as u16;
-        let popup = centered_rect(70, h, area);
-        frame.render_widget(Clear, popup);
-        let items: Vec<ListItem> = state
-            .command_matches
-            .iter()
-            .map(|item| {
-                let style = if !item.availability.is_available() {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    match item.kind {
-                        CommandKind::Action => Style::default().fg(Color::Cyan),
-                        CommandKind::Host => Style::default().fg(Color::Green),
-                        CommandKind::Bookmark => Style::default().fg(Color::Magenta),
-                        CommandKind::History => Style::default(),
-                        CommandKind::Session => Style::default().fg(Color::Yellow),
-                        CommandKind::UserCommand => Style::default().fg(Color::Blue),
-                    }
-                };
-                let line = match item.availability.reason() {
-                    Some(reason) => format!("{}  —  unavailable: {reason}", item.display_line()),
-                    None => item.display_line(),
-                };
-                ListItem::new(line).style(style)
-            })
-            .collect();
-
-        let list = ratatui::widgets::List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(format!(
-                " ARX Command Center — :{}_ | bat chafa pdftotext ffprobe 7z ",
-                state.filter
-            )))
-            .highlight_style(Style::default().fg(Color::Yellow));
-        frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
+        render_command_center(frame, area, state);
     }
 
-    // Command Center overlay (Ctrl+P)
-    // Context menu (right-click) — ponytail: UI-CONTEXT-AVAILABILITY — static presentation, no dispatch lane; later capability-aware rendering
     if state.show_context_menu {
-        let popup = centered_rect(18, 7, area);
-        frame.render_widget(Clear, popup);
-        let items: Vec<ListItem> = [
-            "Copy   F5",
-            "Move   F6",
-            "Mkdir  F7",
-            "Delete F8",
-            "View   F3",
-            "Edit   F4",
-        ]
-        .iter()
-        .map(|s| ListItem::new(*s))
-        .collect();
-        let list = ratatui::widgets::List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" Menu "))
-            .highlight_style(Style::default().fg(Color::Yellow));
-        frame.render_widget(list, popup);
+        render_context_menu(frame, area);
     }
 
     // Bookmarks overlay
