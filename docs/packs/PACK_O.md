@@ -66,6 +66,12 @@ Two defects were identified in the runner itself:
 
 Both defects are in the runner specification, not in repository code. O6 remains unchecked until the corrected deterministic runner completes all gates and pushes one clean integration commit.
 
+### Attempt 2 — hard stop, no code commit
+
+The second deterministic runner started from exact head `642301c60632030dfd48ad7058a0dcd2d2899331`. The corrected code-only `accepts_effect` anchor matched and all deterministic replacements applied, but the generated `Action::Quit` guard still lacked the `||` token at execution time. `cargo fmt` therefore failed at Rust parsing before `cargo check`, tests, commit, or push. Hermes restored the worktree clean to the exact starting head.
+
+No repository code defect was discovered in Attempt 2. The failure remained in the runner text itself. To remove this class of failure, Attempt 3 must not inject the entire multi-line Quit arm. It must replace only the existing one-line guard condition with a single explicit Rust expression containing `||`, and assert that exact expression exists before formatting.
+
 ## Next step
 
-Re-run O6 from the new documentation-only exact head with the two runner defects corrected. The large `src/tui.rs` patch remains a separate O7 step so compile failures can be attributed precisely and the later PACK P refactor is not mixed into this feature PR.
+Re-run O6 from the new documentation-only exact head using a narrowly-scoped guard replacement plus a pre-format assertion for the exact `RemoteEdit || QuickAction` expression. `src/tui.rs` remains out of scope until O7.
