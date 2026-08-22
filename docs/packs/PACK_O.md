@@ -72,6 +72,12 @@ The second deterministic runner started from exact head `642301c60632030dfd48ad7
 
 No repository code defect was discovered in Attempt 2. The failure remained in the runner text itself. To remove this class of failure, Attempt 3 must not inject the entire multi-line Quit arm. It must replace only the existing one-line guard condition with a single explicit Rust expression containing `||`, and assert that exact expression exists before formatting.
 
+### Attempt 3 — hard stop, no code commit
+
+The third deterministic runner started from exact head `bcbe5447676c9715631f377a2344f6c2c8323400`. All anchors matched, the generated `RemoteEdit || QuickAction` Quit guard was proven before formatting, and `cargo fmt` plus `diff --check` succeeded. The run then stopped on the file-scope contract because the local Hermes worktree did not have `src/app/quick_action_prompt.rs` materialized even though `src/app/mod.rs` references that module.
+
+GitHub repository truth was checked independently after the stop: `src/app/quick_action_prompt.rs` is already a tracked file in PR #179 at head `bcbe5447676c9715631f377a2344f6c2c8323400`, with blob `c900d19a484f95ac7e98bb94da590e22ffd98eb9`, and is listed by GitHub among PR #179 changed files. Therefore Attempt 3 did not discover a missing repository artifact. It exposed a local worktree materialization mismatch in the Hermes checkout. No O6 code was committed or pushed.
+
 ## Next step
 
-Re-run O6 from the new documentation-only exact head using a narrowly-scoped guard replacement plus a pre-format assertion for the exact `RemoteEdit || QuickAction` expression. `src/tui.rs` remains out of scope until O7.
+Attempt 4 must first prove that the expected commit tree contains `src/app/quick_action_prompt.rs`, then materialize that exact tracked path with `git checkout --ignore-skip-worktree-bits <expected-sha> -- src/app/quick_action_prompt.rs` if it is absent locally, verify the resulting blob against `c900d19a484f95ac7e98bb94da590e22ffd98eb9`, and require a clean worktree before applying O6. The prompt file is already part of O5 and must remain unchanged/un-staged during O6. `src/tui.rs` remains out of scope until O7.
