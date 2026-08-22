@@ -3520,7 +3520,7 @@ fn render(
 
         // ponytail: enough room for msg (6 lines) + 2-separator + name_lines + 2-border
         let height = (name_lines.len() + msg.lines().count() + 4).min(area.height as usize) as u16;
-        let popup = centered_rect_lines(60, height, area);
+        let popup = centered_rect_lines(60, height.max(8), area);
         frame.render_widget(Clear, popup);
         let p = ratatui::widgets::Paragraph::new(body)
             .block(
@@ -4536,10 +4536,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 /// Like centered_rect but height is in terminal lines instead of percent.
 /// Clamps to available area so the popup never exceeds terminal height.
 fn centered_rect_lines(percent_x: u16, lines: u16, area: Rect) -> Rect {
-    // ponytail: minimum 8 lines so deletion confirmation never collapses
-    let desired = lines.max(8);
     let max_h = area.height.saturating_sub(2);
-    let h = desired.min(max_h);
+    let h = lines.min(max_h);
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -9508,7 +9506,7 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
-        let backend = TestBackend::new(160, 140);
+        let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = AppState {
             infrastructure_lines: vec!["infra-alpha".into(), "infra-beta".into()],
@@ -9537,7 +9535,7 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
-        let backend = TestBackend::new(160, 140);
+        let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = AppState {
             tree_lines: vec!["tree-root".into(), "tree-child".into()],
@@ -9568,7 +9566,7 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
-        let backend = TestBackend::new(160, 140);
+        let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = AppState {
             filter: "needle".into(),
@@ -9579,7 +9577,7 @@ mod tests {
                 target: CommandTarget::ShellCommand("demo".into()),
                 score: 0,
                 availability: ActionAvailability::Disabled {
-                    reason: "characterization reason".into(),
+                    reason: "char reason".into(),
                 },
             }],
             ..Default::default()
@@ -9601,7 +9599,7 @@ mod tests {
         assert!(text.contains(":needle_"));
         assert!(text.contains("[COMMAND] Blocked Demo"));
         assert!(text.contains("example subtitle"));
-        assert!(text.contains("unavailable: characterization reason"));
+        assert!(text.contains("unavailable: char reason"));
     }
 
     #[test]
@@ -9609,7 +9607,7 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
-        let backend = TestBackend::new(160, 140);
+        let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|f| render_context_menu(f, f.area())).unwrap();
@@ -9629,6 +9627,23 @@ mod tests {
         assert!(text.contains("Delete F8"));
         assert!(text.contains("View   F3"));
         assert!(text.contains("Edit   F4"));
+    }
+
+    #[test]
+    fn utility_overlay_centered_rect_lines_sizing() {
+        use ratatui::layout::Rect;
+
+        // requested line height passes through unchanged when area fits
+        let r = centered_rect_lines(80, 5, Rect::new(0, 0, 120, 24));
+        assert_eq!(r.height, 5);
+
+        // oversized height is clamped to available area minus 2
+        let r = centered_rect_lines(80, 9999, Rect::new(0, 0, 120, 24));
+        assert_eq!(r.height, 22);
+
+        // respects a small area
+        let r = centered_rect_lines(80, 50, Rect::new(0, 0, 120, 10));
+        assert_eq!(r.height, 8);
     }
 
     #[test]
