@@ -1,8 +1,8 @@
 > ⚠️ **ARCHIVE / HISTORICAL SNAPSHOT — NOT current status.**
 > Authored **10 August 2026** (PR #40 merged, PR #42 open). It does **NOT** reflect
 > current product truth. For current status see `README.md`, `ROADMAP.md`, `docs/`, and
-> [GitHub Releases](https://github.com/mrAibo/arx/releases) — **ARX v0.17.0 was released
-> 2026-08-16**.
+> [GitHub Releases](https://github.com/mrAibo/arx/releases). The current release line is
+> **ARX v0.20.0**.
 
 # ARX Commander: Final Status
 
