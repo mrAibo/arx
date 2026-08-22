@@ -131,7 +131,7 @@ jobs:
             target/release/arx \
             dist
 
-      - name: Smoke every packaged binary
+      - name: Validate exact package payloads and smoke binaries
         run: |
           set -euo pipefail
           VERSION="${{ env.version }}"
@@ -139,8 +139,29 @@ jobs:
           rm -rf /tmp/arx-release-smoke
           mkdir -p /tmp/arx-release-smoke/{tar,deb,rpm}
 
+          assert_manifest() {
+            local root="$1"
+            shift
+            local expected actual
+            expected="$(mktemp)"
+            actual="$(mktemp)"
+            printf '%s\n' "$@" | sort > "$expected"
+            find "$root" -mindepth 1 \( -type f -o -type l \) -printf '%P\n' | sort > "$actual"
+            if ! diff -u "$expected" "$actual"; then
+              echo "FAIL: unexpected package payload under $root" >&2
+              rm -f "$expected" "$actual"
+              exit 1
+            fi
+            rm -f "$expected" "$actual"
+          }
+
           tar xzf "dist/arx-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" -C /tmp/arx-release-smoke/tar
           TAR_ROOT="/tmp/arx-release-smoke/tar/arx-v${VERSION}-x86_64-unknown-linux-gnu"
+          assert_manifest "$TAR_ROOT" \
+            arx \
+            README.md \
+            LICENSE \
+            THIRD_PARTY_LICENSES.html
           test -s "$TAR_ROOT/THIRD_PARTY_LICENSES.html"
           test "$(sha256sum "$TAR_ROOT/arx" | awk '{print $1}')" = "$ORIGINAL_SHA"
           "$TAR_ROOT/arx" --version | grep -q "$VERSION"
@@ -150,7 +171,14 @@ jobs:
           test "$(dpkg-deb -f "$DEB" Package)" = "arx"
           test "$(dpkg-deb -f "$DEB" Version)" = "$VERSION"
           test "$(dpkg-deb -f "$DEB" Architecture)" = "amd64"
+          test "$(dpkg-deb -f "$DEB" Homepage)" = "https://github.com/mrAibo/arx"
+          test -n "$(dpkg-deb -f "$DEB" Description)"
           dpkg-deb -x "$DEB" /tmp/arx-release-smoke/deb
+          assert_manifest /tmp/arx-release-smoke/deb \
+            usr/bin/arx \
+            usr/share/doc/arx/README.md \
+            usr/share/doc/arx/THIRD_PARTY_LICENSES.html \
+            usr/share/doc/arx/copyright
           test -s /tmp/arx-release-smoke/deb/usr/share/doc/arx/THIRD_PARTY_LICENSES.html
           test "$(sha256sum /tmp/arx-release-smoke/deb/usr/bin/arx | awk '{print $1}')" = "$ORIGINAL_SHA"
           /tmp/arx-release-smoke/deb/usr/bin/arx --version | grep -q "$VERSION"
@@ -160,13 +188,21 @@ jobs:
           test "$(rpm -qp --qf '%{NAME}' "$RPM")" = "arx"
           test "$(rpm -qp --qf '%{VERSION}' "$RPM")" = "$VERSION"
           test "$(rpm -qp --qf '%{ARCH}' "$RPM")" = "x86_64"
+          test "$(rpm -qp --qf '%{LICENSE}' "$RPM")" = "MIT"
+          test "$(rpm -qp --qf '%{URL}' "$RPM")" = "https://github.com/mrAibo/arx"
+          test -n "$(rpm -qp --qf '%{SUMMARY}' "$RPM")"
           ( cd /tmp/arx-release-smoke/rpm && rpm2cpio "$GITHUB_WORKSPACE/$RPM" | cpio -idm --quiet )
+          assert_manifest /tmp/arx-release-smoke/rpm \
+            usr/bin/arx \
+            usr/share/doc/arx/README.md \
+            usr/share/doc/arx/THIRD_PARTY_LICENSES.html \
+            usr/share/licenses/arx/LICENSE
           test -s /tmp/arx-release-smoke/rpm/usr/share/doc/arx/THIRD_PARTY_LICENSES.html
           test "$(sha256sum /tmp/arx-release-smoke/rpm/usr/bin/arx | awk '{print $1}')" = "$ORIGINAL_SHA"
           /tmp/arx-release-smoke/rpm/usr/bin/arx --version | grep -q "$VERSION"
           /tmp/arx-release-smoke/rpm/usr/bin/arx --help >/dev/null
 
-          echo "tar/deb/rpm binary identity + smoke: OK"
+          echo "tar/deb/rpm exact payload + metadata + binary identity smoke: OK"
 
       - name: Verify checksums
         run: |
