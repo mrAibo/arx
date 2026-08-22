@@ -3290,7 +3290,7 @@ fn render(
     // Directory history overlay (Alt+H)
     if state.show_history {
         let h = (state.dir_history.len() + 2).min(20) as u16;
-        let popup = centered_rect(60, h, area);
+        let popup = centered_rect_lines(60, h, area);
         frame.render_widget(Clear, popup);
         let mut items: Vec<ListItem> = state
             .dir_history
@@ -3381,7 +3381,7 @@ fn render(
             items.push(ListItem::new(format!("{pre}R{i}: {loc}")));
         }
         let h = (items.len() + 2) as u16;
-        let popup = centered_rect(60, h, area);
+        let popup = centered_rect_lines(60, h, area);
         frame.render_widget(Clear, popup);
         frame.render_widget(
             List::new(items).block(
