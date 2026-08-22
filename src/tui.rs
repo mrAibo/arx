@@ -10038,6 +10038,110 @@ mod tests {
     }
 
     #[test]
+    fn workspace_ribbon_commander_and_direction_characterization() {
+        let mut state = AppState::default();
+
+        state.left.location = Location::Local("/left".into());
+        state.right.location = Location::Sftp {
+            host: "demo".into(),
+            path: "/srv".into(),
+        };
+
+        assert_eq!(
+            workspace_ribbon_text(&state),
+            "COMMANDER [LOCAL] ⇄ [SSH] · Ctrl+D Compare"
+        );
+
+        state.remote_workspace.enabled = true;
+
+        assert_eq!(
+            workspace_ribbon_text(&state),
+            "WORKSPACE [LOCAL] → [SSH] · Ctrl+D Compare"
+        );
+
+        state.remote_workspace.policy.direction = arx::workspace_sync::SyncDirection::RightToLeft;
+
+        assert_eq!(
+            workspace_ribbon_text(&state),
+            "WORKSPACE [SSH] → [LOCAL] · Ctrl+D Compare"
+        );
+    }
+
+    #[test]
+    fn workspace_ribbon_unknown_provider_label_is_characterized() {
+        let mut state = AppState::default();
+
+        state.left.location = Location::S3 {
+            target: "acc".into(),
+            bucket: Some("bucket".into()),
+            prefix: String::new(),
+        };
+
+        state.right.location = Location::Archive {
+            archive: "/tmp/bundle.tar.gz".into(),
+            inner_path: String::new(),
+        };
+
+        assert_eq!(
+            workspace_ribbon_text(&state),
+            "COMMANDER [?] ⇄ [ARCHIVE] · Ctrl+D Compare"
+        );
+    }
+
+    #[test]
+    fn workspace_ribbon_runtime_state_labels_characterization() {
+        let mut state = AppState::default();
+        state.remote_workspace.enabled = true;
+
+        state.remote_workspace.ux = WorkspaceSyncUxState::Scanning;
+        assert!(workspace_ribbon_text(&state).ends_with("Comparing…"));
+
+        state.remote_workspace.ux = WorkspaceSyncUxState::Blocked {
+            message: "characterization only".into(),
+        };
+        assert!(workspace_ribbon_text(&state).ends_with("BLOCKED"));
+
+        state.remote_workspace.ux = WorkspaceSyncUxState::Verifying {
+            job_id: "sync-characterization".into(),
+        };
+        assert!(workspace_ribbon_text(&state).ends_with("Verifying…"));
+    }
+
+    #[test]
+    fn workspace_ribbon_terminal_verdict_characterization() {
+        let plan_id = test_plan_id();
+        let mut state = AppState::default();
+        state.remote_workspace.enabled = true;
+        state.remote_workspace.ux = WorkspaceSyncUxState::Finished {
+            job_id: "sync-characterization".into(),
+        };
+
+        state.remote_workspace.verification = Some(verification_snapshot(
+            plan_id,
+            arx::workspace_sync_verification::SyncVerificationStatus::Finished(Box::new(
+                synchronized_result(plan_id),
+            )),
+        ));
+        assert!(workspace_ribbon_text(&state).ends_with("✓ SYNCHRONIZED"));
+
+        state.remote_workspace.verification = Some(verification_snapshot(
+            plan_id,
+            arx::workspace_sync_verification::SyncVerificationStatus::Finished(Box::new(
+                differences_result(plan_id),
+            )),
+        ));
+        assert!(workspace_ribbon_text(&state).ends_with("⚠ DIFFERENCES REMAIN"));
+
+        state.remote_workspace.verification = Some(verification_snapshot(
+            plan_id,
+            arx::workspace_sync_verification::SyncVerificationStatus::Finished(Box::new(
+                inconclusive_result(plan_id),
+            )),
+        ));
+        assert!(workspace_ribbon_text(&state).ends_with("? INCONCLUSIVE"));
+    }
+
+    #[test]
     fn verified_sync_milestone_requires_completed_and_synchronized() {
         let plan_id = test_plan_id();
         let cases = [
