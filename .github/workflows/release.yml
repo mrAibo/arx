@@ -8,12 +8,16 @@ on:
     paths:
       - '.github/workflows/release.yml'
       - 'scripts/package-release.sh'
+      - 'packaging/**'
+      - 'about.toml'
+      - 'about.hbs'
+      - 'README.md'
       - 'Cargo.toml'
       - 'Cargo.lock'
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to dry-run (e.g. 0.15.0)'
+        description: 'Version to dry-run (e.g. 0.20.0)'
         required: false
         default: ''
 
@@ -21,10 +25,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Quality gates + build + package + smoke.
-  # Runs on every trigger. No write permissions.
+  # Quality gates + one release build + package + smoke.
+  # Every package is made from the exact same validated ELF.
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
     steps:
@@ -80,7 +84,7 @@ jobs:
         if: steps.ver.outputs.is_tag == 'true'
         run: |
           if [ ! -f docs/assets/remote-workspace-update.gif ]; then
-            echo "FAIL: Product hero GIF is missing. Merge PR #55 before tagging a release."
+            echo "FAIL: Product hero GIF is missing."
             exit 1
           fi
 
@@ -89,6 +93,12 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm cpio
+          cargo install --locked --version 0.9.1 --features cli cargo-about
 
       - name: Format
         run: cargo fmt --check
@@ -104,10 +114,16 @@ jobs:
           rustup toolchain install 1.88 --no-self-update --profile minimal
           cargo +1.88 check --locked --all-features
 
-      - name: Build
+      - name: Build once
         run: cargo build --locked --release
 
-      - name: Package
+      - name: Generate third-party license report
+        run: |
+          cargo about generate about.hbs > THIRD_PARTY_LICENSES.html
+          test -s THIRD_PARTY_LICENSES.html
+          grep -q 'dua-core' THIRD_PARTY_LICENSES.html
+
+      - name: Package tar, deb and rpm
         run: |
           scripts/package-release.sh \
             "${{ env.version }}" \
@@ -115,29 +131,97 @@ jobs:
             target/release/arx \
             dist
 
-      - name: Smoke packaged binary
+      - name: Validate exact package payloads and smoke binaries
         run: |
-          mkdir -p /tmp/arx-release-smoke
-          tar xzf "dist/arx-v${{ env.version }}-x86_64-unknown-linux-gnu.tar.gz" -C /tmp/arx-release-smoke
-          SMOKE_DIR="/tmp/arx-release-smoke/arx-v${{ env.version }}-x86_64-unknown-linux-gnu"
-          "$SMOKE_DIR/arx" --version | grep -q "${{ env.version }}" || {
-            echo "FAIL: packaged binary version mismatch"
-            exit 1
-          }
-          "$SMOKE_DIR/arx" --help > /dev/null
-          echo "Packaged binary smoke: OK"
+          set -euo pipefail
+          VERSION="${{ env.version }}"
+          ORIGINAL_SHA=$(sha256sum target/release/arx | awk '{print $1}')
+          rm -rf /tmp/arx-release-smoke
+          mkdir -p /tmp/arx-release-smoke/{tar,deb,rpm}
 
-      - name: Verify checksum
-        run: ( cd dist && sha256sum -c SHA256SUMS )
+          assert_manifest() {
+            local root="$1"
+            shift
+            local expected actual
+            expected="$(mktemp)"
+            actual="$(mktemp)"
+            printf '%s\n' "$@" | sort > "$expected"
+            find "$root" -mindepth 1 \( -type f -o -type l \) -printf '%P\n' | sort > "$actual"
+            if ! diff -u "$expected" "$actual"; then
+              echo "FAIL: unexpected package payload under $root" >&2
+              rm -f "$expected" "$actual"
+              exit 1
+            fi
+            rm -f "$expected" "$actual"
+          }
+
+          tar xzf "dist/arx-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" -C /tmp/arx-release-smoke/tar
+          TAR_ROOT="/tmp/arx-release-smoke/tar/arx-v${VERSION}-x86_64-unknown-linux-gnu"
+          assert_manifest "$TAR_ROOT" \
+            arx \
+            README.md \
+            LICENSE \
+            THIRD_PARTY_LICENSES.html
+          test -s "$TAR_ROOT/THIRD_PARTY_LICENSES.html"
+          test "$(sha256sum "$TAR_ROOT/arx" | awk '{print $1}')" = "$ORIGINAL_SHA"
+          "$TAR_ROOT/arx" --version | grep -q "$VERSION"
+          "$TAR_ROOT/arx" --help >/dev/null
+
+          DEB="dist/arx_${VERSION}_amd64.deb"
+          test "$(dpkg-deb -f "$DEB" Package)" = "arx"
+          test "$(dpkg-deb -f "$DEB" Version)" = "$VERSION"
+          test "$(dpkg-deb -f "$DEB" Architecture)" = "amd64"
+          test "$(dpkg-deb -f "$DEB" Homepage)" = "https://github.com/mrAibo/arx"
+          test -n "$(dpkg-deb -f "$DEB" Description)"
+          dpkg-deb -x "$DEB" /tmp/arx-release-smoke/deb
+          assert_manifest /tmp/arx-release-smoke/deb \
+            usr/bin/arx \
+            usr/share/doc/arx/README.md \
+            usr/share/doc/arx/THIRD_PARTY_LICENSES.html \
+            usr/share/doc/arx/copyright
+          test -s /tmp/arx-release-smoke/deb/usr/share/doc/arx/THIRD_PARTY_LICENSES.html
+          test "$(sha256sum /tmp/arx-release-smoke/deb/usr/bin/arx | awk '{print $1}')" = "$ORIGINAL_SHA"
+          /tmp/arx-release-smoke/deb/usr/bin/arx --version | grep -q "$VERSION"
+          /tmp/arx-release-smoke/deb/usr/bin/arx --help >/dev/null
+
+          RPM="dist/arx-${VERSION}-1.x86_64.rpm"
+          test "$(rpm -qp --qf '%{NAME}' "$RPM")" = "arx"
+          test "$(rpm -qp --qf '%{VERSION}' "$RPM")" = "$VERSION"
+          test "$(rpm -qp --qf '%{ARCH}' "$RPM")" = "x86_64"
+          test "$(rpm -qp --qf '%{LICENSE}' "$RPM")" = "MIT"
+          test "$(rpm -qp --qf '%{URL}' "$RPM")" = "https://github.com/mrAibo/arx"
+          test -n "$(rpm -qp --qf '%{SUMMARY}' "$RPM")"
+          ( cd /tmp/arx-release-smoke/rpm && rpm2cpio "$GITHUB_WORKSPACE/$RPM" | cpio -idm --quiet )
+          assert_manifest /tmp/arx-release-smoke/rpm \
+            usr/bin/arx \
+            usr/share/doc/arx/README.md \
+            usr/share/doc/arx/THIRD_PARTY_LICENSES.html \
+            usr/share/licenses/arx/LICENSE
+          test -s /tmp/arx-release-smoke/rpm/usr/share/doc/arx/THIRD_PARTY_LICENSES.html
+          test "$(sha256sum /tmp/arx-release-smoke/rpm/usr/bin/arx | awk '{print $1}')" = "$ORIGINAL_SHA"
+          /tmp/arx-release-smoke/rpm/usr/bin/arx --version | grep -q "$VERSION"
+          /tmp/arx-release-smoke/rpm/usr/bin/arx --help >/dev/null
+
+          echo "tar/deb/rpm exact payload + metadata + binary identity smoke: OK"
+
+      - name: Verify checksums
+        run: |
+          cd dist
+          test "$(wc -l < SHA256SUMS)" -eq 3
+          sha256sum -c SHA256SUMS
 
       - name: Upload validated artifacts
         uses: actions/upload-artifact@v7
         with:
           name: release-artifacts
-          path: dist/
+          path: |
+            dist/arx-*.tar.gz
+            dist/arx_*.deb
+            dist/arx-*.rpm
+            dist/SHA256SUMS
           retention-days: 1
 
-  # Publication — tag only. Reuses artifacts from validate, no rebuild.
+  # Publication — tag only. Reuses exact artifacts from validate, no rebuild.
   publish:
     needs: validate
     if: startsWith(github.ref, 'refs/tags/')
@@ -168,6 +252,8 @@ jobs:
         with:
           files: |
             dist/arx-*.tar.gz
+            dist/arx_*.deb
+            dist/arx-*.rpm
             dist/SHA256SUMS
           fail_on_unmatched_files: true
           make_latest: true
