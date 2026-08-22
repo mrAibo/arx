@@ -30,6 +30,23 @@ Current product truth:
 - **Distribution:** GitHub Release is the single publication path; Linux x86_64 ships
   tar.gz, `.deb`, `.rpm`, and one `SHA256SUMS`, all produced from one validated ELF.
 
+Backlog truth after PACK M reconciliation:
+
+- **Quick Actions:** Command Center, user `arx.menu`, mkdir/chmod/symlink are shipped;
+  typed compress/touch/SHA-256 actions remain in #9.
+- **tmux/screen:** tmux discovery + attach are shipped; screen discovery and attach
+  lifecycle hardening remain in #7.
+- **Mouse:** right-click and drag-selection are shipped; pane-wheel scrolling,
+  Shift+Click range selection, and provider-aware context availability remain in #10.
+- **Split panes:** the vertical split/focus model is shipped; horizontal mode, resize,
+  and explicit close semantics remain in #16.
+- **X11 over Windows SSH clients:** this is Linux remote-session interoperability, not
+  native Windows support. The current DISPLAY fallback needs hardening and physical
+  verification under #5.
+- **Plugins:** `mlua` + `src/plugins` are an unwired prototype, not a supported plugin
+  API. #11 is the decision gate to remove it or productize a deliberately narrow Lua
+  surface; WASM is not committed scope.
+
 ## RELEASED — v0.17.0 (2026-08-16)
 
 Release-readiness established the Linux x86_64 publication baseline:
@@ -126,6 +143,24 @@ Merged via PR #171 at `b4e14ee25a4b7be88f5c0330eaf14509c55023e7`.
 - `cargo-about` generated `THIRD_PARTY_LICENSES.html` included in every package.
 - one `SHA256SUMS` covers all three published package artifacts.
 
+## PACK M — BACKLOG RECONCILIATION
+
+PACK M is tracked by #174 and changes repository truth only; it adds no runtime
+behavior.
+
+Reconciled against the v0.20.0 tree:
+
+- #8 Cloud Storage backends — **closed completed**; S3 and WebDAV supported MVPs ship.
+- #41 Embedded Terminal through Action/Command Center — **closed completed**; PR #43
+  delivered the requested shared Action Catalog / Command Center path.
+- #14 Lua plugin issue — **closed duplicate** of canonical plugin decision #11.
+- #5, #7, #9, #10, #11, #13, and #16 were rewritten so they describe only work that
+  remains rather than features already present in v0.20.0.
+
+The reconciliation also found a README overclaim: compress/touch/SHA-256 are not
+present as typed built-in Quick Actions in the current Action Catalog. Documentation
+must stay partial until #9 actually ships them.
+
 ## RELEASE PROCESS POLICY
 
 A release candidate must keep runtime code frozen and change only release truth unless
@@ -143,17 +178,32 @@ a newly discovered blocker requires a separately reviewed fix. Before tagging:
 
 ARX remains intentionally **Linux-only**. Future platform effort, if useful, should
 stay within Linux (for example additional architectures) rather than creating a
-separate Windows product surface.
+separate Windows product surface. Windows SSH clients may still be interoperability
+subjects when they connect to an ARX process running on Linux; that does not change the
+platform policy.
 
 ## FUTURE
 
-- WebDAV post-MVP — Digest/Bearer auth, F4 remote edit, recursive transfers,
-  cross-target move, and Nextcloud/ownCloud physical certification.
+Near-term truth/hardening:
+
+- #5 X11 forwarding hardening: remove unsafe DISPLAY guessing and accept only proven
+  remote-session behavior.
+- #9 Quick Actions completion: typed compress, touch, and SHA-256 actions.
+- #7 tmux/screen follow-up: screen discovery and real-terminal attach/detach lifecycle.
+- #10 mouse follow-up: pane wheel, Shift+Click range selection, context availability.
+- #16 split-pane follow-up: horizontal mode, resize, explicit close semantics.
+- #11 plugin decision: prefer removing the unwired Lua prototype unless a concrete
+  admin workflow justifies a narrow sandboxed API. WASM is not committed scope.
+
+Provider/transfer follow-ups:
+
+- #13 WebDAV post-MVP — Digest/Bearer evaluation, physical Nextcloud/ownCloud
+  certification, recursive transfers/delete under an explicit safe contract, and
+  cross-target operations only with a truthful execution model.
 - Cross-backend Move.
 - SFTP → SFTP workspace sync.
 - Recursive remote delete.
 - Binary remote editing.
-- Plugin system (Lua/WASM).
 - Additional Linux architectures and, if justified, signed package-repository
   distribution.
 
