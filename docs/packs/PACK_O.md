@@ -113,6 +113,24 @@ The next code run must close the whole existing type/lifecycle graph in one patc
 13. Cargo.lock may only add the existing direct `sha2` root dependency; no version/checksum/package churn.
 14. Tests must cover local-only availability, Command Center discovery, mutation-result acceptance after navigation, Quit blocking, control-character escaping and the Touch pre-mutation cancellation boundary.
 
+## Atomic patch scope (audited)
+
+The O6+O7 implementation commit is allowed to modify only these existing tracked paths:
+
+- `Cargo.lock`
+- `docs/packs/PACK_O.md`
+- `src/process/mod.rs`
+- `src/services/quick_actions.rs`
+- `src/app/actions.rs`
+- `src/app/availability.rs`
+- `src/app/mod.rs`
+- `src/app/command_center.rs`
+- `src/tui.rs`
+
+`src/app/quick_action_prompt.rs` is pre-existing O5 content and must be materialized/verified if the local checkout omits it, but must remain byte-identical and unstaged in the O6+O7 commit.
+
+The patch must not touch keymaps, commander hitbox helpers, provider/VFS contracts, jobs, transfer runtime, rendering architecture, module layout, or any PACK P refactor surface.
+
 ## Audit checkpoint
 
 The code patch for the next run is not being issued until every mutation/result/cancellation seam above is represented in one compile-complete change set. This checkpoint exists specifically to avoid another mechanical runner cycle caused by an artificial step boundary or an unconsumed enum variant.
