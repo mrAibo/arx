@@ -28,7 +28,7 @@ Decompose `src/tui.rs` incrementally so rendering, feature orchestration, input 
 
 The first code transaction was deliberately narrow and is complete.
 
-PR #186 accepted exact head `43f70e8eb535c0eab833cf756e5b9402fd19d236` with CI #644 / run `32589046943` fully green: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance.
+PR #186 accepted exact head `43f70e8eb535c0eab7a658b7368a3970a131540a` with CI #644 / run `32589046943` fully green: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance.
 
 Squash merge on `main`: `32f649816adb3e04b0d9f415ac352601a9b699a4`.
 
