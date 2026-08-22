@@ -46,7 +46,10 @@ mod presentation;
 use presentation::{session_callout_text, workspace_ribbon_text};
 
 mod overlays;
-use overlays::{render_bookmarks, render_help, render_session_callout, render_viewer};
+use overlays::{
+    render_bookmarks, render_command_center, render_context_menu, render_help,
+    render_infrastructure_center, render_session_callout, render_smart_tree, render_viewer,
+};
 
 #[derive(Clone)]
 struct SyncUiRuntime {
@@ -3263,96 +3266,20 @@ fn render(
         }
     }
 
-    // Infrastructure Center overlay (Ctrl+I)
     if state.show_infra {
-        let lines = &state.infrastructure_lines;
-        let h = (lines.len().max(1) + 3).min(30) as u16;
-        let popup = centered_rect(80, h, area);
-        frame.render_widget(Clear, popup);
-        let items: Vec<ListItem> = lines.iter().map(|l| ListItem::new(l.as_str())).collect();
-        let list = ratatui::widgets::List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Infrastructure Center — Ctrl+I toggle "),
-            )
-            .highlight_style(Style::default().fg(Color::Cyan));
-        frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
+        render_infrastructure_center(frame, area, state);
     }
-    // Smart Tree overlay (Ctrl+T)
+
     if state.show_tree {
-        let tl = &state.tree_lines;
-        let h = (tl.len().max(1) + 3).min(30) as u16;
-        let popup = centered_rect(80, h, area);
-        frame.render_widget(Clear, popup);
-        let items: Vec<ListItem> = tl.iter().map(|l| ListItem::new(l.as_str())).collect();
-        let title = format!(
-            " ARX Smart Tree — :{}_ | Ctrl+T toggle, Esc close ",
-            state.tree_filter
-        );
-        let list = ratatui::widgets::List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .highlight_style(Style::default().fg(Color::Green));
-        frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
+        render_smart_tree(frame, area, state);
     }
-    // Command Center overlay (Ctrl+P)
+
     if state.show_command_center {
-        let h = (state.command_matches.len().max(1) + 3).min(20) as u16;
-        let popup = centered_rect(70, h, area);
-        frame.render_widget(Clear, popup);
-        let items: Vec<ListItem> = state
-            .command_matches
-            .iter()
-            .map(|item| {
-                let style = if !item.availability.is_available() {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    match item.kind {
-                        CommandKind::Action => Style::default().fg(Color::Cyan),
-                        CommandKind::Host => Style::default().fg(Color::Green),
-                        CommandKind::Bookmark => Style::default().fg(Color::Magenta),
-                        CommandKind::History => Style::default(),
-                        CommandKind::Session => Style::default().fg(Color::Yellow),
-                        CommandKind::UserCommand => Style::default().fg(Color::Blue),
-                    }
-                };
-                let line = match item.availability.reason() {
-                    Some(reason) => format!("{}  —  unavailable: {reason}", item.display_line()),
-                    None => item.display_line(),
-                };
-                ListItem::new(line).style(style)
-            })
-            .collect();
-
-        let list = ratatui::widgets::List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(format!(
-                " ARX Command Center — :{}_ | bat chafa pdftotext ffprobe 7z ",
-                state.filter
-            )))
-            .highlight_style(Style::default().fg(Color::Yellow));
-        frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
+        render_command_center(frame, area, state);
     }
 
-    // Command Center overlay (Ctrl+P)
-    // Context menu (right-click) — ponytail: UI-CONTEXT-AVAILABILITY — static presentation, no dispatch lane; later capability-aware rendering
     if state.show_context_menu {
-        let popup = centered_rect(18, 7, area);
-        frame.render_widget(Clear, popup);
-        let items: Vec<ListItem> = [
-            "Copy   F5",
-            "Move   F6",
-            "Mkdir  F7",
-            "Delete F8",
-            "View   F3",
-            "Edit   F4",
-        ]
-        .iter()
-        .map(|s| ListItem::new(*s))
-        .collect();
-        let list = ratatui::widgets::List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" Menu "))
-            .highlight_style(Style::default().fg(Color::Yellow));
-        frame.render_widget(list, popup);
+        render_context_menu(frame, area);
     }
 
     // Bookmarks overlay
@@ -6975,7 +6902,9 @@ fn selection_or_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arx::app::{Action, InputContext};
+    use arx::app::{
+        Action, ActionAvailability, CommandItem, CommandKind, CommandTarget, InputContext,
+    };
     use arx::input::{KeyBinding, KeyStroke, Keymap};
     use arx::jobs::{Job, JobKind, JobResult, JobStatus};
     use arx::process::ProcessService;
@@ -9572,6 +9501,134 @@ mod tests {
         }));
         job.verification = Some(verification_snapshot(plan_id, verification_status));
         job
+    }
+
+    #[test]
+    fn utility_overlay_infrastructure_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(160, 140);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            infrastructure_lines: vec!["infra-alpha".into(), "infra-beta".into()],
+            ..Default::default()
+        };
+
+        terminal
+            .draw(|f| render_infrastructure_center(f, f.area(), &mut state))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let text = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(text.contains("Infrastructure Center"));
+        assert!(text.contains("Ctrl+I toggle"));
+        assert!(text.contains("infra-alpha"));
+    }
+
+    #[test]
+    fn utility_overlay_smart_tree_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(160, 140);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            tree_lines: vec!["tree-root".into(), "tree-child".into()],
+            tree_filter: "needle".into(),
+            ..Default::default()
+        };
+
+        terminal
+            .draw(|f| render_smart_tree(f, f.area(), &mut state))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let text = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(text.contains("ARX Smart Tree"));
+        assert!(text.contains(":needle_"));
+        assert!(text.contains("Ctrl+T toggle"));
+        assert!(text.contains("tree-child"));
+    }
+
+    #[test]
+    fn utility_overlay_command_center_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(160, 140);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState {
+            filter: "needle".into(),
+            command_matches: vec![CommandItem {
+                title: "Blocked Demo".into(),
+                subtitle: Some("example subtitle".into()),
+                kind: CommandKind::UserCommand,
+                target: CommandTarget::ShellCommand("demo".into()),
+                score: 0,
+                availability: ActionAvailability::Disabled {
+                    reason: "characterization reason".into(),
+                },
+            }],
+            ..Default::default()
+        };
+
+        terminal
+            .draw(|f| render_command_center(f, f.area(), &mut state))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let text = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(text.contains("ARX Command Center"));
+        assert!(text.contains(":needle_"));
+        assert!(text.contains("[COMMAND] Blocked Demo"));
+        assert!(text.contains("example subtitle"));
+        assert!(text.contains("unavailable: characterization reason"));
+    }
+
+    #[test]
+    fn utility_overlay_context_menu_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(160, 140);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| render_context_menu(f, f.area())).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let text = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(text.contains("Menu"));
+        assert!(text.contains("Copy   F5"));
+        assert!(text.contains("Move   F6"));
+        assert!(text.contains("Mkdir  F7"));
+        assert!(text.contains("Delete F8"));
+        assert!(text.contains("View   F3"));
+        assert!(text.contains("Edit   F4"));
     }
 
     #[test]

@@ -38,11 +38,11 @@ P1a created `src/tui/presentation.rs` and moved only the workspace ribbon and se
 
 P1 remains open because additional presentation-only seams may still move as later rendering slices expose them.
 
-## Active transaction: P2a leaf overlays
+## Completed: P2a leaf overlays
 
-Tracked by #187.
+Tracked by #187 and merged through PR #188.
 
-Extract only leaf frame/render helpers into `src/tui/overlays.rs`:
+P2a added focused TestBackend characterization and extracted only these leaf render helpers into `src/tui/overlays.rs`:
 
 - `render_session_callout`
 - `render_help`
@@ -50,7 +50,28 @@ Extract only leaf frame/render helpers into `src/tui/overlays.rs`:
 - `render_viewer`
 - `render_bookmarks`
 
-This transaction may preserve the existing `help_scroll` clamp mutation because it is UI-only state. It must not move or change `render()` itself, pane rendering/state, command-bar hitboxes, Which-Key, sync-preview rendering, Hosts/SSH orchestration, event routing, Action dispatch, Effect/Job handling, or provider behavior.
+Exact PR head `54c1ea80a0b2c921f0399991e2e881aa600e7cd1` passed CI #647 / run `32594193558`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance.
+
+Squash merge on `main`: `2f427bd1f3d138efd5f580ac950abe9d3e921845`.
+
+The parent `render()` composition root, pane rendering/state, command-bar hitboxes, Which-Key, sync-preview rendering, Hosts/SSH orchestration, event routing, Action dispatch, Effect/Job handling, and provider behavior remained in `src/tui.rs`.
+
+## Active transaction: P2b utility overlays
+
+Tracked by #189.
+
+Extract only four state-driven inline overlay blocks from `render()` into the existing `src/tui/overlays.rs` module:
+
+- Infrastructure Center
+- Smart Tree
+- Command Center
+- Context Menu
+
+The parent `render()` must retain the same show/hide predicates and overlay order. P2b must preserve all titles, colors, sizing, cursor state, availability text, display lines, and static context-menu rows exactly.
+
+Explicitly keep out of P2b: command bar / `CommandHitbox` geometry, Which-Key / `KeyRouter` / Action Catalog logic, directory history, hotlist, tab switcher, rename/search bars, Hosts/SSH/Jobs, transfer/storage/filesystem/menu overlays, sync-preview rendering, and all event/action/effect/job/provider ownership.
+
+`Hotlist` stays in `tui.rs` because current rendering performs `AppState::load_hotlist()` and is therefore not a pure render-only seam. Command bar and Which-Key stay in `tui.rs` because they intersect later input/action-routing boundaries.
 
 Use focused semantic/render characterization rather than whole-screen golden snapshots.
 
