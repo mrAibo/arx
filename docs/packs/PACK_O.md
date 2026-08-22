@@ -48,7 +48,7 @@ No TUI architecture rewrite, plugin runtime, remote/cloud Quick Actions, arbitra
 - [x] O5 — add `EffectLane::QuickAction`, typed Effect/Event variants and frozen prompt type
 - [x] O6+O7 — atomic compile-complete integration closure: ProcessService + Action/Catalog + Availability + AppState + TUI dispatch/prompt/result/refresh/safe Quit + service cancellation corrections
 - [x] O8 — reconcile Cargo.lock and run full local `cargo fmt`, `cargo check --locked --all-features`, Clippy/tests and Rust 1.88 gate
-- [ ] O9 — update README/ROADMAP/ARCHITECTURE and this file to shipped truth
+- [x] O9 — update README/ROADMAP/ARCHITECTURE and this file to shipped truth
 - [ ] O10 — exact-head CI + Release validation, review final diff, Ready, merge, close #9/#178
 
 ### Why O6 and O7 are now atomic
@@ -57,11 +57,16 @@ The original plan tried to make O6 a green non-TUI checkpoint and reserve `src/t
 
 PACK O does **not** turn this into a TUI refactor. The only change is the transaction boundary: core wiring and the minimal existing-TUI wiring land in one integration commit. PACK P remains the separate behavior-preserving TUI decomposition pack after PACK O merges.
 
-## Current known CI state
+## CI / Release evidence before O9
 
 The earlier Draft runs CI #620 / Release #91 were intentionally non-authoritative because integration was incomplete. CI #620 stopped first on rustfmt in `src/services/quick_actions.rs`; that run must not be used as final PACK O evidence.
 
-Only exact-head green runs after O6+O7–O9 are completed count as acceptance evidence.
+The compile-complete code head `f95f3e282f9fc6f2f5b5f34e517025c22f35a503` then passed both pull-request workflows:
+
+- CI #638 / run `32582910535` — **success**: quality, Rust 1.88 MSRV, WebDAV physical, and MinIO transfer-queue retry physical jobs all green.
+- Release #107 / run `32582910537` — **success**: release validation completed successfully.
+
+Those runs prove the code/fmt state before O9. Because O9 changes the branch head, O10 still requires fresh exact-head CI and Release validation on the final documentation head before merge.
 
 ## O6 execution log
 
@@ -86,31 +91,31 @@ No repository code defect was discovered in Attempt 2. The failure remained in t
 
 The third deterministic runner started from exact head `bcbe5447676c9715631f377a2344f6c2c8323400`. All anchors matched, the generated `RemoteEdit || QuickAction` Quit guard was proven before formatting, and `cargo fmt` plus `diff --check` succeeded. The run then stopped on the file-scope contract because the local Hermes worktree did not have `src/app/quick_action_prompt.rs` materialized even though `src/app/mod.rs` references that module.
 
-GitHub repository truth was checked independently after the stop: `src/app/quick_action_prompt.rs` is already a tracked file in PR #179 with blob `c900d19a484f95ac7e98bb94da590e22ffd98eb9`. Attempt 3 therefore exposed a local worktree materialization mismatch, not a missing repository artifact. No O6 code was committed or pushed.
+GitHub repository truth was checked independently after the stop: `src/app/quick_action_prompt.rs` was already a tracked file in PR #179. Attempt 3 therefore exposed a local worktree materialization mismatch, not a missing repository artifact. No O6 code was committed or pushed.
 
 ### Attempt 4 — hard stop, no code commit; architecture boundary corrected
 
-Attempt 4 started from exact head `57a203c66fdbce574355639914b29b7b9f6ac6be`. The materialization preflight proved `src/app/quick_action_prompt.rs` is tracked at the expected blob and restored it without changing repository state. All O6 anchors then matched, the generated Quit guard was valid, `cargo fmt`, `git diff --check`, the code-scope guard and the narrow Cargo.lock reconciliation all passed.
+Attempt 4 started from exact head `57a203c66fdbce574355639914b29b7b9f6ac6be`. The materialization preflight proved `src/app/quick_action_prompt.rs` was tracked and restored it without changing repository state. All O6 anchors then matched, the generated Quit guard was valid, `cargo fmt`, `git diff --check`, the code-scope guard and the narrow Cargo.lock reconciliation all passed.
 
-`cargo check --all-features` then correctly failed because the exhaustive `apply_effect_event` match in `src/tui.rs` did not yet cover `EffectEvent::QuickActionFinished`. This is not a new implementation bug: it proves the former O6/O7 split itself was unsatisfiable. O6 added the producer-side `ProcessService` consumer for `Effect::QuickAction`, while the Event consumer was explicitly deferred to O7 and `src/tui.rs` was forbidden. Hermes restored the tree clean and made no commit/push.
+`cargo check --all-features` then correctly failed because the exhaustive `apply_effect_event` match in `src/tui.rs` did not yet cover `EffectEvent::QuickActionFinished`. This was not a new implementation bug: it proved the former O6/O7 split itself was unsatisfiable. O6 added the producer-side `ProcessService` consumer for `Effect::QuickAction`, while the Event consumer was explicitly deferred to O7 and `src/tui.rs` was forbidden. Hermes restored the tree clean and made no commit/push.
 
 ### Atomic integration import scan — hard stop, no code commit
 
 The first atomic O6+O7 runner was pre-scanned from exact head `1ea627354089e51e2b62c762cd8a96285c2f6baf` before mutation. Every source anchor in sections 1–6 and TUI sections 8–14 matched, including the commander-mapping protection. Only the two additive `src/tui.rs` import-block anchors were stale because the import lists had been refactored earlier.
 
-GitHub independently confirmed the exact current import blocks. The correction is purely additive and behavior-preserving: add `QuickActionPrompt` to the existing `arx::app` import list and add `QuickActionFailureKind`, `QuickActionKind`, `QuickActionOutcome`, and `QuickActionRequest` to the existing `arx::services` import list. No implementation, architecture, scope, or lifecycle rule changes. Hermes stopped and restored the exact clean starting tree; no commit/push occurred.
+GitHub independently confirmed the exact current import blocks. The correction was purely additive and behavior-preserving: add `QuickActionPrompt` to the existing `arx::app` import list and add `QuickActionFailureKind`, `QuickActionKind`, `QuickActionOutcome`, and `QuickActionRequest` to the existing `arx::services` import list. No implementation, architecture, scope, or lifecycle rule changed. Hermes stopped and restored the exact clean starting tree; no commit/push occurred.
 
 ### Atomic integration full-test gate — hard stop, no code commit
 
 After the two import anchors were corrected, the atomic O6+O7 patch reached the full locked all-feature test suite. Formatting, unlocked and locked all-feature `cargo check`, Cargo.lock reconciliation, focused PACK O tests, the physical system-tar test and 921 tests all passed. Exactly one pre-existing test failed: `app::tests::quit_waits_for_remote_edit_outcome`.
 
-The failure is caused directly by the intentional PACK O AppState lifecycle change. The old RemoteEdit-only Quit guard emitted `Remote edit in progress — wait for a safe outcome`, while PACK O now uses one guard for both `EffectLane::RemoteEdit` and `EffectLane::QuickAction` with the message `Operation in progress — wait for a safe cancellation outcome`. The existing test still asserted that the message contains `Remote edit`, so its expectation became stale when the message contract was generalized. GitHub independently confirmed that exact assertion in `src/app/mod.rs`.
+The failure was caused directly by the intentional PACK O AppState lifecycle change. The old RemoteEdit-only Quit guard emitted `Remote edit in progress — wait for a safe outcome`, while PACK O now uses one guard for both `EffectLane::RemoteEdit` and `EffectLane::QuickAction` with the message `Operation in progress — wait for a safe cancellation outcome`. The existing test still asserted that the message contains `Remote edit`, so its expectation became stale when the message contract was generalized.
 
-This is not an implementation regression and no behavior should be reverted. The minimal completion is to update that one existing assertion in the already-authorized `src/app/mod.rs` file so it verifies the generalized contract (`safe cancellation outcome`, matching the new QuickAction companion test). Hermes correctly stopped rather than editing a test outside the supplied deterministic patch. No commit/push occurred.
+This was not an implementation regression. The minimal completion was to update that one existing assertion in the already-authorized `src/app/mod.rs` file so it verifies the generalized contract (`safe cancellation outcome`, matching the new QuickAction companion test).
 
-## Pre-integration audit before the next code run
+## Pre-integration audit
 
-The next code run must close the whole existing type/lifecycle graph in one patch. The audit found these mandatory points:
+The compile-complete integration was required to satisfy these points:
 
 1. `ProcessService::execute_with_registry_cancellable` handles `Effect::QuickAction` with the real cancellation flag.
 2. ActionId/Action/ALL_ACTIONS/ACTION_CATALOG contain SHA-256, Touch and Compress; shared Availability is local-only and target-aware.
@@ -121,42 +126,36 @@ The next code run must close the whole existing type/lifecycle graph in one patc
 7. `request_quit` cancels both RemoteEdit and QuickAction lanes and leaves AppState blocked until terminal response.
 8. `apply_effect_event` handles every `QuickActionFinished` outcome with control-safe presentation; SHA opens viewer lines, mutation actions return concise status.
 9. `handle_effect_response` refreshes any pane still at the frozen origin for **all** Touch/Compress terminal results, including failures that may have crossed a mutation boundary; SHA never refreshes.
-10. `QuickActionService::touch_local` must not return `Cancelled` after `open(...create...)` may already have mutated the directory. Cancellation is checked before that boundary only.
+10. `QuickActionService::touch_local` does not return `Cancelled` after `open(...create...)` may already have mutated the directory. Cancellation is checked before that boundary only.
 11. `QuickActionService::compress_tar_gz_local` uses a `kill_on_drop(true)` tar command and `tokio::select!` against `CancellationFlag::cancelled()` so quit cannot orphan tar.
-12. The existing commander hitbox helpers `action_id_to_action` / `action_to_id` stay unchanged: Quick Actions have no new keybinding and Command Center already executes typed `CommandTarget::Action` directly.
-13. Cargo.lock may only add the existing direct `sha2` root dependency; no version/checksum/package churn.
-14. Tests must cover local-only availability, Command Center discovery, mutation-result acceptance after navigation, Quit blocking, control-character escaping and the Touch pre-mutation cancellation boundary.
+12. The existing commander hitbox helpers `action_id_to_action` / `action_to_id` remain unchanged: Quick Actions have no new keybinding and Command Center already executes typed `CommandTarget::Action` directly.
+13. Cargo.lock adds only the existing direct `sha2` root dependency; no version/checksum/package churn.
+14. Tests cover local-only availability, Command Center discovery, mutation-result acceptance after navigation, Quit blocking, control-character escaping and the Touch pre-mutation cancellation boundary.
 
-## Atomic patch scope (audited)
+## Atomic O6+O7 integration — completed
 
-The O6+O7 implementation commit is allowed to modify only these existing tracked paths:
-
-- `Cargo.lock`
-- `docs/packs/PACK_O.md`
-- `src/process/mod.rs`
-- `src/services/quick_actions.rs`
-- `src/app/actions.rs`
-- `src/app/availability.rs`
-- `src/app/mod.rs`
-- `src/app/command_center.rs`
-- `src/tui.rs`
-
-`src/app/quick_action_prompt.rs` is pre-existing O5 content and must be materialized/verified if the local checkout omits it, but must remain byte-identical and unstaged in the O6+O7 commit.
-
-The patch must not touch keymaps, commander hitbox helpers, provider/VFS contracts, jobs, transfer runtime, rendering architecture, module layout, or any PACK P refactor surface.
-
-## Audit checkpoint
-
-The complete graph audit is finished. The remaining known blocker is a single stale pre-existing test assertion in `src/app/mod.rs`; the implementation graph itself reached the full test suite with all other tests green. The next repository mutation should keep the atomic implementation unchanged and add only that one expectation update before rerunning the complete gates.
-
-### Atomic O6+O7 integration — completed
-
-The former non-TUI O6 / TUI O7 boundary was replaced by one compile-complete integration transaction. The completed run wired ProcessService, the shared Action/Catalog/Availability model, AppState mutation ownership, typed Command Center discovery, frozen prompt submission, QuickAction result presentation, mutation refresh and safe Quit cancellation in one commit.
+The former non-TUI O6 / TUI O7 boundary was replaced by one compile-complete integration transaction. Commit `7f8cda4f6bd1002bb6766a6e6edc6726cb4db2d4` wired ProcessService, the shared Action/Catalog/Availability model, AppState mutation ownership, typed Command Center discovery, frozen prompt submission, QuickAction result presentation, mutation refresh and safe Quit cancellation.
 
 The same run corrected the Touch cancellation commit boundary, made the external `tar` child kill-on-drop and cancellation-aware, reconciled Cargo.lock without package/version/checksum churn, physically exercised system tar on Linux, and passed fmt, locked all-feature checks, Clippy with warnings denied, the full locked all-feature test suite, and Rust 1.88 MSRV check.
 
 No PACK P TUI decomposition, keymap change, provider-contract change, plugin runtime, new shortcut, or remote Quick Action was included.
 
+### CI rustfmt normalization — completed
+
+The O6+O7 runner had intentionally restored the earlier O5 `src/app/quick_action_prompt.rs` blob after formatting because the patch contract called it frozen. CI then proved that contract was internally inconsistent: the committed O5 enum layout was not `cargo fmt --check` clean under the CI Rust 1.96 toolchain.
+
+Commit `f95f3e282f9fc6f2f5b5f34e517025c22f35a503` changes only that file and only collapses the two enum variants to rustfmt's canonical layout. `GitHub.fetch_commit` independently confirms a 2-addition/7-deletion formatting-only diff with no semantic change. The frozen-blob rule is therefore superseded by the repository's whole-tree rustfmt gate; the meaningful invariant is that O6+O7 did not modify prompt behavior.
+
+## O9 documentation closure
+
+README, ROADMAP, and ARCHITECTURE now describe the resulting PACK O product truth:
+
+- typed local SHA-256 / Touch / Compress to tar.gz are complete built-in Quick Actions;
+- no remote/cloud Quick Action support is claimed;
+- system `tar` is an explicit optional dependency of the compression action;
+- Quick Actions use the shared Action/Catalog/Availability model and dedicated Effect lane;
+- PACK P is the next architecture pack after PACK O.
+
 ## Next step
 
-O9: update README.md, ROADMAP.md and ARCHITECTURE.md to shipped PACK O truth, then independently review the complete PR diff before exact-head CI/Release acceptance.
+O10: review the final PR diff on the O9 head, require fresh exact-head CI and Release validation, mark PR #179 Ready only after both are green, squash-merge with the expected head SHA pinned, then close #9 and #178 with acceptance evidence.

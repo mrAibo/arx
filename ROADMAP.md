@@ -27,6 +27,9 @@ Current product truth:
   evidence, and JobManager cancellation.
 - **Filesystems (`Alt+D`):** Linux-local, read-only `df++`-style mount/capacity/inode
   view with explicit unavailable/autofs truth and manual refresh.
+- **Typed local Quick Actions:** SHA-256, Touch file, and Compress to tar.gz are built-in
+  Action/Catalog entries discovered through Command Center. They are local-only, use a
+  dedicated correlated Effect lane, and never interpolate filenames into `sh -c`.
 - **SSH/X11 environment:** ARX inherits the process/session environment and never
   synthesizes `DISPLAY`; X11 forwarding must be established by the SSH client/session.
 - **User extension surface:** `arx.menu` is the supported lightweight mechanism; the
@@ -34,10 +37,8 @@ Current product truth:
 - **Distribution:** GitHub Release is the single publication path; Linux x86_64 ships
   tar.gz, `.deb`, `.rpm`, and one `SHA256SUMS`, all produced from one validated ELF.
 
-Backlog truth after PACK M/PACK N reconciliation:
+Backlog truth after PACK O:
 
-- **Quick Actions:** Command Center, user `arx.menu`, mkdir/chmod/symlink are shipped;
-  typed compress/touch/SHA-256 actions are active work in #178 / PR #179 and tracked by #9.
 - **tmux/screen:** tmux discovery + attach are shipped; screen discovery and attach
   lifecycle hardening remain in #7.
 - **Mouse:** right-click and drag-selection are shipped; pane-wheel scrolling,
@@ -47,35 +48,32 @@ Backlog truth after PACK M/PACK N reconciliation:
 - **WebDAV:** the supported Apache mod_dav MVP is shipped; #13 tracks only post-MVP
   auth/interoperability/recursive-operation work.
 
-## ACTIVE DEVELOPMENT SEQUENCE — PACK O → P → Q → R
+## ACTIVE DEVELOPMENT SEQUENCE — PACK P → Q → R
 
 The canonical continuation document is [`docs/DEVELOPMENT_HANDOFF.md`](docs/DEVELOPMENT_HANDOFF.md).
 The architecture sequence is tracked by umbrella issue **#180**.
 
-The approved order is strict:
+The approved order after PACK O is strict:
 
-1. **PACK O — typed local Quick Actions.** Finish #178 / PR #179 independently. Ship
-   SHA-256, Touch file, and Compress to tar.gz through typed Action/Availability/Effect
-   boundaries. Do not mix a TUI architecture rewrite into #179.
-2. **PACK P — TUI decomposition.** Behavior-preserving decomposition of the >10k-line
+1. **PACK P — TUI decomposition.** Behavior-preserving decomposition of the >10k-line
    `src/tui.rs` composition bottleneck: characterization tests, rendering extraction,
    feature controllers, keyboard/mouse routing, Effect/Job response handling, then a
    thin runtime/event loop. No product features and no public plugin API.
-3. **PACK Q — VFS convergence.** Finish the phased ProviderRegistry migration by
+2. **PACK Q — VFS convergence.** Finish the phased ProviderRegistry migration by
    removing duplicate execution authority. Preserve `Location` as typed identity/address
    where useful; make `ProviderRegistry` the execution authority and `CapabilitySet`
    the capability truth.
-4. **PACK R — internal feature/command registration.** Introduce only the smallest
+3. **PACK R — internal feature/command registration.** Introduce only the smallest
    internal registration layer proven necessary after P/Q. Migrate Quick Actions,
    Storage Inspector, and SSH Host Manager as proof consumers. Do not freeze a broad
    public `FeatureModule` plugin trait prematurely.
-5. **External plugin decision gate.** No Lua/WASM/`.so` runtime is scheduled. Evaluate
+4. **External plugin decision gate.** No Lua/WASM/`.so` runtime is scheduled. Evaluate
    external plugins only after PACK R and only if real demand exists. Manifest
    permissions without real OS/runtime enforcement are not a security boundary.
 
 GitHub state and exact SHAs are authoritative over stale chat summaries or cached
 reviews. A new development session should read the handoff document, this roadmap,
-issue #180, and the current state of #178/#179 before changing code.
+issue #180, and the current PACK P planning state before changing code.
 
 ## RELEASED — v0.17.0 (2026-08-16)
 
@@ -187,9 +185,10 @@ Reconciled against the v0.20.0 tree:
 - #5, #7, #9, #10, #11, #13, and #16 were rewritten so they described only work that
   remained rather than features already present in v0.20.0.
 
-The reconciliation also found a README overclaim: compress/touch/SHA-256 are not
-present as typed built-in Quick Actions in the current Action Catalog. Documentation
-stays partial until #9 actually ships them.
+The reconciliation also found a README overclaim: at that point compress/touch/SHA-256
+were not present as typed built-in Quick Actions in the Action Catalog. PACK M therefore
+kept documentation partial until the implementation could ship; PACK O now closes that
+gap.
 
 ## PACK N — LEAN RUNTIME HARDENING
 
@@ -210,6 +209,35 @@ Delivered:
   was introduced.
 
 #5, #11, and #176 are complete under this lean-policy decision.
+
+## PACK O — TYPED LOCAL QUICK ACTIONS
+
+PACK O is tracked by #178 and PR #179 and completes the remaining scope of #9.
+
+Delivered:
+
+- **Compute SHA-256:** local focused/selected regular files are hashed in Rust with
+  `sha2`; results preserve exact filename/digest association and hashing runs off the
+  TUI thread.
+- **Touch file:** local child-name prompt with traversal/absolute-name rejection,
+  `O_NOFOLLOW`, exact opened regular-file verification, `futimens`, and a truthful
+  pre-mutation cancellation boundary.
+- **Compress to tar.gz:** focused/selected local entries, typed system-`tar` argv with
+  `--` before filenames, `kill_on_drop(true)` cancellation, same-directory staging,
+  and `persist_noclobber` finalization.
+- all three actions live in the shared Action / ActionId / Action Catalog / Availability
+  model and are discoverable through Command Center without new global shortcuts.
+- remote/cloud providers fail closed; no local shell semantics are guessed for SFTP,
+  S3, WebDAV, or Archive locations.
+- `EffectLane::QuickAction` owns correlated async lifecycle, safe Quit cancellation,
+  navigation-independent terminal result acceptance, and mutation-origin refresh.
+- control characters in filenames/path/tool errors are escaped before presentation while
+  printable Unicode remains intact.
+- Cargo.lock gained only the already-resolved direct `sha2 0.10.9` root dependency;
+  no package/version/checksum churn was introduced.
+
+The implementation passed local fmt/check/clippy/full-test/Rust-1.88 gates and a
+physical system-`tar` test before final exact-head CI/Release acceptance.
 
 ## RELEASE PROCESS POLICY
 
