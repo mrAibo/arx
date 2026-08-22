@@ -11,7 +11,6 @@ pub mod jobs;
 pub mod journal;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod keyring;
-pub mod plugins;
 pub mod process;
 pub mod remote;
 pub mod services;
