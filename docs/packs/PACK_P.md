@@ -82,55 +82,41 @@ Those fixes changed popup geometry only; Action/Effect/Job/provider/VFS/keybindi
 
 Tracked by #195 and merged through PR #196.
 
-P2c extracted these remaining clean inline render surfaces into `src/tui/overlays.rs`:
+P2c extracted Directory History, Tab Switcher, Rename input, and File Search rendering into `src/tui/overlays.rs` while preserving parent predicates/order and the corrected line-based popup sizing.
 
-- Directory History
-- Tab Switcher
-- Rename input bar
-- File Search bar
-
-The parent `render()` retained the same show/hide predicates and relative ordering. Directory History and Tab Switcher retained the line-based sizing corrected in #193/#194.
-
-Four focused TestBackend characterization tests run on `120x24` and cover representative history path rendering, left/right tab rendering with cursor marker, rename pattern text, and file-search query/match count.
-
-Exact PR head `6a986f00e2e869ce18ada8f3abe9b219284fc148` passed CI #658 / run `32607071395`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance.
-
-Squash merge on `main`: `cf584b0a774f82f9fca73a27058bdacfc1cd38ae`.
+Four focused TestBackend characterization tests run on `120x24`. Exact PR head `6a986f00e2e869ce18ada8f3abe9b219284fc148` passed CI #658 / run `32607071395`; squash merge `cf584b0a774f82f9fca73a27058bdacfc1cd38ae`.
 
 ## P2 boundary decision
 
 P2 is complete at `cf584b0a774f82f9fca73a27058bdacfc1cd38ae`.
 
-The remaining inline surfaces are intentionally not forced into another frame-only slice:
+The remaining inline surfaces are intentionally not forced into another frame-only slice: Hotlist performs I/O; Which-Key intersects `KeyRouter`; command-bar rendering creates mouse hitboxes; Workspace Sync / remote delete is feature-controller-specific; Hosts/SSH/Jobs and transfer/storage/filesystem surfaces are feature-controller territory.
 
-- Hotlist performs `AppState::load_hotlist()` I/O during render and therefore crosses a feature/I/O boundary.
-- Which-Key derives presentation directly from `KeyRouter` pending state and Action Catalog continuations, so it intersects the later routing boundary.
-- command bar rendering also produces `CommandHitbox` geometry consumed by mouse/input routing.
-- Workspace Sync / remote-delete presentation is feature-controller-specific and remains with workspace/remote controller work.
-- Hosts/SSH/Jobs and already-separated transfer/storage/filesystem surfaces are feature-controller territory.
+## Completed: P3a SSH Host Manager controller
 
-## Active transaction: P3a SSH Host Manager controller
+Tracked by #197 and merged through PR #198.
 
-Tracked by #197.
+P3a created `src/tui/ssh_hosts.rs` and moved the cohesive SSH Host Manager rendering, form handling, managed-host persistence helpers, bounded connection test, Ed25519 key generation, config editor launcher, and dedicated keyboard branch behind `ssh_hosts::render` / `ssh_hosts::handle_key`.
 
-Create `src/tui/ssh_hosts.rs` and move the existing cohesive SSH Host Manager feature boundary out of `src/tui.rs` without changing behavior:
+The fail-closed key-generation confirmation gate remains before list-mode mutation keys. Parent event/render composition roots remain authoritative. Exact PR head `e98cf076f658fda5086aa0ffa67ddcbeefb4cd2d` passed CI #661: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO retry physical acceptance.
 
-- SSH-host list and form rendering;
-- feature-local form labels/constants;
-- managed-host save/update helper;
-- bounded SSH connection-test launcher;
-- Ed25519 generate-and-attach helper;
-- SSH-config editor launcher helper;
-- dedicated SSH-host keyboard handling.
+Squash merge on `main`: `f9ec98f64c4bf02de93a4645e8afddd1713196ac`.
 
-Parent `event_loop` remains the runtime composition root. Parent `render()` remains the frame composition root and delegates SSH-host rendering to the feature module.
+## Active macro-transaction: P3 simple feature controllers
 
-Prefer a narrow feature API equivalent to:
+Tracked by #199.
 
-- `ssh_hosts::render(frame, area, state)`;
-- `ssh_hosts::handle_key(state, key) -> bool`, where false means the overlay is inactive and true means the active SSH-host feature consumed the key.
+To reduce mechanical ping-pong while preserving reviewability, this transaction uses one branch/PR with multiple independently green commits:
 
-The existing fail-closed key-generation confirmation gate must remain first in list-mode handling. No global Action/Effect/Job/provider/VFS/keybinding semantics move in P3a.
+1. Bookmarks + generic Hosts controllers;
+2. Jobs controller;
+3. User Menu controller.
+
+The intended feature APIs are narrow `render(...)` and `handle_key(...) -> bool` seams. Existing `PaneLoader`, `TransferQueueRuntime`, and `EffectDispatcher` instances are passed through; no duplicate runtime authority is introduced. Parent `event_loop` and parent `render()` remain composition roots and retain relative feature order.
+
+Mechanical import/rustfmt/clippy/test-fixture corrections may be repaired locally without stopping. The transaction must stop on a semantic contradiction, unexpected production dependency, changed branch head, or required scope expansion.
+
+Explicitly out of this macro-transaction: SSH Host Manager semantics, Hotlist I/O, Which-Key/KeyRouter, command-bar hitboxes, Workspace Sync/remote delete, Remote Edit, Quick Actions, Transfer Center implementation, Storage Inspector, Filesystems, provider/VFS behavior, keybindings, and all new registry/plugin/scheduler abstractions.
 
 ## Acceptance
 
