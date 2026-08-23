@@ -118,8 +118,12 @@ async fn run_f5(
 ) -> Result<(), String> {
     let src_provider = src_loc.provider_id();
     let dst_provider = dst_loc.provider_id();
-    let src_caps = registry.capabilities(&src_provider).unwrap_or_default();
-    let dst_caps = registry.capabilities(&dst_provider).unwrap_or_default();
+    let src_caps = registry
+        .capabilities_for_location(&src_loc)
+        .unwrap_or_default();
+    let dst_caps = registry
+        .capabilities_for_location(&dst_loc)
+        .unwrap_or_default();
 
     let webdav_spec = crate::transfer::build_webdav_copy_spec(
         src_provider,
