@@ -1,4 +1,4 @@
-use arx::app::AppState;
+use arx::app::{AppState, OverlayKind};
 use arx::services::{PaneLoadPurpose, PaneLoader};
 use arx::vfs::Location;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -9,13 +9,19 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem};
 
 use super::{centered_rect_lines, schedule_pane_navigation};
 
+pub(super) fn open(state: &mut AppState) {
+    let entries = AppState::load_hotlist();
+    state.open_overlay(OverlayKind::Hotlist);
+    state.hotlist_entries = entries;
+}
+
 pub(super) fn handle_key(state: &mut AppState, key: KeyEvent, pane_loader: &PaneLoader) -> bool {
     if !state.show_hotlist {
         return false;
     }
 
     match key.code {
-        KeyCode::Esc => state.show_hotlist = false,
+        KeyCode::Esc => state.close_overlay(OverlayKind::Hotlist),
         KeyCode::Up | KeyCode::Char('k') => {
             state.hotlist_cursor = state.hotlist_cursor.saturating_sub(1);
         }
@@ -38,7 +44,7 @@ pub(super) fn handle_key(state: &mut AppState, key: KeyEvent, pane_loader: &Pane
                         remember_current: true,
                     },
                 );
-                state.show_hotlist = false;
+                state.close_overlay(OverlayKind::Hotlist);
                 state.message = Some("Opening hotlist entry…".into());
             }
         }
