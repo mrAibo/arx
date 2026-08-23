@@ -17,7 +17,7 @@ Decompose `src/tui.rs` incrementally so rendering, feature orchestration, input 
 
 - [x] P0 — characterization baseline for the seams that move first
 - [ ] P1 — pure presentation-model extraction into `src/tui/` submodules
-- [ ] P2 — frame/render-only extraction
+- [x] P2 — frame/render-only extraction
 - [ ] P3 — feature-controller extraction in independently green slices
 - [ ] P4 — keyboard/mouse routing extraction
 - [ ] P5 — Effect/Job response handling extraction
@@ -36,7 +36,7 @@ P0 added semantic characterization for the workspace ribbon while existing sessi
 
 P1a created `src/tui/presentation.rs` and moved only the workspace ribbon and session-callout presentation model. Frame rendering, routing, Action dispatch, Effect/Job handling, provider execution, and feature-controller ownership remained in `src/tui.rs`.
 
-P1 remains open because additional presentation-only seams may still move as later rendering slices expose them.
+P1 remains open because additional presentation-only seams may still move as later controller slices expose them.
 
 ## Completed: P2a leaf overlays
 
@@ -78,24 +78,59 @@ The extraction exposed a pre-existing line-count-vs-percentage popup sizing defe
 
 Those fixes changed popup geometry only; Action/Effect/Job/provider/VFS/keybinding ownership remained unchanged.
 
-## Active transaction: P2c history, tabs, and inline input renderers
+## Completed: P2c history, tabs, and inline input renderers
 
-Tracked by #195.
+Tracked by #195 and merged through PR #196.
 
-Extract only these currently-inline pure render surfaces from `render()` into the existing `src/tui/overlays.rs` module:
+P2c extracted these remaining clean inline render surfaces into `src/tui/overlays.rs`:
 
 - Directory History
 - Tab Switcher
 - Rename input bar
 - File Search bar
 
-The parent `render()` must retain the same show/hide predicates and relative overlay ordering. Directory History and Tab Switcher must keep the line-based sizing already corrected in #193/#194.
+The parent `render()` retained the same show/hide predicates and relative ordering. Directory History and Tab Switcher retained the line-based sizing corrected in #193/#194.
 
-Add focused TestBackend characterization on a normal terminal (target `120x24`) after callable seams exist, covering representative history numbering/path rendering, left/right tab rendering and cursor marker, rename pattern text, and file-search query/match count.
+Four focused TestBackend characterization tests run on `120x24` and cover representative history path rendering, left/right tab rendering with cursor marker, rename pattern text, and file-search query/match count.
 
-Explicitly keep out of P2c: Hotlist (render still performs `AppState::load_hotlist()` I/O), command bar / `CommandHitbox`, Which-Key / `KeyRouter` / Action Catalog logic, Hosts/SSH/Jobs, transfer/storage/filesystem surfaces, sync-preview rendering, pane rendering, event routing, Action dispatch, Effect/Job handling, provider/VFS behavior, and keybindings.
+Exact PR head `6a986f00e2e869ce18ada8f3abe9b219284fc148` passed CI #658 / run `32607071395`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance.
 
-Use focused semantic/render characterization rather than whole-screen golden snapshots.
+Squash merge on `main`: `cf584b0a774f82f9fca73a27058bdacfc1cd38ae`.
+
+## P2 boundary decision
+
+P2 is complete at `cf584b0a774f82f9fca73a27058bdacfc1cd38ae`.
+
+The remaining inline surfaces are intentionally not forced into another frame-only slice:
+
+- Hotlist performs `AppState::load_hotlist()` I/O during render and therefore crosses a feature/I/O boundary.
+- Which-Key derives presentation directly from `KeyRouter` pending state and Action Catalog continuations, so it intersects the later routing boundary.
+- command bar rendering also produces `CommandHitbox` geometry consumed by mouse/input routing.
+- Workspace Sync / remote-delete presentation is feature-controller-specific and remains with workspace/remote controller work.
+- Hosts/SSH/Jobs and already-separated transfer/storage/filesystem surfaces are feature-controller territory.
+
+## Active transaction: P3a SSH Host Manager controller
+
+Tracked by #197.
+
+Create `src/tui/ssh_hosts.rs` and move the existing cohesive SSH Host Manager feature boundary out of `src/tui.rs` without changing behavior:
+
+- SSH-host list and form rendering;
+- feature-local form labels/constants;
+- managed-host save/update helper;
+- bounded SSH connection-test launcher;
+- Ed25519 generate-and-attach helper;
+- SSH-config editor launcher helper;
+- dedicated SSH-host keyboard handling.
+
+Parent `event_loop` remains the runtime composition root. Parent `render()` remains the frame composition root and delegates SSH-host rendering to the feature module.
+
+Prefer a narrow feature API equivalent to:
+
+- `ssh_hosts::render(frame, area, state)`;
+- `ssh_hosts::handle_key(state, key) -> bool`, where false means the overlay is inactive and true means the active SSH-host feature consumed the key.
+
+The existing fail-closed key-generation confirmation gate must remain first in list-mode handling. No global Action/Effect/Job/provider/VFS/keybinding semantics move in P3a.
 
 ## Acceptance
 
@@ -110,7 +145,7 @@ cargo +1.88 check --locked --all-features
 git diff --check
 ```
 
-CI must retain quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO transfer-queue retry physical acceptance. Substantial extraction PRs also require Release validation before merge.
+CI must retain quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO transfer-queue retry physical acceptance. Release validation is required only when a slice changes release/packaging-relevant behavior; behavior-preserving internal decomposition slices do not require a release workflow run.
 
 ## Scope guards
 
