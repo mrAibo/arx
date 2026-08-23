@@ -4,7 +4,6 @@ use ratatui::layout::Rect;
 
 use arx::app::AppState;
 use arx::jobs::JobKind;
-use arx::transfer_queue_runtime::TransferQueueRuntime;
 
 use super::*;
 
@@ -53,11 +52,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_stateful_widget(list, popup_area, &mut list_state);
 }
 
-pub(super) fn handle_key(
-    state: &mut AppState,
-    key: KeyEvent,
-    transfers: &TransferQueueRuntime,
-) -> bool {
+pub(super) fn handle_key(state: &mut AppState, key: KeyEvent, sync: &super::SyncUiRuntime) -> bool {
     if !state.show_jobs {
         return false;
     }
@@ -77,7 +72,7 @@ pub(super) fn handle_key(
         KeyCode::Char('p') => {
             if let Some(job) = state.jobs.get(state.job_cursor)
                 && job.kind == JobKind::Transfer
-                && transfers.request_pause(&job.id).is_ok()
+                && sync.transfers.request_pause(&job.id).is_ok()
             {
                 state.message =
                     Some("Pause requested (will checkpoint at next safe boundary)".into());
@@ -86,9 +81,15 @@ pub(super) fn handle_key(
         KeyCode::Char('r') => {
             if let Some(job) = state.jobs.get(state.job_cursor)
                 && job.kind == JobKind::Transfer
-                && transfers.resume(&job.id).is_ok()
+                && sync.transfers.resume(&job.id).is_ok()
             {
                 state.message = Some("Resume requested".into());
+            }
+        }
+        KeyCode::Delete if state.show_jobs => {
+            if let Some(job) = state.jobs.get(state.job_cursor) {
+                let id = job.id.clone();
+                super::cancel_job_product_route(state, sync, &id);
             }
         }
         _ => {}
@@ -101,7 +102,9 @@ pub(super) fn handle_key(
 mod tests {
     use super::*;
     use arx::jobs::JobManager;
+    use arx::services::WorkspaceSyncController;
     use arx::transfer_queue::TransferQueueConfig;
+    use arx::transfer_queue_runtime::TransferQueueRuntime;
     use arx::vfs::ProviderRegistry;
     use crossterm::event::KeyModifiers;
     use tokio::sync::mpsc;
@@ -110,14 +113,23 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn runtime() -> TransferQueueRuntime {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        TransferQueueRuntime::new(
-            JobManager::default(),
-            tx,
-            ProviderRegistry::new(),
-            TransferQueueConfig::default(),
-        )
+    fn sync() -> super::SyncUiRuntime {
+        let (job_tx, _job_rx) = mpsc::unbounded_channel();
+        let (ver_tx, _ver_rx) = mpsc::unbounded_channel();
+        let (launch_tx, _launch_rx) = mpsc::unbounded_channel();
+        super::SyncUiRuntime {
+            controller: WorkspaceSyncController::new(ProviderRegistry::new()),
+            jobs: JobManager::default(),
+            job_events: job_tx.clone(),
+            verification_events: ver_tx,
+            launch_events: launch_tx,
+            transfers: TransferQueueRuntime::new(
+                JobManager::default(),
+                job_tx,
+                ProviderRegistry::new(),
+                TransferQueueConfig::default(),
+            ),
+        }
     }
 
     fn transfer_job() -> arx::jobs::Job {
@@ -128,8 +140,8 @@ mod tests {
     fn handle_key_inactive_returns_false() {
         let mut state = AppState::default();
         state.show_jobs = false;
-        let rt = runtime();
-        let handled = handle_key(&mut state, key(KeyCode::Char('a')), &rt);
+        let s = sync();
+        let handled = handle_key(&mut state, key(KeyCode::Char('a')), &s);
         assert!(!handled);
         assert_eq!(state.job_cursor, 0);
     }
@@ -138,9 +150,9 @@ mod tests {
     fn handle_key_close_key_closes() {
         let mut state = AppState::default();
         state.show_jobs = true;
-        let rt = runtime();
+        let s = sync();
         let k = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
-        let handled = handle_key(&mut state, k, &rt);
+        let handled = handle_key(&mut state, k, &s);
         assert!(handled);
         assert!(!state.show_jobs);
     }
@@ -150,8 +162,8 @@ mod tests {
         let mut state = AppState::default();
         state.show_jobs = true;
         state.jobs = vec![transfer_job()];
-        let rt = runtime();
-        handle_key(&mut state, key(KeyCode::Up), &rt);
+        let s = sync();
+        handle_key(&mut state, key(KeyCode::Up), &s);
         assert_eq!(state.job_cursor, 0);
     }
 
@@ -160,10 +172,10 @@ mod tests {
         let mut state = AppState::default();
         state.show_jobs = true;
         state.jobs = vec![transfer_job(), transfer_job()];
-        let rt = runtime();
-        handle_key(&mut state, key(KeyCode::Down), &rt);
+        let s = sync();
+        handle_key(&mut state, key(KeyCode::Down), &s);
         assert_eq!(state.job_cursor, 1);
-        handle_key(&mut state, key(KeyCode::Down), &rt);
+        handle_key(&mut state, key(KeyCode::Down), &s);
         assert_eq!(state.job_cursor, 1);
     }
 }

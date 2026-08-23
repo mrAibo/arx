@@ -1038,20 +1038,7 @@ async fn event_loop(
                         continue;
                     }
 
-                    if state.show_jobs {
-                        match key.code {
-                            KeyCode::Delete if state.show_jobs => {
-                                if let Some(job) = state.jobs.get(state.job_cursor) {
-                                    let id = job.id.clone();
-                                    cancel_job_product_route(&mut state, &sync_runtime, &id);
-                                }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-                    if jobs::handle_key(&mut state, key, &sync_runtime.transfers) {
+                    if jobs::handle_key(&mut state, key, &sync_runtime) {
                         continue;
                     }
 

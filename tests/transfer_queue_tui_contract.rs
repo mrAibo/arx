@@ -23,14 +23,15 @@ fn function_block(name: &str) -> &'static str {
 
 #[test]
 fn jobs_panel_delete_enters_product_cancel_router() {
-    let delete_arm = TUI_SOURCE
+    let delete_arm = JOBS_SOURCE
         .find("KeyCode::Delete if state.show_jobs")
-        .expect("Jobs-panel Delete key arm must exist");
-    let nearby_end = (delete_arm + 800).min(TUI_SOURCE.len());
-    let nearby = &TUI_SOURCE[delete_arm..nearby_end];
+        .expect("Jobs-panel Delete key arm must exist in jobs.rs");
+    let nearby_end = (delete_arm + 400).min(JOBS_SOURCE.len());
+    let nearby = &JOBS_SOURCE[delete_arm..nearby_end];
 
     assert!(
-        nearby.contains("cancel_job_product_route(&mut state, &sync_runtime, &id)"),
+        nearby.contains("super::cancel_job_product_route(state, sync, &id)")
+            || nearby.contains("cancel_job_product_route(state, sync, &id)"),
         "Jobs-panel Delete must route through the product cancel helper"
     );
 }
@@ -70,16 +71,28 @@ fn copy_and_move_product_paths_enqueue_into_persistent_runtime() {
 
 #[test]
 fn pause_resume_controls_wired_for_transfer_jobs() {
-    assert!(JOBS_SOURCE.contains("transfers.request_pause("));
-    assert!(JOBS_SOURCE.contains("transfers.resume("));
+    assert!(JOBS_SOURCE.contains("sync.transfers.request_pause("));
+    assert!(JOBS_SOURCE.contains("sync.transfers.resume("));
 
     let jobs_panel = JOBS_SOURCE
         .find("if !state.show_jobs")
         .expect("Jobs-panel handler must exist");
     let end = (jobs_panel + 1200).min(JOBS_SOURCE.len());
     let handler = &JOBS_SOURCE[jobs_panel..end];
-    assert!(handler.contains("transfers.request_pause("));
-    assert!(handler.contains("transfers.resume("));
+    assert!(handler.contains("sync.transfers.request_pause("));
+    assert!(handler.contains("sync.transfers.resume("));
+}
+
+#[test]
+fn parent_wires_controller_through_full_runtime() {
+    assert!(
+        TUI_SOURCE.contains("jobs::handle_key(&mut state, key, &sync_runtime)"),
+        "tui.rs must delegate the whole Jobs panel to jobs::handle_key with the full runtime"
+    );
+    assert!(
+        !TUI_SOURCE.contains("if state.show_jobs {\n                        match key.code {"),
+        "the inline Jobs Delete arm must not shadow the extracted controller"
+    );
 }
 
 #[test]

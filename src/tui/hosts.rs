@@ -40,7 +40,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &AppState) {
         .enumerate()
         .map(|(i, h)| {
             let prefix = if i == state.host_cursor { "> " } else { "  " };
-            let line = format!("{prefix}{} ({}): {}", h.name, h.hostname, h.id);
+            let line = format!("{prefix}{} ({})", h.name, h.hostname);
             ListItem::new(Line::from(line))
         })
         .collect();
@@ -108,6 +108,8 @@ mod tests {
     use super::*;
     use arx::vfs::ProviderRegistry;
     use crossterm::event::KeyModifiers;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -159,5 +161,19 @@ mod tests {
         assert_eq!(state.host_cursor, 1);
         handle_key(&mut state, key(KeyCode::Down), &loader());
         assert_eq!(state.host_cursor, 1);
+    }
+
+    #[test]
+    fn render_hides_host_id() {
+        let mut state = AppState::default();
+        state.show_hosts = true;
+        state.hosts = vec![host("Example", "example.test")];
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| render(f, f.area(), &state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Example (example.test)"));
+        assert!(!text.contains("example.test (example.test)"));
+        assert!(!text.contains("internal-id"));
     }
 }
