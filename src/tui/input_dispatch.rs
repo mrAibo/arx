@@ -44,7 +44,7 @@ pub(super) async fn handle_event(
             embedded_terminal::handle_key(&mut *state, key);
         }
         Event::Mouse(mouse) => {
-            match mouse::classify(&state, mouse) {
+            match mouse::classify(state, mouse) {
                 mouse::MouseRoute::Ignore => {}
                 mouse::MouseRoute::CommandBar { action, available } => {
                     // Clear any pending keyboard chord on explicit mouse command
@@ -95,7 +95,7 @@ pub(super) async fn handle_event(
                         )
                         .await?;
                     } else {
-                        let ctx = ActionContext::from_state(&state).with_file_context(
+                        let ctx = ActionContext::from_state(state).with_file_context(
                             focused
                                 .and_then(|row| row.action_entry())
                                 .map(|entry| entry.kind),
@@ -217,8 +217,8 @@ pub(super) async fn handle_event(
                 }
             }
             // Command Center owns keyboard input before generic text-input routing.
-            let focused_kind = focused_visible_entry(&state, &left_visible, &right_visible)
-                .map(|entry| entry.kind);
+            let focused_kind =
+                focused_visible_entry(state, left_visible, right_visible).map(|entry| entry.kind);
             match command_center::handle_key(
                 &mut *state,
                 key,
@@ -416,8 +416,8 @@ pub(super) async fn handle_event(
                             if state.show_command_center {
                                 state.command_matches = build_command_items_with_file_context(
                                     &state.filter,
-                                    &state,
-                                    focused_visible_entry(&state, &left_visible, &right_visible)
+                                    state,
+                                    focused_visible_entry(state, left_visible, right_visible)
                                         .map(|entry| entry.kind),
                                     configured_editor.is_some(),
                                 );
@@ -549,7 +549,7 @@ pub(super) async fn handle_event(
                     });
                 }
                 KeyResolution::Action(action) => {
-                    let context = ActionContext::from_state(&state).with_file_context(
+                    let context = ActionContext::from_state(state).with_file_context(
                         visible_rows
                             .get(cursor)
                             .and_then(|row| row.action_entry())
@@ -593,7 +593,7 @@ pub(super) async fn handle_event(
                 KeyResolution::Unhandled => {}
             }
 
-            match browser_input::classify(&state, key) {
+            match browser_input::classify(state, key) {
                 #[cfg(target_os = "linux")]
                 browser_input::BrowserRoute::OpenStorageInspector => {
                     match arx::storage_inspector_ui::launch_storage_inspector(&mut *state) {
@@ -836,20 +836,15 @@ pub(super) async fn handle_event(
                     if let Some(entry) = visible_rows
                         .get(cursor)
                         .and_then(VisiblePaneRow::listed_entry)
+                        && let Location::Local(dir) = &pane.location
                     {
-                        if let Location::Local(dir) = &pane.location {
-                            let p = dir.join(&entry.name);
-                            let size = entry.size.map(format_size).unwrap_or_default();
-                            state.viewer_content = FileInfoService::metadata_summary(
-                                &p,
-                                &entry.name,
-                                entry.kind,
-                                &size,
-                            )
-                            .await
-                            .unwrap_or_else(|error| vec![format!("File info failed: {error}")]);
-                            state.viewer_scroll = 0;
-                        }
+                        let p = dir.join(&entry.name);
+                        let size = entry.size.map(format_size).unwrap_or_default();
+                        state.viewer_content =
+                            FileInfoService::metadata_summary(&p, &entry.name, entry.kind, &size)
+                                .await
+                                .unwrap_or_else(|error| vec![format!("File info failed: {error}")]);
+                        state.viewer_scroll = 0;
                     }
                 }
                 // Ctrl+I: file info (stat)
@@ -858,20 +853,19 @@ pub(super) async fn handle_event(
                     if let Some(entry) = visible_rows
                         .get(cursor)
                         .and_then(VisiblePaneRow::listed_entry)
+                        && let Location::Local(dir) = &pane.location
                     {
-                        if let Location::Local(dir) = &pane.location {
-                            let path = dir.join(&entry.name);
-                            let size = entry.size.map(format_size).unwrap_or_default();
-                            state.viewer_content = FileInfoService::metadata_summary(
-                                &path,
-                                &entry.name,
-                                entry.kind,
-                                &size,
-                            )
-                            .await
-                            .unwrap_or_else(|error| vec![format!("File info failed: {error}")]);
-                            state.viewer_scroll = 0;
-                        }
+                        let path = dir.join(&entry.name);
+                        let size = entry.size.map(format_size).unwrap_or_default();
+                        state.viewer_content = FileInfoService::metadata_summary(
+                            &path,
+                            &entry.name,
+                            entry.kind,
+                            &size,
+                        )
+                        .await
+                        .unwrap_or_else(|error| vec![format!("File info failed: {error}")]);
+                        state.viewer_scroll = 0;
                     }
                 }
                 // Alt+O: sync other pane to active pane
@@ -996,19 +990,18 @@ pub(super) async fn handle_event(
                     if let Some(entry) = visible_rows
                         .get(cursor)
                         .and_then(VisiblePaneRow::listed_entry)
+                        && entry.kind != EntryKind::Directory
                     {
-                        if entry.kind != EntryKind::Directory {
-                            let path = match &pane.location {
-                                Location::Local(dir) => dir.join(&entry.name),
-                                _ => {
-                                    return Ok(InputDispatchOutcome {
-                                        flow: InputFlow::ContinueLoop,
-                                        entry_mutation: EntryMutation::None,
-                                    });
-                                }
-                            };
-                            let _ = DesktopService::page_with_bat(&path).await;
-                        }
+                        let path = match &pane.location {
+                            Location::Local(dir) => dir.join(&entry.name),
+                            _ => {
+                                return Ok(InputDispatchOutcome {
+                                    flow: InputFlow::ContinueLoop,
+                                    entry_mutation: EntryMutation::None,
+                                });
+                            }
+                        };
+                        let _ = DesktopService::page_with_bat(&path).await;
                     }
                 }
                 // Ctrl+C: copy filename to clipboard
@@ -1035,7 +1028,7 @@ pub(super) async fn handle_event(
                 }
                 // Ctrl+S: save workspace
                 browser_input::BrowserRoute::SaveWorkspace => {
-                    match crate::workspace::save_workspace(&state) {
+                    match crate::workspace::save_workspace(state) {
                         Ok(()) => state.message = Some("Workspace saved".into()),
                         Err(e) => state.message = Some(format!("Save failed: {e}")),
                     }

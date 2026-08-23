@@ -135,6 +135,43 @@ mod tests {
             .expect("production runtime source")
     }
 
+    fn event_loop_source() -> &'static str {
+        let start = TUI_SOURCE.find("async fn event_loop(").expect("event loop");
+        let end = TUI_SOURCE[start..]
+            .find("\nfn normalize_entries(")
+            .map(|offset| start + offset)
+            .expect("end of event loop");
+        &TUI_SOURCE[start..end]
+    }
+
+    #[test]
+    fn event_loop_is_a_thin_composition_root() {
+        let production = event_loop_source();
+        for required in [
+            "runtime.next_event",
+            "input_dispatch::handle_event",
+            "drive_deferred_editor",
+        ] {
+            assert!(
+                production.contains(required),
+                "event loop missing {required}"
+            );
+        }
+        for forbidden in [
+            "tokio::select!",
+            ".recv()",
+            "MouseRoute::",
+            "BrowserRoute::",
+            "KeyResolution::",
+            "match key.code",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "event loop contains {forbidden}"
+            );
+        }
+    }
+
     #[test]
     fn runtime_event_contract_has_all_eight_variants() {
         let production = production_source();

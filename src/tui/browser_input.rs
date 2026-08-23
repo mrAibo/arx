@@ -297,7 +297,7 @@ mod tests {
             .split_once("\n    Ok(InputDispatchOutcome {")
             .expect("input-dispatch tail seam")
             .0;
-        assert!(fallback.contains("match browser_input::classify(&state, key) {"));
+        assert!(fallback.contains("match browser_input::classify(state, key) {"));
         assert!(!fallback.contains("match key.code {"));
     }
 

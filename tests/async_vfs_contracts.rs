@@ -18,7 +18,7 @@ fn tui_does_not_reinstall_thread_local_provider_registry() {
 }
 
 #[test]
-fn tui_initial_loading_uses_pane_loader() {
+fn tui_initial_loading_uses_runtime_pane_loader() {
     let tui = include_str!("../src/tui.rs");
     let event_loop_start = tui.find("async fn event_loop(").unwrap();
     let event_loop_end = tui[event_loop_start..]
@@ -27,11 +27,13 @@ fn tui_initial_loading_uses_pane_loader() {
         .unwrap();
     let event_loop = &tui[event_loop_start..event_loop_end];
 
-    assert!(event_loop.contains(
-        "let (pane_loader, mut pane_load_rx, mut pane_next_page_rx) =\n        PaneLoader::channel(state.registry.clone());"
-    ));
-    assert!(event_loop.contains("Some(response) = pane_load_rx.recv() =>"));
-    assert!(event_loop.contains("Some(response) = pane_next_page_rx.recv() =>"));
+    assert!(event_loop.contains("let mut runtime = TuiRuntime::new(&mut state, &config);"));
+    assert!(
+        event_loop.contains("schedule_pane_load(&runtime.pane_loader, &mut state, Pane::Left);")
+    );
+    assert!(
+        event_loop.contains("schedule_pane_load(&runtime.pane_loader, &mut state, Pane::Right);")
+    );
 }
 
 #[test]
