@@ -289,13 +289,13 @@ mod tests {
 
     #[test]
     fn parent_fallback_is_typed_and_has_no_physical_key_matcher() {
-        const TUI_SOURCE: &str = include_str!("../tui.rs");
-        let fallback = TUI_SOURCE
+        const INPUT_DISPATCH_SOURCE: &str = include_str!("input_dispatch.rs");
+        let fallback = INPUT_DISPATCH_SOURCE
             .split_once("KeyResolution::Unhandled => {}")
             .expect("KeyRouter fallback seam")
             .1
-            .split_once("// ── Deferred editor launch")
-            .expect("event-loop tail seam")
+            .split_once("\n    Ok(InputDispatchOutcome {")
+            .expect("input-dispatch tail seam")
             .0;
         assert!(fallback.contains("match browser_input::classify(&state, key) {"));
         assert!(!fallback.contains("match key.code {"));

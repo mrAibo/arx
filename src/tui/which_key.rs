@@ -147,12 +147,12 @@ mod tests {
 
     #[test]
     fn parent_pending_resolution_consumes_before_legacy_matcher() {
-        let source = include_str!("../tui.rs");
+        let source = include_str!("input_dispatch.rs");
         let pending = source
             .find("KeyResolution::Pending =>")
             .expect("parent Pending arm");
         let consumed = source[pending..]
-            .find("continue;")
+            .find("flow: InputFlow::ContinueLoop")
             .map(|offset| pending + offset)
             .expect("Pending is consumed");
         let legacy = source
