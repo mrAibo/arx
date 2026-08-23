@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use arx::app::{AppState, CommandKind};
 use arx::vfs::Location;
@@ -215,37 +215,6 @@ pub(super) fn render_viewer(frame: &mut Frame, area: Rect, state: &AppState) {
         .split(popup_area);
     let hint = Paragraph::new(Line::from(scroll_hint)).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(hint, hint_area[1]);
-}
-
-pub(super) fn render_bookmarks(frame: &mut Frame, area: Rect, state: &AppState) {
-    let popup_area = centered_rect(60, 70, area);
-    frame.render_widget(Clear, popup_area);
-
-    let items: Vec<ListItem> = state
-        .bookmarks
-        .iter()
-        .enumerate()
-        .map(|(i, loc)| {
-            let prefix = if i == state.bookmark_cursor {
-                "> "
-            } else {
-                "  "
-            };
-            ListItem::new(Line::from(format!("{prefix}{loc}")))
-        })
-        .collect();
-
-    let mut list_state = ListState::default();
-    list_state.select(Some(state.bookmark_cursor));
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Bookmarks (Ctrl+B: close, Enter: go) "),
-        )
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
-    frame.render_stateful_widget(list, popup_area, &mut list_state);
 }
 
 pub(super) fn render_infrastructure_center(frame: &mut Frame, area: Rect, state: &mut AppState) {
