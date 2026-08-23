@@ -47,8 +47,9 @@ use presentation::{session_callout_text, workspace_ribbon_text};
 
 mod overlays;
 use overlays::{
-    render_bookmarks, render_command_center, render_context_menu, render_help,
-    render_infrastructure_center, render_session_callout, render_smart_tree, render_viewer,
+    render_bookmarks, render_command_center, render_context_menu, render_directory_history,
+    render_file_search, render_help, render_infrastructure_center, render_rename_input,
+    render_session_callout, render_smart_tree, render_tab_switcher, render_viewer,
 };
 
 #[derive(Clone)]
@@ -3289,34 +3290,7 @@ fn render(
 
     // Directory history overlay (Alt+H)
     if state.show_history {
-        let h = (state.dir_history.len() + 2).min(20) as u16;
-        let popup = centered_rect_lines(60, h, area);
-        frame.render_widget(Clear, popup);
-        let mut items: Vec<ListItem> = state
-            .dir_history
-            .iter()
-            .rev()
-            .enumerate()
-            .map(|(i, p)| {
-                ListItem::new(format!(
-                    "{:2}  {}",
-                    state.dir_history.len() - i,
-                    p.display()
-                ))
-            })
-            .collect();
-        if items.is_empty() {
-            items.push(ListItem::new("(empty)"));
-        }
-        frame.render_widget(
-            List::new(items).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Directory History (Alt+H) ")
-                    .border_style(Style::default().fg(Color::Cyan)),
-            ),
-            popup,
-        );
+        render_directory_history(frame, area, state);
     }
 
     // Hotlist overlay
@@ -3350,78 +3324,14 @@ fn render(
             popup,
         );
     }
-    // Tab switcher overlay
     if state.show_tab_switcher {
-        let mut items: Vec<ListItem> = vec![ListItem::new("── Left pane ──")];
-        for (i, tab) in state.left.tabs.iter().enumerate() {
-            let idx = items.len();
-            let pre = if idx == state.tab_switcher_cursor {
-                "> "
-            } else {
-                "  "
-            };
-            let loc = match &tab.0 {
-                Location::Local(p) => p.display().to_string(),
-                o => o.to_string(),
-            };
-            items.push(ListItem::new(format!("{pre}L{i}: {loc}")));
-        }
-        items.push(ListItem::new("── Right pane ──"));
-        for (i, tab) in state.right.tabs.iter().enumerate() {
-            let idx = items.len();
-            let pre = if idx == state.tab_switcher_cursor {
-                "> "
-            } else {
-                "  "
-            };
-            let loc = match &tab.0 {
-                Location::Local(p) => p.display().to_string(),
-                o => o.to_string(),
-            };
-            items.push(ListItem::new(format!("{pre}R{i}: {loc}")));
-        }
-        let h = (items.len() + 2) as u16;
-        let popup = centered_rect_lines(60, h, area);
-        frame.render_widget(Clear, popup);
-        frame.render_widget(
-            List::new(items).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Tabs (Alt+`) ")
-                    .border_style(Style::default().fg(Color::Cyan)),
-            ),
-            popup,
-        );
+        render_tab_switcher(frame, area, state);
     }
-    // Rename input bar
     if state.rename_input {
-        frame.render_widget(
-            Paragraph::new(format!(" Rename: {}_", state.rename_pattern))
-                .style(Style::default().fg(Color::Yellow).bg(Color::DarkGray)),
-            Rect {
-                x: area.x,
-                y: area.y + area.height.saturating_sub(2),
-                width: area.width,
-                height: 1,
-            },
-        );
+        render_rename_input(frame, area, state);
     }
-    // File search bar (/)
     if state.file_search {
-        frame.render_widget(
-            Paragraph::new(format!(
-                " /{}_  ({})",
-                state.search_query,
-                state.search_matches.len()
-            ))
-            .style(Style::default().fg(Color::Yellow).bg(Color::DarkGray)),
-            Rect {
-                x: area.x,
-                y: area.y + area.height.saturating_sub(2),
-                width: area.width,
-                height: 1,
-            },
-        );
+        render_file_search(frame, area, state);
     }
 
     // Hosts overlay
@@ -9627,6 +9537,142 @@ mod tests {
         assert!(text.contains("Delete F8"));
         assert!(text.contains("View   F3"));
         assert!(text.contains("Edit   F4"));
+    }
+
+    #[test]
+    fn history_tabs_input_directory_history_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            dir_history: vec![PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")],
+            show_history: true,
+            ..Default::default()
+        };
+
+        terminal
+            .draw(|f| render_directory_history(f, f.area(), &state))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let text = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(text.contains("Directory History"));
+        assert!(text.contains("/tmp/one"));
+        assert!(text.contains("/tmp/two"));
+    }
+
+    #[test]
+    fn history_tabs_input_tab_switcher_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let state = AppState {
+            left: arx::app::PaneState {
+                location: Location::Local(PathBuf::from("/")),
+                cursor: 0,
+                tabs: vec![(Location::Local(PathBuf::from("/tmp/left")), 0)],
+                dir_history: vec![],
+                split: false,
+                split_cursor: 0,
+                split_active: false,
+            },
+            right: arx::app::PaneState {
+                location: Location::Local(PathBuf::from("/")),
+                cursor: 0,
+                tabs: vec![(Location::Local(PathBuf::from("/tmp/right")), 0)],
+                dir_history: vec![],
+                split: false,
+                split_cursor: 0,
+                split_active: false,
+            },
+            tab_switcher_cursor: 1,
+            show_tab_switcher: true,
+            ..Default::default()
+        };
+
+        terminal
+            .draw(|f| render_tab_switcher(f, f.area(), &state))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let text = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(text.contains("Tabs (Alt+`)"));
+        assert!(text.contains("> L0: /tmp/left"));
+        assert!(text.contains("R0: /tmp/right"));
+    }
+
+    #[test]
+    fn history_tabs_input_rename_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            rename_input: true,
+            rename_pattern: "new-name".into(),
+            ..Default::default()
+        };
+
+        terminal
+            .draw(|f| render_rename_input(f, f.area(), &state))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let text = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(text.contains("Rename: new-name_"));
+    }
+
+    #[test]
+    fn history_tabs_input_file_search_characterization() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            file_search: true,
+            search_query: "needle".into(),
+            ..Default::default()
+        };
+
+        terminal
+            .draw(|f| render_file_search(f, f.area(), &state))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let text = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(text.contains("/needle_"));
+        assert!(text.contains("(0)"));
     }
 
     #[test]
