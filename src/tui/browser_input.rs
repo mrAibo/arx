@@ -40,8 +40,8 @@ pub(super) enum BrowserRoute {
     ToggleTransferCenter,
     TreeClose,
     CloseInfrastructure,
-    TreeFilterChar(char),
     TogglePanelMode,
+    TreeFilterChar(char),
     BeginCommand,
     SwitchTabNumber(usize),
     NewTab,
@@ -52,10 +52,6 @@ pub(super) enum BrowserRoute {
 
 pub(super) fn classify(state: &AppState, key: KeyEvent) -> BrowserRoute {
     use BrowserRoute::*;
-
-    if key_router_owns(key) {
-        return Unhandled;
-    }
 
     #[cfg(target_os = "linux")]
     if key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::ALT) {
@@ -121,10 +117,13 @@ pub(super) fn classify(state: &AppState, key: KeyEvent) -> BrowserRoute {
         KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => ToggleTransferCenter,
         KeyCode::Esc if state.show_tree => TreeClose,
         KeyCode::Esc if state.show_infra => CloseInfrastructure,
+        // #212 authoritative route: Alt+T must remain panel-mode toggle even
+        // while Smart Tree is open. Tree filter text owns only non-Control
+        // characters that are not an explicit higher-priority browser route.
+        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => TogglePanelMode,
         KeyCode::Char(c) if state.show_tree && !key.modifiers.contains(KeyModifiers::CONTROL) => {
             TreeFilterChar(c)
         }
-        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => TogglePanelMode,
         KeyCode::Char(':') => BeginCommand,
         KeyCode::Char(c)
             if key.modifiers.contains(KeyModifiers::ALT) && ('1'..='9').contains(&c) =>
@@ -146,20 +145,6 @@ pub(super) fn classify(state: &AppState, key: KeyEvent) -> BrowserRoute {
             NextTab
         }
         _ => Unhandled,
-    }
-}
-
-fn key_router_owns(key: KeyEvent) -> bool {
-    match (key.code, key.modifiers) {
-        (KeyCode::Char('q' | ' ' | '?'), KeyModifiers::NONE)
-        | (KeyCode::F(1 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 12), KeyModifiers::NONE)
-        | (KeyCode::Char('p' | '\\' | 'b' | 'j' | 'd' | 'x'), KeyModifiers::CONTROL) => true,
-        (KeyCode::Char('s'), modifiers)
-            if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
-        {
-            true
-        }
-        _ => false,
     }
 }
 
@@ -188,6 +173,18 @@ mod tests {
         assert_eq!(
             route(KeyCode::Char('i'), KeyModifiers::CONTROL),
             BrowserRoute::FileInfo
+        );
+    }
+
+    #[test]
+    fn corrected_alt_t_precedes_smart_tree_text_filter() {
+        let state = AppState {
+            show_tree: true,
+            ..AppState::default()
+        };
+        assert_eq!(
+            classify(&state, key(KeyCode::Char('t'), KeyModifiers::ALT)),
+            BrowserRoute::TogglePanelMode
         );
     }
 
@@ -255,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_and_key_router_owned_keys_are_unhandled() {
+    fn unknown_and_migrated_keys_have_no_legacy_route() {
         assert_eq!(
             route(KeyCode::F(11), KeyModifiers::NONE),
             BrowserRoute::Unhandled
@@ -302,5 +299,13 @@ mod tests {
             .0;
         assert!(fallback.contains("match browser_input::classify(&state, key) {"));
         assert!(!fallback.contains("match key.code {"));
+    }
+
+    #[test]
+    fn classifier_does_not_embed_a_second_static_keymap() {
+        const SOURCE: &str = include_str!("browser_input.rs");
+        assert!(!SOURCE.contains("fn key_router_owns"));
+        assert!(!SOURCE.contains("KeyResolution::"));
+        assert!(!SOURCE.contains("KeyBinding::"));
     }
 }
