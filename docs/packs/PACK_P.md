@@ -56,22 +56,44 @@ Squash merge on `main`: `2f427bd1f3d138efd5f580ac950abe9d3e921845`.
 
 The parent `render()` composition root, pane rendering/state, command-bar hitboxes, Which-Key, sync-preview rendering, Hosts/SSH orchestration, event routing, Action dispatch, Effect/Job handling, and provider behavior remained in `src/tui.rs`.
 
-## Active transaction: P2b utility overlays
+## Completed: P2b utility overlays
 
-Tracked by #189.
+Tracked by #189 and merged through PR #190.
 
-Extract only four state-driven inline overlay blocks from `render()` into the existing `src/tui/overlays.rs` module:
+P2b added focused TestBackend characterization and extracted these four state-driven utility overlays into the existing `src/tui/overlays.rs` module:
 
 - Infrastructure Center
 - Smart Tree
 - Command Center
 - Context Menu
 
-The parent `render()` must retain the same show/hide predicates and overlay order. P2b must preserve all titles, colors, sizing, cursor state, availability text, display lines, and static context-menu rows exactly.
+Exact PR head `8ce28a3959d8b2f1e896ee5b9a8fac1fd8789ef7` passed CI #650 / run `32597743305`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance.
 
-Explicitly keep out of P2b: command bar / `CommandHitbox` geometry, Which-Key / `KeyRouter` / Action Catalog logic, directory history, hotlist, tab switcher, rename/search bars, Hosts/SSH/Jobs, transfer/storage/filesystem/menu overlays, sync-preview rendering, and all event/action/effect/job/provider ownership.
+Squash merge on `main`: `c41e626fa9a2b031cd379b5885927f1b4920a360`.
 
-`Hotlist` stays in `tui.rs` because current rendering performs `AppState::load_hotlist()` and is therefore not a pure render-only seam. Command bar and Which-Key stay in `tui.rs` because they intersect later input/action-routing boundaries.
+The extraction exposed a pre-existing line-count-vs-percentage popup sizing defect. That semantic fix was deliberately split from P2b:
+
+- #191 / PR #192 corrected the four extracted utility overlays and made `centered_rect_lines` a generic exact/clamped line-height helper while preserving the delete-confirmation minimum at its call site. Exact head `88b53b23ac30b2d21ffb4c69a0ef072922fb3535`; CI #653 green; merge `26d309dac02e784460542f349dc2e1f4563538cc`.
+- #193 / PR #194 applied the same already-reviewed line-height semantics to the still-inline Directory History and Tab Switcher call sites only. Exact head `d47f67d7c2805623e9454efb1fb35eed81077dca`; CI #655 green; merge `a9049a2c76153e00b0fa0f15c223f56657c9bad7`.
+
+Those fixes changed popup geometry only; Action/Effect/Job/provider/VFS/keybinding ownership remained unchanged.
+
+## Active transaction: P2c history, tabs, and inline input renderers
+
+Tracked by #195.
+
+Extract only these currently-inline pure render surfaces from `render()` into the existing `src/tui/overlays.rs` module:
+
+- Directory History
+- Tab Switcher
+- Rename input bar
+- File Search bar
+
+The parent `render()` must retain the same show/hide predicates and relative overlay ordering. Directory History and Tab Switcher must keep the line-based sizing already corrected in #193/#194.
+
+Add focused TestBackend characterization on a normal terminal (target `120x24`) after callable seams exist, covering representative history numbering/path rendering, left/right tab rendering and cursor marker, rename pattern text, and file-search query/match count.
+
+Explicitly keep out of P2c: Hotlist (render still performs `AppState::load_hotlist()` I/O), command bar / `CommandHitbox`, Which-Key / `KeyRouter` / Action Catalog logic, Hosts/SSH/Jobs, transfer/storage/filesystem surfaces, sync-preview rendering, pane rendering, event routing, Action dispatch, Effect/Job handling, provider/VFS behavior, and keybindings.
 
 Use focused semantic/render characterization rather than whole-screen golden snapshots.
 

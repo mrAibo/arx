@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use arx::app::{AppState, CommandKind};
+use arx::vfs::Location;
 
 use super::{centered_rect, centered_rect_lines};
 
@@ -334,4 +335,108 @@ pub(super) fn render_context_menu(frame: &mut Frame, area: Rect) {
         .block(Block::default().borders(Borders::ALL).title(" Menu "))
         .highlight_style(Style::default().fg(Color::Yellow));
     frame.render_widget(list, popup);
+}
+
+pub(super) fn render_directory_history(frame: &mut Frame, area: Rect, state: &AppState) {
+    let h = (state.dir_history.len() + 2).min(20) as u16;
+    let popup = centered_rect_lines(60, h, area);
+    frame.render_widget(Clear, popup);
+    let mut items: Vec<ListItem> = state
+        .dir_history
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, p)| {
+            ListItem::new(format!(
+                "{:2}  {}",
+                state.dir_history.len() - i,
+                p.display()
+            ))
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(ListItem::new("(empty)"));
+    }
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Directory History (Alt+H) ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        popup,
+    );
+}
+
+pub(super) fn render_tab_switcher(frame: &mut Frame, area: Rect, state: &AppState) {
+    let mut items: Vec<ListItem> = vec![ListItem::new("── Left pane ──")];
+    for (i, tab) in state.left.tabs.iter().enumerate() {
+        let idx = items.len();
+        let pre = if idx == state.tab_switcher_cursor {
+            "> "
+        } else {
+            "  "
+        };
+        let loc = match &tab.0 {
+            Location::Local(p) => p.display().to_string(),
+            o => o.to_string(),
+        };
+        items.push(ListItem::new(format!("{pre}L{i}: {loc}")));
+    }
+    items.push(ListItem::new("── Right pane ──"));
+    for (i, tab) in state.right.tabs.iter().enumerate() {
+        let idx = items.len();
+        let pre = if idx == state.tab_switcher_cursor {
+            "> "
+        } else {
+            "  "
+        };
+        let loc = match &tab.0 {
+            Location::Local(p) => p.display().to_string(),
+            o => o.to_string(),
+        };
+        items.push(ListItem::new(format!("{pre}R{i}: {loc}")));
+    }
+    let h = (items.len() + 2) as u16;
+    let popup = centered_rect_lines(60, h, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Tabs (Alt+`) ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        popup,
+    );
+}
+
+pub(super) fn render_rename_input(frame: &mut Frame, area: Rect, state: &AppState) {
+    frame.render_widget(
+        Paragraph::new(format!(" Rename: {}_", state.rename_pattern))
+            .style(Style::default().fg(Color::Yellow).bg(Color::DarkGray)),
+        Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(2),
+            width: area.width,
+            height: 1,
+        },
+    );
+}
+
+pub(super) fn render_file_search(frame: &mut Frame, area: Rect, state: &AppState) {
+    frame.render_widget(
+        Paragraph::new(format!(
+            " /{}_  ({})",
+            state.search_query,
+            state.search_matches.len()
+        ))
+        .style(Style::default().fg(Color::Yellow).bg(Color::DarkGray)),
+        Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(2),
+            width: area.width,
+            height: 1,
+        },
+    );
 }
