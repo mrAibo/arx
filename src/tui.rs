@@ -2,8 +2,8 @@ use crate::tui_terminal::TuiTerminalSession;
 use arx::app::InputContext;
 use arx::app::{
     Action, ActionAvailability, ActionContext, ActionId, AppState, CommandItem, CommandKind,
-    CommandTarget, OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, QuickActionPrompt,
-    SessionCallout, SortMode, WorkspaceSyncUxState, action_availability, action_meta,
+    CommandTarget, OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SessionCallout,
+    SortMode, WorkspaceSyncUxState, action_availability, action_meta,
     build_command_items_with_file_context, listed_entry_navigation_target,
     navigation_parent_target,
 };
@@ -15,9 +15,8 @@ use arx::input::{ContextHint, KeyResolution, KeyRouter, command_bar_rows};
 use arx::services::{
     DesktopService, FileInfoService, GitService, MutationError, MutationService,
     PaneListingContinuation, PaneLoadPurpose, PaneLoadResponse, PaneLoader, PaneNextPageResponse,
-    QuickActionFailureKind, QuickActionKind, QuickActionOutcome, QuickActionRequest, SyncLaunchId,
-    WorkspaceScanError, WorkspaceScanOptions, WorkspaceScanResponse, WorkspaceScanner,
-    WorkspaceSyncController,
+    QuickActionFailureKind, QuickActionOutcome, SyncLaunchId, WorkspaceScanError,
+    WorkspaceScanOptions, WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
 };
 use arx::vfs::{
     Entry, EntryIdentity, EntryKind, ListedEntry, Location, ProviderId, ProviderRegistry,
@@ -49,6 +48,7 @@ mod bookmarks;
 mod hosts;
 mod jobs;
 mod overlays;
+mod quick_actions;
 mod ssh_hosts;
 mod user_menu;
 use overlays::{
@@ -789,46 +789,14 @@ async fn event_loop(
                                     if command.is_empty() {
                                         state.message = Some(": command cancelled".into());
                                     } else if let Some(prompt) = pending_quick_action {
-                                        if state.pending_effect(EffectLane::QuickAction).is_some() {
-                                            state.message = Some(
-                                                "Another Quick Action is still in progress".into(),
-                                            );
+                                        if quick_actions::submit_prompt(
+                                            &mut state,
+                                            prompt,
+                                            command,
+                                            &effect_dispatcher,
+                                        ) {
                                             continue;
                                         }
-
-                                        let (request, location, status) = match prompt {
-                                            QuickActionPrompt::Touch { dir } => {
-                                                let location = Location::Local(dir.clone());
-                                                (
-                                                    QuickActionRequest::Touch {
-                                                        dir,
-                                                        name: command,
-                                                    },
-                                                    location,
-                                                    "Touching file…",
-                                                )
-                                            }
-                                            QuickActionPrompt::CompressTarGz { dir, names } => {
-                                                let location = Location::Local(dir.clone());
-                                                (
-                                                    QuickActionRequest::CompressTarGz {
-                                                        dir,
-                                                        names,
-                                                        output_name: command,
-                                                    },
-                                                    location,
-                                                    "Compressing to tar.gz…",
-                                                )
-                                            }
-                                        };
-
-                                        let id = effect_dispatcher.dispatch(
-                                            EffectLane::QuickAction,
-                                            EffectScope::Location(location),
-                                            Effect::QuickAction { request },
-                                        );
-                                        state.register_effect(EffectLane::QuickAction, id);
-                                        state.message = Some(status.into());
                                     } else if let Some(loc) = pending_mkdir {
                                         let name = command;
                                         // Validate child name — reject empty, ".", "..", "/", NUL.
@@ -4353,82 +4321,6 @@ fn build_s3_copy_spec(
     }
 }
 
-fn display_safe_text(value: &str) -> String {
-    let mut safe = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\n' => safe.push_str("\\n"),
-            '\r' => safe.push_str("\\r"),
-            '\t' => safe.push_str("\\t"),
-            ch if ch.is_control() => {
-                safe.push_str(&format!("\\u{{{:x}}}", ch as u32));
-            }
-            ch => safe.push(ch),
-        }
-    }
-    safe
-}
-
-fn collect_quick_action_names(
-    state: &AppState,
-    focused: Option<&Entry>,
-    active_entries: &[&Entry],
-    files_only: bool,
-) -> Result<Vec<String>, String> {
-    let location = &state.active_pane().location;
-    let names = if let Some(selected) = state.selection_names(state.active, location) {
-        selected.iter().cloned().collect::<Vec<_>>()
-    } else if let Some(entry) = focused {
-        vec![entry.name.clone()]
-    } else {
-        return Err("Select a file or directory first".into());
-    };
-
-    for name in &names {
-        let Some(entry) = active_entries
-            .iter()
-            .copied()
-            .find(|entry| entry.name.as_str() == name.as_str())
-        else {
-            return Err(format!("Selection is stale: {}", display_safe_text(name)));
-        };
-
-        if files_only && entry.kind != EntryKind::File {
-            return Err(format!(
-                "SHA-256 requires regular files; {} is not a regular file",
-                display_safe_text(name)
-            ));
-        }
-    }
-
-    Ok(names)
-}
-
-fn quick_action_refresh_location(event: &EffectEvent, scope: &EffectScope) -> Option<Location> {
-    let may_have_mutated = match event {
-        EffectEvent::QuickActionFinished { result } => match result {
-            Ok(QuickActionOutcome::Touched { .. }) | Ok(QuickActionOutcome::Compressed { .. }) => {
-                true
-            }
-            Ok(QuickActionOutcome::Sha256 { .. }) => false,
-            Err(failure) => matches!(
-                failure.action,
-                QuickActionKind::Touch | QuickActionKind::CompressTarGz
-            ),
-        },
-        _ => false,
-    };
-
-    if !may_have_mutated {
-        return None;
-    }
-
-    match scope {
-        EffectScope::Location(location) => Some(location.clone()),
-        EffectScope::Global | EffectScope::Workspace { .. } => None,
-    }
-}
-
 // ponytail: keep the one action seam instead of wrapping runtime services in a one-use context.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_ui_action(
@@ -4449,6 +4341,9 @@ async fn dispatch_ui_action(
     let focused = focused_row
         .and_then(|row| row.listed())
         .map(|listed| &listed.entry);
+    if quick_actions::handle_action(state, &action, focused, active_entries, effect_dispatcher) {
+        return Ok(());
+    }
     // ponytail: keep the ListedEntry (exact identity) for preview, not &Entry
     let focused_listed = focused_row.and_then(|row| row.listed());
     // ponytail: passive pane's focused entry — needed for cross-pane S3 transfer
@@ -4490,79 +4385,6 @@ async fn dispatch_ui_action(
         }
         Action::ToggleSelect => {
             toggle_selection_and_advance(state, focused, visible_count);
-        }
-        Action::ComputeSha256 => {
-            if state.pending_effect(EffectLane::QuickAction).is_some() {
-                state.message = Some("Another Quick Action is still in progress".into());
-                return Ok(());
-            }
-
-            let Location::Local(dir) = state.active_pane().location.clone() else {
-                state.message = Some("Quick Actions are currently local-only".into());
-                return Ok(());
-            };
-
-            let names = match collect_quick_action_names(state, focused, active_entries, true) {
-                Ok(names) => names,
-                Err(message) => {
-                    state.message = Some(message);
-                    return Ok(());
-                }
-            };
-
-            let location = Location::Local(dir.clone());
-            let id = effect_dispatcher.dispatch(
-                EffectLane::QuickAction,
-                EffectScope::Location(location),
-                Effect::QuickAction {
-                    request: QuickActionRequest::Sha256 { dir, names },
-                },
-            );
-            state.register_effect(EffectLane::QuickAction, id);
-            state.message = Some("Computing SHA-256…".into());
-        }
-        Action::TouchFile => {
-            if state.pending_effect(EffectLane::QuickAction).is_some() {
-                state.message = Some("Another Quick Action is still in progress".into());
-                return Ok(());
-            }
-
-            let Location::Local(dir) = state.active_pane().location.clone() else {
-                state.message = Some("Quick Actions are currently local-only".into());
-                return Ok(());
-            };
-
-            state.pending_mkdir_location = None;
-            state.pending_quick_action_prompt = Some(QuickActionPrompt::Touch { dir });
-            state.cmd.clear();
-            state.cmd_input = true;
-            state.message = Some("Touch file: enter child name".into());
-        }
-        Action::CompressTarGz => {
-            if state.pending_effect(EffectLane::QuickAction).is_some() {
-                state.message = Some("Another Quick Action is still in progress".into());
-                return Ok(());
-            }
-
-            let Location::Local(dir) = state.active_pane().location.clone() else {
-                state.message = Some("Quick Actions are currently local-only".into());
-                return Ok(());
-            };
-
-            let names = match collect_quick_action_names(state, focused, active_entries, false) {
-                Ok(names) => names,
-                Err(message) => {
-                    state.message = Some(message);
-                    return Ok(());
-                }
-            };
-
-            state.pending_mkdir_location = None;
-            state.pending_quick_action_prompt =
-                Some(QuickActionPrompt::CompressTarGz { dir, names });
-            state.cmd = "archive.tar.gz".into();
-            state.cmd_input = true;
-            state.message = Some("Compress: enter output tar.gz name".into());
         }
         Action::ViewFile => {
             let Some(listed) = focused_listed.filter(|listed| listed.entry.kind == EntryKind::File)
@@ -5806,7 +5628,11 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
                 state.viewer_content = checksums
                     .into_iter()
                     .map(|checksum| {
-                        format!("{}  {}", checksum.sha256, display_safe_text(&checksum.name))
+                        format!(
+                            "{}  {}",
+                            checksum.sha256,
+                            quick_actions::display_safe_text(&checksum.name)
+                        )
                     })
                     .collect();
                 state.viewer_scroll = 0;
@@ -5815,13 +5641,13 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
             Ok(QuickActionOutcome::Touched { path }) => {
                 state.message = Some(format!(
                     "Touched {}",
-                    display_safe_text(path.to_string_lossy().as_ref())
+                    quick_actions::display_safe_text(path.to_string_lossy().as_ref())
                 ));
             }
             Ok(QuickActionOutcome::Compressed { path, entries }) => {
                 state.message = Some(format!(
                     "Created {} from {entries} entr{}",
-                    display_safe_text(path.to_string_lossy().as_ref()),
+                    quick_actions::display_safe_text(path.to_string_lossy().as_ref()),
                     if entries == 1 { "y" } else { "ies" }
                 ));
             }
@@ -5832,7 +5658,7 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
                     state.message = Some(format!(
                         "{} failed: {}",
                         failure.action.label(),
-                        display_safe_text(&failure.message)
+                        quick_actions::display_safe_text(&failure.message)
                     ));
                 }
             }
@@ -6015,7 +5841,8 @@ fn handle_effect_response(
     if !state.accepts_effect(response.id, response.lane, &response.scope) {
         return;
     }
-    let quick_action_refresh = quick_action_refresh_location(&response.event, &response.scope);
+    let quick_action_refresh =
+        quick_actions::quick_action_refresh_location(&response.event, &response.scope);
     let refresh_origin = if matches!(
         &response.event,
         EffectEvent::WrittenBack { .. } | EffectEvent::WrittenBackWarning { .. }
@@ -10089,47 +9916,6 @@ mod tests {
 #[cfg(test)]
 mod pack_o_quick_action_tests {
     use super::*;
-
-    #[test]
-    fn display_safe_text_escapes_controls_but_preserves_unicode() {
-        assert_eq!(
-            display_safe_text("a\nb\tc\rd\u{1b}ü"),
-            "a\\nb\\tc\\rd\\u{1b}ü"
-        );
-    }
-
-    #[test]
-    fn sha_name_collection_rejects_directory_and_stale_selection() {
-        let state = AppState::default();
-        let directory = Entry {
-            name: "dir".into(),
-            kind: EntryKind::Directory,
-            size: None,
-            modified_unix_ms: None,
-        };
-        let entries = [&directory];
-
-        let error =
-            collect_quick_action_names(&state, Some(&directory), &entries, true).unwrap_err();
-        assert!(error.contains("requires regular files"));
-
-        let mut state = AppState::default();
-        let location = state.active_pane().location.clone();
-        state.toggle_selection(state.active, &location, "missing\nname");
-
-        let file = Entry {
-            name: "present".into(),
-            kind: EntryKind::File,
-            size: Some(1),
-            modified_unix_ms: None,
-        };
-        let entries = [&file];
-
-        let error = collect_quick_action_names(&state, Some(&file), &entries, true).unwrap_err();
-        assert!(error.contains("Selection is stale"));
-        assert!(error.contains("missing\\nname"));
-        assert!(!error.contains("missing\nname"));
-    }
 
     #[test]
     fn sha_result_presentation_escapes_filename_controls() {
