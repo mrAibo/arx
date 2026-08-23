@@ -22,7 +22,7 @@ Decompose `src/tui.rs` incrementally so rendering, feature orchestration, input 
 - [x] P4 — keyboard/mouse routing extraction
 - [x] P5 — Effect/Job response handling extraction
 - [x] P6 — thin runtime/event-loop composition root
-- [ ] P7 — docs/final exact-head acceptance and PACK P closure
+- [x] P7 — docs/final exact-head acceptance and PACK P closure
 
 ## Completed: P0 + P1a
 
@@ -260,7 +260,7 @@ P6 is complete at merge `b8a7181589091ecb17f8205d8311ac15028e7b27`.
 
 ## P7 final structural audit
 
-Tracked by #221. At accepted P6 `main` `b8a7181589091ecb17f8205d8311ac15028e7b27`, the final ownership map is:
+Tracked by #221 through PR #222. At accepted P6 `main` `b8a7181589091ecb17f8205d8311ac15028e7b27`, the final ownership map is:
 
 - presentation model — `presentation.rs`;
 - rendering/geometry — `overlays.rs`, `command_bar.rs`, and feature-owned renderers;
@@ -275,7 +275,11 @@ The audit found no remaining PACK P ownership contradiction that requires produc
 
 User-configurable effective keymaps remain future ROADMAP issue #214. Mouse feature additions remain #10. PACK Q ProviderRegistry / Location / CapabilitySet convergence and PACK R registration work remain subsequent scopes and are not pulled into PACK P.
 
-P7 remains open until this documentation head passes the required exact-head CI and final acceptance.
+## P7 closure decision
+
+The structural-audit head `babfba0b561c172be4386fec244d2d8fe1c59370` passed exact-head CI #695 / run `32670718300`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance all succeeded; both physical jobs passed Exact-SHA evidence.
+
+That accepted audit resolves the final deferred P1 boundary, records completed P5/P6 evidence, and confirms the final PACK P ownership map. This final docs-only commit marks P7 and the sequence complete. It introduces no production, test, Cargo, README, provider/VFS, routing/keymap, release or packaging change and must itself pass the same exact-head CI before pinned merge and #183 closure.
 
 ## Acceptance
 
