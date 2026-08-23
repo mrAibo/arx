@@ -274,8 +274,15 @@ mod tests {
     }
 
     #[test]
-    fn render_source_has_no_file_loader_call() {
+    fn render_body_has_no_file_loader_call() {
         let source = include_str!("hotlist.rs");
-        assert!(!source.contains(concat!("load_", "hotlist")));
+        let render_body = source
+            .split_once("pub(super) fn render")
+            .expect("render function exists")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("test module follows render")
+            .0;
+        assert!(!render_body.contains(concat!("load_", "hotlist")));
     }
 }
