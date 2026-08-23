@@ -47,6 +47,7 @@ use presentation::{session_callout_text, workspace_ribbon_text};
 
 mod bookmarks;
 mod hosts;
+mod jobs;
 mod overlays;
 mod ssh_hosts;
 use overlays::{
@@ -1036,47 +1037,20 @@ async fn event_loop(
                         continue;
                     }
 
-                    // Jobs panel: Ctrl+J
                     if state.show_jobs {
-                        let sync = &sync_runtime;
                         match key.code {
-                            KeyCode::Esc | KeyCode::Char('j')
-                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                state.show_jobs = false;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                state.job_cursor = state.job_cursor.saturating_sub(1);
-                            }
-                            KeyCode::Down | KeyCode::Char('j')
-                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                let max = state.jobs.len().saturating_sub(1);
-                                if state.job_cursor < max {
-                                    state.job_cursor += 1;
-                                }
-                            }
-                            KeyCode::Char('p') => {
-                                if let Some(job) = state.jobs.get(state.job_cursor)
-                                    && job.kind == arx::jobs::JobKind::Transfer
-                                    && sync.transfers.request_pause(&job.id).is_ok()
-                                {
-                                    state.message = Some(
-                                        "Pause requested (will checkpoint at next safe boundary)"
-                                            .into(),
-                                    );
-                                }
-                            }
-                            KeyCode::Char('r') => {
-                                if let Some(job) = state.jobs.get(state.job_cursor)
-                                    && job.kind == arx::jobs::JobKind::Transfer
-                                    && sync.transfers.resume(&job.id).is_ok()
-                                {
-                                    state.message = Some("Resume requested".into());
+                            KeyCode::Delete if state.show_jobs => {
+                                if let Some(job) = state.jobs.get(state.job_cursor) {
+                                    let id = job.id.clone();
+                                    cancel_job_product_route(&mut state, &sync_runtime, &id);
                                 }
                             }
                             _ => {}
                         }
+                        continue;
+                    }
+
+                    if jobs::handle_key(&mut state, key, &sync_runtime.transfers) {
                         continue;
                     }
 
@@ -3071,7 +3045,7 @@ fn render(
 
     // Jobs overlay
     if state.show_jobs {
-        render_jobs(frame, area, state);
+        jobs::render(frame, area, state);
     }
 
     if state.show_transfer_center {
@@ -3777,51 +3751,6 @@ fn render_verification_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>
             )));
         }
     }
-}
-
-fn render_jobs(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
-    let popup_area = centered_rect(70, 70, area);
-    frame.render_widget(Clear, popup_area);
-
-    let items: Vec<ListItem> = if state.jobs.is_empty() {
-        vec![ListItem::new(Line::from(
-            "  No jobs yet — start a copy/move to see it here.",
-        ))]
-    } else {
-        state
-            .jobs
-            .iter()
-            .enumerate()
-            .map(|(i, j)| {
-                let prefix = if i == state.job_cursor { "> " } else { "  " };
-                let bar = if j.status == arx::jobs::JobStatus::Running {
-                    let filled = j.progress.percent().unwrap_or(0) as usize / 5; // 0-20 chars
-                    let empty = 20 - filled;
-                    format!(
-                        " [{}{}] {}%",
-                        "=".repeat(filled),
-                        " ".repeat(empty),
-                        j.progress
-                    )
-                } else {
-                    String::new()
-                };
-                ListItem::new(Line::from(format!("{prefix}{j} {bar}")))
-            })
-            .collect()
-    };
-
-    let mut list_state = ListState::default();
-    list_state.select(Some(state.job_cursor));
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Jobs (Ctrl+J: close) "),
-        )
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
-    frame.render_stateful_widget(list, popup_area, &mut list_state);
 }
 
 fn render_menu(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {

@@ -6,6 +6,7 @@
 //! regressing to a direct `JobManager::cancel()` call.
 
 const TUI_SOURCE: &str = include_str!("../src/tui.rs");
+const JOBS_SOURCE: &str = include_str!("../src/tui/jobs.rs");
 
 fn function_block(name: &str) -> &'static str {
     let needle = format!("fn {name}");
@@ -69,18 +70,16 @@ fn copy_and_move_product_paths_enqueue_into_persistent_runtime() {
 
 #[test]
 fn pause_resume_controls_wired_for_transfer_jobs() {
-    assert!(TUI_SOURCE.contains("sync.transfers.request_pause("));
-    assert!(TUI_SOURCE.contains("sync.transfers.resume("));
+    assert!(JOBS_SOURCE.contains("transfers.request_pause("));
+    assert!(JOBS_SOURCE.contains("transfers.resume("));
 
-    let jobs_panel = TUI_SOURCE
-        .find("if state.show_jobs")
+    let jobs_panel = JOBS_SOURCE
+        .find("if !state.show_jobs")
         .expect("Jobs-panel handler must exist");
-    let delete_arm = TUI_SOURCE
-        .find("KeyCode::Delete if state.show_jobs")
-        .expect("Jobs-panel Delete key arm must exist");
-    let handler = &TUI_SOURCE[jobs_panel..delete_arm];
-    assert!(handler.contains("sync.transfers.request_pause("));
-    assert!(handler.contains("sync.transfers.resume("));
+    let end = (jobs_panel + 1200).min(JOBS_SOURCE.len());
+    let handler = &JOBS_SOURCE[jobs_panel..end];
+    assert!(handler.contains("transfers.request_pause("));
+    assert!(handler.contains("transfers.resume("));
 }
 
 #[test]
