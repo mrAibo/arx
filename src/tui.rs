@@ -1,23 +1,30 @@
 use crate::tui_terminal::TuiTerminalSession;
+#[cfg(test)]
+use arx::app::CommandItem;
 use arx::app::InputContext;
+#[cfg(test)]
+use arx::app::PaneLoadUiError;
 use arx::app::{
-    Action, ActionAvailability, ActionContext, ActionId, AppState, CommandItem, CommandKind,
-    CommandTarget, OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SessionCallout,
-    SortMode, WorkspaceSyncUxState, action_availability, action_meta,
-    build_command_items_with_file_context, listed_entry_navigation_target,
-    navigation_parent_target,
+    Action, ActionAvailability, ActionContext, ActionId, AppState, CommandKind, CommandTarget,
+    OverlayKind, Pane, PaneState, PanelMode, SessionCallout, SortMode, WorkspaceSyncUxState,
+    action_availability, action_meta, build_command_items_with_file_context,
+    listed_entry_navigation_target, navigation_parent_target,
 };
-use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectResponse, EffectScope};
-use arx::effects::{Effect, EffectEvent, ProgressSlot};
+use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectScope};
+#[cfg(test)]
+use arx::effects::EffectEvent;
+use arx::effects::{Effect, ProgressSlot};
 #[cfg(test)]
 use arx::input::contextual_hints_with_file_context;
 use arx::input::{ContextHint, KeyResolution, KeyRouter, command_bar_rows};
 use arx::services::{
     DesktopService, FileInfoService, GitService, PaneListingContinuation, PaneLoadPurpose,
-    PaneLoadResponse, PaneLoader, PaneNextPageResponse, QuickActionFailureKind, QuickActionOutcome,
-    SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions, WorkspaceScanResponse,
-    WorkspaceScanner, WorkspaceSyncController,
+    PaneLoader, SyncLaunchId, WorkspaceScanOptions, WorkspaceScanner, WorkspaceSyncController,
 };
+#[cfg(test)]
+use arx::services::{PaneLoadResponse, PaneNextPageResponse, QuickActionOutcome};
+#[cfg(test)]
+use arx::services::{WorkspaceScanError, WorkspaceScanResponse};
 use arx::vfs::{
     Entry, EntryIdentity, EntryKind, ListedEntry, Location, ProviderId, ProviderRegistry,
     RemoteEditSession, RemoteEditState,
@@ -50,14 +57,17 @@ mod bookmarks;
 mod browser_input;
 mod command_bar;
 mod command_center;
+mod effect_responses;
 mod embedded_terminal;
 mod help;
 mod hosts;
 mod hotlist;
+mod job_responses;
 mod jobs;
 mod mouse;
 mod mutations;
 mod overlays;
+mod pane_responses;
 mod quick_actions;
 mod remote_edit;
 mod ssh_hosts;
@@ -66,6 +76,8 @@ mod user_menu;
 mod viewer;
 mod which_key;
 mod workspace;
+mod workspace_responses;
+use effect_responses::pane_still_at_location;
 use overlays::{
     render_context_menu, render_directory_history, render_file_search,
     render_infrastructure_center, render_rename_input, render_session_callout, render_smart_tree,
@@ -240,11 +252,11 @@ async fn event_loop(
         // Unified dispatch: crossterm key/mouse + background jobs + PTY
         let next_input = tokio::select! {
             Some(response) = workspace_scan_rx.recv() => {
-                handle_workspace_scan_response(response, &mut state);
+                workspace_responses::handle_workspace_scan_response(response, &mut state);
                 continue;
             }
             Some(response) = pane_load_rx.recv() => {
-                apply_pane_load_response(
+                pane_responses::apply_pane_load_response(
                     response,
                     &mut state,
                     &mut left_entries,
@@ -253,7 +265,7 @@ async fn event_loop(
                 continue;
             }
             Some(response) = pane_next_page_rx.recv() => {
-                apply_next_page_response(
+                pane_responses::apply_next_page_response(
                     response,
                     &mut state,
                     &mut left_entries,
@@ -262,13 +274,10 @@ async fn event_loop(
                 continue;
             }
             Some(response) = effect_rx.recv() => {
-                let mut response = response;
-                finalize_received_effect(&effect_dispatcher, &mut response);
-                handle_effect_response(
+                effect_responses::apply_received(
+                    &effect_dispatcher,
                     response,
                     &mut state,
-                    &mut left_entries,
-                    &mut right_entries,
                     &pane_loader,
                 );
 
@@ -281,66 +290,26 @@ async fn event_loop(
                 continue;
             }
             Some(response) = sync_launch_rx.recv() => {
-                let still_current = sync_runtime
-                    .controller
-                    .is_launch_current(response.launch_id)
-                    && state
-                        .remote_workspace
-                        .frozen_plan
-                        .as_ref()
-                        .is_some_and(|frozen| frozen.id() == response.plan_id);
-                if still_current {
-                    match response.result {
-                        Ok(job_id) => {
-                            state.jobs = job_manager.snapshot();
-                            if let Some(job) = job_manager.get(&job_id) {
-                                state.remote_workspace.sync_from_job(&job);
-                            }
-                        }
-                        Err(message) => state.remote_workspace.mark_blocked(message),
-                    }
-                }
+                workspace_responses::apply_sync_launch_response(
+                    response,
+                    &mut state,
+                    &sync_runtime.controller,
+                    &job_manager,
+                );
                 continue;
             }
             Some(event) = verification_rx.recv() => {
-                let left_root = state.left.location.clone();
-                let right_root = state.right.location.clone();
-                let accepted = state.remote_workspace.apply_verification(
-                    &event.verification,
-                    &left_root,
-                    &right_root,
-                );
-                // JobManager accepted the verification before publishing this
-                // event, so its render snapshot is useful even when pane roots
-                // have moved and RemoteWorkspaceState rejects the old diff.
-                state.jobs = job_manager.snapshot();
-                if let Some(job) = job_manager.get(&event.job_id) {
-                    observe_verified_sync_success(&mut state, &job);
-                }
-                if accepted {
-                    state.remote_workspace.sync_verification_stage(&event.job_id);
-                } else {
-                    state
-                        .remote_workspace
-                        .settle_rejected_verification(&event.job_id, &event.verification);
-                }
+                workspace_responses::apply_verification_event(event, &mut state, &job_manager);
                 continue;
             }
             Some(ev) = job_rx.recv() => {
-        // The manager already accepted this transition before publishing it.
-        state.jobs = job_manager.snapshot();
-        let sync_job_id = job_event_id(&ev);
-        if let Some(job) = job_manager.get(sync_job_id) {
-            state.remote_workspace.sync_from_job(&job);
-        }
-        if let arx::jobs::JobEvent::Failed { id, error, .. } = &ev {
-                    let body = format!("Job {id} failed: {error}");
+                let outcome = job_responses::apply_job_event(&ev, &mut state, &job_manager);
+                if let Some(body) = outcome.failure_notification {
                     tokio::spawn(async move {
                         DesktopService::notify("ARX", &body).await;
                     });
                 }
-                let refresh_panes = handle_job_event(&ev, &mut state);
-                if refresh_panes {
+                if outcome.refresh_panes {
                     schedule_pane_load(&pane_loader, &mut state, Pane::Left);
                     schedule_pane_load(&pane_loader, &mut state, Pane::Right);
                 }
@@ -1481,216 +1450,6 @@ fn schedule_both_pane_loads(loader: &PaneLoader, state: &mut AppState) {
     schedule_pane_load(loader, state, Pane::Right);
 }
 
-#[derive(Clone, PartialEq, Eq)]
-enum VisibleRowSelection {
-    Parent,
-    Listed(EntryIdentity),
-    LoadMore,
-}
-
-fn selected_visible_row(
-    state: &AppState,
-    pane: Pane,
-    entries: &[ListedEntry],
-    cursor: usize,
-) -> Option<VisibleRowSelection> {
-    let pane_state = match pane {
-        Pane::Left => &state.left,
-        Pane::Right => &state.right,
-    };
-    let parent = virtual_parent_entry();
-    let load_more = load_more_entry();
-    apply_filter_with_parent_and_continuation(
-        entries,
-        &state.filter,
-        &pane_state.location,
-        &state.registry,
-        &parent,
-        &load_more,
-        state.pane_listing_continuations.get(&pane),
-    )
-    .get(cursor)
-    .map(|row| match row {
-        VisiblePaneRow::Parent(_) => VisibleRowSelection::Parent,
-        VisiblePaneRow::Listed(listed) => VisibleRowSelection::Listed(listed.identity.clone()),
-        VisiblePaneRow::LoadMore(_) => VisibleRowSelection::LoadMore,
-    })
-}
-
-fn visible_index_for_selection(
-    state: &AppState,
-    pane: Pane,
-    entries: &[ListedEntry],
-    selection: &VisibleRowSelection,
-) -> Option<usize> {
-    let pane_state = match pane {
-        Pane::Left => &state.left,
-        Pane::Right => &state.right,
-    };
-    let parent = virtual_parent_entry();
-    let load_more = load_more_entry();
-    apply_filter_with_parent_and_continuation(
-        entries,
-        &state.filter,
-        &pane_state.location,
-        &state.registry,
-        &parent,
-        &load_more,
-        state.pane_listing_continuations.get(&pane),
-    )
-    .iter()
-    .position(|row| match (selection, row) {
-        (VisibleRowSelection::Parent, VisiblePaneRow::Parent(_))
-        | (VisibleRowSelection::LoadMore, VisiblePaneRow::LoadMore(_)) => true,
-        (VisibleRowSelection::Listed(identity), VisiblePaneRow::Listed(listed)) => {
-            identity == &listed.identity
-        }
-        _ => false,
-    })
-}
-
-fn apply_next_page_response(
-    response: PaneNextPageResponse,
-    state: &mut AppState,
-    left_entries: &mut Vec<ListedEntry>,
-    right_entries: &mut Vec<ListedEntry>,
-) {
-    if !state.accepts_next_page(
-        response.pane,
-        response.request_id,
-        &response.initiating_continuation,
-    ) {
-        return;
-    }
-    state.finish_next_page(response.pane, response.request_id);
-    match response.result {
-        Ok(page) => {
-            let entries = match response.pane {
-                Pane::Left => left_entries,
-                Pane::Right => right_entries,
-            };
-            let pane_state = match response.pane {
-                Pane::Left => &state.left,
-                Pane::Right => &state.right,
-            };
-            let primary_selection =
-                selected_visible_row(state, response.pane, entries, pane_state.cursor);
-            let split_selection = pane_state
-                .split
-                .then(|| {
-                    selected_visible_row(state, response.pane, entries, pane_state.split_cursor)
-                })
-                .flatten();
-            entries.extend(page.entries);
-            *entries =
-                normalize_entries(std::mem::take(entries), state.show_hidden, state.sort_mode);
-            state.apply_pane_listing_continuation(response.pane, page.continuation);
-            let primary_index = primary_selection.as_ref().and_then(|selection| {
-                visible_index_for_selection(state, response.pane, entries, selection)
-            });
-            let split_index = split_selection.as_ref().and_then(|selection| {
-                visible_index_for_selection(state, response.pane, entries, selection)
-            });
-            let pane_state = match response.pane {
-                Pane::Left => &mut state.left,
-                Pane::Right => &mut state.right,
-            };
-            if let Some(index) = primary_index {
-                pane_state.cursor = index;
-            }
-            if let Some(index) = split_index {
-                pane_state.split_cursor = index;
-            }
-        }
-        Err(error) => {
-            state.message = Some(format!("Load next page failed: {error}"));
-        }
-    }
-}
-
-fn apply_pane_load_response(
-    response: PaneLoadResponse,
-    state: &mut AppState,
-    left_entries: &mut Vec<ListedEntry>,
-    right_entries: &mut Vec<ListedEntry>,
-) {
-    if !state.accepts_pane_load(response.pane, response.id, &response.location) {
-        return;
-    }
-    state.finish_pane_load(response.pane, response.id);
-
-    match response.result {
-        Ok(page) => {
-            state.pane_load_errors.remove(&response.pane);
-            let entries = normalize_entries(page.entries, state.show_hidden, state.sort_mode);
-            let active = state.active == response.pane;
-            match response.pane {
-                Pane::Left => {
-                    if response.purpose != PaneLoadPurpose::Refresh {
-                        let old = state.left.location.clone();
-                        match response.purpose {
-                            PaneLoadPurpose::Navigate {
-                                remember_current: true,
-                            } => state.left.dir_history.push(old),
-                            PaneLoadPurpose::HistoryBack => {
-                                let _ = state.left.dir_history.pop();
-                            }
-                            _ => {}
-                        }
-                        state.left.location = response.location.clone();
-                        state.left.cursor = 0;
-                    }
-                    *left_entries = entries;
-                    state.left.cursor = state.left.cursor.min(left_entries.len().saturating_sub(1));
-                }
-                Pane::Right => {
-                    if response.purpose != PaneLoadPurpose::Refresh {
-                        let old = state.right.location.clone();
-                        match response.purpose {
-                            PaneLoadPurpose::Navigate {
-                                remember_current: true,
-                            } => state.right.dir_history.push(old),
-                            PaneLoadPurpose::HistoryBack => {
-                                let _ = state.right.dir_history.pop();
-                            }
-                            _ => {}
-                        }
-                        state.right.location = response.location.clone();
-                        state.right.cursor = 0;
-                    }
-                    *right_entries = entries;
-                    state.right.cursor = state
-                        .right
-                        .cursor
-                        .min(right_entries.len().saturating_sub(1));
-                }
-            }
-            if response.purpose != PaneLoadPurpose::Refresh {
-                state.clear_selection_for_pane(response.pane);
-            }
-            if active && response.purpose != PaneLoadPurpose::Refresh {
-                state.remote_workspace.disable();
-                state.show_diff = false;
-            }
-            state.apply_pane_listing_continuation(response.pane, page.continuation);
-        }
-        Err(error) => {
-            // Transactional navigation: current pane location is intentionally
-            // untouched on error. Persist the accepted failure so the pane can
-            // explain what failed after the one-shot status message is gone.
-            let message = error.to_string();
-            state.pane_load_errors.insert(
-                response.pane,
-                PaneLoadUiError {
-                    attempted: response.location.clone(),
-                    message: message.clone(),
-                },
-            );
-            state.message = Some(format!("{}: {message}", response.location));
-        }
-    }
-}
-
 fn sort_entries(entries: &mut [ListedEntry], mode: SortMode) {
     match mode {
         SortMode::NameAsc => entries.sort_by_key(|a| a.entry.name.to_lowercase()),
@@ -2732,168 +2491,6 @@ fn parse_size(s: &str) -> Result<u64, ()> {
     num_str.parse::<u64>().map(|n| n * mult).map_err(|_| ())
 }
 
-fn job_event_id(event: &arx::jobs::JobEvent) -> &str {
-    match event {
-        arx::jobs::JobEvent::Running { id }
-        | arx::jobs::JobEvent::PausePending { id }
-        | arx::jobs::JobEvent::Paused { id }
-        | arx::jobs::JobEvent::RetryWaiting { id }
-        | arx::jobs::JobEvent::Progress { id, .. }
-        | arx::jobs::JobEvent::Completed { id, .. }
-        | arx::jobs::JobEvent::Failed { id, .. }
-        | arx::jobs::JobEvent::Cancelled { id, .. } => id,
-    }
-}
-
-fn observe_compare_success(state: &mut AppState) {
-    let Some(diff) = state.remote_workspace.diff.as_ref() else {
-        return;
-    };
-    let differences = diff.changed_count();
-    let bytes_to_transfer = state
-        .remote_workspace
-        .plan
-        .as_ref()
-        .map(|plan| plan.bytes_to_transfer)
-        .unwrap_or(0);
-    if state.milestones.take_compare_success() {
-        state.session_callout = Some(SessionCallout::CompareCompleted {
-            differences,
-            bytes_to_transfer,
-        });
-    }
-}
-
-fn is_verified_sync_success(job: &arx::jobs::Job) -> bool {
-    if job.status != arx::jobs::JobStatus::Completed {
-        return false;
-    }
-    let execution_completed = matches!(
-        &job.result,
-        Some(arx::jobs::JobResult::WorkspaceSync(outcome))
-            if matches!(
-                &outcome.terminal,
-                arx::workspace_sync_executor::SyncTerminalState::Completed
-            )
-    );
-    if !execution_completed {
-        return false;
-    }
-
-    job.verification.as_ref().is_some_and(|verification| {
-        matches!(
-            &verification.status,
-            SyncVerificationStatus::Finished(result)
-                if result.verdict == SyncVerificationVerdict::Synchronized
-        )
-    })
-}
-
-fn observe_verified_sync_success(state: &mut AppState, job: &arx::jobs::Job) {
-    if !is_verified_sync_success(job) {
-        return;
-    }
-    if state.milestones.take_verified_sync_success() {
-        state.session_callout = Some(SessionCallout::WorkspaceSyncVerified {
-            job_id: job.id.clone(),
-        });
-    }
-}
-
-/// Present an already-accepted JobManager event. Lifecycle state lives in JobManager.
-fn handle_job_event(ev: &arx::jobs::JobEvent, state: &mut AppState) -> bool {
-    match ev {
-        arx::jobs::JobEvent::Completed { id, result } => {
-            match result {
-                arx::jobs::JobResult::Generic { message, .. } => {
-                    state.message = Some(
-                        message
-                            .clone()
-                            .unwrap_or_else(|| format!("Job {id} completed")),
-                    );
-                    true
-                }
-                arx::jobs::JobResult::WorkspaceSync(outcome) => {
-                    state.message = Some(format!(
-                        "Sync completed: {} physical step(s), {} bytes",
-                        outcome.completed.len(),
-                        outcome.transferred_bytes
-                    ));
-                    true
-                }
-                arx::jobs::JobResult::RemoteEdit(_) => {
-                    state.message = Some(format!("Remote edit job {id} completed"));
-                    true
-                }
-                #[cfg(target_os = "linux")]
-                arx::jobs::JobResult::StorageScan(summary) => {
-                    // Read-only scan: truthful message, never refresh panes.
-                    state.message = Some(match summary.outcome {
-                        arx::storage_inspector::UsageScanOutcome::Complete => {
-                            "Storage scan completed".to_string()
-                        }
-                        arx::storage_inspector::UsageScanOutcome::Partial => {
-                            format!("Storage scan partial: {} error(s)", summary.totals.errors)
-                        }
-                        arx::storage_inspector::UsageScanOutcome::Cancelled => {
-                            "Storage scan cancelled".to_string()
-                        }
-                    });
-                    false
-                }
-            }
-        }
-        arx::jobs::JobEvent::Failed { error, .. } => {
-            state.message = Some(error.clone());
-            true
-        }
-        arx::jobs::JobEvent::Cancelled { id, result } => {
-            match result {
-                arx::jobs::JobResult::Generic { message, .. } => {
-                    state.message = Some(
-                        message
-                            .clone()
-                            .unwrap_or_else(|| format!("Job {id} cancelled")),
-                    );
-                    true
-                }
-                arx::jobs::JobResult::WorkspaceSync(outcome) => {
-                    state.message = Some(format!(
-                        "Sync cancelled after {} completed physical step(s)",
-                        outcome.completed.len()
-                    ));
-                    true
-                }
-                arx::jobs::JobResult::RemoteEdit(_) => {
-                    state.message = Some(format!("Remote edit job {id} cancelled"));
-                    true
-                }
-                #[cfg(target_os = "linux")]
-                arx::jobs::JobResult::StorageScan(summary) => {
-                    // Read-only scan: truthful message, never refresh panes.
-                    state.message = Some(match summary.outcome {
-                        arx::storage_inspector::UsageScanOutcome::Complete => {
-                            "Storage scan completed".to_string()
-                        }
-                        arx::storage_inspector::UsageScanOutcome::Partial => {
-                            format!("Storage scan partial: {} error(s)", summary.totals.errors)
-                        }
-                        arx::storage_inspector::UsageScanOutcome::Cancelled => {
-                            "Storage scan cancelled".to_string()
-                        }
-                    });
-                    false
-                }
-            }
-        }
-        arx::jobs::JobEvent::Running { .. }
-        | arx::jobs::JobEvent::PausePending { .. }
-        | arx::jobs::JobEvent::Progress { .. }
-        | arx::jobs::JobEvent::Paused { .. }
-        | arx::jobs::JobEvent::RetryWaiting { .. } => false,
-    }
-}
-
 fn toggle_hosts_overlay(state: &mut AppState) {
     state.toggle_overlay(OverlayKind::Hosts);
 }
@@ -3243,348 +2840,6 @@ async fn execute_command_target(
     Ok(effect)
 }
 
-fn handle_workspace_scan_response(response: WorkspaceScanResponse, state: &mut AppState) {
-    if !state.remote_workspace.accepts_scan(&response) {
-        return;
-    }
-
-    let current_root = match response.side {
-        WorkspaceSide::Left => &state.left.location,
-        WorkspaceSide::Right => &state.right.location,
-    };
-    if current_root != &response.root {
-        state
-            .remote_workspace
-            .finish_scan(response.side, response.id);
-        return;
-    }
-
-    let side = response.side;
-    let id = response.id;
-    match response.result {
-        Ok(entries) => match side {
-            WorkspaceSide::Left => state.remote_workspace.left_entries = Some(entries),
-            WorkspaceSide::Right => state.remote_workspace.right_entries = Some(entries),
-        },
-        Err(WorkspaceScanError::Cancelled) => {
-            state.remote_workspace.finish_scan(side, id);
-            return;
-        }
-        Err(error) => {
-            state.remote_workspace.finish_scan(side, id);
-            state.message = Some(format!("Workspace scan failed: {error}"));
-            return;
-        }
-    }
-    state.remote_workspace.finish_scan(side, id);
-
-    if state
-        .remote_workspace
-        .try_build_recursive_diff(state.left.location.clone(), state.right.location.clone())
-    {
-        observe_compare_success(state);
-        state.message = Some(state.remote_workspace.summary());
-    } else {
-        let waiting = match side {
-            WorkspaceSide::Left => "right",
-            WorkspaceSide::Right => "left",
-        };
-        state.message = Some(format!("Remote Workspace: waiting for {waiting} pane…"));
-    }
-}
-
-fn finalize_received_effect(dispatcher: &EffectDispatcher, response: &mut EffectResponse) {
-    let was_cancelled = dispatcher
-        .finish(response.id)
-        .is_some_and(|cancellation| cancellation.is_cancelled());
-    // #48/MAJOR#1: an explicitly cancelled queued download is a typed Cancelled,
-    // never a generic Failed. apply_effect_event maps this to
-    // RemoteEditOutcome::Cancelled; the Failed branch is reserved for real
-    // provider/download errors.
-    if was_cancelled && let EffectEvent::Downloaded { session } = &response.event {
-        response.event = EffectEvent::RemoteEditCancelled {
-            name: session.name.clone(),
-            reason: arx::jobs::RemoteEditCancelReason::Queued,
-        };
-    }
-}
-
-fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent) {
-    match event {
-        EffectEvent::ShellCaptured {
-            command,
-            success,
-            stdout,
-            stderr,
-        } => {
-            let stdout = stdout.trim();
-            let stderr = stderr.trim();
-            let text = if !stdout.is_empty() {
-                stdout
-            } else if !stderr.is_empty() {
-                stderr
-            } else if success {
-                "ok"
-            } else {
-                "failed"
-            };
-            state.message = Some(format!(": {command} — {}", truncate_message(text, 80)));
-        }
-        EffectEvent::ProcessExited { label, success } => {
-            state.message = Some(format!(
-                "{label} — {}",
-                if success { "done" } else { "failed" }
-            ));
-        }
-        EffectEvent::Spawned { label } => {
-            state.message = Some(format!("{label} — started"));
-        }
-        EffectEvent::TmuxSessions { sessions } => {
-            if sessions.is_empty() {
-                state.message = Some("No tmux sessions found".into());
-                return;
-            }
-            state.command_matches = sessions
-                .into_iter()
-                .map(|name| CommandItem {
-                    title: name.clone(),
-                    subtitle: Some("Attach tmux session".into()),
-                    kind: CommandKind::Session,
-                    target: CommandTarget::TmuxSession(name),
-                    score: 0,
-                    availability: ActionAvailability::Available,
-                })
-                .collect();
-            state.open_overlay(OverlayKind::CommandCenter);
-            state.overlay_list_state.select(Some(0));
-        }
-        EffectEvent::ViewerLines { title, lines } => {
-            state.viewer_content = lines;
-            state.viewer_scroll = 0;
-            state.message = Some(title);
-        }
-        EffectEvent::InfrastructureLines { lines } => {
-            state.infrastructure_lines = if lines.is_empty() {
-                vec!["No SSH hosts discovered".into()]
-            } else {
-                lines
-            }
-        }
-        EffectEvent::TreeLines { lines } => {
-            state.tree_lines = if lines.is_empty() {
-                vec!["(empty)".into()]
-            } else {
-                lines
-            }
-        }
-        EffectEvent::PathOpened { path } => {
-            state.message = Some(format!("Opened {}", path.display()));
-        }
-        EffectEvent::QuickActionFinished { result } => match result {
-            Ok(QuickActionOutcome::Sha256 { checksums, .. }) => {
-                let count = checksums.len();
-                state.viewer_content = checksums
-                    .into_iter()
-                    .map(|checksum| {
-                        format!(
-                            "{}  {}",
-                            checksum.sha256,
-                            quick_actions::display_safe_text(&checksum.name)
-                        )
-                    })
-                    .collect();
-                state.viewer_scroll = 0;
-                state.message = Some(format!("SHA-256 computed for {count} file(s)"));
-            }
-            Ok(QuickActionOutcome::Touched { path }) => {
-                state.message = Some(format!(
-                    "Touched {}",
-                    quick_actions::display_safe_text(path.to_string_lossy().as_ref())
-                ));
-            }
-            Ok(QuickActionOutcome::Compressed { path, entries }) => {
-                state.message = Some(format!(
-                    "Created {} from {entries} entr{}",
-                    quick_actions::display_safe_text(path.to_string_lossy().as_ref()),
-                    if entries == 1 { "y" } else { "ies" }
-                ));
-            }
-            Err(failure) => {
-                if failure.kind == QuickActionFailureKind::Cancelled {
-                    state.message = Some(format!("{} cancelled", failure.action.label()));
-                } else {
-                    state.message = Some(format!(
-                        "{} failed: {}",
-                        failure.action.label(),
-                        quick_actions::display_safe_text(&failure.message)
-                    ));
-                }
-            }
-        },
-        EffectEvent::Downloaded { session } => {
-            let download_name = &session.name;
-            state.message = Some(format!("Downloaded: {download_name}"));
-            let job_id = state.pending_remote_edit_job_id.clone();
-            let mut session = session;
-            session.job_id = job_id;
-            if session.job_id.is_some() {
-                // Downloaded: queued→awaiting-editor phase (TUI owns editor launch).
-                remote_edit::publish_remote_edit_phase(
-                    state,
-                    arx::jobs::RemoteEditPhase::AwaitingEditor,
-                );
-            }
-            state.pending_remote_edit_session = Some(session);
-        }
-        EffectEvent::WrittenBack { name } => {
-            state.message = Some(format!("Uploaded: {name}"));
-            // #51/MAJOR#1: Verifying is NOT invented here — it was already
-            // published at the real verification boundary by the provider
-            // progress closure (before verify_remote_matches). Only terminate.
-            remote_edit::terminate_remote_edit_job(
-                state,
-                arx::jobs::RemoteEditOutcome::Completed,
-                None,
-            );
-        }
-        EffectEvent::NoChange { name } => {
-            state.message = Some(format!("No changes: {name}"));
-            remote_edit::terminate_remote_edit_job(
-                state,
-                arx::jobs::RemoteEditOutcome::NoChange,
-                None,
-            );
-        }
-        EffectEvent::RemoteConflict { name, reason } => {
-            state.message = Some(format!(
-                "{name} changed on remote — write-back refused: {reason}"
-            ));
-            remote_edit::terminate_remote_edit_job(
-                state,
-                arx::jobs::RemoteEditOutcome::Failed,
-                Some(format!("remote conflict: {reason}")),
-            );
-        }
-        EffectEvent::RecoveryRequired { name, details } => {
-            state.message = Some(format!("{name}: RECOVERY REQUIRED — {details}"));
-            // #51: recovery path exposes RollbackOrRecovery before the typed
-            // RecoveryRequired terminal so the phase model is observable end-to-end.
-            remote_edit::publish_remote_edit_phase(
-                state,
-                arx::jobs::RemoteEditPhase::RollbackOrRecovery,
-            );
-            remote_edit::terminate_remote_edit_job(
-                state,
-                arx::jobs::RemoteEditOutcome::RecoveryRequired,
-                Some(format!("recovery required: {details}")),
-            );
-        }
-        EffectEvent::WrittenBackWarning { name, warning } => {
-            state.message = Some(format!("Uploaded {name} with warning: {warning}"));
-            remote_edit::terminate_remote_edit_job(
-                state,
-                arx::jobs::RemoteEditOutcome::CommittedWithWarning,
-                None,
-            );
-        }
-        EffectEvent::Failed { label, error } => {
-            // #51/MAJOR: a generic failure only terminates an in-flight Remote
-            // Edit when it actually belongs to the RemoteEdit lane. An unrelated
-            // effect (LeftPane, GlobalProcess, …) must NOT mutate another
-            // session's lifecycle, job status, or pending ownership.
-            if lane == EffectLane::RemoteEdit {
-                state.message = Some(format!("{label} failed: {error}"));
-                remote_edit::terminate_remote_edit_job(
-                    state,
-                    arx::jobs::RemoteEditOutcome::Failed,
-                    Some(format!("{label} failed: {error}")),
-                );
-            } else {
-                state.message = Some(format!("{label} failed: {error}"));
-            }
-        }
-        EffectEvent::RemoteEditCancelled { name, reason } => {
-            state.message = Some(format!("Remote edit cancelled: {name} ({reason:?})"));
-            remote_edit::terminate_remote_edit_job(
-                state,
-                arx::jobs::RemoteEditOutcome::Cancelled,
-                Some(format!("{reason:?}")),
-            );
-        }
-    }
-}
-
-fn handle_effect_response(
-    response: EffectResponse,
-    state: &mut AppState,
-    _left_entries: &mut Vec<ListedEntry>,
-    _right_entries: &mut Vec<ListedEntry>,
-    pane_loader: &PaneLoader,
-) {
-    if !state.accepts_effect(response.id, response.lane, &response.scope) {
-        return;
-    }
-    let quick_action_refresh =
-        quick_actions::quick_action_refresh_location(&response.event, &response.scope);
-    let refresh_origin = if matches!(
-        &response.event,
-        EffectEvent::WrittenBack { .. } | EffectEvent::WrittenBackWarning { .. }
-    ) {
-        state.pending_remote_edit_origin.clone()
-    } else {
-        None
-    };
-    let remote_terminal = response.lane == EffectLane::RemoteEdit
-        && !matches!(&response.event, EffectEvent::Downloaded { .. });
-
-    state.finish_effect(response.lane, response.id);
-    apply_effect_event(state, response.lane, response.event);
-    if remote_terminal {
-        state.pending_remote_edit_origin = None;
-    }
-
-    if let Some((pane, location)) = refresh_origin
-        && pane_still_at_location(state, pane, &location)
-    {
-        schedule_pane_load(pane_loader, state, pane);
-    }
-
-    if let Some(location) = quick_action_refresh {
-        for pane in [Pane::Left, Pane::Right] {
-            if pane_still_at_location(state, pane, &location) {
-                schedule_pane_load(pane_loader, state, pane);
-            }
-        }
-    }
-
-    match response.lane {
-        EffectLane::LeftPane => {
-            schedule_pane_load(pane_loader, state, Pane::Left);
-        }
-        EffectLane::RightPane => {
-            schedule_pane_load(pane_loader, state, Pane::Right);
-        }
-        _ => {}
-    }
-}
-
-fn pane_still_at_location(state: &AppState, pane: Pane, location: &Location) -> bool {
-    match pane {
-        Pane::Left => &state.left.location == location,
-        Pane::Right => &state.right.location == location,
-    }
-}
-
-fn truncate_message(text: &str, max_chars: usize) -> String {
-    let mut chars = text.chars();
-    let prefix: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{prefix}...")
-    } else {
-        prefix
-    }
-}
-
 // ponytail: keep for test visibility; selection logic lives in dispatch_ui_action.
 #[allow(dead_code)]
 fn selection_or_cursor(
@@ -3760,14 +3015,8 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert!(matches!(&response.event, EffectEvent::Downloaded { .. }));
-        finalize_received_effect(&dispatcher, &mut response);
-        handle_effect_response(
-            response,
-            &mut state,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            &pane_loader,
-        );
+        effect_responses::finalize_received_effect(&dispatcher, &mut response);
+        effect_responses::handle_effect_response(response, &mut state, &pane_loader);
 
         let session = state.pending_remote_edit_session.take().unwrap();
         let temp_path = session.temp_dir.path().to_path_buf();
@@ -4239,7 +3488,7 @@ mod tests {
                 .id
                 .clone(),
         );
-        apply_effect_event(
+        effect_responses::apply_effect_event(
             &mut cancel_state,
             EffectLane::RemoteEdit,
             EffectEvent::RemoteEditCancelled {
@@ -4277,7 +3526,7 @@ mod tests {
                 .id
                 .clone(),
         );
-        apply_effect_event(
+        effect_responses::apply_effect_event(
             &mut fail_state,
             EffectLane::RemoteEdit,
             EffectEvent::Failed {
@@ -4323,7 +3572,7 @@ mod tests {
         state.pending_remote_edit_job_id = Some(re_id.clone());
 
         // Feed a generic failure on an unrelated lane (e.g. LeftPane).
-        apply_effect_event(
+        effect_responses::apply_effect_event(
             &mut state,
             EffectLane::LeftPane,
             EffectEvent::Failed {
@@ -4375,7 +3624,7 @@ mod tests {
         );
 
         // Now the same failure on the RemoteEdit lane DOES terminate it once.
-        apply_effect_event(
+        effect_responses::apply_effect_event(
             &mut state,
             EffectLane::RemoteEdit,
             EffectEvent::Failed {
@@ -4454,13 +3703,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(&response.event, EffectEvent::Downloaded { .. }));
-        handle_effect_response(
-            response,
-            &mut state,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            &pane_loader,
-        );
+        effect_responses::handle_effect_response(response, &mut state, &pane_loader);
         // Downloaded must have created exactly one RemoteEdit job id.
         let job_id = state
             .pending_remote_edit_job_id
@@ -4533,7 +3776,7 @@ mod tests {
             dispatcher.cancel(id),
             "queued response must remain cancellable"
         );
-        finalize_received_effect(&dispatcher, &mut response);
+        effect_responses::finalize_received_effect(&dispatcher, &mut response);
         assert!(
             matches!(
                 &response.event,
@@ -4544,13 +3787,7 @@ mod tests {
             ),
             "explicit queued cancel must be typed Cancelled, not generic Failed"
         );
-        handle_effect_response(
-            response,
-            &mut state,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            &pane_loader,
-        );
+        effect_responses::handle_effect_response(response, &mut state, &pane_loader);
 
         assert!(state.pending_remote_edit_session.is_none());
         assert!(state.pending_remote_edit_origin.is_none());
@@ -4572,12 +3809,28 @@ mod tests {
         state.left.location = origin.clone();
         state.right.location = origin.clone();
 
-        assert!(pane_still_at_location(&state, Pane::Left, &origin));
-        assert!(pane_still_at_location(&state, Pane::Right, &origin));
+        assert!(effect_responses::pane_still_at_location(
+            &state,
+            Pane::Left,
+            &origin
+        ));
+        assert!(effect_responses::pane_still_at_location(
+            &state,
+            Pane::Right,
+            &origin
+        ));
 
         state.left.location = Location::Local("/elsewhere".into());
-        assert!(!pane_still_at_location(&state, Pane::Left, &origin));
-        assert!(pane_still_at_location(&state, Pane::Right, &origin));
+        assert!(!effect_responses::pane_still_at_location(
+            &state,
+            Pane::Left,
+            &origin
+        ));
+        assert!(effect_responses::pane_still_at_location(
+            &state,
+            Pane::Right,
+            &origin
+        ));
     }
 
     fn file(name: &str) -> Entry {
@@ -4992,7 +4245,12 @@ mod tests {
         let mut left_entries = Vec::new();
         let mut right_entries = Vec::new();
 
-        apply_pane_load_response(response, &mut state, &mut left_entries, &mut right_entries);
+        pane_responses::apply_pane_load_response(
+            response,
+            &mut state,
+            &mut left_entries,
+            &mut right_entries,
+        );
         let parent = virtual_parent_entry();
         let visible = apply_filter_with_parent(&left_entries, "", &location, &registry, &parent);
         let listed_row = visible
@@ -5296,7 +4554,7 @@ mod tests {
         state.left.cursor = 2; // Parent, split row, primary row
         state.left.split_cursor = 1;
 
-        apply_next_page_response(
+        pane_responses::apply_next_page_response(
             PaneNextPageResponse {
                 request_id: arx::services::PanePageRequestId(9),
                 pane: Pane::Left,
@@ -5366,7 +4624,7 @@ mod tests {
                 continuation: Some(next.clone()),
             }),
         };
-        apply_next_page_response(response, &mut state, &mut left, &mut Vec::new());
+        pane_responses::apply_next_page_response(response, &mut state, &mut left, &mut Vec::new());
 
         assert_eq!(
             left.iter()
@@ -5387,7 +4645,7 @@ mod tests {
             arx::services::PanePageRequestId(10),
             next.clone(),
         ));
-        apply_next_page_response(
+        pane_responses::apply_next_page_response(
             PaneNextPageResponse {
                 request_id: arx::services::PanePageRequestId(10),
                 pane: Pane::Left,
@@ -5417,11 +4675,11 @@ mod tests {
                 continuation: None,
             }),
         };
-        apply_next_page_response(stale, &mut state, &mut left, &mut Vec::new());
+        pane_responses::apply_next_page_response(stale, &mut state, &mut left, &mut Vec::new());
         assert_eq!(left, original);
         assert!(state.pending_next_pages.contains_key(&Pane::Left));
 
-        apply_next_page_response(
+        pane_responses::apply_next_page_response(
             PaneNextPageResponse {
                 request_id: arx::services::PanePageRequestId(9),
                 pane: Pane::Left,
@@ -5443,7 +4701,7 @@ mod tests {
             Some("Load next page failed: offline failure")
         );
 
-        apply_next_page_response(
+        pane_responses::apply_next_page_response(
             PaneNextPageResponse {
                 request_id: arx::services::PanePageRequestId(9),
                 pane: Pane::Left,
@@ -5531,7 +4789,7 @@ mod tests {
         let mut left_entries = vec![listed(file("current.txt"))];
         let mut right_entries = Vec::new();
 
-        apply_pane_load_response(
+        pane_responses::apply_pane_load_response(
             PaneLoadResponse {
                 id: PaneLoadId(1),
                 pane: Pane::Left,
@@ -5567,7 +4825,7 @@ mod tests {
                 remember_current: true,
             },
         );
-        apply_pane_load_response(
+        pane_responses::apply_pane_load_response(
             PaneLoadResponse {
                 id: PaneLoadId(1),
                 pane: Pane::Left,
@@ -5601,7 +4859,7 @@ mod tests {
                 remember_current: true,
             },
         );
-        apply_pane_load_response(
+        pane_responses::apply_pane_load_response(
             PaneLoadResponse {
                 id: PaneLoadId(2),
                 pane: Pane::Left,
@@ -5630,7 +4888,7 @@ mod tests {
         let mut left_entries = Vec::new();
         let mut right_entries = Vec::new();
 
-        apply_pane_load_response(
+        pane_responses::apply_pane_load_response(
             PaneLoadResponse {
                 id,
                 pane: Pane::Left,
@@ -5672,7 +4930,7 @@ mod tests {
         let mut left_entries = vec![listed(file("current.txt"))];
         let mut right_entries = Vec::new();
 
-        apply_pane_load_response(
+        pane_responses::apply_pane_load_response(
             PaneLoadResponse {
                 id: PaneLoadId(11),
                 pane: Pane::Left,
@@ -5832,7 +5090,7 @@ mod tests {
             .remote_workspace
             .register_scan(WorkspaceSide::Right, right_id);
 
-        handle_workspace_scan_response(
+        workspace_responses::handle_workspace_scan_response(
             WorkspaceScanResponse {
                 id: left_id,
                 side: WorkspaceSide::Left,
@@ -5841,7 +5099,7 @@ mod tests {
             },
             state,
         );
-        handle_workspace_scan_response(
+        workspace_responses::handle_workspace_scan_response(
             WorkspaceScanResponse {
                 id: right_id,
                 side: WorkspaceSide::Right,
@@ -6011,6 +5269,378 @@ mod tests {
         }));
         job.verification = Some(verification_snapshot(plan_id, verification_status));
         job
+    }
+
+    fn frozen_launch(
+        state: &mut AppState,
+        generation: u64,
+        entry_name: &str,
+    ) -> (WorkspaceSyncController, SyncLaunchId, SyncPlanId) {
+        accept_workspace_compare(
+            state,
+            vec![workspace_entry(entry_name, 1, None, Some("left"))],
+            Vec::new(),
+            generation,
+        );
+        let controller = WorkspaceSyncController::new(state.registry.clone());
+        let frozen = controller
+            .freeze(
+                state.remote_workspace.plan.as_ref().unwrap(),
+                state.remote_workspace.diff.as_ref().unwrap(),
+            )
+            .unwrap();
+        let plan_id = frozen.id();
+        state.remote_workspace.set_frozen_plan(frozen);
+        let launch_id = controller.begin_launch();
+        (controller, launch_id, plan_id)
+    }
+
+    fn completed_verification_job(
+        plan_id: SyncPlanId,
+        verification: &SyncVerificationSnapshot,
+    ) -> (arx::jobs::JobManager, String) {
+        let manager = arx::jobs::JobManager::new();
+        let job = manager.create_job(
+            "sync-response",
+            JobKind::Synchronize,
+            "test sync response",
+            Some(Location::Local("/left".into())),
+            Some(Location::Local("/right".into())),
+        );
+        let result = sync_job(
+            plan_id,
+            "outcome",
+            JobStatus::Completed,
+            SyncTerminalState::Completed,
+            verification.status.clone(),
+            SyncJournalFinalization::Recorded,
+        )
+        .result
+        .unwrap();
+        assert!(manager.apply_event(&arx::jobs::JobEvent::Completed {
+            id: job.id.clone(),
+            result,
+        }));
+        assert!(manager.apply_sync_verification(
+            &job.id,
+            &verification_snapshot(plan_id, SyncVerificationStatus::Pending),
+        ));
+        assert!(manager.apply_sync_verification(
+            &job.id,
+            &verification_snapshot(
+                plan_id,
+                SyncVerificationStatus::Running {
+                    left_scan: WorkspaceScanId(1),
+                    right_scan: WorkspaceScanId(2),
+                },
+            ),
+        ));
+        assert!(manager.apply_sync_verification(&job.id, verification));
+        (manager, job.id)
+    }
+
+    #[test]
+    fn workspace_response_rejects_stale_scan_id() {
+        let mut state = AppState::default();
+        state.left.location = Location::Local("/left".into());
+        state
+            .remote_workspace
+            .register_scan(WorkspaceSide::Left, WorkspaceScanId(2));
+
+        workspace_responses::handle_workspace_scan_response(
+            WorkspaceScanResponse {
+                id: WorkspaceScanId(1),
+                side: WorkspaceSide::Left,
+                root: state.left.location.clone(),
+                result: Ok(vec![workspace_entry("stale", 1, None, None)]),
+            },
+            &mut state,
+        );
+
+        assert_eq!(state.remote_workspace.left_scan, Some(WorkspaceScanId(2)));
+        assert!(state.remote_workspace.left_entries.is_none());
+        assert!(state.message.is_none());
+    }
+
+    #[test]
+    fn workspace_response_wrong_current_root_settles_without_entries() {
+        let mut state = AppState::default();
+        state.left.location = Location::Local("/current".into());
+        state
+            .remote_workspace
+            .register_scan(WorkspaceSide::Left, WorkspaceScanId(1));
+
+        workspace_responses::handle_workspace_scan_response(
+            WorkspaceScanResponse {
+                id: WorkspaceScanId(1),
+                side: WorkspaceSide::Left,
+                root: Location::Local("/old".into()),
+                result: Ok(vec![workspace_entry("old", 1, None, None)]),
+            },
+            &mut state,
+        );
+
+        assert!(state.remote_workspace.left_scan.is_none());
+        assert!(state.remote_workspace.left_entries.is_none());
+        assert!(state.remote_workspace.diff.is_none());
+    }
+
+    #[test]
+    fn workspace_response_two_current_sides_build_diff() {
+        let mut state = AppState::default();
+        accept_workspace_compare(
+            &mut state,
+            vec![workspace_entry("left", 3, None, Some("left"))],
+            vec![workspace_entry("right", 4, None, Some("right"))],
+            1,
+        );
+
+        assert!(state.remote_workspace.left_scan.is_none());
+        assert!(state.remote_workspace.right_scan.is_none());
+        assert_eq!(
+            state
+                .remote_workspace
+                .diff
+                .as_ref()
+                .unwrap()
+                .changed_count(),
+            2
+        );
+        assert!(state.message.as_deref().unwrap().starts_with("workspace:"));
+    }
+
+    #[test]
+    fn workspace_response_cancelled_and_error_settle_scan() {
+        let root = Location::Local("/left".into());
+        let mut cancelled = AppState::default();
+        cancelled.left.location = root.clone();
+        cancelled
+            .remote_workspace
+            .register_scan(WorkspaceSide::Left, WorkspaceScanId(1));
+        workspace_responses::handle_workspace_scan_response(
+            WorkspaceScanResponse {
+                id: WorkspaceScanId(1),
+                side: WorkspaceSide::Left,
+                root: root.clone(),
+                result: Err(WorkspaceScanError::Cancelled),
+            },
+            &mut cancelled,
+        );
+        assert!(cancelled.remote_workspace.left_scan.is_none());
+        assert!(cancelled.message.is_none());
+
+        let mut failed = AppState::default();
+        failed.left.location = root.clone();
+        failed
+            .remote_workspace
+            .register_scan(WorkspaceSide::Left, WorkspaceScanId(2));
+        workspace_responses::handle_workspace_scan_response(
+            WorkspaceScanResponse {
+                id: WorkspaceScanId(2),
+                side: WorkspaceSide::Left,
+                root,
+                result: Err(WorkspaceScanError::EntryLimit { limit: 7 }),
+            },
+            &mut failed,
+        );
+        assert!(failed.remote_workspace.left_scan.is_none());
+        assert_eq!(
+            failed.message.as_deref(),
+            Some("Workspace scan failed: workspace scan exceeded the 7 entry safety limit")
+        );
+    }
+
+    #[test]
+    fn workspace_response_rejects_stale_launch_id() {
+        let mut state = AppState::default();
+        let (controller, stale_id, plan_id) = frozen_launch(&mut state, 1, "stale");
+        let _current_id = controller.begin_launch();
+        let manager = arx::jobs::JobManager::new();
+        let before = state.remote_workspace.ux.clone();
+
+        workspace_responses::apply_sync_launch_response(
+            SyncLaunchResponse {
+                launch_id: stale_id,
+                plan_id,
+                result: Err("must be ignored".into()),
+            },
+            &mut state,
+            &controller,
+            &manager,
+        );
+
+        assert_eq!(state.remote_workspace.ux, before);
+        assert!(state.jobs.is_empty());
+    }
+
+    #[test]
+    fn workspace_response_rejects_mismatched_frozen_plan() {
+        let mut state = AppState::default();
+        let (controller, launch_id, _) = frozen_launch(&mut state, 1, "current");
+        let mut other = AppState::default();
+        let (_, _, other_plan_id) = frozen_launch(&mut other, 2, "other");
+        let manager = arx::jobs::JobManager::new();
+        let before = state.remote_workspace.ux.clone();
+
+        workspace_responses::apply_sync_launch_response(
+            SyncLaunchResponse {
+                launch_id,
+                plan_id: other_plan_id,
+                result: Err("must be ignored".into()),
+            },
+            &mut state,
+            &controller,
+            &manager,
+        );
+
+        assert_eq!(state.remote_workspace.ux, before);
+        assert!(state.jobs.is_empty());
+    }
+
+    #[test]
+    fn workspace_response_accepts_launch_job_and_error() {
+        let mut launched = AppState::default();
+        let (controller, launch_id, plan_id) = frozen_launch(&mut launched, 1, "job");
+        let manager = arx::jobs::JobManager::new();
+        let job = manager.create_job("sync", JobKind::Synchronize, "sync", None, None);
+        workspace_responses::apply_sync_launch_response(
+            SyncLaunchResponse {
+                launch_id,
+                plan_id,
+                result: Ok(job.id.clone()),
+            },
+            &mut launched,
+            &controller,
+            &manager,
+        );
+        assert_eq!(launched.jobs.len(), 1);
+        assert_eq!(launched.jobs[0].id, job.id);
+
+        let mut blocked = AppState::default();
+        let (controller, launch_id, plan_id) = frozen_launch(&mut blocked, 2, "error");
+        workspace_responses::apply_sync_launch_response(
+            SyncLaunchResponse {
+                launch_id,
+                plan_id,
+                result: Err("launch failed".into()),
+            },
+            &mut blocked,
+            &controller,
+            &manager,
+        );
+        assert_eq!(
+            blocked.remote_workspace.ux,
+            WorkspaceSyncUxState::Blocked {
+                message: "launch failed".into()
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_response_applies_accepted_verification() {
+        let plan_id = test_plan_id();
+        let finished = verification_snapshot(
+            plan_id,
+            SyncVerificationStatus::Finished(Box::new(synchronized_result(plan_id))),
+        );
+        let (manager, job_id) = completed_verification_job(plan_id, &finished);
+        let mut state = AppState::default();
+        state.left.location = Location::Local("/left".into());
+        state.right.location = Location::Local("/right".into());
+        state.remote_workspace.enabled = true;
+        state.remote_workspace.verification = Some(verification_snapshot(
+            plan_id,
+            SyncVerificationStatus::Running {
+                left_scan: WorkspaceScanId(1),
+                right_scan: WorkspaceScanId(2),
+            },
+        ));
+
+        workspace_responses::apply_verification_event(
+            SyncVerificationEvent {
+                job_id: job_id.clone(),
+                verification: finished.clone(),
+            },
+            &mut state,
+            &manager,
+        );
+
+        assert_eq!(state.remote_workspace.verification, Some(finished.clone()));
+        assert_eq!(
+            state.remote_workspace.ux,
+            WorkspaceSyncUxState::Finished {
+                job_id: job_id.clone()
+            }
+        );
+        assert_eq!(state.jobs.len(), 1);
+        assert_eq!(state.jobs[0].id, job_id);
+        assert_eq!(state.jobs[0].verification, Some(finished.clone()));
+        assert!(matches!(
+            state.session_callout,
+            Some(SessionCallout::WorkspaceSyncVerified { job_id: ref id }) if id == &job_id
+        ));
+    }
+
+    #[test]
+    fn workspace_response_rejected_verification_settles_and_refreshes_jobs() {
+        let plan_id = test_plan_id();
+        let finished = verification_snapshot(
+            plan_id,
+            SyncVerificationStatus::Finished(Box::new(synchronized_result(plan_id))),
+        );
+        let (manager, job_id) = completed_verification_job(plan_id, &finished);
+        let mut state = AppState::default();
+        accept_workspace_compare(
+            &mut state,
+            vec![workspace_entry("current", 1, None, Some("current"))],
+            Vec::new(),
+            1,
+        );
+        let current_diff = state.remote_workspace.diff.clone();
+        state.remote_workspace.verification = Some(verification_snapshot(
+            plan_id,
+            SyncVerificationStatus::Running {
+                left_scan: WorkspaceScanId(1),
+                right_scan: WorkspaceScanId(2),
+            },
+        ));
+        state.remote_workspace.ux = WorkspaceSyncUxState::Verifying {
+            job_id: job_id.clone(),
+        };
+        state.left.location = Location::Local("/moved".into());
+
+        workspace_responses::apply_verification_event(
+            SyncVerificationEvent {
+                job_id: job_id.clone(),
+                verification: finished,
+            },
+            &mut state,
+            &manager,
+        );
+
+        assert_eq!(state.remote_workspace.diff, current_diff);
+        assert!(matches!(
+            state
+                .remote_workspace
+                .verification
+                .as_ref()
+                .map(|item| &item.status),
+            Some(SyncVerificationStatus::Superseded)
+        ));
+        assert_eq!(
+            state.remote_workspace.ux,
+            WorkspaceSyncUxState::Finished {
+                job_id: job_id.clone()
+            }
+        );
+        assert_eq!(state.jobs.len(), 1);
+        assert_eq!(state.jobs[0].id, job_id);
+        assert!(
+            state.jobs[0]
+                .verification
+                .as_ref()
+                .is_some_and(|item| { matches!(item.status, SyncVerificationStatus::Finished(_)) })
+        );
     }
 
     #[test]
@@ -6477,7 +6107,7 @@ mod tests {
 
         for job in cases {
             let mut state = AppState::default();
-            observe_verified_sync_success(&mut state, &job);
+            workspace_responses::observe_verified_sync_success(&mut state, &job);
             assert!(
                 state.session_callout.is_none(),
                 "unexpected milestone for {}",
@@ -6509,7 +6139,7 @@ mod tests {
         let mut state = AppState::default();
         let previous_ux = state.remote_workspace.ux.clone();
 
-        observe_verified_sync_success(&mut state, &first);
+        workspace_responses::observe_verified_sync_success(&mut state, &first);
         assert_eq!(state.remote_workspace.ux, previous_ux);
         assert_eq!(state.active_overlay(), None);
         assert!(matches!(
@@ -6518,7 +6148,7 @@ mod tests {
         ));
 
         state.dismiss_session_callout();
-        observe_verified_sync_success(&mut state, &second);
+        workspace_responses::observe_verified_sync_success(&mut state, &second);
         assert!(state.session_callout.is_none());
     }
 
@@ -7155,7 +6785,7 @@ mod pack_o_quick_action_tests {
     fn sha_result_presentation_escapes_filename_controls() {
         let mut state = AppState::default();
 
-        apply_effect_event(
+        effect_responses::apply_effect_event(
             &mut state,
             EffectLane::QuickAction,
             EffectEvent::QuickActionFinished {
