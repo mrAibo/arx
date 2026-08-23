@@ -20,7 +20,7 @@ Decompose `src/tui.rs` incrementally so rendering, feature orchestration, input 
 - [x] P2 — frame/render-only extraction
 - [x] P3 — feature-controller extraction in independently green slices
 - [x] P4 — keyboard/mouse routing extraction
-- [ ] P5 — Effect/Job response handling extraction
+- [x] P5 — Effect/Job response handling extraction
 - [ ] P6 — thin runtime/event-loop composition root
 - [ ] P7 — docs/final exact-head acceptance and PACK P closure
 
@@ -201,11 +201,34 @@ Final implementation head `8bc75e5e6e7d741f32340c3a6cfcaefb7ca697a6` passed exac
 
 ## P4 boundary decision
 
-P4 is complete at the accepted PR #215 implementation boundary, pending only this documentation commit and final exact-head merge acceptance.
+P4 is complete through PR #215. Final docs head `4d7e55243653a4cea2c5459c839d92e2d37e4253` passed exact-head CI #686 / run `32656821491`, and PR #215 squash-merged on `main` as `f553efffe06627bf6bcc113241ae762ada4f89a5`.
 
 Migrated shortcuts are owned by `KeyRouter`; remaining explicit legacy Browser classification is isolated in `browser_input.rs` after `KeyResolution::Unhandled`; mouse geometry/routing classification is isolated in `mouse.rs`; and command-bar rendering/hitboxes share one geometry source in `command_bar.rs`. Feature controllers retain their pre-KeyRouter ownership. The final audit found no unresolved documented shortcut collision after #212.
 
-Mouse feature additions remain in follow-up #10. User-configurable effective keymaps are separately documented in ROADMAP issue #214 and are intentionally not implemented by PACK P. P5 async response ownership remains unchanged and parent-owned.
+Mouse feature additions remain in follow-up #10. User-configurable effective keymaps are separately documented in ROADMAP issue #214 and are intentionally not implemented by PACK P.
+
+## Completed: P5 correlated async response handling
+
+Tracked by #216 through PR #217.
+
+P5 extracts response application while deliberately leaving channel/runtime ownership for P6:
+
+1. `src/tui/pane_responses.rs` owns accepted pane-load and continuation/page application while preserving `PaneLoadId`/location rejection, transactional navigation, history, selection/cursor and continuation identity truth. Implementation commit: `aaf59142c287607de638c3cf61ccc9087a57fa36`.
+2. `src/tui/effect_responses.rs` owns dispatcher finalization, cancellation conversion, Effect correlation and typed `EffectEvent` application while preserving stale lane/scope rejection, Quick Action refresh truth, Remote Edit terminal outcomes and origin-only refresh. Implementation commit: `eade1db3c345bd5121da2facf30813963bf077bc`.
+3. `src/tui/workspace_responses.rs` owns Workspace scan, launch and verification response application while preserving scan/root correlation, launch-id plus frozen-plan-id acceptance, rejected-verification settlement, JobManager snapshot truth and one-shot milestones. Implementation commit: `d9c579bfd20bc8a3d0538f71075691071b5666a1`.
+4. `src/tui/job_responses.rs` owns already-accepted JobEvent presentation/snapshot application and returns a narrow `JobResponseOutcome`; the parent still owns desktop notification spawning, pane refresh scheduling and terminal drain timing. Implementation commit: `012cef8cd07aae10b7c35ec344fa615aa36ac388`.
+
+Independent review confirmed the branch contains exactly these four real commits and only `src/tui.rs` plus the four response modules. No production response module constructs a JobManager, EffectDispatcher, WorkspaceSyncController, ProviderRegistry, TransferQueueRuntime, channel, scheduler or response loop; test-only fixtures may construct local managers/registries.
+
+The P5/P6 boundary remains explicit: `tokio::select!`, `workspace_scan_rx.recv()`, `pane_load_rx.recv()`, `pane_next_page_rx.recv()`, `effect_rx.recv()`, `sync_launch_rx.recv()`, `verification_rx.recv()`, `job_rx.recv()`, tick/input polling, deferred editor launch, notification spawning, post-job pane scheduling and terminal-drain placement remain physically parent-owned in `src/tui.rs`.
+
+Exact implementation head `012cef8cd07aae10b7c35ec344fa615aa36ac388` passed CI #690 / run `32661952951`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance all succeeded with exact-SHA evidence.
+
+## P5 boundary decision
+
+P5 is complete at the accepted PR #217 implementation boundary, pending only this documentation commit and final exact-head merge acceptance.
+
+Response semantics are now isolated behind four tested modules; P6 may thin only runtime/event-loop composition and must not reopen stale/correlation/refresh semantics.
 
 ## Acceptance
 
