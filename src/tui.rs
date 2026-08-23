@@ -17,9 +17,11 @@ use arx::effects::{Effect, ProgressSlot};
 #[cfg(test)]
 use arx::input::contextual_hints_with_file_context;
 use arx::input::{ContextHint, KeyResolution, KeyRouter, command_bar_rows};
+#[cfg(test)]
+use arx::services::WorkspaceSyncController;
 use arx::services::{
     DesktopService, FileInfoService, GitService, PaneListingContinuation, PaneLoadPurpose,
-    PaneLoader, SyncLaunchId, WorkspaceScanOptions, WorkspaceScanner, WorkspaceSyncController,
+    PaneLoader, SyncLaunchId, WorkspaceScanOptions, WorkspaceScanner,
 };
 #[cfg(test)]
 use arx::services::{PaneLoadResponse, PaneNextPageResponse, QuickActionOutcome};
@@ -33,9 +35,9 @@ use arx::workspace_sync::{
     DiffState, SyncDirection, SyncMode, WorkspaceSide, WorkspaceSyncOperation,
 };
 use arx::workspace_sync_execution::SyncPlanId;
-use arx::workspace_sync_verification::{
-    SyncVerificationEvent, SyncVerificationStatus, SyncVerificationVerdict,
-};
+#[cfg(test)]
+use arx::workspace_sync_verification::SyncVerificationEvent;
+use arx::workspace_sync_verification::{SyncVerificationStatus, SyncVerificationVerdict};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -48,6 +50,7 @@ use ratatui::{
 };
 use std::io;
 use std::path::PathBuf;
+#[cfg(test)]
 use tokio::sync::mpsc;
 
 mod presentation;
@@ -70,6 +73,7 @@ mod overlays;
 mod pane_responses;
 mod quick_actions;
 mod remote_edit;
+mod runtime;
 mod ssh_hosts;
 mod transfers;
 mod user_menu;
@@ -83,24 +87,7 @@ use overlays::{
     render_infrastructure_center, render_rename_input, render_session_callout, render_smart_tree,
     render_tab_switcher,
 };
-
-#[derive(Clone)]
-struct SyncUiRuntime {
-    controller: WorkspaceSyncController,
-    jobs: arx::jobs::JobManager,
-    job_events: mpsc::UnboundedSender<arx::jobs::JobEvent>,
-    verification_events: mpsc::UnboundedSender<SyncVerificationEvent>,
-    launch_events: mpsc::UnboundedSender<SyncLaunchResponse>,
-    /// Single persistent transfer queue runtime. Copy/Move route here; it owns
-    /// the only transfer executor and scheduler keyed by the same JobId.
-    transfers: arx::transfer_queue_runtime::TransferQueueRuntime,
-}
-
-struct SyncLaunchResponse {
-    launch_id: SyncLaunchId,
-    plan_id: SyncPlanId,
-    result: Result<String, String>,
-}
+use runtime::{RuntimeEvent, SyncLaunchResponse, SyncUiRuntime, TuiRuntime};
 
 pub async fn run(config: arx::config::ArxConfig) -> io::Result<()> {
     let mut terminal_session = TuiTerminalSession::enter()?;
@@ -129,51 +116,16 @@ async fn event_loop(
         menu: AppState::load_menu(),
         ..AppState::default()
     };
-    // Install configured S3 target inventory (offline; no AWS load/client).
-    // DESIGN_S3 §10 lazy per-target model: clients appear later inside providers.
-    state.registry.register_s3_targets(&config.s3.targets);
-    state
-        .registry
-        .register_webdav_targets(&config.webdav.targets);
-    let (pane_loader, mut pane_load_rx, mut pane_next_page_rx) =
-        PaneLoader::channel(state.registry.clone());
-    let (workspace_scanner, mut workspace_scan_rx) =
-        WorkspaceScanner::channel(state.registry.clone());
+    let mut runtime = TuiRuntime::new(&mut state, &config);
     let mut left_entries = Vec::new();
     let mut right_entries = Vec::new();
-    schedule_pane_load(&pane_loader, &mut state, Pane::Left);
-    schedule_pane_load(&pane_loader, &mut state, Pane::Right);
+    schedule_pane_load(&runtime.pane_loader, &mut state, Pane::Left);
+    schedule_pane_load(&runtime.pane_loader, &mut state, Pane::Right);
     let mut left_list = ListState::default();
     let mut right_list = ListState::default();
     let mut split_left_list = ListState::default();
     let mut split_right_list = ListState::default();
     let mut key_router = KeyRouter::default();
-    let (effect_dispatcher, mut effect_rx) = EffectDispatcher::channel(state.registry.clone());
-    // JobManager is the runtime source of truth. AppState.jobs is only a render snapshot.
-    let job_manager = arx::jobs::JobManager::new();
-    let (job_tx, mut job_rx) = mpsc::unbounded_channel::<arx::jobs::JobEvent>();
-    // PACK C #51: bind the single runtime JobManager + channel into AppState so
-    // remote-edit observers publish into the exact manager that drives state.jobs
-    // and the Jobs UI (no second/independent manager, no dead sender).
-    state.job_manager = Some(job_manager.clone());
-    state.job_events = Some(job_tx.clone());
-    let (verification_tx, mut verification_rx) = mpsc::unbounded_channel::<SyncVerificationEvent>();
-    let (sync_launch_tx, mut sync_launch_rx) = mpsc::unbounded_channel::<SyncLaunchResponse>();
-    let sync_runtime = SyncUiRuntime {
-        controller: WorkspaceSyncController::new(state.registry.clone()),
-        jobs: job_manager.clone(),
-        job_events: job_tx.clone(),
-        verification_events: verification_tx,
-        launch_events: sync_launch_tx,
-        transfers: arx::transfer_queue_runtime::TransferQueueRuntime::new(
-            job_manager.clone(),
-            job_tx.clone(),
-            state.registry.clone(),
-            arx::transfer_queue::TransferQueueConfig::new(config.transfer.concurrency)
-                .unwrap_or_default(),
-        ),
-    };
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
     let parent_entry = virtual_parent_entry();
     let load_more_entry = load_more_entry();
 
@@ -238,7 +190,7 @@ async fn event_loop(
                 focused_kind,
                 editor.is_some(),
                 msg.as_deref(),
-                &sync_runtime,
+                &runtime.sync,
             )
         })?;
         state.message = None; // one-shot clear after render
@@ -248,14 +200,12 @@ async fn event_loop(
             term.drain();
         }
 
-        // ── tokio::select! async event loop ──
-        // Unified dispatch: crossterm key/mouse + background jobs + PTY
-        let next_input = tokio::select! {
-            Some(response) = workspace_scan_rx.recv() => {
+        let next_input = match runtime.next_event().await {
+            RuntimeEvent::WorkspaceScan(response) => {
                 workspace_responses::handle_workspace_scan_response(response, &mut state);
                 continue;
             }
-            Some(response) = pane_load_rx.recv() => {
+            RuntimeEvent::PaneLoad(response) => {
                 pane_responses::apply_pane_load_response(
                     response,
                     &mut state,
@@ -264,7 +214,7 @@ async fn event_loop(
                 );
                 continue;
             }
-            Some(response) = pane_next_page_rx.recv() => {
+            RuntimeEvent::PaneNextPage(response) => {
                 pane_responses::apply_next_page_response(
                     response,
                     &mut state,
@@ -273,12 +223,12 @@ async fn event_loop(
                 );
                 continue;
             }
-            Some(response) = effect_rx.recv() => {
+            RuntimeEvent::Effect(response) => {
                 effect_responses::apply_received(
-                    &effect_dispatcher,
+                    &runtime.effect_dispatcher,
                     response,
                     &mut state,
-                    &pane_loader,
+                    &runtime.pane_loader,
                 );
 
                 // Defer editor launch until after terminal input is polled,
@@ -289,38 +239,47 @@ async fn event_loop(
 
                 continue;
             }
-            Some(response) = sync_launch_rx.recv() => {
+            RuntimeEvent::SyncLaunch(response) => {
                 workspace_responses::apply_sync_launch_response(
                     response,
                     &mut state,
-                    &sync_runtime.controller,
-                    &job_manager,
+                    &runtime.sync.controller,
+                    &runtime.job_manager,
                 );
                 continue;
             }
-            Some(event) = verification_rx.recv() => {
-                workspace_responses::apply_verification_event(event, &mut state, &job_manager);
+            RuntimeEvent::Verification(event) => {
+                workspace_responses::apply_verification_event(
+                    event,
+                    &mut state,
+                    &runtime.job_manager,
+                );
                 continue;
             }
-            Some(ev) = job_rx.recv() => {
-                let outcome = job_responses::apply_job_event(&ev, &mut state, &job_manager);
+            RuntimeEvent::Job(event) => {
+                let outcome =
+                    job_responses::apply_job_event(&event, &mut state, &runtime.job_manager);
                 if let Some(body) = outcome.failure_notification {
                     tokio::spawn(async move {
                         DesktopService::notify("ARX", &body).await;
                     });
                 }
                 if outcome.refresh_panes {
-                    schedule_pane_load(&pane_loader, &mut state, Pane::Left);
-                    schedule_pane_load(&pane_loader, &mut state, Pane::Right);
+                    schedule_pane_load(&runtime.pane_loader, &mut state, Pane::Left);
+                    schedule_pane_load(&runtime.pane_loader, &mut state, Pane::Right);
                 }
-                if let Some(ref mut term) = state.term { term.drain(); }
+                if let Some(ref mut term) = state.term {
+                    term.drain();
+                }
                 continue;
             }
-            _ = tick.tick() => {
+            RuntimeEvent::Tick => {
                 if event::poll(std::time::Duration::ZERO)? {
                     Some(event::read()?)
                 } else {
-                    if let Some(ref mut term) = state.term { term.drain(); }
+                    if let Some(ref mut term) = state.term {
+                        term.drain();
+                    }
                     if state.pending_editor {
                         None
                     } else {
@@ -379,10 +338,10 @@ async fn event_loop(
                                     other_focused_row,
                                     entries,
                                     visible_count,
-                                    &workspace_scanner,
-                                    &sync_runtime,
-                                    &effect_dispatcher,
-                                    &pane_loader,
+                                    &runtime.workspace_scanner,
+                                    &runtime.sync,
+                                    &runtime.effect_dispatcher,
+                                    &runtime.pane_loader,
                                     terminal_session,
                                     editor.as_deref(),
                                     &mut key_router,
@@ -463,10 +422,10 @@ async fn event_loop(
                                     None,
                                     &[],
                                     0,
-                                    &workspace_scanner,
-                                    &sync_runtime,
-                                    &effect_dispatcher,
-                                    &pane_loader,
+                                    &runtime.workspace_scanner,
+                                    &runtime.sync,
+                                    &runtime.effect_dispatcher,
+                                    &runtime.pane_loader,
                                     terminal_session,
                                     editor.as_deref(),
                                     &mut key_router,
@@ -482,10 +441,10 @@ async fn event_loop(
                                     None,
                                     &[],
                                     0,
-                                    &workspace_scanner,
-                                    &sync_runtime,
-                                    &effect_dispatcher,
-                                    &pane_loader,
+                                    &runtime.workspace_scanner,
+                                    &runtime.sync,
+                                    &runtime.effect_dispatcher,
+                                    &runtime.pane_loader,
                                     terminal_session,
                                     editor.as_deref(),
                                     &mut key_router,
@@ -547,24 +506,24 @@ async fn event_loop(
                                 other_focused_row,
                                 &active_entries,
                                 visible_count,
-                                &workspace_scanner,
-                                &pane_loader,
-                                &sync_runtime,
-                                &effect_dispatcher,
+                                &runtime.workspace_scanner,
+                                &runtime.pane_loader,
+                                &runtime.sync,
+                                &runtime.effect_dispatcher,
                                 terminal_session,
                                 editor.as_deref(),
                                 &mut key_router,
                             )
                             .await?
                             {
-                                let id = effect_dispatcher.dispatch(
+                                let id = runtime.effect_dispatcher.dispatch(
                                     EffectLane::GlobalProcess,
                                     EffectScope::Global,
                                     effect,
                                 );
                                 state.register_effect(EffectLane::GlobalProcess, id);
                             }
-                            schedule_both_pane_loads(&pane_loader, &mut state);
+                            schedule_both_pane_loads(&runtime.pane_loader, &mut state);
                             continue;
                         }
                     }
@@ -624,7 +583,7 @@ async fn event_loop(
                                     };
                                     let active = state.active;
                                     schedule_pane_navigation(
-                                        &pane_loader,
+                                        &runtime.pane_loader,
                                         &mut state,
                                         active,
                                         Location::Local(resolved),
@@ -649,7 +608,7 @@ async fn event_loop(
                                             &mut state,
                                             prompt,
                                             command,
-                                            &effect_dispatcher,
+                                            &runtime.effect_dispatcher,
                                         ) {
                                             continue;
                                         }
@@ -658,13 +617,13 @@ async fn event_loop(
                                             &mut state,
                                             loc,
                                             command,
-                                            &sync_runtime,
-                                            &pane_loader,
+                                            &runtime.sync,
+                                            &runtime.pane_loader,
                                         ) {
                                             continue;
                                         }
                                     } else {
-                                        let id = effect_dispatcher.dispatch(
+                                        let id = runtime.effect_dispatcher.dispatch(
                                             EffectLane::GlobalProcess,
                                             EffectScope::Global,
                                             Effect::RunShellCapture { command },
@@ -726,15 +685,15 @@ async fn event_loop(
                         continue;
                     }
 
-                    if bookmarks::handle_key(&mut state, key, &pane_loader) {
+                    if bookmarks::handle_key(&mut state, key, &runtime.pane_loader) {
                         continue;
                     }
 
-                    if hotlist::handle_key(&mut state, key, &pane_loader) {
+                    if hotlist::handle_key(&mut state, key, &runtime.pane_loader) {
                         continue;
                     }
 
-                    if hosts::handle_key(&mut state, key, &pane_loader) {
+                    if hosts::handle_key(&mut state, key, &runtime.pane_loader) {
                         continue;
                     }
 
@@ -742,6 +701,7 @@ async fn event_loop(
                         continue;
                     }
 
+                    let sync_runtime = &runtime.sync;
                     if jobs::handle_key(&mut state, key, &sync_runtime) {
                         continue;
                     }
@@ -749,13 +709,13 @@ async fn event_loop(
                     if state.show_transfer_center {
                         arx::transfer_center_ui::handle_transfer_center_key(
                             &mut state,
-                            &sync_runtime.transfers,
+                            &runtime.sync.transfers,
                             key,
                         );
                         continue;
                     }
 
-                    if user_menu::handle_key(&mut state, key, &effect_dispatcher) {
+                    if user_menu::handle_key(&mut state, key, &runtime.effect_dispatcher) {
                         continue;
                     }
 
@@ -809,10 +769,10 @@ async fn event_loop(
                                         other_focused_row,
                                         entries,
                                         entries.len(),
-                                        &workspace_scanner,
-                                        &sync_runtime,
-                                        &effect_dispatcher,
-                                        &pane_loader,
+                                        &runtime.workspace_scanner,
+                                        &runtime.sync,
+                                        &runtime.effect_dispatcher,
+                                        &runtime.pane_loader,
                                         terminal_session,
                                         editor.as_deref(),
                                         &mut key_router,
@@ -930,7 +890,7 @@ async fn event_loop(
                             let pane = state.active_pane();
                             if let Location::Local(dir) = &pane.location {
                                 let location = Location::Local(dir.clone());
-                                let id = effect_dispatcher.dispatch(
+                                let id = runtime.effect_dispatcher.dispatch(
                                     EffectLane::Preview,
                                     EffectScope::Location(location),
                                     Effect::DirectoryChildrenSizes { path: dir.clone() },
@@ -944,7 +904,7 @@ async fn event_loop(
                             if matches!(visible_rows.get(cursor), Some(VisiblePaneRow::LoadMore(_)))
                             {
                                 let active = state.active;
-                                schedule_next_page(&pane_loader, &mut state, active);
+                                schedule_next_page(&runtime.pane_loader, &mut state, active);
                                 continue;
                             }
                             if let Some(row) = visible_rows.get(cursor) {
@@ -955,7 +915,7 @@ async fn event_loop(
                                 {
                                     let active = state.active;
                                     schedule_pane_navigation(
-                                        &pane_loader,
+                                        &runtime.pane_loader,
                                         &mut state,
                                         active,
                                         new_location,
@@ -974,7 +934,7 @@ async fn event_loop(
                                         };
                                         let active = state.active;
                                         schedule_pane_navigation(
-                                            &pane_loader,
+                                            &runtime.pane_loader,
                                             &mut state,
                                             active,
                                             target,
@@ -995,7 +955,7 @@ async fn event_loop(
                                             left: state.left.location.clone(),
                                             right: state.right.location.clone(),
                                         };
-                                        let id = effect_dispatcher.dispatch(
+                                        let id = runtime.effect_dispatcher.dispatch(
                                             EffectLane::Preview,
                                             scope,
                                             Effect::UnifiedDiff {
@@ -1015,7 +975,7 @@ async fn event_loop(
                             if let Some(new_loc) = navigation_parent_target(&loc, &state.registry) {
                                 let active = state.active;
                                 schedule_pane_navigation(
-                                    &pane_loader,
+                                    &runtime.pane_loader,
                                     &mut state,
                                     active,
                                     new_loc,
@@ -1027,7 +987,7 @@ async fn event_loop(
                             }
                         }
                         browser_input::BrowserRoute::Refresh => {
-                            schedule_both_pane_loads(&pane_loader, &mut state);
+                            schedule_both_pane_loads(&runtime.pane_loader, &mut state);
                             state.message = Some("Refreshing panes…".into());
                         }
                         // Ctrl+U: swap panes
@@ -1038,7 +998,7 @@ async fn event_loop(
                             state.remote_workspace.disable();
                             state.show_diff = false;
                             state.message = Some("Swapped".into());
-                            schedule_both_pane_loads(&pane_loader, &mut state);
+                            schedule_both_pane_loads(&runtime.pane_loader, &mut state);
                         }
                         // Shift+F6: rename file under cursor (local-only)
                         browser_input::BrowserRoute::BeginRename => {
@@ -1117,7 +1077,7 @@ async fn event_loop(
                             state.remote_workspace.disable();
                             state.show_diff = false;
                             state.message = Some("Directory synced".into());
-                            schedule_pane_load(&pane_loader, &mut state, destination_pane);
+                            schedule_pane_load(&runtime.pane_loader, &mut state, destination_pane);
                         }
                         // Alt+Down: go back in directory history
                         browser_input::BrowserRoute::HistoryBack => {
@@ -1125,7 +1085,7 @@ async fn event_loop(
                             if let Some(prev) = pane.dir_history.last().cloned() {
                                 let active = state.active;
                                 schedule_pane_navigation(
-                                    &pane_loader,
+                                    &runtime.pane_loader,
                                     &mut state,
                                     active,
                                     prev,
@@ -1181,7 +1141,7 @@ async fn event_loop(
                             } else {
                                 "Hidden files hidden".into()
                             });
-                            schedule_both_pane_loads(&pane_loader, &mut state);
+                            schedule_both_pane_loads(&runtime.pane_loader, &mut state);
                         }
                         // *: invert selection on visible entries (local/SFTP/archive only)
                         browser_input::BrowserRoute::InvertSelection => {
@@ -1281,7 +1241,7 @@ async fn event_loop(
                         browser_input::BrowserRoute::TreeFilterChar(c) => {
                             state.tree_filter.push(c);
                             let location = state.active_pane().location.clone();
-                            let id = effect_dispatcher.dispatch(
+                            let id = runtime.effect_dispatcher.dispatch(
                                 EffectLane::Tree,
                                 EffectScope::Location(location.clone()),
                                 Effect::TreeSnapshot {
@@ -1321,7 +1281,7 @@ async fn event_loop(
                                 state.clear_selection();
                                 state.remote_workspace.disable();
                                 state.show_diff = false;
-                                schedule_active_pane_load(&pane_loader, &mut state);
+                                schedule_active_pane_load(&runtime.pane_loader, &mut state);
                             }
                         }
                         // Ctrl+T: new tab in active pane
@@ -1331,7 +1291,7 @@ async fn event_loop(
                             state.clear_selection();
                             state.remote_workspace.disable();
                             state.show_diff = false;
-                            schedule_active_pane_load(&pane_loader, &mut state);
+                            schedule_active_pane_load(&runtime.pane_loader, &mut state);
                             state.message = Some(format!("Tab {tabs}/{tabs}"));
                         }
                         // Ctrl+W: close tab in active pane
@@ -1341,7 +1301,7 @@ async fn event_loop(
                             state.clear_selection();
                             state.remote_workspace.disable();
                             state.show_diff = false;
-                            schedule_active_pane_load(&pane_loader, &mut state);
+                            schedule_active_pane_load(&runtime.pane_loader, &mut state);
                             state.message = Some(format!("Tab {}/{}", tabs.min(1), tabs));
                         }
                         // Ctrl+Left: previous tab
@@ -1352,7 +1312,7 @@ async fn event_loop(
                                 state.clear_selection();
                                 state.remote_workspace.disable();
                                 state.show_diff = false;
-                                schedule_active_pane_load(&pane_loader, &mut state);
+                                schedule_active_pane_load(&runtime.pane_loader, &mut state);
                                 state.message = Some("Tab ←".into());
                             }
                         }
@@ -1362,7 +1322,7 @@ async fn event_loop(
                             state.clear_selection();
                             state.remote_workspace.disable();
                             state.show_diff = false;
-                            schedule_active_pane_load(&pane_loader, &mut state);
+                            schedule_active_pane_load(&runtime.pane_loader, &mut state);
                             state.message = Some("Tab →".into());
                         }
                         browser_input::BrowserRoute::Unhandled => {}
@@ -1378,7 +1338,7 @@ async fn event_loop(
                 &mut state,
                 editor.as_deref(),
                 terminal_session,
-                &effect_dispatcher,
+                &runtime.effect_dispatcher,
             )
             .await?
             {
