@@ -165,7 +165,23 @@ P4b completes the previously incomplete Hotlist interaction as `src/tui/hotlist.
 
 Hermes implementation heads were `ec1aea573072a7c7c9283e6b9f041fc4489c2311` and `bf0c2809a8c65fc0865d7ea897eeff6debd22345`; independent review added the empty-state, overlay-state-machine, render-contract, and final dispatch-delegation corrections. Final code head `ac76ef772132858b058c61087d853c988723f3b8` passed local acceptance at 1225 passed / 12 ignored and exact-head CI #677 / run `32644347131`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance all succeeded with exact-SHA evidence.
 
-P4 remains open. This slice deliberately leaves Help/Viewer/Command Center interaction extraction, Which-Key ownership, command-bar hitboxes, general mouse routing, and any further authoritative key-routing cleanup for later P4 work. P5 response ownership is unchanged.
+Final docs head `b6e39c20be2bb45180a29b527f8a33929bc6b4e4` passed exact-head CI #678 / run `32646058741` with the same four gates green; PR #209 squash-merged as `e648c0b110a136d73111e638001a874016aadeb6`, closing #206 as completed.
+
+## Completed: P4c/P4d/P4e overlay routing ownership
+
+Tracked by #210 through PR #211.
+
+This behavior-preserving macro-batch extracts the remaining large pre-KeyRouter overlay keyboard seams while keeping runtime-heavy execution in the parent composition root:
+
+1. P4c — `src/tui/help.rs` owns Help rendering and its pre-KeyRouter close/scroll handling. Unknown Help keys still pass through exactly as before, close keys clear any pending KeyRouter chord, and the F1 Help text was explicitly corrected to the already-approved #206 contract (`Ctrl+\\` = split pane; Open-in-file-manager remains Command Center discoverable). Implementation commit: `c7103fbdbd993d2981e8b7ffd831737b1710bd15`.
+2. P4d — `src/tui/viewer.rs` owns Viewer rendering and keyboard handling. An active Viewer still consumes every keyboard event, preserves exact close/scroll bounds, and leaves Viewer mouse-wheel handling in the parent `Event::Mouse` path for the later mouse-routing slice. Implementation commit: `537a8e30b7bb7a3f46ef55a39c622779519d62b9`.
+3. P4e — `src/tui/command_center.rs` owns Command Center open/render/edit/navigation state and returns a narrow `KeyOutcome::Execute(CommandTarget)` for available Enter selection; `execute_command_target`, focused/other-pane derivation, EffectDispatcher use, navigation and pane refresh remain parent-owned. `src/tui/which_key.rs` owns the existing Which-Key presentation derived only from `KeyRouter::pending/continuations` and shared `action_meta`; no mutable Which-Key state or second shortcut table was introduced. Implementation commit: `e9b83b3ceed64730afa39f3fa10398da24436aab`.
+
+Independent review confirmed the moved Help/Command Center close paths preserve the pre-existing legacy boolean-transition semantics rather than broadening behavior through a new `close_all_overlays()` side effect. Viewer/Help consume/pass-through behavior, Command Center disabled-selection behavior, `KeyResolution::Pending => continue`, and parent runtime authority all remain unchanged.
+
+Hermes reported local acceptance at 1250 passed / 12 ignored with fmt/check/clippy/Rust 1.88/diff-check green. Exact implementation-head CI #680 / run `32651805160` on `e9b83b3ceed64730afa39f3fa10398da24436aab` passed quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance with exact-SHA evidence.
+
+P4 remains open after this slice only for the parent-owned mouse / command-bar hitbox routing boundary and any final authoritative legacy-routing audit. Feature additions from mouse follow-up #10 remain explicitly out of scope for PACK P refactoring. P5 response ownership remains unchanged.
 
 ## Acceptance
 
