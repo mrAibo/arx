@@ -29,7 +29,9 @@ use arx::workspace_sync_execution::SyncPlanId;
 use arx::workspace_sync_verification::{
     SyncVerificationEvent, SyncVerificationStatus, SyncVerificationVerdict,
 };
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{
     DefaultTerminal,
     layout::{Constraint, Direction, Layout, Rect},
@@ -52,6 +54,7 @@ mod help;
 mod hosts;
 mod hotlist;
 mod jobs;
+mod mouse;
 mod mutations;
 mod overlays;
 mod quick_actions;
@@ -365,118 +368,83 @@ async fn event_loop(
                     embedded_terminal::handle_key(&mut state, key);
                 }
                 Event::Mouse(mouse) => {
-                    // Check command bar hitboxes first (before pane area)
-                    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-                        let hitboxes: Vec<_> = state.command_hitboxes.clone();
-                        for hb in &hitboxes {
-                            if mouse.column >= hb.rect.x
-                                && mouse.column < hb.rect.x + hb.rect.width
-                                && mouse.row >= hb.rect.y
-                                && mouse.row < hb.rect.y + hb.rect.height
-                            {
-                                // Clear any pending keyboard chord on explicit mouse command
-                                key_router.clear_pending();
+                    match mouse::classify(&state, mouse) {
+                        mouse::MouseRoute::Ignore => {}
+                        mouse::MouseRoute::CommandBar { action, available } => {
+                            // Clear any pending keyboard chord on explicit mouse command
+                            key_router.clear_pending();
 
-                                // Derive the SAME active context as keyboard dispatch
-                                let entries = if state.active == Pane::Left {
-                                    &left_filtered
-                                } else {
-                                    &right_filtered
-                                };
-                                let rows = if state.active == Pane::Left {
-                                    &left_visible
-                                } else {
-                                    &right_visible
-                                };
-                                let cursor = {
-                                    let pane = state.active_pane();
-                                    if pane.split && pane.split_active {
-                                        pane.split_cursor
-                                    } else {
-                                        pane.cursor
-                                    }
-                                };
-                                let focused = rows.get(cursor).copied();
-                                let other_focused_row = if state.active == Pane::Left {
-                                    right_visible.get(state.right.cursor).copied()
-                                } else {
-                                    left_visible.get(state.left.cursor).copied()
-                                };
-                                let visible_count = entries.len();
-
-                                if hb.available {
-                                    dispatch_ui_action(
-                                        &mut state,
-                                        hb.action,
-                                        focused,
-                                        other_focused_row,
-                                        entries,
-                                        visible_count,
-                                        &workspace_scanner,
-                                        &sync_runtime,
-                                        &effect_dispatcher,
-                                        &pane_loader,
-                                        terminal_session,
-                                        editor.as_deref(),
-                                        &mut key_router,
-                                    )
-                                    .await?;
-                                } else {
-                                    let ctx = ActionContext::from_state(&state).with_file_context(
-                                        focused
-                                            .and_then(|row| row.action_entry())
-                                            .map(|entry| entry.kind),
-                                        editor.is_some(),
-                                    );
-                                    let action_id = action_to_id(hb.action);
-                                    let avail = action_availability(action_id, &ctx);
-                                    state.message =
-                                        Some(avail.reason().unwrap_or("unavailable").to_string());
-                                }
-                                continue; // handled by command bar
-                            }
-                        }
-                    }
-                    // Compute pane + row once for all mouse events
-                    let (area, is_left) = if let Some(a) = state.left_area {
-                        if mouse.column >= a.x
-                            && mouse.column < a.x + a.width
-                            && mouse.row >= a.y
-                            && mouse.row < a.y + a.height
-                        {
-                            (a, true)
-                        } else if let Some(a) = state.right_area {
-                            if mouse.column >= a.x
-                                && mouse.column < a.x + a.width
-                                && mouse.row >= a.y
-                                && mouse.row < a.y + a.height
-                            {
-                                (a, false)
+                            // Derive the SAME active context as keyboard dispatch
+                            let entries = if state.active == Pane::Left {
+                                &left_filtered
                             } else {
-                                continue;
+                                &right_filtered
+                            };
+                            let rows = if state.active == Pane::Left {
+                                &left_visible
+                            } else {
+                                &right_visible
+                            };
+                            let cursor = {
+                                let pane = state.active_pane();
+                                if pane.split && pane.split_active {
+                                    pane.split_cursor
+                                } else {
+                                    pane.cursor
+                                }
+                            };
+                            let focused = rows.get(cursor).copied();
+                            let other_focused_row = if state.active == Pane::Left {
+                                right_visible.get(state.right.cursor).copied()
+                            } else {
+                                left_visible.get(state.left.cursor).copied()
+                            };
+                            let visible_count = entries.len();
+
+                            if available {
+                                dispatch_ui_action(
+                                    &mut state,
+                                    action,
+                                    focused,
+                                    other_focused_row,
+                                    entries,
+                                    visible_count,
+                                    &workspace_scanner,
+                                    &sync_runtime,
+                                    &effect_dispatcher,
+                                    &pane_loader,
+                                    terminal_session,
+                                    editor.as_deref(),
+                                    &mut key_router,
+                                )
+                                .await?;
+                            } else {
+                                let ctx = ActionContext::from_state(&state).with_file_context(
+                                    focused
+                                        .and_then(|row| row.action_entry())
+                                        .map(|entry| entry.kind),
+                                    editor.is_some(),
+                                );
+                                let action_id = action_to_id(action);
+                                let avail = action_availability(action_id, &ctx);
+                                state.message =
+                                    Some(avail.reason().unwrap_or("unavailable").to_string());
                             }
-                        } else {
                             continue;
                         }
-                    } else {
-                        continue;
-                    };
-                    let row = (mouse.row.saturating_sub(area.y + 1)) as usize;
-
-                    match mouse.kind {
-                        MouseEventKind::ScrollDown if !state.viewer_content.is_empty() => {
+                        mouse::MouseRoute::ViewerScrollDown => {
                             state.viewer_scroll = (state.viewer_scroll + 1)
                                 .min(state.viewer_content.len().saturating_sub(1));
                         }
-                        MouseEventKind::ScrollUp if !state.viewer_content.is_empty() => {
+                        mouse::MouseRoute::ViewerScrollUp => {
                             state.viewer_scroll = state.viewer_scroll.saturating_sub(1);
                         }
-                        MouseEventKind::Down(MouseButton::Right) => {
+                        mouse::MouseRoute::ContextMenu { column, row } => {
                             state.show_context_menu = !state.show_context_menu;
-                            state.context_menu_pos = (mouse.column, mouse.row);
+                            state.context_menu_pos = (column, row);
                         }
-                        MouseEventKind::Drag(MouseButton::Left) => {
-                            let rows = if is_left {
+                        mouse::MouseRoute::DragSelect { pane, row } => {
+                            let rows = if pane == Pane::Left {
                                 &left_visible
                             } else {
                                 &right_visible
@@ -486,8 +454,7 @@ async fn event_loop(
                                 .and_then(VisiblePaneRow::listed)
                                 .map(|listed| &listed.entry)
                             {
-                                let pane = if is_left { Pane::Left } else { Pane::Right };
-                                let location = if is_left {
+                                let location = if pane == Pane::Left {
                                     state.left.location.clone()
                                 } else {
                                     state.right.location.clone()
@@ -497,22 +464,21 @@ async fn event_loop(
                                 }
                             }
                         }
-                        MouseEventKind::Down(_) => {
-                            let filt = if is_left {
+                        mouse::MouseRoute::ActivatePaneRow { pane, row } => {
+                            let filt = if pane == Pane::Left {
                                 &left_filtered
                             } else {
                                 &right_filtered
                             };
                             if row < filt.len() {
-                                if is_left {
+                                if pane == Pane::Left {
                                     state.left.cursor = row;
                                 } else {
                                     state.right.cursor = row;
                                 }
-                                state.active = if is_left { Pane::Left } else { Pane::Right };
+                                state.active = pane;
                             }
                         }
-                        _ => {}
                     }
                 }
                 Event::Key(key) => {
