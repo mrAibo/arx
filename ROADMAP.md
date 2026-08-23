@@ -273,6 +273,35 @@ Near-term product follow-ups after the architecture sequence:
 - #10 mouse follow-up: pane wheel, Shift+Click range selection, context availability.
 - #16 split-pane follow-up: horizontal mode, resize, explicit close semantics.
 
+### Configurable effective keymap (#214)
+
+After the P/Q/R architecture seams are stable, add a conflict-safe user-configurable
+keymap without returning shortcut ownership to individual features.
+
+- Stable `ActionId` / Action Catalog entries remain the only user-addressable actions.
+- Built-in defaults are layered with user overrides into one **effective runtime
+  Keymap**; `KeyRouter` remains the execution source of truth.
+- Prefer an extensible list-based TOML schema (`context`, `action`, `keys`) rather than
+  one configuration field per action. Unknown ActionIds are rejected.
+- A binding may be explicitly disabled so the action stays available through Command
+  Center without consuming a global shortcut.
+- Duplicate physical sequences in the same `InputContext` are a configuration error;
+  ARX must never silently pick the first action. Reusing the same key in different
+  contexts remains valid.
+- Help, Which-Key, the command bar/footer, and Command Center shortcut labels derive
+  from the effective runtime keymap instead of maintaining independent hard-coded
+  shortcut tables.
+- Add read-only effective-keymap discovery for admins, preferably through Command
+  Center and/or `arx --print-keymap`, including context, action, binding, and whether
+  the binding is built-in or user-provided.
+- This is configuration/discovery work, not a plugin surface: no arbitrary executable
+  strings, no user-defined action names, no second KeyRouter, and no per-feature
+  shortcut ownership.
+
+This follow-up is tracked by **#214**. It is intentionally outside behavior-preserving
+PACK P and does not change the approved P → Q → R sequence unless a later architecture
+review explicitly reschedules it.
+
 Provider/transfer follow-ups:
 
 - #13 WebDAV post-MVP — Digest/Bearer evaluation, physical Nextcloud/ownCloud
