@@ -50,6 +50,7 @@ mod hosts;
 mod jobs;
 mod overlays;
 mod ssh_hosts;
+mod user_menu;
 use overlays::{
     render_command_center, render_context_menu, render_directory_history, render_file_search,
     render_help, render_infrastructure_center, render_rename_input, render_session_callout,
@@ -1063,37 +1064,7 @@ async fn event_loop(
                         continue;
                     }
 
-                    // User menu: F2
-                    if state.show_menu {
-                        match key.code {
-                            KeyCode::Esc | KeyCode::F(2) => {
-                                state.show_menu = false;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                state.menu_cursor = state.menu_cursor.saturating_sub(1);
-                            }
-                            KeyCode::Down | KeyCode::Char('j')
-                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                let max = state.menu.len().saturating_sub(1);
-                                if state.menu_cursor < max {
-                                    state.menu_cursor += 1;
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if let Some(entry) = state.menu.get(state.menu_cursor) {
-                                    let cmd = entry.command.clone();
-                                    state.close_all_overlays();
-                                    let id = effect_dispatcher.dispatch(
-                                        EffectLane::GlobalProcess,
-                                        EffectScope::Global,
-                                        Effect::RunShellCapture { command: cmd },
-                                    );
-                                    state.register_effect(EffectLane::GlobalProcess, id);
-                                }
-                            }
-                            _ => {}
-                        }
+                    if user_menu::handle_key(&mut state, key, &effect_dispatcher) {
                         continue;
                     }
 
@@ -3064,7 +3035,7 @@ fn render(
 
     // User menu overlay
     if state.show_menu {
-        render_menu(frame, area, state);
+        user_menu::render(frame, area, state);
     }
 
     // Remote delete confirmation overlay
@@ -3751,33 +3722,6 @@ fn render_verification_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>
             )));
         }
     }
-}
-
-fn render_menu(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
-    let popup_area = centered_rect(60, 70, area);
-    frame.render_widget(Clear, popup_area);
-
-    let items: Vec<ListItem> = state
-        .menu
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let prefix = if i == state.menu_cursor { "> " } else { "  " };
-            ListItem::new(Line::from(format!("{prefix}{}", m.label)))
-        })
-        .collect();
-
-    let mut list_state = ListState::default();
-    list_state.select(Some(state.menu_cursor));
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" User Menu (F2: close, Enter: run) "),
-        )
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
-    frame.render_stateful_widget(list, popup_area, &mut list_state);
 }
 
 /// ponytail: simple centered rect helper; add flexible sizing when needed
