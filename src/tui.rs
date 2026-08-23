@@ -46,6 +46,7 @@ use presentation::{session_callout_text, workspace_ribbon_text};
 
 mod bookmarks;
 mod embedded_terminal;
+mod help;
 mod hosts;
 mod hotlist;
 mod jobs;
@@ -59,8 +60,8 @@ mod user_menu;
 mod workspace;
 use overlays::{
     render_command_center, render_context_menu, render_directory_history, render_file_search,
-    render_help, render_infrastructure_center, render_rename_input, render_session_callout,
-    render_smart_tree, render_tab_switcher, render_viewer,
+    render_infrastructure_center, render_rename_input, render_session_callout, render_smart_tree,
+    render_tab_switcher, render_viewer,
 };
 
 #[derive(Clone)]
@@ -926,43 +927,8 @@ async fn event_loop(
                     };
 
                     // Help overlay owns navigation keys when open — intercept BEFORE router
-                    if matches!(state.input_context(), InputContext::Help) {
-                        match key.code {
-                            KeyCode::Esc
-                            | KeyCode::F(1)
-                            | KeyCode::Char('?')
-                            | KeyCode::Char('q') => {
-                                key_router.clear_pending();
-                                state.show_help = false;
-                                state.help_scroll = 0;
-                                continue;
-                            }
-                            KeyCode::Char('j') | KeyCode::Down => {
-                                state.help_scroll = state.help_scroll.saturating_add(1);
-                                continue;
-                            }
-                            KeyCode::Char('k') | KeyCode::Up => {
-                                state.help_scroll = state.help_scroll.saturating_sub(1);
-                                continue;
-                            }
-                            KeyCode::PageDown => {
-                                state.help_scroll = state.help_scroll.saturating_add(20);
-                                continue;
-                            }
-                            KeyCode::PageUp => {
-                                state.help_scroll = state.help_scroll.saturating_sub(20);
-                                continue;
-                            }
-                            KeyCode::Home => {
-                                state.help_scroll = 0;
-                                continue;
-                            }
-                            KeyCode::End => {
-                                state.help_scroll = usize::MAX;
-                                continue;
-                            }
-                            _ => {}
-                        }
+                    if help::handle_key(&mut state, key, &mut key_router) {
+                        continue;
                     }
 
                     // First migration slice: resolve stable app actions before
@@ -2630,7 +2596,7 @@ fn render(
 
     // Help overlay
     if state.show_help {
-        render_help(frame, area, state);
+        help::render(frame, area, state);
     }
 
     // Viewer overlay
@@ -7026,55 +6992,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
         assert!(text.contains("✓ characterization"));
-    }
-
-    #[test]
-    fn leaf_overlay_help_scroll_characterization() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        // Phase 1 — bottom clamp characterization (render_help unchanged).
-        let backend = TestBackend::new(120, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut state = AppState {
-            help_scroll: usize::MAX,
-            ..Default::default()
-        };
-
-        terminal
-            .draw(|f| render_help(f, f.area(), &mut state))
-            .unwrap();
-        assert!(state.help_scroll != usize::MAX);
-
-        let bottom = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol().to_owned())
-            .collect::<Vec<_>>()
-            .join("");
-        assert!(bottom.contains("Help"));
-        assert!(bottom.contains("q/Esc/F1:close"));
-
-        // Phase 2 — top content reachable at scroll 0.
-        state.help_scroll = 0;
-        let backend2 = TestBackend::new(120, 24);
-        let mut terminal2 = Terminal::new(backend2).unwrap();
-        terminal2
-            .draw(|f| render_help(f, f.area(), &mut state))
-            .unwrap();
-        assert_eq!(state.help_scroll, 0);
-
-        let top = terminal2
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol().to_owned())
-            .collect::<Vec<_>>()
-            .join("");
-        assert!(top.contains("ARX Help"));
     }
 
     #[test]
