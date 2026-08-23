@@ -49,6 +49,7 @@ mod hosts;
 mod jobs;
 mod overlays;
 mod quick_actions;
+mod remote_edit;
 mod ssh_hosts;
 mod user_menu;
 use overlays::{
@@ -1795,40 +1796,15 @@ async fn event_loop(
 
         // ── Deferred editor launch: only after terminal input is drained ──
         if state.pending_editor && !state.should_quit {
-            state.pending_editor = false;
-            // Terminalize (Cancelled/Failed) if the originating pane moved away
-            // or the session is no longer ready; otherwise proceed to launch.
-            if finalize_remote_edit_if_stale(&mut state) {
+            if remote_edit::drive_deferred_editor(
+                &mut state,
+                editor.as_deref(),
+                terminal_session,
+                &effect_dispatcher,
+            )
+            .await?
+            {
                 continue;
-            }
-            if let Some(mut session) = state.pending_remote_edit_session.take() {
-                let editor_cmd = if let Some(cfg_editor) = &editor {
-                    cfg_editor.clone()
-                } else {
-                    session.editor.clone()
-                };
-                let working_path = session.temp_dir.path().join("working");
-                session.state = RemoteEditState::Editing;
-                // #51: observe phase transition (TUI still owns editor lifecycle).
-                publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Editing);
-                let editor_result = terminal_session
-                    .suspend_while(|| DesktopService::open_editor(&editor_cmd, &working_path))
-                    .await?;
-                if let Some(effect) = finish_remote_editor(session, editor_result, &mut state) {
-                    let location = match &effect {
-                        Effect::WriteBackRemoteFile {
-                            session,
-                            progress: _,
-                        } => session.location.clone(),
-                        _ => unreachable!("remote editor can only schedule write-back"),
-                    };
-                    let id = effect_dispatcher.dispatch(
-                        EffectLane::RemoteEdit,
-                        EffectScope::Location(location),
-                        effect,
-                    );
-                    state.register_effect(EffectLane::RemoteEdit, id);
-                }
             }
         }
     }
@@ -4433,7 +4409,7 @@ async fn dispatch_ui_action(
                 return Ok(());
             };
 
-            match &state.active_pane().location {
+            match state.active_pane().location.clone() {
                 Location::Local(base) => {
                     // Local: direct editor on original file
                     let path = base.join(&entry.name);
@@ -4446,57 +4422,9 @@ async fn dispatch_ui_action(
                     schedule_active_pane_load(pane_loader, state);
                 }
                 Location::Sftp { .. } => {
-                    // Remote: download → edit → write-back
-                    if state.pending_effects.contains_key(&EffectLane::RemoteEdit)
-                        || state.pending_remote_edit_origin.is_some()
-                    {
-                        state.message = Some("Another remote edit is still in progress".into());
-                        return Ok(());
-                    }
                     let location = state.active_pane().location.clone();
                     let name = entry.name.clone();
-
-                    state.pending_remote_edit_session = None;
-                    state.pending_remote_edit_origin = Some((state.active, location.clone()));
-                    // #51: one RemoteEdit job observed across all phases (download→editor→writeback).
-                    let re_job = state
-                        .job_manager
-                        .as_ref()
-                        .expect("job manager bound")
-                        .create_job(
-                            "remote-edit",
-                            arx::jobs::JobKind::RemoteEdit,
-                            format!("Remote edit {name}"),
-                            Some(location.clone()),
-                            None,
-                        );
-                    let _ = state
-                        .job_manager
-                        .as_ref()
-                        .expect("job manager bound")
-                        .publish_event(
-                            state.job_events.as_ref().expect("job events bound"),
-                            arx::jobs::JobEvent::Running {
-                                id: re_job.id.clone(),
-                            },
-                        );
-                    state.pending_remote_edit_job_id = Some(re_job.id.clone());
-                    // Observable phases: queued → downloading (job id now set).
-                    publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::Queued);
-                    publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::Downloading);
-                    let id = effect_dispatcher.dispatch(
-                        EffectLane::RemoteEdit,
-                        EffectScope::Location(location.clone()),
-                        Effect::DownloadRemoteFile {
-                            location: location.clone(),
-                            name: name.clone(),
-                            editor: editor.to_string(),
-                        },
-                    );
-                    state.register_effect(EffectLane::RemoteEdit, id);
-                    state.message = Some(format!("Downloading: {name}..."));
-
-                    // ponytail: Phase 2+3 handled in select! when Downloaded arrives
+                    remote_edit::begin_sftp_edit(state, location, name, editor, effect_dispatcher);
                 }
                 _ => {
                     state.message = Some("File editing is not supported for this location".into());
@@ -5511,46 +5439,6 @@ fn finalize_received_effect(dispatcher: &EffectDispatcher, response: &mut Effect
     }
 }
 
-fn finish_remote_editor(
-    mut session: RemoteEditSession,
-    editor_result: io::Result<()>,
-    state: &mut AppState,
-) -> Option<Effect> {
-    if let Err(error) = editor_result {
-        session.state = RemoteEditState::Failed;
-        // #51: editor failure terminalizes the job as typed Failed (no leak).
-        terminate_remote_edit_job(
-            state,
-            arx::jobs::RemoteEditOutcome::Failed,
-            Some(error.to_string()),
-        );
-        state.message = Some(format!("Editor failed: {error}"));
-        return None;
-    }
-
-    session.state = RemoteEditState::WritingBack;
-    // #51/MAJOR#9: supply a narrow synchronous Send+Sync progress callback so
-    // Verifying is emitted at the real verification boundary inside the provider,
-    // in program order BEFORE the terminal event — no detached relay, no scheduler
-    // races. The callback captures only the Send+Sync handles (job_manager +
-    // event sink + id), never &AppState (AppState is not Sync). The provider never
-    // knows about JobManager; it just calls progress(phase).
-    publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::ValidatingWorkingCopy);
-    publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::WriteBack);
-    let job_manager = state.job_manager.clone();
-    let job_events = state.job_events.clone();
-    let job_id = session.job_id.clone();
-    let progress: arx::vfs::RemoteEditProgressFn = std::sync::Arc::new(move |phase| {
-        if let (Some(jm), Some(events), Some(id)) = (&job_manager, &job_events, &job_id) {
-            jm.publish_remote_edit_phase(events, id, phase);
-        }
-    });
-    Some(Effect::WriteBackRemoteFile {
-        session,
-        progress: ProgressSlot(Some(progress)),
-    })
-}
-
 fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent) {
     match event {
         EffectEvent::ShellCaptured {
@@ -5671,7 +5559,10 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
             session.job_id = job_id;
             if session.job_id.is_some() {
                 // Downloaded: queued→awaiting-editor phase (TUI owns editor launch).
-                publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::AwaitingEditor);
+                remote_edit::publish_remote_edit_phase(
+                    state,
+                    arx::jobs::RemoteEditPhase::AwaitingEditor,
+                );
             }
             state.pending_remote_edit_session = Some(session);
         }
@@ -5680,17 +5571,25 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
             // #51/MAJOR#1: Verifying is NOT invented here — it was already
             // published at the real verification boundary by the provider
             // progress closure (before verify_remote_matches). Only terminate.
-            terminate_remote_edit_job(state, arx::jobs::RemoteEditOutcome::Completed, None);
+            remote_edit::terminate_remote_edit_job(
+                state,
+                arx::jobs::RemoteEditOutcome::Completed,
+                None,
+            );
         }
         EffectEvent::NoChange { name } => {
             state.message = Some(format!("No changes: {name}"));
-            terminate_remote_edit_job(state, arx::jobs::RemoteEditOutcome::NoChange, None);
+            remote_edit::terminate_remote_edit_job(
+                state,
+                arx::jobs::RemoteEditOutcome::NoChange,
+                None,
+            );
         }
         EffectEvent::RemoteConflict { name, reason } => {
             state.message = Some(format!(
                 "{name} changed on remote — write-back refused: {reason}"
             ));
-            terminate_remote_edit_job(
+            remote_edit::terminate_remote_edit_job(
                 state,
                 arx::jobs::RemoteEditOutcome::Failed,
                 Some(format!("remote conflict: {reason}")),
@@ -5700,8 +5599,11 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
             state.message = Some(format!("{name}: RECOVERY REQUIRED — {details}"));
             // #51: recovery path exposes RollbackOrRecovery before the typed
             // RecoveryRequired terminal so the phase model is observable end-to-end.
-            publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::RollbackOrRecovery);
-            terminate_remote_edit_job(
+            remote_edit::publish_remote_edit_phase(
+                state,
+                arx::jobs::RemoteEditPhase::RollbackOrRecovery,
+            );
+            remote_edit::terminate_remote_edit_job(
                 state,
                 arx::jobs::RemoteEditOutcome::RecoveryRequired,
                 Some(format!("recovery required: {details}")),
@@ -5709,7 +5611,7 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
         }
         EffectEvent::WrittenBackWarning { name, warning } => {
             state.message = Some(format!("Uploaded {name} with warning: {warning}"));
-            terminate_remote_edit_job(
+            remote_edit::terminate_remote_edit_job(
                 state,
                 arx::jobs::RemoteEditOutcome::CommittedWithWarning,
                 None,
@@ -5722,7 +5624,7 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
             // session's lifecycle, job status, or pending ownership.
             if lane == EffectLane::RemoteEdit {
                 state.message = Some(format!("{label} failed: {error}"));
-                terminate_remote_edit_job(
+                remote_edit::terminate_remote_edit_job(
                     state,
                     arx::jobs::RemoteEditOutcome::Failed,
                     Some(format!("{label} failed: {error}")),
@@ -5733,102 +5635,13 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
         }
         EffectEvent::RemoteEditCancelled { name, reason } => {
             state.message = Some(format!("Remote edit cancelled: {name} ({reason:?})"));
-            terminate_remote_edit_job(
+            remote_edit::terminate_remote_edit_job(
                 state,
                 arx::jobs::RemoteEditOutcome::Cancelled,
                 Some(format!("{reason:?}")),
             );
         }
     }
-}
-
-/// Centralized RemoteEdit terminalization.
-///
-/// Session-scoped pending state (origin, session, deferred editor) is cleared
-/// UNCONDITIONALLY: once a Remote Edit reaches a terminal outcome, no leftover
-/// ownership may survive even when no JobId publication is available (e.g. an
-/// isolated lifecycle where the job id was never registered). Job terminal
-/// publication stays conditional on an actual job id so we never publish a
-/// terminal event for a job that does not exist.
-///
-/// Called from every terminal production path so no job leaks as Running and no
-/// stale session/origin remains.
-fn terminate_remote_edit_job(
-    state: &mut AppState,
-    outcome: arx::jobs::RemoteEditOutcome,
-    error: Option<String>,
-) {
-    // Unconditional cleanup of session-scoped pending ownership.
-    state.pending_remote_edit_origin = None;
-    state.pending_remote_edit_session = None;
-    state.pending_editor = false;
-    if let Some(jid) = state.pending_remote_edit_job_id.take() {
-        state
-            .job_manager
-            .as_ref()
-            .expect("job manager bound")
-            .terminate_remote_edit(
-                state.job_events.as_ref().expect("job events bound"),
-                &jid,
-                outcome,
-                error,
-            );
-    }
-}
-
-/// Publish an observable RemoteEdit phase on the shared Job Manager.
-fn publish_remote_edit_phase(state: &AppState, phase: arx::jobs::RemoteEditPhase) {
-    if let Some(jid) = &state.pending_remote_edit_job_id {
-        state
-            .job_manager
-            .as_ref()
-            .expect("job manager bound")
-            .publish_remote_edit_phase(
-                state.job_events.as_ref().expect("job events bound"),
-                jid,
-                phase,
-            );
-    }
-}
-
-/// Production stale/invalid terminalization for a deferred remote edit. Runs the
-/// exact same cancellation logic that `event_loop`'s deferred-launch branch
-/// uses: if the originating pane navigated away → Cancelled; if the session is
-/// no longer ReadyToEdit → Failed. Terminalizes exactly once and clears all
-/// in-flight ownership. Returns true if it handled the job (caller should skip
-/// launching the editor). Drives the real finalization path so tests exercise
-/// production behavior instead of poking fields.
-fn finalize_remote_edit_if_stale(state: &mut AppState) -> bool {
-    let Some(session) = state.pending_remote_edit_session.take() else {
-        return false;
-    };
-    let origin_matches =
-        state
-            .pending_remote_edit_origin
-            .as_ref()
-            .is_some_and(|(pane, location)| {
-                location == &session.location && pane_still_at_location(state, *pane, location)
-            });
-    if session.state != RemoteEditState::ReadyToEdit {
-        state.pending_remote_edit_origin = None;
-        terminate_remote_edit_job(
-            state,
-            arx::jobs::RemoteEditOutcome::Failed,
-            Some("remote edit session invalid".into()),
-        );
-        return true;
-    }
-    if !origin_matches {
-        state.pending_remote_edit_origin = None;
-        terminate_remote_edit_job(
-            state,
-            arx::jobs::RemoteEditOutcome::Cancelled,
-            Some("originating pane navigated away".into()),
-        );
-        return true;
-    }
-    state.pending_remote_edit_session = Some(session);
-    false
 }
 
 fn handle_effect_response(
@@ -6095,7 +5908,7 @@ mod tests {
         assert!(editor_result.is_err(), "editor must return non-zero");
         // No writeback effect is scheduled on editor failure.
         assert!(
-            finish_remote_editor(session, editor_result, &mut state).is_none(),
+            remote_edit::finish_remote_editor(session, editor_result, &mut state).is_none(),
             "editor failure must not schedule a writeback effect"
         );
         // Session-scoped pending state cleared (defensive, job-id-independent).
@@ -6284,15 +6097,22 @@ mod tests {
         // Production: download-complete sets the job Running before phases.
         let _ = mgr.publish_event(ev, arx::jobs::JobEvent::Running { id: id.clone() });
         // F4 production start (tui.rs deferred-launch path).
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Downloading);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::AwaitingEditor);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Editing);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Downloading);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::AwaitingEditor);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Editing);
         // finish_remote_editor: validation → writeback → verification.
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::ValidatingWorkingCopy);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::WriteBack);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Verifying);
-        terminate_remote_edit_job(&mut state, arx::jobs::RemoteEditOutcome::Completed, None);
+        remote_edit::publish_remote_edit_phase(
+            &state,
+            arx::jobs::RemoteEditPhase::ValidatingWorkingCopy,
+        );
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::WriteBack);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Verifying);
+        remote_edit::terminate_remote_edit_job(
+            &mut state,
+            arx::jobs::RemoteEditOutcome::Completed,
+            None,
+        );
 
         let mut phases = Vec::new();
         let mut terminal = None;
@@ -6352,10 +6172,13 @@ mod tests {
         let mgr = state.job_manager.as_ref().expect("job manager bound");
         let ev = state.job_events.as_ref().expect("job events bound");
         let _ = mgr.publish_event(ev, arx::jobs::JobEvent::Running { id: id.clone() });
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
         // RecoveryRequired handler emits RollbackOrRecovery first.
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::RollbackOrRecovery);
-        terminate_remote_edit_job(
+        remote_edit::publish_remote_edit_phase(
+            &state,
+            arx::jobs::RemoteEditPhase::RollbackOrRecovery,
+        );
+        remote_edit::terminate_remote_edit_job(
             &mut state,
             arx::jobs::RemoteEditOutcome::RecoveryRequired,
             Some("recovery required".into()),
@@ -6417,13 +6240,20 @@ mod tests {
         let mgr = state.job_manager.as_ref().expect("job manager bound");
         let ev = state.job_events.as_ref().expect("job events bound");
         let _ = mgr.publish_event(ev, arx::jobs::JobEvent::Running { id: id.clone() });
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Downloading);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::AwaitingEditor);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Editing);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::ValidatingWorkingCopy);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Downloading);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::AwaitingEditor);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Editing);
+        remote_edit::publish_remote_edit_phase(
+            &state,
+            arx::jobs::RemoteEditPhase::ValidatingWorkingCopy,
+        );
         // NoChange terminal — must NOT emit WriteBack/Verifying.
-        terminate_remote_edit_job(&mut state, arx::jobs::RemoteEditOutcome::NoChange, None);
+        remote_edit::terminate_remote_edit_job(
+            &mut state,
+            arx::jobs::RemoteEditOutcome::NoChange,
+            None,
+        );
 
         let mut phases = Vec::new();
         let mut terminal = None;
@@ -6478,10 +6308,10 @@ mod tests {
         let mgr = state.job_manager.as_ref().expect("job manager bound");
         let ev = state.job_events.as_ref().expect("job events bound");
         let _ = mgr.publish_event(ev, arx::jobs::JobEvent::Running { id: id.clone() });
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Editing);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Editing);
         // Editor failure → Failed terminal (finish_remote_editor Err arm).
-        terminate_remote_edit_job(
+        remote_edit::terminate_remote_edit_job(
             &mut state,
             arx::jobs::RemoteEditOutcome::Failed,
             Some("editor failed".into()),
@@ -6781,7 +6611,7 @@ mod tests {
         // stale check terminalize the job (Cancelled) and clear all ownership.
         state.left.location = Location::Local("/elsewhere".into());
         assert!(
-            finalize_remote_edit_if_stale(&mut state),
+            remote_edit::finalize_remote_edit_if_stale(&mut state),
             "stale-navigation must terminalize the in-flight job"
         );
         assert!(state.pending_remote_edit_job_id.is_none());
