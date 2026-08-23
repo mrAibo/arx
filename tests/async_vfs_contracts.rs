@@ -387,8 +387,14 @@ fn cancelled_pending_job_never_regresses_to_running() {
 
 #[test]
 fn transfer_worker_uses_same_cancel_token_owned_by_job_manager() {
-    let tui = include_str!("../src/tui.rs");
-    assert!(tui.contains("let cancel = job.cancel.clone();"));
+    let tui = [
+        include_str!("../src/tui.rs"),
+        include_str!("../src/tui/transfers.rs"),
+    ]
+    .concat();
+    // Copy/Move delegate to the single TransferQueueRuntime (which owns the
+    // JobManager + cancel token); no second manager and no direct job push.
+    assert!(tui.contains("sync.transfers.enqueue(plan, names)"));
     assert!(tui.contains("job_manager.cancel(&id)"));
     assert!(!tui.contains("state.jobs.push("));
 }
