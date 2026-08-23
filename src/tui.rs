@@ -45,6 +45,7 @@ mod presentation;
 use presentation::{session_callout_text, workspace_ribbon_text};
 
 mod bookmarks;
+mod embedded_terminal;
 mod hosts;
 mod jobs;
 mod mutations;
@@ -355,35 +356,7 @@ async fn event_loop(
             }
             match event {
                 Event::Key(key) if state.show_terminal && state.active == Pane::Right => {
-                    use crossterm::event::KeyCode as KC;
-                    if let Some(ref mut term) = state.term {
-                        match key.code {
-                            KC::Esc => {
-                                // Toggle back to file browser
-                                state.show_terminal = false;
-                                if let Some(ref mut t) = state.term {
-                                    t.kill();
-                                }
-                                state.term = None;
-                                state.message = Some("Terminal closed".into());
-                            }
-                            KC::Enter => term.write("\r\n"),
-                            KC::Backspace => term.write("\x7f"),
-                            KC::Tab => term.write("\t"),
-                            KC::Up => term.write("\x1b[A"),
-                            KC::Down => term.write("\x1b[B"),
-                            KC::Left => term.write("\x1b[D"),
-                            KC::Right => term.write("\x1b[C"),
-                            KC::Home => term.write("\x1b[H"),
-                            KC::End => term.write("\x1b[F"),
-                            KC::Char(c) => {
-                                let mut buf = [0u8; 4];
-                                let s = c.encode_utf8(&mut buf);
-                                term.write(s);
-                            }
-                            _ => {}
-                        }
-                    }
+                    embedded_terminal::handle_key(&mut state, key);
                 }
                 Event::Mouse(mouse) => {
                     // Check command bar hitboxes first (before pane area)
@@ -2635,32 +2608,7 @@ fn render(
             state.panel_mode,
         );
     }
-    if state.show_terminal {
-        if let Some(ref term) = state.term {
-            // Render terminal buffer in right pane
-            let border_style = if state.active == Pane::Right {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let lines: Vec<Line<'_>> = term
-                .buffer
-                .iter()
-                .skip(term.scroll)
-                .take(panes[1].height.saturating_sub(2) as usize)
-                .map(|s| Line::from(s.as_str()))
-                .collect();
-            frame.render_widget(
-                Paragraph::new(lines).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Terminal ")
-                        .border_style(border_style),
-                ),
-                panes[1],
-            );
-        }
-    } else {
+    if !embedded_terminal::render_if_active(frame, panes[1], state) {
         if state.right.split {
             let mid = panes[1].width / 2;
             let a1 = ratatui::layout::Rect::new(panes[1].x, panes[1].y, mid, panes[1].height);
@@ -3567,6 +3515,9 @@ async fn dispatch_ui_action(
     configured_editor: Option<&str>,
     key_router: &mut KeyRouter,
 ) -> io::Result<()> {
+    if embedded_terminal::handle_action(state, &action) {
+        return Ok(());
+    }
     let focused = focused_row
         .and_then(|row| row.listed())
         .map(|listed| &listed.entry);
@@ -3711,28 +3662,6 @@ async fn dispatch_ui_action(
             );
             state.register_effect(EffectLane::TmuxDiscovery, id);
             state.message = Some("Discovering tmux sessions…".into());
-        }
-        Action::ToggleEmbeddedTerminal => {
-            if state.show_terminal {
-                state.show_terminal = false;
-                if let Some(ref mut t) = state.term {
-                    t.kill();
-                }
-                state.term = None;
-                state.message = Some("Terminal closed".into());
-            } else if let Location::Local(dir) = &state.right.location {
-                match arx::terminal::TermPane::spawn(dir) {
-                    Ok(t) => {
-                        state.term = Some(t);
-                        state.show_terminal = true;
-                        state.active = Pane::Right;
-                        state.message = Some("Terminal started — Esc to close".into());
-                    }
-                    Err(e) => {
-                        state.message = Some(format!("Terminal error: {e}"));
-                    }
-                }
-            }
         }
         _ => state.apply(action),
     }
