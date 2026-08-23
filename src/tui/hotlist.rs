@@ -285,4 +285,11 @@ mod tests {
             .0;
         assert!(!render_body.contains(concat!("load_", "hotlist")));
     }
+
+    #[test]
+    fn action_dispatch_delegates_hotlist_open_to_controller() {
+        let tui = include_str!("../tui.rs");
+        assert!(tui.contains("Action::OpenHotlist => hotlist::open(state),"));
+        assert!(!tui.contains("state.hotlist_entries = arx::app::AppState::load_hotlist();"));
+    }
 }

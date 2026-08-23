@@ -3516,11 +3516,7 @@ async fn dispatch_ui_action(
                 }
             ));
         }
-        Action::OpenHotlist => {
-            state.hotlist_entries = arx::app::AppState::load_hotlist();
-            state.hotlist_cursor = 0;
-            state.show_hotlist = true;
-        }
+        Action::OpenHotlist => hotlist::open(state),
         Action::OpenInFileManager => {
             let Location::Local(dir) = &state.active_pane().location else {
                 state.message = Some("Open in file manager is currently local-only".into());
