@@ -18,7 +18,7 @@ Decompose `src/tui.rs` incrementally so rendering, feature orchestration, input 
 - [x] P0 — characterization baseline for the seams that move first
 - [ ] P1 — pure presentation-model extraction into `src/tui/` submodules
 - [x] P2 — frame/render-only extraction
-- [ ] P3 — feature-controller extraction in independently green slices
+- [x] P3 — feature-controller extraction in independently green slices
 - [ ] P4 — keyboard/mouse routing extraction
 - [ ] P5 — Effect/Job response handling extraction
 - [ ] P6 — thin runtime/event-loop composition root
@@ -121,7 +121,37 @@ The P3/P5 ownership boundary remains explicit: `handle_effect_response`, generic
 
 The implementation head `897a4716511a3e8c4273121d654191ace886c33c` passed the full locked local suite reported as 1204 passed / 12 ignored and exact-head CI #669 / run `32636005836`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO transfer retry physical acceptance.
 
-P3 remains open pending reassessment of the smaller feature-controller surfaces deliberately left out of this transaction, including remote delete and any remaining storage/filesystem/transfer ownership still embedded in the parent composition root.
+Squash merge on `main`: `8dad8f5746ad3010bcd61fb8a4d41c54884c6dfe`.
+
+## Completed: P3 final feature-controller macro-batch
+
+Tracked by #207 through PR #208.
+
+The final P3 transaction removes the remaining cohesive stateful feature orchestration from the parent TUI composition root:
+
+1. `src/tui/transfers.rs` owns Copy/Move planning and enqueue orchestration while preserving exact S3 `S3ObjectRef` identity, WebDAV planning, executor/capability truth, and the one existing `TransferQueueRuntime` — implementation commit `1eac8dd5b15174c7bb895b5972414e26b10e5973`;
+2. `src/tui/mutations.rs` owns Mkdir initiation/prompt completion, local Trash, frozen SFTP/S3 delete plans, fail-closed Remote Delete preflight/execution, and confirmation rendering while reusing the existing JobManager/event channel and provider registry — implementation commit `1e193fc8dcfe77610e01ac7d075a1a2c92f8b68c`;
+3. `src/tui/embedded_terminal.rs` owns embedded-terminal toggle, active key translation, and right-pane rendering while parent runtime code keeps PTY drain timing and the same high-priority input/render predicates — implementation commit `bcdbea4a24e2bb3219e4f76ae62e0788866d58f6`.
+
+A fourth commit, `9967daa635786b1e696650ef908b52791e2c21b3`, is test-only mechanical repair after the full suite exposed two source-contract fixtures that still expected the pre-extraction Copy/Move location. The retarget keeps product delegation through `sync.transfers.enqueue(...)`; independent review confirmed the authoritative `TransferQueueRuntime` still obtains the cancellation token from its one JobManager and the behavioral transfer-queue contracts continue to exercise real queue cancellation.
+
+Hermes reported final locked local acceptance at 1210 passed / 12 ignored with fmt/check/clippy/Rust 1.88/diff-check green. Exact PR-head CI remains the merge gate for PR #208.
+
+## P3 boundary decision
+
+P3 is complete with PR #208 once its exact-head CI is accepted.
+
+Stateful feature ownership is now explicit for SSH Hosts, Bookmarks, Hosts, Jobs, User Menu, Quick Actions, Remote Edit, Workspace Sync, Transfers, Mutations/Remote Delete, and Embedded Terminal. Transfer Center, Storage Inspector, and Filesystems already have their own existing UI modules and are deliberately not wrapped again solely to increase module count.
+
+The remaining parent-owned action arms are intentionally small composition/leaf dispatch such as local View/Edit, shell/link command seeding, simple overlay toggles, and one-shot effect launches. Turning each into a one-use module would not create a meaningful controller boundary and is deferred to later composition-root thinning only if it materially improves P6.
+
+The later-phase boundaries remain frozen:
+
+- P4 owns keyboard/mouse routing, Help/Viewer/Command Center interaction, Which-Key, command-bar hitboxes, Hotlist interaction, and the pre-existing duplicate legacy `Ctrl+\\` routing collision recorded as #206.
+- P5 owns async response application: `effect_rx`, `job_rx`, workspace scan/launch/verification receivers, `handle_effect_response`, generic `EffectEvent` application, and `handle_job_event`.
+- P6 owns final event-loop/composition-root thinning after P4/P5 establish those boundaries.
+
+No new provider/VFS semantics, keybindings, scheduler, JobManager, TransferQueueRuntime, EffectDispatcher, ProviderRegistry, terminal runtime, or generic controller framework were introduced by P3.
 
 ## Acceptance
 
