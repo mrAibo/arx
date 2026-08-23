@@ -167,13 +167,14 @@ mod tests {
     fn render_hides_host_id() {
         let mut state = AppState::default();
         state.show_hosts = true;
-        state.hosts = vec![host("Example", "example.test")];
+        let mut example = host("Example", "internal-id");
+        example.hostname = "example.test".into();
+        state.hosts = vec![example];
         let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
         term.draw(|f| render(f, f.area(), &state)).unwrap();
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Example (example.test)"));
-        assert!(!text.contains("example.test (example.test)"));
         assert!(!text.contains("internal-id"));
     }
 }
