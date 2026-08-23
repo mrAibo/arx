@@ -518,10 +518,10 @@ fn compile_transfer_plan(
     let destination_provider = destination.provider_id();
     let availability = executors.for_transfer(source, destination)?;
     let source_capabilities = registry
-        .capabilities(&source_provider)
+        .capabilities_for_location(source)
         .unwrap_or(CapabilitySet::NONE);
     let destination_capabilities = registry
-        .capabilities(&destination_provider)
+        .capabilities_for_location(destination)
         .unwrap_or(CapabilitySet::NONE);
 
     TransferPlanner::plan(TransferRequest {

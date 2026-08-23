@@ -395,8 +395,9 @@ impl SyncPlanValidator {
         side: WorkspaceSide,
         registry: &ProviderRegistry,
     ) -> Result<(), SyncValidationError> {
-        let provider = root_for_side(plan, side).provider_id();
-        if registry.supports(&provider, Capability::Delete) {
+        let location = root_for_side(plan, side).clone();
+        let provider = location.provider_id();
+        if registry.supports_at(&location, Capability::Delete) {
             Ok(())
         } else {
             Err(SyncValidationError::UnsupportedDestinationCapability {

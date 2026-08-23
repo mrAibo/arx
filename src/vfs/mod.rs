@@ -573,6 +573,10 @@ pub enum ProviderInstanceKey {
 #[derive(Debug, Clone)]
 pub struct RegisteredProvider {
     pub provider: Arc<dyn VfsProvider>,
+    /// Effective capability declaration of THIS concrete instance. Replaces the
+    /// former ProviderId-keyed registry map (PACK Q1): two SFTP hosts may carry
+    /// different sets without overwriting each other.
+    pub capabilities: CapabilitySet,
     /// Concrete S3 provider when this instance is an `S3Target(id)`; `None`
     /// otherwise. For S3 registrations this aliases the exact `provider` Arc
     /// (same underlying `S3Provider`), so the transfer path reuses the listing
@@ -589,9 +593,10 @@ pub struct RegisteredProvider {
 
 /// Cloneable, async-safe provider registry.
 ///
-/// Provider *capabilities* are keyed by provider class (`ProviderId`), while
-/// provider *instances* are keyed by the concrete resource. This distinction
-/// is essential for multiple SFTP hosts and multiple archive files.
+/// Each concrete provider instance carries its own effective capability
+/// declaration; per-location queries answer from that declaration (PACK Q1).
+/// Unregistered locations fall back to the built-in per-kind declarations,
+/// except S3/WebDAV which fail closed unless the target id is configured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum S3TargetBinding {
     /// `config.bucket == None` — whole-account / target-root listing.
@@ -603,7 +608,6 @@ pub enum S3TargetBinding {
 #[derive(Debug, Clone)]
 pub struct ProviderRegistry {
     providers: Arc<RwLock<HashMap<ProviderInstanceKey, RegisteredProvider>>>,
-    capabilities: Arc<RwLock<HashMap<ProviderId, CapabilitySet>>>,
     // ponytail: configured S3 target inventory (id -> validated config).
     // Populated at startup via register_s3_targets; never builds clients.
     s3_targets: Arc<RwLock<HashMap<String, crate::config::S3TargetConfig>>>,
@@ -616,7 +620,6 @@ impl ProviderRegistry {
     pub fn new() -> Self {
         Self {
             providers: Arc::new(RwLock::new(HashMap::new())),
-            capabilities: Arc::new(RwLock::new(HashMap::new())),
             s3_targets: Arc::new(RwLock::new(HashMap::new())),
             webdav_targets: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -712,6 +715,7 @@ impl ProviderRegistry {
         let mut providers = self.providers.write().expect("provider registry poisoned");
         let registered = providers.entry(key).or_insert_with(|| RegisteredProvider {
             provider: Arc::clone(&provider),
+            capabilities: capabilities::WEBDAV_CAPABILITIES,
             s3: None,
             webdav: Some(webdav_provider.clone()),
         });
@@ -739,7 +743,6 @@ impl ProviderRegistry {
     ) {
         self.insert_instance(
             ProviderInstanceKey::Singleton(id),
-            id,
             Arc::from(provider),
             capabilities,
         );
@@ -754,7 +757,6 @@ impl ProviderRegistry {
     ) {
         self.insert_instance(
             ProviderInstanceKey::SftpHost(host.to_string()),
-            ProviderId::Sftp,
             Arc::from(provider),
             capabilities,
         );
@@ -763,7 +765,6 @@ impl ProviderRegistry {
     fn insert_instance(
         &self,
         key: ProviderInstanceKey,
-        id: ProviderId,
         provider: Arc<dyn VfsProvider>,
         capabilities: CapabilitySet,
     ) {
@@ -774,14 +775,11 @@ impl ProviderRegistry {
                 key,
                 RegisteredProvider {
                     provider,
+                    capabilities,
                     s3: None,
                     webdav: None,
                 },
             );
-        self.capabilities
-            .write()
-            .expect("provider capabilities poisoned")
-            .insert(id, capabilities);
     }
 
     pub fn get(&self, id: &ProviderId) -> Option<Arc<dyn VfsProvider>> {
@@ -792,38 +790,67 @@ impl ProviderRegistry {
             .map(|registered| Arc::clone(&registered.provider))
     }
 
-    pub fn capabilities(&self, id: &ProviderId) -> Option<CapabilitySet> {
-        if let Some(capabilities) = self
-            .capabilities
+    /// Capability truth for an EXACT location (PACK Q1).
+    ///
+    /// Answers offline from the registered instance's own declaration or the
+    /// built-in per-provider-kind declaration. Never constructs an S3/WebDAV
+    /// provider, never creates clients, never touches keyring/secrets.
+    /// S3/WebDAV return `Some` only when the location's target id is present in
+    /// this registry's configured inventory; unknown target fails closed (`None`).
+    pub fn capabilities_for_location(&self, location: &Location) -> Option<CapabilitySet> {
+        let key = Self::instance_key_for_location(location);
+        if let Some(registered) = self
+            .providers
             .read()
-            .expect("provider capabilities poisoned")
-            .get(id)
-            .copied()
+            .expect("provider registry poisoned")
+            .get(&key)
         {
-            return Some(capabilities);
+            return Some(registered.capabilities);
         }
-        Some(match id {
-            ProviderId::Local => capabilities::LOCAL_CAPABILITIES,
-            ProviderId::Sftp => capabilities::SFTP_CAPABILITIES,
-            ProviderId::Archive => capabilities::ARCHIVE_CAPABILITIES,
-            ProviderId::S3 => capabilities::S3_CAPABILITIES,
-            ProviderId::WebDAV => capabilities::WEBDAV_CAPABILITIES,
-        })
+        match location {
+            Location::Local(_) => Some(capabilities::LOCAL_CAPABILITIES),
+            Location::Sftp { .. } => Some(capabilities::SFTP_CAPABILITIES),
+            Location::Archive { .. } => Some(capabilities::ARCHIVE_CAPABILITIES),
+            // ponytail: inventory membership only — no provider construction
+            Location::S3 { target, .. } => {
+                if self
+                    .s3_targets
+                    .read()
+                    .expect("s3 target inventory poisoned")
+                    .contains_key(target)
+                {
+                    Some(capabilities::S3_CAPABILITIES)
+                } else {
+                    None
+                }
+            }
+            Location::WebDav { target, .. } => {
+                if self
+                    .webdav_targets
+                    .read()
+                    .expect("webdav target inventory poisoned")
+                    .contains_key(target)
+                {
+                    Some(capabilities::WEBDAV_CAPABILITIES)
+                } else {
+                    None
+                }
+            }
+        }
     }
 
-    pub fn supports(&self, id: &ProviderId, capability: Capability) -> bool {
-        self.capabilities(id)
+    pub fn supports_at(&self, location: &Location, capability: Capability) -> bool {
+        self.capabilities_for_location(location)
             .is_some_and(|capabilities| capabilities.supports(capability))
     }
 
-    pub fn require(&self, id: &ProviderId, capability: Capability) -> Result<(), VfsError> {
-        if self.supports(id, capability) {
-            Ok(())
-        } else {
-            Err(VfsError::UnsupportedOperation {
-                provider: *id,
+    pub fn require_at(&self, location: &Location, capability: Capability) -> Result<(), VfsError> {
+        match self.capabilities_for_location(location) {
+            Some(caps) if caps.supports(capability) => Ok(()),
+            _ => Err(VfsError::UnsupportedOperation {
+                provider: location.provider_id(),
                 capability,
-            })
+            }),
         }
     }
 
@@ -914,58 +941,46 @@ impl ProviderRegistry {
             return Ok((provider, path));
         }
 
-        let (id, provider, capabilities): (ProviderId, Arc<dyn VfsProvider>, CapabilitySet) =
-            match loc {
-                Location::Local(_) => (
-                    ProviderId::Local,
-                    Arc::new(local::LocalProvider),
-                    capabilities::LOCAL_CAPABILITIES,
-                ),
-                Location::Sftp { host, .. } => (
-                    ProviderId::Sftp,
-                    Arc::new(sftp::SftpProvider::new(crate::remote::Host::from_alias(
-                        host,
-                    ))),
-                    capabilities::SFTP_CAPABILITIES,
-                ),
-                Location::Archive { archive, .. } => (
-                    ProviderId::Archive,
-                    Arc::new(archive::ArchiveProvider {
-                        archive: archive.clone(),
-                    }),
-                    capabilities::ARCHIVE_CAPABILITIES,
-                ),
-                Location::WebDav { target, .. } => {
-                    let provider = self.resolve_webdav_provider(target)?;
-                    (
-                        ProviderId::WebDAV,
-                        provider,
-                        capabilities::WEBDAV_CAPABILITIES,
-                    )
-                }
-                // ponytail: S3 provider routing not wired yet (later client/registry card);
-                // fail-closed Unsupported, no client/provider construction, no bucket+prefix flatten
-                Location::S3 { .. } => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "S3 provider routing not implemented yet",
-                    ));
-                }
-            };
+        let (provider, capabilities): (Arc<dyn VfsProvider>, CapabilitySet) = match loc {
+            Location::Local(_) => (
+                Arc::new(local::LocalProvider),
+                capabilities::LOCAL_CAPABILITIES,
+            ),
+            Location::Sftp { host, .. } => (
+                Arc::new(sftp::SftpProvider::new(crate::remote::Host::from_alias(
+                    host,
+                ))),
+                capabilities::SFTP_CAPABILITIES,
+            ),
+            Location::Archive { archive, .. } => (
+                Arc::new(archive::ArchiveProvider {
+                    archive: archive.clone(),
+                }),
+                capabilities::ARCHIVE_CAPABILITIES,
+            ),
+            Location::WebDav { target, .. } => {
+                let provider = self.resolve_webdav_provider(target)?;
+                (provider, capabilities::WEBDAV_CAPABILITIES)
+            }
+            // ponytail: S3 provider routing not wired yet (later client/registry card);
+            // fail-closed Unsupported, no client/provider construction, no bucket+prefix flatten
+            Location::S3 { .. } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "S3 provider routing not implemented yet",
+                ));
+            }
+        };
 
         let mut providers = self.providers.write().expect("provider registry poisoned");
         let registered = providers.entry(key).or_insert_with(|| RegisteredProvider {
             provider: Arc::clone(&provider),
+            capabilities,
             s3: None,
             webdav: None,
         });
         let provider = Arc::clone(&registered.provider);
         drop(providers);
-
-        self.capabilities
-            .write()
-            .expect("provider capabilities poisoned")
-            .insert(id, capabilities);
 
         Ok((provider, path))
     }
@@ -1029,6 +1044,7 @@ impl ProviderRegistry {
         let mut providers = self.providers.write().expect("provider registry poisoned");
         let registered = providers.entry(key).or_insert_with(|| RegisteredProvider {
             provider: Arc::clone(&provider),
+            capabilities: capabilities::S3_CAPABILITIES,
             s3: Some(s3_provider.clone()),
             webdav: None,
         });
@@ -1308,7 +1324,7 @@ impl ProviderRegistry {
         cancellation: &CancellationFlag,
         progress: Option<crate::vfs::RemoteEditProgressFn>,
     ) -> std::io::Result<()> {
-        self.require(&location.provider_id(), Capability::Write)
+        self.require_at(location, Capability::Write)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::Unsupported, error))?;
         let (provider, parent_path) = self.provider_for_location(location)?;
         let path = validated_child_path(&parent_path, name)?;
@@ -2262,16 +2278,17 @@ mod tests {
     #[test]
     fn default_registry_reports_local_capabilities() {
         let registry = default_registry();
-        assert!(registry.supports(&ProviderId::Local, Capability::List));
-        assert!(registry.supports(&ProviderId::Local, Capability::Move));
-        assert!(!registry.supports(&ProviderId::Local, Capability::ServerSideCopy));
+        let local = Location::Local("/".into());
+        assert!(registry.supports_at(&local, Capability::List));
+        assert!(registry.supports_at(&local, Capability::Move));
+        assert!(!registry.supports_at(&local, Capability::ServerSideCopy));
     }
 
     #[test]
     fn require_returns_typed_unsupported_operation() {
         let registry = default_registry();
         let error = registry
-            .require(&ProviderId::Local, Capability::ServerSideCopy)
+            .require_at(&Location::Local("/".into()), Capability::ServerSideCopy)
             .unwrap_err();
         assert!(matches!(
             error,
@@ -2517,10 +2534,158 @@ mod tests {
     #[test]
     fn default_registry_reports_sftp_capabilities() {
         let registry = default_registry();
-        let caps = registry.capabilities(&ProviderId::Sftp).unwrap();
+        let caps = registry
+            .capabilities_for_location(&Location::Sftp {
+                host: "any-host".into(),
+                path: "/".into(),
+            })
+            .unwrap();
         assert!(caps.supports(Capability::Read));
         assert!(caps.supports(Capability::List));
         assert!(!caps.supports(Capability::Move));
+    }
+
+    // ── PACK Q1: concrete-location capability authority ──
+
+    #[test]
+    fn q1_two_sftp_instances_carry_independent_capabilities() {
+        let registry = ProviderRegistry::new();
+        let read_only = CapabilitySet::NONE
+            .with(Capability::List)
+            .with(Capability::Read);
+        assert_ne!(read_only, capabilities::SFTP_CAPABILITIES);
+        registry.insert_sftp("host-a", Box::new(local::LocalProvider), read_only);
+        registry.insert_sftp(
+            "host-b",
+            Box::new(local::LocalProvider),
+            capabilities::SFTP_CAPABILITIES,
+        );
+        let loc_a = Location::Sftp {
+            host: "host-a".into(),
+            path: "/data".into(),
+        };
+        let loc_b = Location::Sftp {
+            host: "host-b".into(),
+            path: "/data".into(),
+        };
+        assert_eq!(
+            registry.capabilities_for_location(&loc_a),
+            Some(read_only),
+            "host-a must keep exactly its supplied set"
+        );
+        assert_eq!(
+            registry.capabilities_for_location(&loc_b),
+            Some(capabilities::SFTP_CAPABILITIES),
+            "host-b must carry exactly its own set"
+        );
+        // Registering host-b did NOT overwrite host-a (regression for removing
+        // the ProviderId-global capability map).
+        assert_eq!(registry.capabilities_for_location(&loc_a), Some(read_only));
+        assert!(registry.supports_at(&loc_b, Capability::Write));
+        assert!(!registry.supports_at(&loc_a, Capability::Write));
+    }
+
+    #[test]
+    fn q1_unregistered_sftp_gets_builtin_declaration_without_construction() {
+        let registry = ProviderRegistry::new();
+        let loc = Location::Sftp {
+            host: "never-registered".into(),
+            path: "/x".into(),
+        };
+        assert_eq!(
+            registry.capabilities_for_location(&loc),
+            Some(capabilities::SFTP_CAPABILITIES)
+        );
+        assert_eq!(
+            registry.instance_count(),
+            0,
+            "capability query must not construct a provider"
+        );
+    }
+
+    #[test]
+    fn q1_local_location_keeps_builtin_declaration() {
+        let registry = ProviderRegistry::new();
+        let loc = Location::Local("/tmp".into());
+        assert_eq!(
+            registry.capabilities_for_location(&loc),
+            Some(capabilities::LOCAL_CAPABILITIES)
+        );
+        assert!(registry.supports_at(&loc, Capability::Move));
+    }
+
+    #[test]
+    fn q1_s3_known_target_serves_builtin_unknown_fails_closed() {
+        let registry = ProviderRegistry::new();
+        registry.register_s3_targets(&[crate::config::S3TargetConfig {
+            id: "known".into(),
+            name: "Known Target".into(),
+            bucket: Some("bucket".into()),
+            region: Some("us-east-1".into()),
+            profile: None,
+            endpoint_url: Some("http://127.0.0.1:9".into()),
+            force_path_style: true,
+        }]);
+        let known = Location::S3 {
+            target: "known".into(),
+            bucket: Some("bucket".into()),
+            prefix: String::new(),
+        };
+        let unknown = Location::S3 {
+            target: "missing".into(),
+            bucket: None,
+            prefix: String::new(),
+        };
+        assert_eq!(
+            registry.capabilities_for_location(&known),
+            Some(capabilities::S3_CAPABILITIES)
+        );
+        assert_eq!(
+            registry.capabilities_for_location(&unknown),
+            None,
+            "unknown target fails closed"
+        );
+        assert_eq!(
+            registry.instance_count(),
+            0,
+            "capability query must not resolve an S3 client/provider"
+        );
+    }
+
+    #[test]
+    fn q1_webdav_known_target_serves_builtin_unknown_fails_closed_no_secret() {
+        // No secret is installed: the capability query must never attempt
+        // keyring/provider resolution.
+        let registry = ProviderRegistry::new();
+        registry.register_webdav_targets(&[crate::config::WebDavTargetConfig {
+            id: "web".into(),
+            name: "Web Target".into(),
+            url: "http://127.0.0.1:9/dav".into(),
+            username: "user".into(),
+            auth: "basic".into(),
+        }]);
+        let known = Location::WebDav {
+            target: "web".into(),
+            path: "/".into(),
+        };
+        let unknown = Location::WebDav {
+            target: "missing".into(),
+            path: "/".into(),
+        };
+        assert_eq!(
+            registry.capabilities_for_location(&known),
+            Some(capabilities::WEBDAV_CAPABILITIES)
+        );
+        assert_eq!(
+            registry.capabilities_for_location(&unknown),
+            None,
+            "unknown target fails closed"
+        );
+        assert_eq!(
+            registry.instance_count(),
+            0,
+            "capability query must not construct a WebDAV provider"
+        );
     }
 
     #[test]

@@ -1,7 +1,5 @@
 use super::{ActionId, AppState, WorkspaceSyncUxState};
-use crate::vfs::{
-    Capability, CapabilitySet, EntryKind, Location, ProviderId, capabilities::builtin_capabilities,
-};
+use crate::vfs::{Capability, CapabilitySet, EntryKind, Location, ProviderId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionAvailability {
@@ -44,16 +42,20 @@ pub struct ActionContext {
 
 impl ActionContext {
     pub fn from_state(state: &AppState) -> Self {
-        let active_provider = state.active_pane().location.provider_id();
-        let passive_provider = state.other_pane().location.provider_id();
+        let active_location = state.active_pane().location.clone();
+        let passive_location = state.other_pane().location.clone();
+        let active_provider = active_location.provider_id();
+        let passive_provider = passive_location.provider_id();
+        // PACK Q1: capability truth comes from the exact Location through the
+        // registry; no independent ProviderId-keyed builtin fallback.
         let active_capabilities = state
             .registry
-            .capabilities(&active_provider)
-            .unwrap_or_else(|| builtin_capabilities(active_provider));
+            .capabilities_for_location(&active_location)
+            .unwrap_or_default();
         let passive_capabilities = state
             .registry
-            .capabilities(&passive_provider)
-            .unwrap_or_else(|| builtin_capabilities(passive_provider));
+            .capabilities_for_location(&passive_location)
+            .unwrap_or_default();
 
         let sync_execute_ready = matches!(
             state.remote_workspace.ux,
@@ -449,6 +451,46 @@ mod tests {
             right_location: Location::Local(std::path::PathBuf::from("/")),
             active_location: Location::Local(std::path::PathBuf::from("/")),
         }
+    }
+
+    // PACK Q1: from_state must consume exact-Location registry truth, not an
+    // independent ProviderId-keyed builtin fallback.
+    #[test]
+    fn q1_action_context_consumes_exact_location_capability_truth() {
+        use crate::vfs::{ProviderRegistry, local::LocalProvider};
+
+        let mut state = AppState::default();
+        let registry = ProviderRegistry::new();
+        registry.insert(
+            ProviderId::Local,
+            Box::new(LocalProvider),
+            crate::vfs::capabilities::LOCAL_CAPABILITIES,
+        );
+        let restricted = CapabilitySet::NONE
+            .with(Capability::List)
+            .with(Capability::Read);
+        registry.insert_sftp("q1-ctx-host", Box::new(LocalProvider), restricted);
+        state.registry = registry;
+        state.right.location = Location::Sftp {
+            host: "q1-ctx-host".into(),
+            path: "/data".into(),
+        };
+
+        let ctx = ActionContext::from_state(&state);
+        assert_eq!(
+            ctx.passive_capabilities, restricted,
+            "passive pane must see its exact host-instance capability set"
+        );
+        assert_ne!(
+            ctx.passive_capabilities,
+            crate::vfs::capabilities::SFTP_CAPABILITIES
+        );
+        assert_eq!(ctx.active_provider, ProviderId::Local);
+        assert_eq!(ctx.passive_provider, ProviderId::Sftp);
+        assert_eq!(
+            ctx.active_capabilities,
+            crate::vfs::capabilities::LOCAL_CAPABILITIES
+        );
     }
 
     #[test]

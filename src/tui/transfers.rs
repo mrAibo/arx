@@ -67,13 +67,14 @@ pub(super) fn handle_action(
             let dst_loc = state.other_pane().location.clone();
             let src_provider = src_loc.provider_id();
             let dst_provider = dst_loc.provider_id();
+            // PACK Q1: capability truth from the exact Locations.
             let src_caps = state
                 .registry
-                .capabilities(&src_provider)
+                .capabilities_for_location(&src_loc)
                 .unwrap_or_default();
             let dst_caps = state
                 .registry
-                .capabilities(&dst_provider)
+                .capabilities_for_location(&dst_loc)
                 .unwrap_or_default();
             // S3 basic transfer: a single S3 object paired with a Local pane.
             let s3_spec: Option<arx::transfer::S3TransferSpec> =
@@ -201,13 +202,14 @@ pub(super) fn handle_action(
             let dst_loc = state.other_pane().location.clone();
             let src_provider = src_loc.provider_id();
             let dst_provider = dst_loc.provider_id();
+            // PACK Q1: capability truth from the exact Locations.
             let src_caps = state
                 .registry
-                .capabilities(&src_provider)
+                .capabilities_for_location(&src_loc)
                 .unwrap_or_default();
             let dst_caps = state
                 .registry
-                .capabilities(&dst_provider)
+                .capabilities_for_location(&dst_loc)
                 .unwrap_or_default();
             let executors =
                 arx::transfer::probe::local_executors(arx::transfer::probe::detect_local_tools());
