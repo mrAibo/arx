@@ -47,6 +47,7 @@ use presentation::{session_callout_text, workspace_ribbon_text};
 mod bookmarks;
 mod embedded_terminal;
 mod hosts;
+mod hotlist;
 mod jobs;
 mod mutations;
 mod overlays;
@@ -873,6 +874,10 @@ async fn event_loop(
                     }
 
                     if bookmarks::handle_key(&mut state, key, &pane_loader) {
+                        continue;
+                    }
+
+                    if hotlist::handle_key(&mut state, key, &pane_loader) {
                         continue;
                     }
 
@@ -2709,34 +2714,7 @@ fn render(
 
     // Hotlist overlay
     if state.show_hotlist {
-        let hl = arx::app::AppState::load_hotlist();
-        let h = (hl.len() + 2).min(20) as u16;
-        let popup = centered_rect(60, h, area);
-        frame.render_widget(Clear, popup);
-        let items: Vec<ListItem> = if hl.is_empty() {
-            vec![ListItem::new("(empty - create ~/.config/arx/hotlist)")]
-        } else {
-            hl.iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    let pre = if i == state.hotlist_cursor {
-                        "> "
-                    } else {
-                        "  "
-                    };
-                    ListItem::new(format!("{pre}{}", p.display()))
-                })
-                .collect()
-        };
-        frame.render_widget(
-            List::new(items).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Hotlist (Ctrl+\\) ")
-                    .border_style(Style::default().fg(Color::Magenta)),
-            ),
-            popup,
-        );
+        hotlist::render(frame, area, state);
     }
     if state.show_tab_switcher {
         render_tab_switcher(frame, area, state);
@@ -3539,8 +3517,9 @@ async fn dispatch_ui_action(
             ));
         }
         Action::OpenHotlist => {
-            state.show_hotlist = !state.show_hotlist;
+            state.hotlist_entries = arx::app::AppState::load_hotlist();
             state.hotlist_cursor = 0;
+            state.show_hotlist = true;
         }
         Action::OpenInFileManager => {
             let Location::Local(dir) = &state.active_pane().location else {

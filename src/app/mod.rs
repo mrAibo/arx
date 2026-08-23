@@ -394,6 +394,7 @@ pub struct AppState {
     pub command_hitboxes: Vec<CommandHitbox>,
     pub show_hotlist: bool,
     pub hotlist_cursor: usize,
+    pub hotlist_entries: Vec<PathBuf>,
     pub show_tab_switcher: bool,
     pub tab_switcher_cursor: usize,
     pub split: bool, // Ctrl+\ split pane vertically
@@ -525,6 +526,7 @@ impl Default for AppState {
             panel_ratio: 50,
             show_hotlist: false,
             hotlist_cursor: 0,
+            hotlist_entries: Vec::new(),
             show_tab_switcher: false,
             tab_switcher_cursor: 0,
             split: false,
