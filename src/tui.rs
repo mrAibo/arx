@@ -19,11 +19,12 @@ use arx::input::contextual_hints_with_file_context;
 use arx::input::{ContextHint, KeyResolution, KeyRouter, command_bar_rows};
 use arx::services::{
     DesktopService, FileInfoService, GitService, PaneListingContinuation, PaneLoadPurpose,
-    PaneLoader, SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions, WorkspaceScanResponse,
-    WorkspaceScanner, WorkspaceSyncController,
+    PaneLoader, SyncLaunchId, WorkspaceScanOptions, WorkspaceScanner, WorkspaceSyncController,
 };
 #[cfg(test)]
 use arx::services::{PaneLoadResponse, PaneNextPageResponse, QuickActionOutcome};
+#[cfg(test)]
+use arx::services::{WorkspaceScanError, WorkspaceScanResponse};
 use arx::vfs::{
     Entry, EntryIdentity, EntryKind, ListedEntry, Location, ProviderId, ProviderRegistry,
     RemoteEditSession, RemoteEditState,
@@ -74,6 +75,7 @@ mod user_menu;
 mod viewer;
 mod which_key;
 mod workspace;
+mod workspace_responses;
 use effect_responses::pane_still_at_location;
 use overlays::{
     render_context_menu, render_directory_history, render_file_search,
@@ -249,7 +251,7 @@ async fn event_loop(
         // Unified dispatch: crossterm key/mouse + background jobs + PTY
         let next_input = tokio::select! {
             Some(response) = workspace_scan_rx.recv() => {
-                handle_workspace_scan_response(response, &mut state);
+                workspace_responses::handle_workspace_scan_response(response, &mut state);
                 continue;
             }
             Some(response) = pane_load_rx.recv() => {
@@ -287,49 +289,16 @@ async fn event_loop(
                 continue;
             }
             Some(response) = sync_launch_rx.recv() => {
-                let still_current = sync_runtime
-                    .controller
-                    .is_launch_current(response.launch_id)
-                    && state
-                        .remote_workspace
-                        .frozen_plan
-                        .as_ref()
-                        .is_some_and(|frozen| frozen.id() == response.plan_id);
-                if still_current {
-                    match response.result {
-                        Ok(job_id) => {
-                            state.jobs = job_manager.snapshot();
-                            if let Some(job) = job_manager.get(&job_id) {
-                                state.remote_workspace.sync_from_job(&job);
-                            }
-                        }
-                        Err(message) => state.remote_workspace.mark_blocked(message),
-                    }
-                }
+                workspace_responses::apply_sync_launch_response(
+                    response,
+                    &mut state,
+                    &sync_runtime.controller,
+                    &job_manager,
+                );
                 continue;
             }
             Some(event) = verification_rx.recv() => {
-                let left_root = state.left.location.clone();
-                let right_root = state.right.location.clone();
-                let accepted = state.remote_workspace.apply_verification(
-                    &event.verification,
-                    &left_root,
-                    &right_root,
-                );
-                // JobManager accepted the verification before publishing this
-                // event, so its render snapshot is useful even when pane roots
-                // have moved and RemoteWorkspaceState rejects the old diff.
-                state.jobs = job_manager.snapshot();
-                if let Some(job) = job_manager.get(&event.job_id) {
-                    observe_verified_sync_success(&mut state, &job);
-                }
-                if accepted {
-                    state.remote_workspace.sync_verification_stage(&event.job_id);
-                } else {
-                    state
-                        .remote_workspace
-                        .settle_rejected_verification(&event.job_id, &event.verification);
-                }
+                workspace_responses::apply_verification_event(event, &mut state, &job_manager);
                 continue;
             }
             Some(ev) = job_rx.recv() => {
@@ -2541,61 +2510,6 @@ fn job_event_id(event: &arx::jobs::JobEvent) -> &str {
     }
 }
 
-fn observe_compare_success(state: &mut AppState) {
-    let Some(diff) = state.remote_workspace.diff.as_ref() else {
-        return;
-    };
-    let differences = diff.changed_count();
-    let bytes_to_transfer = state
-        .remote_workspace
-        .plan
-        .as_ref()
-        .map(|plan| plan.bytes_to_transfer)
-        .unwrap_or(0);
-    if state.milestones.take_compare_success() {
-        state.session_callout = Some(SessionCallout::CompareCompleted {
-            differences,
-            bytes_to_transfer,
-        });
-    }
-}
-
-fn is_verified_sync_success(job: &arx::jobs::Job) -> bool {
-    if job.status != arx::jobs::JobStatus::Completed {
-        return false;
-    }
-    let execution_completed = matches!(
-        &job.result,
-        Some(arx::jobs::JobResult::WorkspaceSync(outcome))
-            if matches!(
-                &outcome.terminal,
-                arx::workspace_sync_executor::SyncTerminalState::Completed
-            )
-    );
-    if !execution_completed {
-        return false;
-    }
-
-    job.verification.as_ref().is_some_and(|verification| {
-        matches!(
-            &verification.status,
-            SyncVerificationStatus::Finished(result)
-                if result.verdict == SyncVerificationVerdict::Synchronized
-        )
-    })
-}
-
-fn observe_verified_sync_success(state: &mut AppState, job: &arx::jobs::Job) {
-    if !is_verified_sync_success(job) {
-        return;
-    }
-    if state.milestones.take_verified_sync_success() {
-        state.session_callout = Some(SessionCallout::WorkspaceSyncVerified {
-            job_id: job.id.clone(),
-        });
-    }
-}
-
 /// Present an already-accepted JobManager event. Lifecycle state lives in JobManager.
 fn handle_job_event(ev: &arx::jobs::JobEvent, state: &mut AppState) -> bool {
     match ev {
@@ -3037,56 +2951,6 @@ async fn execute_command_target(
         CommandTarget::ShellCommand(command) => Some(Effect::SpawnShell { command }),
     };
     Ok(effect)
-}
-
-fn handle_workspace_scan_response(response: WorkspaceScanResponse, state: &mut AppState) {
-    if !state.remote_workspace.accepts_scan(&response) {
-        return;
-    }
-
-    let current_root = match response.side {
-        WorkspaceSide::Left => &state.left.location,
-        WorkspaceSide::Right => &state.right.location,
-    };
-    if current_root != &response.root {
-        state
-            .remote_workspace
-            .finish_scan(response.side, response.id);
-        return;
-    }
-
-    let side = response.side;
-    let id = response.id;
-    match response.result {
-        Ok(entries) => match side {
-            WorkspaceSide::Left => state.remote_workspace.left_entries = Some(entries),
-            WorkspaceSide::Right => state.remote_workspace.right_entries = Some(entries),
-        },
-        Err(WorkspaceScanError::Cancelled) => {
-            state.remote_workspace.finish_scan(side, id);
-            return;
-        }
-        Err(error) => {
-            state.remote_workspace.finish_scan(side, id);
-            state.message = Some(format!("Workspace scan failed: {error}"));
-            return;
-        }
-    }
-    state.remote_workspace.finish_scan(side, id);
-
-    if state
-        .remote_workspace
-        .try_build_recursive_diff(state.left.location.clone(), state.right.location.clone())
-    {
-        observe_compare_success(state);
-        state.message = Some(state.remote_workspace.summary());
-    } else {
-        let waiting = match side {
-            WorkspaceSide::Left => "right",
-            WorkspaceSide::Right => "left",
-        };
-        state.message = Some(format!("Remote Workspace: waiting for {waiting} pane…"));
-    }
 }
 
 // ponytail: keep for test visibility; selection logic lives in dispatch_ui_action.
@@ -5339,7 +5203,7 @@ mod tests {
             .remote_workspace
             .register_scan(WorkspaceSide::Right, right_id);
 
-        handle_workspace_scan_response(
+        workspace_responses::handle_workspace_scan_response(
             WorkspaceScanResponse {
                 id: left_id,
                 side: WorkspaceSide::Left,
@@ -5348,7 +5212,7 @@ mod tests {
             },
             state,
         );
-        handle_workspace_scan_response(
+        workspace_responses::handle_workspace_scan_response(
             WorkspaceScanResponse {
                 id: right_id,
                 side: WorkspaceSide::Right,
@@ -5518,6 +5382,378 @@ mod tests {
         }));
         job.verification = Some(verification_snapshot(plan_id, verification_status));
         job
+    }
+
+    fn frozen_launch(
+        state: &mut AppState,
+        generation: u64,
+        entry_name: &str,
+    ) -> (WorkspaceSyncController, SyncLaunchId, SyncPlanId) {
+        accept_workspace_compare(
+            state,
+            vec![workspace_entry(entry_name, 1, None, Some("left"))],
+            Vec::new(),
+            generation,
+        );
+        let controller = WorkspaceSyncController::new(state.registry.clone());
+        let frozen = controller
+            .freeze(
+                state.remote_workspace.plan.as_ref().unwrap(),
+                state.remote_workspace.diff.as_ref().unwrap(),
+            )
+            .unwrap();
+        let plan_id = frozen.id();
+        state.remote_workspace.set_frozen_plan(frozen);
+        let launch_id = controller.begin_launch();
+        (controller, launch_id, plan_id)
+    }
+
+    fn completed_verification_job(
+        plan_id: SyncPlanId,
+        verification: &SyncVerificationSnapshot,
+    ) -> (arx::jobs::JobManager, String) {
+        let manager = arx::jobs::JobManager::new();
+        let job = manager.create_job(
+            "sync-response",
+            JobKind::Synchronize,
+            "test sync response",
+            Some(Location::Local("/left".into())),
+            Some(Location::Local("/right".into())),
+        );
+        let result = sync_job(
+            plan_id,
+            "outcome",
+            JobStatus::Completed,
+            SyncTerminalState::Completed,
+            verification.status.clone(),
+            SyncJournalFinalization::Recorded,
+        )
+        .result
+        .unwrap();
+        assert!(manager.apply_event(&arx::jobs::JobEvent::Completed {
+            id: job.id.clone(),
+            result,
+        }));
+        assert!(manager.apply_sync_verification(
+            &job.id,
+            &verification_snapshot(plan_id, SyncVerificationStatus::Pending),
+        ));
+        assert!(manager.apply_sync_verification(
+            &job.id,
+            &verification_snapshot(
+                plan_id,
+                SyncVerificationStatus::Running {
+                    left_scan: WorkspaceScanId(1),
+                    right_scan: WorkspaceScanId(2),
+                },
+            ),
+        ));
+        assert!(manager.apply_sync_verification(&job.id, verification));
+        (manager, job.id)
+    }
+
+    #[test]
+    fn workspace_response_rejects_stale_scan_id() {
+        let mut state = AppState::default();
+        state.left.location = Location::Local("/left".into());
+        state
+            .remote_workspace
+            .register_scan(WorkspaceSide::Left, WorkspaceScanId(2));
+
+        workspace_responses::handle_workspace_scan_response(
+            WorkspaceScanResponse {
+                id: WorkspaceScanId(1),
+                side: WorkspaceSide::Left,
+                root: state.left.location.clone(),
+                result: Ok(vec![workspace_entry("stale", 1, None, None)]),
+            },
+            &mut state,
+        );
+
+        assert_eq!(state.remote_workspace.left_scan, Some(WorkspaceScanId(2)));
+        assert!(state.remote_workspace.left_entries.is_none());
+        assert!(state.message.is_none());
+    }
+
+    #[test]
+    fn workspace_response_wrong_current_root_settles_without_entries() {
+        let mut state = AppState::default();
+        state.left.location = Location::Local("/current".into());
+        state
+            .remote_workspace
+            .register_scan(WorkspaceSide::Left, WorkspaceScanId(1));
+
+        workspace_responses::handle_workspace_scan_response(
+            WorkspaceScanResponse {
+                id: WorkspaceScanId(1),
+                side: WorkspaceSide::Left,
+                root: Location::Local("/old".into()),
+                result: Ok(vec![workspace_entry("old", 1, None, None)]),
+            },
+            &mut state,
+        );
+
+        assert!(state.remote_workspace.left_scan.is_none());
+        assert!(state.remote_workspace.left_entries.is_none());
+        assert!(state.remote_workspace.diff.is_none());
+    }
+
+    #[test]
+    fn workspace_response_two_current_sides_build_diff() {
+        let mut state = AppState::default();
+        accept_workspace_compare(
+            &mut state,
+            vec![workspace_entry("left", 3, None, Some("left"))],
+            vec![workspace_entry("right", 4, None, Some("right"))],
+            1,
+        );
+
+        assert!(state.remote_workspace.left_scan.is_none());
+        assert!(state.remote_workspace.right_scan.is_none());
+        assert_eq!(
+            state
+                .remote_workspace
+                .diff
+                .as_ref()
+                .unwrap()
+                .changed_count(),
+            2
+        );
+        assert!(state.message.as_deref().unwrap().starts_with("workspace:"));
+    }
+
+    #[test]
+    fn workspace_response_cancelled_and_error_settle_scan() {
+        let root = Location::Local("/left".into());
+        let mut cancelled = AppState::default();
+        cancelled.left.location = root.clone();
+        cancelled
+            .remote_workspace
+            .register_scan(WorkspaceSide::Left, WorkspaceScanId(1));
+        workspace_responses::handle_workspace_scan_response(
+            WorkspaceScanResponse {
+                id: WorkspaceScanId(1),
+                side: WorkspaceSide::Left,
+                root: root.clone(),
+                result: Err(WorkspaceScanError::Cancelled),
+            },
+            &mut cancelled,
+        );
+        assert!(cancelled.remote_workspace.left_scan.is_none());
+        assert!(cancelled.message.is_none());
+
+        let mut failed = AppState::default();
+        failed.left.location = root.clone();
+        failed
+            .remote_workspace
+            .register_scan(WorkspaceSide::Left, WorkspaceScanId(2));
+        workspace_responses::handle_workspace_scan_response(
+            WorkspaceScanResponse {
+                id: WorkspaceScanId(2),
+                side: WorkspaceSide::Left,
+                root,
+                result: Err(WorkspaceScanError::EntryLimit { limit: 7 }),
+            },
+            &mut failed,
+        );
+        assert!(failed.remote_workspace.left_scan.is_none());
+        assert_eq!(
+            failed.message.as_deref(),
+            Some("Workspace scan failed: workspace scan exceeded the 7 entry safety limit")
+        );
+    }
+
+    #[test]
+    fn workspace_response_rejects_stale_launch_id() {
+        let mut state = AppState::default();
+        let (controller, stale_id, plan_id) = frozen_launch(&mut state, 1, "stale");
+        let _current_id = controller.begin_launch();
+        let manager = arx::jobs::JobManager::new();
+        let before = state.remote_workspace.ux.clone();
+
+        workspace_responses::apply_sync_launch_response(
+            SyncLaunchResponse {
+                launch_id: stale_id,
+                plan_id,
+                result: Err("must be ignored".into()),
+            },
+            &mut state,
+            &controller,
+            &manager,
+        );
+
+        assert_eq!(state.remote_workspace.ux, before);
+        assert!(state.jobs.is_empty());
+    }
+
+    #[test]
+    fn workspace_response_rejects_mismatched_frozen_plan() {
+        let mut state = AppState::default();
+        let (controller, launch_id, _) = frozen_launch(&mut state, 1, "current");
+        let mut other = AppState::default();
+        let (_, _, other_plan_id) = frozen_launch(&mut other, 2, "other");
+        let manager = arx::jobs::JobManager::new();
+        let before = state.remote_workspace.ux.clone();
+
+        workspace_responses::apply_sync_launch_response(
+            SyncLaunchResponse {
+                launch_id,
+                plan_id: other_plan_id,
+                result: Err("must be ignored".into()),
+            },
+            &mut state,
+            &controller,
+            &manager,
+        );
+
+        assert_eq!(state.remote_workspace.ux, before);
+        assert!(state.jobs.is_empty());
+    }
+
+    #[test]
+    fn workspace_response_accepts_launch_job_and_error() {
+        let mut launched = AppState::default();
+        let (controller, launch_id, plan_id) = frozen_launch(&mut launched, 1, "job");
+        let manager = arx::jobs::JobManager::new();
+        let job = manager.create_job("sync", JobKind::Synchronize, "sync", None, None);
+        workspace_responses::apply_sync_launch_response(
+            SyncLaunchResponse {
+                launch_id,
+                plan_id,
+                result: Ok(job.id.clone()),
+            },
+            &mut launched,
+            &controller,
+            &manager,
+        );
+        assert_eq!(launched.jobs.len(), 1);
+        assert_eq!(launched.jobs[0].id, job.id);
+
+        let mut blocked = AppState::default();
+        let (controller, launch_id, plan_id) = frozen_launch(&mut blocked, 2, "error");
+        workspace_responses::apply_sync_launch_response(
+            SyncLaunchResponse {
+                launch_id,
+                plan_id,
+                result: Err("launch failed".into()),
+            },
+            &mut blocked,
+            &controller,
+            &manager,
+        );
+        assert_eq!(
+            blocked.remote_workspace.ux,
+            WorkspaceSyncUxState::Blocked {
+                message: "launch failed".into()
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_response_applies_accepted_verification() {
+        let plan_id = test_plan_id();
+        let finished = verification_snapshot(
+            plan_id,
+            SyncVerificationStatus::Finished(Box::new(synchronized_result(plan_id))),
+        );
+        let (manager, job_id) = completed_verification_job(plan_id, &finished);
+        let mut state = AppState::default();
+        state.left.location = Location::Local("/left".into());
+        state.right.location = Location::Local("/right".into());
+        state.remote_workspace.enabled = true;
+        state.remote_workspace.verification = Some(verification_snapshot(
+            plan_id,
+            SyncVerificationStatus::Running {
+                left_scan: WorkspaceScanId(1),
+                right_scan: WorkspaceScanId(2),
+            },
+        ));
+
+        workspace_responses::apply_verification_event(
+            SyncVerificationEvent {
+                job_id: job_id.clone(),
+                verification: finished.clone(),
+            },
+            &mut state,
+            &manager,
+        );
+
+        assert_eq!(state.remote_workspace.verification, Some(finished.clone()));
+        assert_eq!(
+            state.remote_workspace.ux,
+            WorkspaceSyncUxState::Finished {
+                job_id: job_id.clone()
+            }
+        );
+        assert_eq!(state.jobs.len(), 1);
+        assert_eq!(state.jobs[0].id, job_id);
+        assert_eq!(state.jobs[0].verification, Some(finished.clone()));
+        assert!(matches!(
+            state.session_callout,
+            Some(SessionCallout::WorkspaceSyncVerified { job_id: ref id }) if id == &job_id
+        ));
+    }
+
+    #[test]
+    fn workspace_response_rejected_verification_settles_and_refreshes_jobs() {
+        let plan_id = test_plan_id();
+        let finished = verification_snapshot(
+            plan_id,
+            SyncVerificationStatus::Finished(Box::new(synchronized_result(plan_id))),
+        );
+        let (manager, job_id) = completed_verification_job(plan_id, &finished);
+        let mut state = AppState::default();
+        accept_workspace_compare(
+            &mut state,
+            vec![workspace_entry("current", 1, None, Some("current"))],
+            Vec::new(),
+            1,
+        );
+        let current_diff = state.remote_workspace.diff.clone();
+        state.remote_workspace.verification = Some(verification_snapshot(
+            plan_id,
+            SyncVerificationStatus::Running {
+                left_scan: WorkspaceScanId(1),
+                right_scan: WorkspaceScanId(2),
+            },
+        ));
+        state.remote_workspace.ux = WorkspaceSyncUxState::Verifying {
+            job_id: job_id.clone(),
+        };
+        state.left.location = Location::Local("/moved".into());
+
+        workspace_responses::apply_verification_event(
+            SyncVerificationEvent {
+                job_id: job_id.clone(),
+                verification: finished,
+            },
+            &mut state,
+            &manager,
+        );
+
+        assert_eq!(state.remote_workspace.diff, current_diff);
+        assert!(matches!(
+            state
+                .remote_workspace
+                .verification
+                .as_ref()
+                .map(|item| &item.status),
+            Some(SyncVerificationStatus::Superseded)
+        ));
+        assert_eq!(
+            state.remote_workspace.ux,
+            WorkspaceSyncUxState::Finished {
+                job_id: job_id.clone()
+            }
+        );
+        assert_eq!(state.jobs.len(), 1);
+        assert_eq!(state.jobs[0].id, job_id);
+        assert!(
+            state.jobs[0]
+                .verification
+                .as_ref()
+                .is_some_and(|item| { matches!(item.status, SyncVerificationStatus::Finished(_)) })
+        );
     }
 
     #[test]
@@ -5984,7 +6220,7 @@ mod tests {
 
         for job in cases {
             let mut state = AppState::default();
-            observe_verified_sync_success(&mut state, &job);
+            workspace_responses::observe_verified_sync_success(&mut state, &job);
             assert!(
                 state.session_callout.is_none(),
                 "unexpected milestone for {}",
@@ -6016,7 +6252,7 @@ mod tests {
         let mut state = AppState::default();
         let previous_ux = state.remote_workspace.ux.clone();
 
-        observe_verified_sync_success(&mut state, &first);
+        workspace_responses::observe_verified_sync_success(&mut state, &first);
         assert_eq!(state.remote_workspace.ux, previous_ux);
         assert_eq!(state.active_overlay(), None);
         assert!(matches!(
@@ -6025,7 +6261,7 @@ mod tests {
         ));
 
         state.dismiss_session_callout();
-        observe_verified_sync_success(&mut state, &second);
+        workspace_responses::observe_verified_sync_success(&mut state, &second);
         assert!(state.session_callout.is_none());
     }
 
