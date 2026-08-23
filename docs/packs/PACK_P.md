@@ -42,7 +42,7 @@ P1 remains open because additional presentation-only seams may still move as lat
 
 Tracked by #187 and merged through PR #188.
 
-P2a added focused TestBackend characterization and extracted only these leaf render helpers into `src/tui/overlays.rs`:
+P2a added focused TestBackend characterization and extracted these leaf render helpers into `src/tui/overlays.rs`:
 
 - `render_session_callout`
 - `render_help`
@@ -50,41 +50,27 @@ P2a added focused TestBackend characterization and extracted only these leaf ren
 - `render_viewer`
 - `render_bookmarks`
 
-Exact PR head `54c1ea80a0b2c921f0399991e2e881aa600e7cd1` passed CI #647 / run `32594193558`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance.
+Exact PR head `54c1ea80a0b2c921f0399991e2e881aa600e7cd1` passed CI #647 / run `32594193558`; squash merge `2f427bd1f3d138efd5f580ac950abe9d3e921845`.
 
-Squash merge on `main`: `2f427bd1f3d138efd5f580ac950abe9d3e921845`.
+## Completed: P2b utility overlays + sizing corrections
 
-The parent `render()` composition root, pane rendering/state, command-bar hitboxes, Which-Key, sync-preview rendering, Hosts/SSH orchestration, event routing, Action dispatch, Effect/Job handling, and provider behavior remained in `src/tui.rs`.
+Tracked by #189/#191/#193 and merged through PRs #190/#192/#194.
 
-## Completed: P2b utility overlays
+P2b extracted Infrastructure Center, Smart Tree, Command Center, and Context Menu into `src/tui/overlays.rs`. The extraction exposed a pre-existing line-count-vs-percentage sizing defect, corrected separately without hiding semantic changes inside the refactor.
 
-Tracked by #189 and merged through PR #190.
+Key merges:
 
-P2b added focused TestBackend characterization and extracted these four state-driven utility overlays into the existing `src/tui/overlays.rs` module:
-
-- Infrastructure Center
-- Smart Tree
-- Command Center
-- Context Menu
-
-Exact PR head `8ce28a3959d8b2f1e896ee5b9a8fac1fd8789ef7` passed CI #650 / run `32597743305`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance.
-
-Squash merge on `main`: `c41e626fa9a2b031cd379b5885927f1b4920a360`.
-
-The extraction exposed a pre-existing line-count-vs-percentage popup sizing defect. That semantic fix was deliberately split from P2b:
-
-- #191 / PR #192 corrected the four extracted utility overlays and made `centered_rect_lines` a generic exact/clamped line-height helper while preserving the delete-confirmation minimum at its call site. Exact head `88b53b23ac30b2d21ffb4c69a0ef072922fb3535`; CI #653 green; merge `26d309dac02e784460542f349dc2e1f4563538cc`.
-- #193 / PR #194 applied the same already-reviewed line-height semantics to the still-inline Directory History and Tab Switcher call sites only. Exact head `d47f67d7c2805623e9454efb1fb35eed81077dca`; CI #655 green; merge `a9049a2c76153e00b0fa0f15c223f56657c9bad7`.
-
-Those fixes changed popup geometry only; Action/Effect/Job/provider/VFS/keybinding ownership remained unchanged.
+- P2b: `c41e626fa9a2b031cd379b5885927f1b4920a360`
+- utility sizing: `26d309dac02e784460542f349dc2e1f4563538cc`
+- History/Tab sizing: `a9049a2c76153e00b0fa0f15c223f56657c9bad7`
 
 ## Completed: P2c history, tabs, and inline input renderers
 
 Tracked by #195 and merged through PR #196.
 
-P2c extracted Directory History, Tab Switcher, Rename input, and File Search rendering into `src/tui/overlays.rs` while preserving parent predicates/order and the corrected line-based popup sizing.
+P2c extracted Directory History, Tab Switcher, Rename input, and File Search rendering into `src/tui/overlays.rs` while preserving parent predicates/order and corrected line-based popup sizing.
 
-Four focused TestBackend characterization tests run on `120x24`. Exact PR head `6a986f00e2e869ce18ada8f3abe9b219284fc148` passed CI #658 / run `32607071395`; squash merge `cf584b0a774f82f9fca73a27058bdacfc1cd38ae`.
+Exact PR head `6a986f00e2e869ce18ada8f3abe9b219284fc148` passed CI #658 / run `32607071395`; squash merge `cf584b0a774f82f9fca73a27058bdacfc1cd38ae`.
 
 ## P2 boundary decision
 
@@ -98,25 +84,44 @@ Tracked by #197 and merged through PR #198.
 
 P3a created `src/tui/ssh_hosts.rs` and moved the cohesive SSH Host Manager rendering, form handling, managed-host persistence helpers, bounded connection test, Ed25519 key generation, config editor launcher, and dedicated keyboard branch behind `ssh_hosts::render` / `ssh_hosts::handle_key`.
 
-The fail-closed key-generation confirmation gate remains before list-mode mutation keys. Parent event/render composition roots remain authoritative. Exact PR head `e98cf076f658fda5086aa0ffa67ddcbeefb4cd2d` passed CI #661: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO retry physical acceptance.
+The fail-closed key-generation confirmation gate remains before list-mode mutation keys. Exact PR head `e98cf076f658fda5086aa0ffa67ddcbeefb4cd2d` passed CI #661; squash merge `f9ec98f64c4bf02de93a4645e8afddd1713196ac`.
 
-Squash merge on `main`: `f9ec98f64c4bf02de93a4645e8afddd1713196ac`.
+## Completed: P3 simple feature-controller macro-batch
 
-## Active macro-transaction: P3 simple feature controllers
+Tracked by #199 and merged through PR #200.
 
-Tracked by #199.
+One macro-transaction extracted four simple feature boundaries with shared runtime authority preserved:
 
-To reduce mechanical ping-pong while preserving reviewability, this transaction uses one branch/PR with multiple independently green commits:
+- `src/tui/bookmarks.rs`
+- `src/tui/hosts.rs`
+- `src/tui/jobs.rs`
+- `src/tui/user_menu.rs`
 
-1. Bookmarks + generic Hosts controllers;
-2. Jobs controller;
-3. User Menu controller.
+Independent review caught and corrected two implementation regressions before merge: a temporary Jobs routing shadow that made the extracted controller unreachable, and an accidental internal host-id addition to the generic Hosts presentation. The final Hosts regression fixture uses distinct host id and hostname values.
 
-The intended feature APIs are narrow `render(...)` and `handle_key(...) -> bool` seams. Existing `PaneLoader`, `TransferQueueRuntime`, and `EffectDispatcher` instances are passed through; no duplicate runtime authority is introduced. Parent `event_loop` and parent `render()` remain composition roots and retain relative feature order.
+The same review exposed a pre-existing product bug: the old Jobs `Delete` route was unreachable behind the overlay `continue`. That semantic defect was recorded explicitly as #201 and resolved by moving reachable Delete handling into the Jobs controller while retaining `cancel_job_product_route` and the existing `SyncUiRuntime`/TransferQueueRuntime/JobManager authority.
 
-Mechanical import/rustfmt/clippy/test-fixture corrections may be repaired locally without stopping. The transaction must stop on a semantic contradiction, unexpected production dependency, changed branch head, or required scope expansion.
+Final PR head `f73d19fff5d90c3458afb3347074f086049b66e2` passed CI #666 / run `32634023679`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO transfer retry physical acceptance.
 
-Explicitly out of this macro-transaction: SSH Host Manager semantics, Hotlist I/O, Which-Key/KeyRouter, command-bar hitboxes, Workspace Sync/remote delete, Remote Edit, Quick Actions, Transfer Center implementation, Storage Inspector, Filesystems, provider/VFS behavior, keybindings, and all new registry/plugin/scheduler abstractions.
+Squash merge on `main`: `e78f0f347764f7ec389908ced44e55d15d4e6359`.
+
+## Completed: P3 orchestration-controller macro-batch
+
+Tracked by canonical #202 through PR #205. Duplicate tracker creations #203/#204 were closed immediately without code changes.
+
+The transaction extracted three large feature-orchestration seams while preserving the P3/P5 boundary:
+
+1. Quick Actions orchestration into `src/tui/quick_actions.rs` — implementation commit `bfde833b0a21204baf6fd53e68c7690a7f2f58a2`;
+2. Remote Edit lifecycle/initiation/deferred editor into `src/tui/remote_edit.rs` — implementation commit `cbbd772e4eb65438e06cf90eb52e805d787c3c88`;
+3. Workspace Sync action orchestration and feature rendering into `src/tui/workspace.rs` — implementation commit `897a4716511a3e8c4273121d654191ace886c33c`.
+
+Quick Actions keeps generic command input, mkdir, and shell execution in the parent; only an already-frozen `QuickActionPrompt` is completed through the feature helper. Remote Edit preserves the one shared Job lifecycle, phase ordering, stale-origin fail-closed behavior, deferred editor placement, and existing `EffectLane::RemoteEdit`. Workspace preserves immutable-plan, confirmation, launch supersession, queue-boundary, and verification presentation truth while reusing the existing `WorkspaceSyncController` and JobManager.
+
+The P3/P5 ownership boundary remains explicit: `handle_effect_response`, generic `EffectEvent` application, `workspace_scan_rx`, `sync_launch_rx`, `verification_rx`, and `job_rx` remain parent-owned in `src/tui.rs`. No second EffectDispatcher, JobManager, TransferQueueRuntime, WorkspaceSyncController, scheduler, provider registry, or response loop was introduced.
+
+The implementation head `897a4716511a3e8c4273121d654191ace886c33c` passed the full locked local suite reported as 1204 passed / 12 ignored and exact-head CI #669 / run `32636005836`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO transfer retry physical acceptance.
+
+P3 remains open pending reassessment of the smaller feature-controller surfaces deliberately left out of this transaction, including remote delete and any remaining storage/filesystem/transfer ownership still embedded in the parent composition root.
 
 ## Acceptance
 
@@ -125,13 +130,13 @@ Every extraction must pass locally and on exact PR head:
 ```bash
 cargo fmt --check
 cargo check --locked --all-features
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
 cargo +1.88 check --locked --all-features
 git diff --check
 ```
 
-CI must retain quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO transfer-queue retry physical acceptance. Release validation is required only when a slice changes release/packaging-relevant behavior; behavior-preserving internal decomposition slices do not require a release workflow run.
+CI must retain quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO transfer-queue retry physical acceptance. Release validation is required only when a slice changes release/packaging-relevant behavior.
 
 ## Scope guards
 
@@ -145,4 +150,4 @@ PACK P must not introduce:
 - PACK Q ProviderRegistry convergence changes;
 - PACK R registration abstractions.
 
-If an extraction requires a semantic change to compile, stop and split/review that semantic change separately instead of hiding it inside the refactor.
+If an extraction requires a semantic change to compile, stop and record/review that semantic change separately instead of hiding it inside the refactor.

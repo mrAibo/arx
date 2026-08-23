@@ -2,8 +2,8 @@ use crate::tui_terminal::TuiTerminalSession;
 use arx::app::InputContext;
 use arx::app::{
     Action, ActionAvailability, ActionContext, ActionId, AppState, CommandItem, CommandKind,
-    CommandTarget, OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, QuickActionPrompt,
-    SessionCallout, SortMode, WorkspaceSyncUxState, action_availability, action_meta,
+    CommandTarget, OverlayKind, Pane, PaneLoadUiError, PaneState, PanelMode, SessionCallout,
+    SortMode, WorkspaceSyncUxState, action_availability, action_meta,
     build_command_items_with_file_context, listed_entry_navigation_target,
     navigation_parent_target,
 };
@@ -15,9 +15,8 @@ use arx::input::{ContextHint, KeyResolution, KeyRouter, command_bar_rows};
 use arx::services::{
     DesktopService, FileInfoService, GitService, MutationError, MutationService,
     PaneListingContinuation, PaneLoadPurpose, PaneLoadResponse, PaneLoader, PaneNextPageResponse,
-    QuickActionFailureKind, QuickActionKind, QuickActionOutcome, QuickActionRequest, SyncLaunchId,
-    WorkspaceScanError, WorkspaceScanOptions, WorkspaceScanResponse, WorkspaceScanner,
-    WorkspaceSyncController,
+    QuickActionFailureKind, QuickActionOutcome, SyncLaunchId, WorkspaceScanError,
+    WorkspaceScanOptions, WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
 };
 use arx::vfs::{
     Entry, EntryIdentity, EntryKind, ListedEntry, Location, ProviderId, ProviderRegistry,
@@ -49,8 +48,11 @@ mod bookmarks;
 mod hosts;
 mod jobs;
 mod overlays;
+mod quick_actions;
+mod remote_edit;
 mod ssh_hosts;
 mod user_menu;
+mod workspace;
 use overlays::{
     render_command_center, render_context_menu, render_directory_history, render_file_search,
     render_help, render_infrastructure_center, render_rename_input, render_session_callout,
@@ -789,46 +791,14 @@ async fn event_loop(
                                     if command.is_empty() {
                                         state.message = Some(": command cancelled".into());
                                     } else if let Some(prompt) = pending_quick_action {
-                                        if state.pending_effect(EffectLane::QuickAction).is_some() {
-                                            state.message = Some(
-                                                "Another Quick Action is still in progress".into(),
-                                            );
+                                        if quick_actions::submit_prompt(
+                                            &mut state,
+                                            prompt,
+                                            command,
+                                            &effect_dispatcher,
+                                        ) {
                                             continue;
                                         }
-
-                                        let (request, location, status) = match prompt {
-                                            QuickActionPrompt::Touch { dir } => {
-                                                let location = Location::Local(dir.clone());
-                                                (
-                                                    QuickActionRequest::Touch {
-                                                        dir,
-                                                        name: command,
-                                                    },
-                                                    location,
-                                                    "Touching file…",
-                                                )
-                                            }
-                                            QuickActionPrompt::CompressTarGz { dir, names } => {
-                                                let location = Location::Local(dir.clone());
-                                                (
-                                                    QuickActionRequest::CompressTarGz {
-                                                        dir,
-                                                        names,
-                                                        output_name: command,
-                                                    },
-                                                    location,
-                                                    "Compressing to tar.gz…",
-                                                )
-                                            }
-                                        };
-
-                                        let id = effect_dispatcher.dispatch(
-                                            EffectLane::QuickAction,
-                                            EffectScope::Location(location),
-                                            Effect::QuickAction { request },
-                                        );
-                                        state.register_effect(EffectLane::QuickAction, id);
-                                        state.message = Some(status.into());
                                     } else if let Some(loc) = pending_mkdir {
                                         let name = command;
                                         // Validate child name — reject empty, ".", "..", "/", NUL.
@@ -1827,40 +1797,15 @@ async fn event_loop(
 
         // ── Deferred editor launch: only after terminal input is drained ──
         if state.pending_editor && !state.should_quit {
-            state.pending_editor = false;
-            // Terminalize (Cancelled/Failed) if the originating pane moved away
-            // or the session is no longer ready; otherwise proceed to launch.
-            if finalize_remote_edit_if_stale(&mut state) {
+            if remote_edit::drive_deferred_editor(
+                &mut state,
+                editor.as_deref(),
+                terminal_session,
+                &effect_dispatcher,
+            )
+            .await?
+            {
                 continue;
-            }
-            if let Some(mut session) = state.pending_remote_edit_session.take() {
-                let editor_cmd = if let Some(cfg_editor) = &editor {
-                    cfg_editor.clone()
-                } else {
-                    session.editor.clone()
-                };
-                let working_path = session.temp_dir.path().join("working");
-                session.state = RemoteEditState::Editing;
-                // #51: observe phase transition (TUI still owns editor lifecycle).
-                publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Editing);
-                let editor_result = terminal_session
-                    .suspend_while(|| DesktopService::open_editor(&editor_cmd, &working_path))
-                    .await?;
-                if let Some(effect) = finish_remote_editor(session, editor_result, &mut state) {
-                    let location = match &effect {
-                        Effect::WriteBackRemoteFile {
-                            session,
-                            progress: _,
-                        } => session.location.clone(),
-                        _ => unreachable!("remote editor can only schedule write-back"),
-                    };
-                    let id = effect_dispatcher.dispatch(
-                        EffectLane::RemoteEdit,
-                        EffectScope::Location(location),
-                        effect,
-                    );
-                    state.register_effect(EffectLane::RemoteEdit, id);
-                }
             }
         }
     }
@@ -3170,544 +3115,7 @@ fn render(
     );
 
     if state.active_overlay() == Some(OverlayKind::SyncPreview) {
-        render_sync_preview(frame, area, state);
-    }
-}
-
-fn sync_heading(label: &'static str, color: Color) -> Line<'static> {
-    Line::from(Span::styled(label, Style::default().fg(color)))
-}
-
-fn render_sync_preview(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
-    let popup = centered_rect(86, 82, area);
-    frame.render_widget(Clear, popup);
-
-    let mut lines = Vec::new();
-    let mut title = " Workspace Sync ".to_string();
-    let mut border = Style::default().fg(Color::Cyan);
-
-    match &state.remote_workspace.ux {
-        WorkspaceSyncUxState::Idle | WorkspaceSyncUxState::Scanning => {
-            title = " Workspace Sync · SCANNING ".into();
-            lines.push(sync_heading("SCAN", Color::Cyan));
-            lines.push(Line::from("Scanning both workspace roots…"));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "No files will be changed while ARX builds the preview.",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-        WorkspaceSyncUxState::Preview { .. } => {
-            render_sync_plan_lines(state, &mut lines);
-            if let Some(plan) = state.remote_workspace.plan.as_ref() {
-                title = if plan.can_execute() {
-                    " Workspace Sync · PREVIEW READY ".into()
-                } else {
-                    border = Style::default().fg(Color::Yellow);
-                    " Workspace Sync · PREVIEW BLOCKED ".into()
-                };
-            }
-        }
-        WorkspaceSyncUxState::ConfirmationRequired {
-            digest,
-            destructive_operations,
-            ..
-        } => {
-            title = " Workspace Sync · CONFIRM MIRROR ".into();
-            border = Style::default().fg(Color::Yellow);
-            lines.push(sync_heading("DESTRUCTIVE CONFIRMATION", Color::Red));
-            lines.push(Line::from(format!(
-                "This frozen plan contains {destructive_operations} destructive operation(s)."
-            )));
-            lines.push(Line::from(
-                "Destination-only entries in this exact plan may be removed.",
-            ));
-            lines.push(Line::from(""));
-            render_sync_plan_lines(state, &mut lines);
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                format!("Frozen preview digest  {}…", &digest.as_hex()[..8]),
-                Style::default().fg(Color::DarkGray),
-            )));
-            lines.push(Line::from(Span::styled(
-                "Confirmation applies only to this exact frozen plan.",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-        WorkspaceSyncUxState::Launching { .. } => {
-            title = " Workspace Sync · PREPARING ".into();
-            lines.push(sync_heading("PREPARING EXECUTION", Color::Cyan));
-            lines.push(Line::from("Freezing transport choice and execution steps…"));
-            lines.push(Line::from("No Job has been created yet."));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "A newer compare, direction, or mode action supersedes preparation before a Job is queued.",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-        WorkspaceSyncUxState::Blocked { message } => {
-            title = " Workspace Sync · CANNOT EXECUTE ".into();
-            border = Style::default().fg(Color::Yellow);
-            lines.push(sync_heading("BLOCKED", Color::Yellow));
-            lines.extend(message.lines().map(|line| Line::from(line.to_string())));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "Adjust the current preview before trying again.",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-        WorkspaceSyncUxState::VerificationDiff { job_id } => {
-            title = " Workspace Sync · VERIFICATION DIFF ".into();
-            if let Some(job) = state.jobs.iter().find(|job| job.id == *job_id) {
-                render_sync_verification_diff_lines(job, &mut lines);
-            } else {
-                lines.push(Line::from("The verification Job is no longer available."));
-            }
-        }
-        WorkspaceSyncUxState::Queued { job_id }
-        | WorkspaceSyncUxState::Running { job_id }
-        | WorkspaceSyncUxState::Cancelling { job_id }
-        | WorkspaceSyncUxState::Verifying { job_id }
-        | WorkspaceSyncUxState::Finished { job_id } => {
-            if let Some(job) = state.jobs.iter().find(|job| job.id == *job_id) {
-                title = sync_job_title(job, &state.remote_workspace.ux);
-                let show_first_success = matches!(
-                    state.session_callout.as_ref(),
-                    Some(SessionCallout::WorkspaceSyncVerified { job_id }) if job_id == &job.id
-                );
-                render_sync_job_lines(
-                    job,
-                    &state.remote_workspace.ux,
-                    show_first_success,
-                    &mut lines,
-                );
-            } else {
-                lines.push(Line::from("Waiting for JobManager snapshot…"));
-            }
-        }
-    }
-
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .border_style(border),
-            )
-            .wrap(Wrap { trim: false }),
-        popup,
-    );
-}
-fn render_sync_plan_lines(state: &AppState, lines: &mut Vec<Line<'static>>) {
-    let Some(plan) = state.remote_workspace.plan.as_ref() else {
-        lines.push(Line::from("Preview is not ready yet."));
-        return;
-    };
-    let (source, destination) =
-        sync_display_roots(&plan.left_root, &plan.right_root, plan.policy.direction);
-    let copies = plan
-        .operations
-        .iter()
-        .filter(|operation| matches!(operation, WorkspaceSyncOperation::Copy { .. }))
-        .count();
-    let deletes = plan
-        .operations
-        .iter()
-        .filter(|operation| matches!(operation, WorkspaceSyncOperation::Delete { .. }))
-        .count();
-    let create_dirs = state
-        .remote_workspace
-        .diff
-        .as_ref()
-        .map(|diff| {
-            plan.operations
-                .iter()
-                .filter(|operation| match operation {
-                    WorkspaceSyncOperation::Copy {
-                        relative_path,
-                        from,
-                        ..
-                    } => diff
-                        .entries
-                        .iter()
-                        .find(|entry| entry.relative_path == *relative_path)
-                        .and_then(|entry| match from {
-                            WorkspaceSide::Left => entry.left.as_ref(),
-                            WorkspaceSide::Right => entry.right.as_ref(),
-                        })
-                        .is_some_and(|fingerprint| fingerprint.kind == EntryKind::Directory),
-                    _ => false,
-                })
-                .count()
-        })
-        .unwrap_or(0);
-
-    lines.push(sync_heading("ROUTE", Color::Cyan));
-    lines.push(Line::from(Span::styled(
-        format!("{source}  →  {destination}"),
-        Style::default().fg(Color::Cyan),
-    )));
-    lines.push(Line::from(Span::styled(
-        format!(
-            "{} · {}",
-            state.remote_workspace.direction_label(),
-            state.remote_workspace.mode_label()
-        ),
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(""));
-
-    lines.push(sync_heading("PLAN", Color::Cyan));
-    lines.push(Line::from(format!("Copy / update     {copies}")));
-    lines.push(Line::from(format!("Create dirs       {create_dirs}")));
-    lines.push(Line::from(format!("Delete            {deletes}")));
-    lines.push(Line::from(format!("Conflicts         {}", plan.conflicts)));
-    lines.push(Line::from(format!(
-        "Transfer          {}",
-        format_size(plan.bytes_to_transfer)
-    )));
-    lines.push(Line::from(""));
-
-    lines.push(sync_heading(
-        "SAFETY",
-        if plan.destructive_operations == 0 {
-            Color::Green
-        } else {
-            Color::Yellow
-        },
-    ));
-    if plan.destructive_operations == 0 && plan.policy.mode == SyncMode::Update {
-        lines.push(Line::from(Span::styled(
-            "Safe update — destination-only entries are preserved.",
-            Style::default().fg(Color::Green),
-        )));
-    } else if plan.destructive_operations == 0 {
-        lines.push(Line::from(Span::styled(
-            "This plan is non-destructive.",
-            Style::default().fg(Color::Green),
-        )));
-    } else {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "This plan contains {} destructive operation(s).",
-                plan.destructive_operations
-            ),
-            Style::default().fg(Color::Yellow),
-        )));
-    }
-}
-fn sync_display_roots<'a>(
-    left: &'a Location,
-    right: &'a Location,
-    direction: SyncDirection,
-) -> (&'a Location, &'a Location) {
-    match direction {
-        SyncDirection::LeftToRight => (left, right),
-        SyncDirection::RightToLeft => (right, left),
-    }
-}
-
-fn sync_job_title(job: &arx::jobs::Job, ux: &WorkspaceSyncUxState) -> String {
-    let destination = job
-        .display_destination()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "destination".into());
-    match ux {
-        WorkspaceSyncUxState::Queued { .. } => {
-            format!(" Workspace Sync · QUEUED → {destination} ")
-        }
-        WorkspaceSyncUxState::Running { .. } => {
-            format!(" Workspace Sync · RUNNING → {destination} ")
-        }
-        WorkspaceSyncUxState::Cancelling { .. } => " Workspace Sync · CANCELLING ".into(),
-        WorkspaceSyncUxState::Verifying { .. } => " Workspace Sync · VERIFYING ".into(),
-        WorkspaceSyncUxState::Finished { .. } => " Workspace Sync · RESULT ".into(),
-        _ => " Workspace Sync ".into(),
-    }
-}
-fn render_sync_job_lines(
-    job: &arx::jobs::Job,
-    ux: &WorkspaceSyncUxState,
-    show_first_success: bool,
-    lines: &mut Vec<Line<'static>>,
-) {
-    if let (Some(source), Some(destination)) = (job.display_source(), job.display_destination()) {
-        lines.push(sync_heading("ROUTE", Color::Cyan));
-        lines.push(Line::from(Span::styled(
-            format!("{source}  →  {destination}"),
-            Style::default().fg(Color::Cyan),
-        )));
-        lines.push(Line::from(""));
-    }
-
-    if let arx::jobs::JobProgress::WorkspaceSync(progress) = &job.progress {
-        let percent = progress.percent().unwrap_or(0);
-        let filled = usize::from(percent) / 5;
-        lines.push(sync_heading("PROGRESS", Color::Cyan));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "[{}{}] {percent}%",
-                "█".repeat(filled),
-                "░".repeat(20usize.saturating_sub(filled))
-            ),
-            Style::default().fg(Color::Cyan),
-        )));
-        lines.push(Line::from(format!(
-            "{} / {} physical steps",
-            progress.completed_steps, progress.total_steps
-        )));
-        lines.push(Line::from(format!(
-            "{} / {} transferred",
-            format_size(progress.transferred_bytes),
-            format_size(progress.total_bytes)
-        )));
-        if let Some(path) = &progress.current_path {
-            lines.push(Line::from(format!("Current  → {path}")));
-        }
-        lines.push(Line::from(""));
-    }
-
-    match &job.result {
-        Some(arx::jobs::JobResult::WorkspaceSync(outcome)) => {
-            lines.push(sync_heading("EXECUTION", Color::Cyan));
-            match &outcome.terminal {
-                arx::workspace_sync_executor::SyncTerminalState::Completed => {
-                    lines.push(Line::from(Span::styled(
-                        "✓ Execution completed",
-                        Style::default().fg(Color::Green),
-                    )));
-                }
-                arx::workspace_sync_executor::SyncTerminalState::Cancelled { .. } => {
-                    lines.push(Line::from(Span::styled(
-                        "Sync cancelled",
-                        Style::default().fg(Color::Yellow),
-                    )));
-                    lines.push(Line::from(format!(
-                        "✓ {} physical step(s) completed",
-                        outcome.completed.len()
-                    )));
-                    lines.push(Line::from(format!(
-                        "○ {} physical step(s) not completed",
-                        outcome.remaining.len()
-                    )));
-                    if outcome.workspace_may_have_changed {
-                        lines.push(Line::from(Span::styled(
-                            "Workspace may have changed.",
-                            Style::default().fg(Color::Yellow),
-                        )));
-                    }
-                }
-                arx::workspace_sync_executor::SyncTerminalState::Failed { step, error } => {
-                    lines.push(Line::from(Span::styled(
-                        "✗ Sync partially completed",
-                        Style::default().fg(Color::Red),
-                    )));
-                    lines.push(Line::from(format!(
-                        "✓ {} physical step(s) completed",
-                        outcome.completed.len()
-                    )));
-                    lines.push(Line::from(format!("✗ Step {} failed: {error}", step.0)));
-                    lines.push(Line::from(format!(
-                        "○ {} physical step(s) not started",
-                        outcome.remaining.len()
-                    )));
-                    lines.push(Line::from("No global rollback was attempted."));
-                }
-            }
-            lines.push(Line::from(format!(
-                "{} transferred",
-                format_size(outcome.transferred_bytes)
-            )));
-            if let arx::workspace_sync_executor::SyncJournalFinalization::Failed { error } =
-                &outcome.journal
-            {
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "⚠ Audit record finalization failed",
-                    Style::default().fg(Color::Yellow),
-                )));
-                lines.push(Line::from(error.to_string()));
-                lines.push(Line::from("The physical result was preserved."));
-            }
-        }
-        Some(arx::jobs::JobResult::RemoteEdit(_)) => {}
-        #[cfg(target_os = "linux")]
-        Some(arx::jobs::JobResult::StorageScan(_)) => {}
-        Some(arx::jobs::JobResult::Generic { .. }) | None => {}
-    }
-
-    if matches!(ux, WorkspaceSyncUxState::Cancelling { .. }) {
-        lines.push(Line::from(""));
-        lines.push(sync_heading("CANCELLATION", Color::Yellow));
-        lines.push(Line::from(Span::styled(
-            "Cancelling… waiting for the executor's terminal outcome.",
-            Style::default().fg(Color::Yellow),
-        )));
-    }
-
-    if matches!(ux, WorkspaceSyncUxState::Verifying { .. }) {
-        lines.push(Line::from(""));
-        lines.push(sync_heading("POST-SYNC VERIFICATION", Color::Cyan));
-        lines.push(Line::from("Verifying the current workspace…"));
-        lines.push(Line::from(Span::styled(
-            "Scanning both workspace roots again after execution.",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-
-    if matches!(ux, WorkspaceSyncUxState::Finished { .. }) {
-        lines.push(Line::from(""));
-        lines.push(sync_heading("POST-SYNC VERIFICATION", Color::Cyan));
-        render_verification_lines(job, lines);
-        if show_first_success {
-            lines.push(Line::from(""));
-            lines.push(sync_heading("FIRST SUCCESS THIS SESSION", Color::Green));
-            lines.push(Line::from(Span::styled(
-                "✓ Remote Workspace workflow completed end-to-end.",
-                Style::default().fg(Color::Green),
-            )));
-            lines.push(Line::from(Span::styled(
-                "ARX executed the frozen plan and verified the result.",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-    }
-}
-fn render_sync_verification_diff_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>>) {
-    let Some(verification) = &job.verification else {
-        lines.push(Line::from("No post-sync verification result is available."));
-        return;
-    };
-    let SyncVerificationStatus::Finished(result) = &verification.status else {
-        lines.push(Line::from("Verification has not finished yet."));
-        return;
-    };
-    if !matches!(
-        result.verdict,
-        SyncVerificationVerdict::DifferencesRemain { .. }
-    ) {
-        lines.push(Line::from(
-            "Verification did not report remaining differences.",
-        ));
-        return;
-    }
-
-    lines.push(sync_heading("SNAPSHOT", Color::Cyan));
-    lines.push(Line::from(format!("LEFT   {}", result.left_root)));
-    lines.push(Line::from(format!("RIGHT  {}", result.right_root)));
-    lines.push(Line::from(Span::styled(
-        "This is the recursive post-sync verification snapshot for this Job.",
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(""));
-    lines.push(sync_heading("SUMMARY", Color::Yellow));
-    lines.push(Line::from(format!(
-        "{} proven difference(s) · {} conflict(s) · {} unverified",
-        result.changed_entries, result.conflicts, result.unverified_entries
-    )));
-    lines.push(Line::from(""));
-    lines.push(sync_heading("DIFFERENCES", Color::Yellow));
-
-    let visible = result
-        .diff
-        .entries
-        .iter()
-        .filter(|entry| entry.state != DiffState::SameFingerprint)
-        .collect::<Vec<_>>();
-    for entry in visible.iter().take(40) {
-        let (label, color) = match entry.state {
-            DiffState::OnlyLeft => ("LEFT ONLY", Color::Yellow),
-            DiffState::OnlyRight => ("RIGHT ONLY", Color::Yellow),
-            DiffState::LeftNewer => ("LEFT NEWER", Color::Cyan),
-            DiffState::RightNewer => ("RIGHT NEWER", Color::Cyan),
-            DiffState::Different => ("COMPARE", Color::Red),
-            DiffState::SameFingerprint => continue,
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{label:>11}"), Style::default().fg(color)),
-            Span::raw(format!("  {}", entry.relative_path)),
-        ]));
-    }
-    if visible.len() > 40 {
-        lines.push(Line::from(format!(
-            "… {} more verification entry/entries",
-            visible.len() - 40
-        )));
-    }
-}
-fn render_verification_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>>) {
-    let Some(verification) = &job.verification else {
-        lines.push(Line::from(Span::styled(
-            "Verification result is not available.",
-            Style::default().fg(Color::DarkGray),
-        )));
-        return;
-    };
-    match &verification.status {
-        SyncVerificationStatus::Finished(result) => match &result.verdict {
-            SyncVerificationVerdict::Synchronized => {
-                lines.push(Line::from(Span::styled(
-                    "✓ VERIFIED",
-                    Style::default().fg(Color::Green),
-                )));
-                lines.push(Line::from("Both workspace roots are synchronized."));
-            }
-            SyncVerificationVerdict::DifferencesRemain {
-                changed,
-                conflicts,
-                unverified,
-            } => {
-                lines.push(Line::from(Span::styled(
-                    "⚠ DIFFERENCES REMAIN",
-                    Style::default().fg(Color::Yellow),
-                )));
-                lines.push(Line::from(format!("{changed} entries still differ")));
-                lines.push(Line::from(format!("{conflicts} conflict(s)")));
-                if *unverified > 0 {
-                    lines.push(Line::from(format!("{unverified} entry/entries unverified")));
-                }
-                lines.push(Line::from(
-                    "Preview the next sync to resolve current differences.",
-                ));
-            }
-            SyncVerificationVerdict::Inconclusive { unverified } => {
-                lines.push(Line::from(Span::styled(
-                    "? INCONCLUSIVE",
-                    Style::default().fg(Color::Yellow),
-                )));
-                lines.push(Line::from(format!(
-                    "ARX cannot prove {unverified} entry/entries are identical."
-                )));
-                lines.push(Line::from("No mismatch was proven."));
-            }
-        },
-        SyncVerificationStatus::Failed { error, .. } => {
-            lines.push(Line::from(Span::styled(
-                "⚠ VERIFICATION FAILED",
-                Style::default().fg(Color::Yellow),
-            )));
-            lines.push(Line::from(error.clone()));
-            lines.push(Line::from("Execution truth above is unchanged."));
-        }
-        SyncVerificationStatus::Cancelled => {
-            lines.push(Line::from(Span::styled(
-                "Verification cancelled.",
-                Style::default().fg(Color::Yellow),
-            )));
-        }
-        SyncVerificationStatus::Superseded => {
-            lines.push(Line::from(Span::styled(
-                "Verification superseded by a newer workspace state.",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-        SyncVerificationStatus::Pending | SyncVerificationStatus::Running { .. } => {
-            lines.push(Line::from(Span::styled(
-                "Verifying current workspace…",
-                Style::default().fg(Color::Cyan),
-            )));
-        }
+        workspace::render(frame, area, state);
     }
 }
 
@@ -4353,82 +3761,6 @@ fn build_s3_copy_spec(
     }
 }
 
-fn display_safe_text(value: &str) -> String {
-    let mut safe = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\n' => safe.push_str("\\n"),
-            '\r' => safe.push_str("\\r"),
-            '\t' => safe.push_str("\\t"),
-            ch if ch.is_control() => {
-                safe.push_str(&format!("\\u{{{:x}}}", ch as u32));
-            }
-            ch => safe.push(ch),
-        }
-    }
-    safe
-}
-
-fn collect_quick_action_names(
-    state: &AppState,
-    focused: Option<&Entry>,
-    active_entries: &[&Entry],
-    files_only: bool,
-) -> Result<Vec<String>, String> {
-    let location = &state.active_pane().location;
-    let names = if let Some(selected) = state.selection_names(state.active, location) {
-        selected.iter().cloned().collect::<Vec<_>>()
-    } else if let Some(entry) = focused {
-        vec![entry.name.clone()]
-    } else {
-        return Err("Select a file or directory first".into());
-    };
-
-    for name in &names {
-        let Some(entry) = active_entries
-            .iter()
-            .copied()
-            .find(|entry| entry.name.as_str() == name.as_str())
-        else {
-            return Err(format!("Selection is stale: {}", display_safe_text(name)));
-        };
-
-        if files_only && entry.kind != EntryKind::File {
-            return Err(format!(
-                "SHA-256 requires regular files; {} is not a regular file",
-                display_safe_text(name)
-            ));
-        }
-    }
-
-    Ok(names)
-}
-
-fn quick_action_refresh_location(event: &EffectEvent, scope: &EffectScope) -> Option<Location> {
-    let may_have_mutated = match event {
-        EffectEvent::QuickActionFinished { result } => match result {
-            Ok(QuickActionOutcome::Touched { .. }) | Ok(QuickActionOutcome::Compressed { .. }) => {
-                true
-            }
-            Ok(QuickActionOutcome::Sha256 { .. }) => false,
-            Err(failure) => matches!(
-                failure.action,
-                QuickActionKind::Touch | QuickActionKind::CompressTarGz
-            ),
-        },
-        _ => false,
-    };
-
-    if !may_have_mutated {
-        return None;
-    }
-
-    match scope {
-        EffectScope::Location(location) => Some(location.clone()),
-        EffectScope::Global | EffectScope::Workspace { .. } => None,
-    }
-}
-
 // ponytail: keep the one action seam instead of wrapping runtime services in a one-use context.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_ui_action(
@@ -4449,18 +3781,14 @@ async fn dispatch_ui_action(
     let focused = focused_row
         .and_then(|row| row.listed())
         .map(|listed| &listed.entry);
+    if quick_actions::handle_action(state, &action, focused, active_entries, effect_dispatcher) {
+        return Ok(());
+    }
     // ponytail: keep the ListedEntry (exact identity) for preview, not &Entry
     let focused_listed = focused_row.and_then(|row| row.listed());
     // ponytail: passive pane's focused entry — needed for cross-pane S3 transfer
     let other_listed = other_focused_row.and_then(|row| row.listed());
-    if matches!(
-        action,
-        Action::ToggleWorkspaceComparison
-            | Action::PreviewWorkspaceSync
-            | Action::ReverseWorkspaceDirection
-            | Action::ToggleWorkspaceSyncMode
-    ) && !supersede_workspace_launch_for_new_action(state, sync)
-    {
+    if workspace::handle_action(state, &action, workspace_scanner, sync) {
         return Ok(());
     }
 
@@ -4490,79 +3818,6 @@ async fn dispatch_ui_action(
         }
         Action::ToggleSelect => {
             toggle_selection_and_advance(state, focused, visible_count);
-        }
-        Action::ComputeSha256 => {
-            if state.pending_effect(EffectLane::QuickAction).is_some() {
-                state.message = Some("Another Quick Action is still in progress".into());
-                return Ok(());
-            }
-
-            let Location::Local(dir) = state.active_pane().location.clone() else {
-                state.message = Some("Quick Actions are currently local-only".into());
-                return Ok(());
-            };
-
-            let names = match collect_quick_action_names(state, focused, active_entries, true) {
-                Ok(names) => names,
-                Err(message) => {
-                    state.message = Some(message);
-                    return Ok(());
-                }
-            };
-
-            let location = Location::Local(dir.clone());
-            let id = effect_dispatcher.dispatch(
-                EffectLane::QuickAction,
-                EffectScope::Location(location),
-                Effect::QuickAction {
-                    request: QuickActionRequest::Sha256 { dir, names },
-                },
-            );
-            state.register_effect(EffectLane::QuickAction, id);
-            state.message = Some("Computing SHA-256…".into());
-        }
-        Action::TouchFile => {
-            if state.pending_effect(EffectLane::QuickAction).is_some() {
-                state.message = Some("Another Quick Action is still in progress".into());
-                return Ok(());
-            }
-
-            let Location::Local(dir) = state.active_pane().location.clone() else {
-                state.message = Some("Quick Actions are currently local-only".into());
-                return Ok(());
-            };
-
-            state.pending_mkdir_location = None;
-            state.pending_quick_action_prompt = Some(QuickActionPrompt::Touch { dir });
-            state.cmd.clear();
-            state.cmd_input = true;
-            state.message = Some("Touch file: enter child name".into());
-        }
-        Action::CompressTarGz => {
-            if state.pending_effect(EffectLane::QuickAction).is_some() {
-                state.message = Some("Another Quick Action is still in progress".into());
-                return Ok(());
-            }
-
-            let Location::Local(dir) = state.active_pane().location.clone() else {
-                state.message = Some("Quick Actions are currently local-only".into());
-                return Ok(());
-            };
-
-            let names = match collect_quick_action_names(state, focused, active_entries, false) {
-                Ok(names) => names,
-                Err(message) => {
-                    state.message = Some(message);
-                    return Ok(());
-                }
-            };
-
-            state.pending_mkdir_location = None;
-            state.pending_quick_action_prompt =
-                Some(QuickActionPrompt::CompressTarGz { dir, names });
-            state.cmd = "archive.tar.gz".into();
-            state.cmd_input = true;
-            state.message = Some("Compress: enter output tar.gz name".into());
         }
         Action::ViewFile => {
             let Some(listed) = focused_listed.filter(|listed| listed.entry.kind == EntryKind::File)
@@ -4611,7 +3866,7 @@ async fn dispatch_ui_action(
                 return Ok(());
             };
 
-            match &state.active_pane().location {
+            match state.active_pane().location.clone() {
                 Location::Local(base) => {
                     // Local: direct editor on original file
                     let path = base.join(&entry.name);
@@ -4624,57 +3879,9 @@ async fn dispatch_ui_action(
                     schedule_active_pane_load(pane_loader, state);
                 }
                 Location::Sftp { .. } => {
-                    // Remote: download → edit → write-back
-                    if state.pending_effects.contains_key(&EffectLane::RemoteEdit)
-                        || state.pending_remote_edit_origin.is_some()
-                    {
-                        state.message = Some("Another remote edit is still in progress".into());
-                        return Ok(());
-                    }
                     let location = state.active_pane().location.clone();
                     let name = entry.name.clone();
-
-                    state.pending_remote_edit_session = None;
-                    state.pending_remote_edit_origin = Some((state.active, location.clone()));
-                    // #51: one RemoteEdit job observed across all phases (download→editor→writeback).
-                    let re_job = state
-                        .job_manager
-                        .as_ref()
-                        .expect("job manager bound")
-                        .create_job(
-                            "remote-edit",
-                            arx::jobs::JobKind::RemoteEdit,
-                            format!("Remote edit {name}"),
-                            Some(location.clone()),
-                            None,
-                        );
-                    let _ = state
-                        .job_manager
-                        .as_ref()
-                        .expect("job manager bound")
-                        .publish_event(
-                            state.job_events.as_ref().expect("job events bound"),
-                            arx::jobs::JobEvent::Running {
-                                id: re_job.id.clone(),
-                            },
-                        );
-                    state.pending_remote_edit_job_id = Some(re_job.id.clone());
-                    // Observable phases: queued → downloading (job id now set).
-                    publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::Queued);
-                    publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::Downloading);
-                    let id = effect_dispatcher.dispatch(
-                        EffectLane::RemoteEdit,
-                        EffectScope::Location(location.clone()),
-                        Effect::DownloadRemoteFile {
-                            location: location.clone(),
-                            name: name.clone(),
-                            editor: editor.to_string(),
-                        },
-                    );
-                    state.register_effect(EffectLane::RemoteEdit, id);
-                    state.message = Some(format!("Downloading: {name}..."));
-
-                    // ponytail: Phase 2+3 handled in select! when Downloaded arrives
+                    remote_edit::begin_sftp_edit(state, location, name, editor, effect_dispatcher);
                 }
                 _ => {
                     state.message = Some("File editing is not supported for this location".into());
@@ -4701,66 +3908,6 @@ async fn dispatch_ui_action(
             state.cmd = "chown ".into();
             state.cmd_input = true;
         }
-        Action::ToggleWorkspaceComparison
-        | Action::PreviewWorkspaceSync
-        | Action::ReverseWorkspaceDirection
-        | Action::ToggleWorkspaceSyncMode
-            if state.remote_workspace.ux.is_locked_flow() =>
-        {
-            state.open_overlay(OverlayKind::SyncPreview);
-            state.message = Some(
-                "Workspace sync is already preparing or active; the current immutable plan is locked."
-                    .into(),
-            );
-        }
-        Action::ToggleWorkspaceComparison => {
-            if state.remote_workspace.enabled {
-                state.remote_workspace.disable();
-                state.show_diff = false;
-                state.message = Some("Remote Workspace comparison off".into());
-            } else {
-                start_workspace_scan(workspace_scanner, state, false);
-            }
-        }
-        Action::PreviewWorkspaceSync => {
-            start_workspace_scan(workspace_scanner, state, true);
-            state.open_overlay(OverlayKind::SyncPreview);
-        }
-        Action::ReverseWorkspaceDirection => state.remote_workspace.reverse_direction(),
-        Action::ToggleWorkspaceSyncMode => state.remote_workspace.toggle_mode(),
-        Action::ExecuteWorkspaceSync => prepare_workspace_sync(state, sync),
-        Action::ConfirmWorkspaceSync => launch_workspace_sync(state, sync, true),
-        Action::CancelWorkspaceSync => cancel_workspace_sync(state, sync),
-        Action::ShowWorkspaceSyncDetails => {
-            if state.remote_workspace.ux.is_job_flow() {
-                state.open_overlay(OverlayKind::SyncPreview);
-            }
-        }
-        Action::ShowWorkspaceVerificationDiff => {
-            if let Some(job_id) = state.remote_workspace.ux.job_id().map(str::to_string) {
-                state.remote_workspace.show_verification_diff(job_id);
-                state.open_overlay(OverlayKind::SyncPreview);
-                // The overlay renders the recursive Job-bound verification
-                // snapshot. Do not reuse shallow pane-level diff highlighting.
-                state.show_diff = false;
-            }
-        }
-        Action::ReturnToWorkspaceSyncPreview => {
-            if state.remote_workspace.return_from_verification_diff() {
-                state.open_overlay(OverlayKind::SyncPreview);
-            } else if matches!(
-                state.remote_workspace.ux,
-                WorkspaceSyncUxState::ConfirmationRequired { .. }
-                    | WorkspaceSyncUxState::Blocked { .. }
-                    | WorkspaceSyncUxState::Finished { .. }
-            ) {
-                state.remote_workspace.mark_preview();
-            } else if state.remote_workspace.ux.is_job_flow() {
-                state.message =
-                    Some("The active sync remains in its Job view until it is finished.".into());
-            }
-        }
-        Action::CloseWorkspaceSyncOverlay => state.close_overlay(OverlayKind::SyncPreview),
         Action::Copy => {
             let names: Vec<String> = state
                 .selection_names(state.active, &state.active_pane().location)
@@ -5408,101 +4555,6 @@ async fn dispatch_ui_action(
     Ok(())
 }
 
-fn supersede_workspace_launch_for_new_action(state: &mut AppState, sync: &SyncUiRuntime) -> bool {
-    if !matches!(
-        state.remote_workspace.ux,
-        WorkspaceSyncUxState::Launching { .. }
-    ) {
-        return true;
-    }
-
-    if sync.controller.supersede_launch() {
-        state.remote_workspace.supersede_launch_presentation();
-        true
-    } else {
-        state.open_overlay(OverlayKind::SyncPreview);
-        state.message = Some(
-            "Workspace sync has already crossed the Job queue boundary; waiting for its Job view."
-                .into(),
-        );
-        false
-    }
-}
-
-fn prepare_workspace_sync(state: &mut AppState, sync: &SyncUiRuntime) {
-    let (Some(plan), Some(diff)) = (
-        state.remote_workspace.plan.as_ref(),
-        state.remote_workspace.diff.as_ref(),
-    ) else {
-        state.remote_workspace.mark_blocked(
-            "Plan cannot be executed\nThe workspace preview is not ready.\nNo files were changed.",
-        );
-        return;
-    };
-    match sync.controller.freeze(plan, diff) {
-        Ok(frozen) => {
-            let requires_confirmation = frozen.requires_confirmation();
-            state.remote_workspace.set_frozen_plan(frozen);
-            if !requires_confirmation {
-                launch_workspace_sync(state, sync, false);
-            }
-        }
-        Err(error) => state.remote_workspace.mark_blocked(format!(
-            "Plan cannot be executed\n{error}\nNo files were changed."
-        )),
-    }
-}
-
-fn launch_workspace_sync(state: &mut AppState, sync: &SyncUiRuntime, confirmed: bool) {
-    let (Some(frozen), Some(diff)) = (
-        state.remote_workspace.frozen_plan.clone(),
-        state.remote_workspace.diff.clone(),
-    ) else {
-        state.remote_workspace.mark_blocked(
-            "Plan cannot be executed\nThe frozen preview is no longer current.\nNo files were changed.",
-        );
-        return;
-    };
-    let plan_id = frozen.id();
-    let launch_id = sync.controller.begin_launch();
-    state.remote_workspace.mark_launching();
-    let controller = sync.controller.clone();
-    let jobs = sync.jobs.clone();
-    let job_events = sync.job_events.clone();
-    let verification_events = sync.verification_events.clone();
-    let launch_events = sync.launch_events.clone();
-    tokio::spawn(async move {
-        let result = controller
-            .launch_guarded(
-                launch_id,
-                frozen,
-                diff,
-                confirmed,
-                jobs,
-                (job_events, verification_events),
-            )
-            .await
-            .map_err(|error| error.user_message());
-        let _ = launch_events.send(SyncLaunchResponse {
-            launch_id,
-            plan_id,
-            result,
-        });
-    });
-}
-
-fn cancel_workspace_sync(state: &mut AppState, sync: &SyncUiRuntime) {
-    let Some(job_id) = state.remote_workspace.ux.job_id().map(str::to_string) else {
-        return;
-    };
-    if sync.jobs.cancel(&job_id) {
-        state.jobs = sync.jobs.snapshot();
-        if let Some(job) = sync.jobs.get(&job_id) {
-            state.remote_workspace.sync_from_job(&job);
-        }
-    }
-}
-
 /// Product-path cancel for the Jobs UI. Transfer jobs route through the queue
 /// runtime (which holds the executor + scheduler); every other kind uses the
 /// legacy JobManager cancel. Tests exercise exactly this function.
@@ -5603,26 +4655,6 @@ async fn execute_command_target(
     Ok(effect)
 }
 
-fn start_workspace_scan(scanner: &WorkspaceScanner, state: &mut AppState, keep_preview_open: bool) {
-    let left_root = state.left.location.clone();
-    let right_root = state.right.location.clone();
-    let cancel = state.remote_workspace.begin_recursive_scan();
-    state.remote_workspace.enabled = true;
-    state.remote_workspace.preview_open = keep_preview_open;
-    state.show_diff = true;
-
-    let options = WorkspaceScanOptions::default();
-    let left_id = scanner.scan(WorkspaceSide::Left, left_root, options, cancel.clone());
-    let right_id = scanner.scan(WorkspaceSide::Right, right_root, options, cancel);
-    state
-        .remote_workspace
-        .register_scan(WorkspaceSide::Left, left_id);
-    state
-        .remote_workspace
-        .register_scan(WorkspaceSide::Right, right_id);
-    state.message = Some("Remote Workspace: scanning both panes…".into());
-}
-
 fn handle_workspace_scan_response(response: WorkspaceScanResponse, state: &mut AppState) {
     if !state.remote_workspace.accepts_scan(&response) {
         return;
@@ -5687,46 +4719,6 @@ fn finalize_received_effect(dispatcher: &EffectDispatcher, response: &mut Effect
             reason: arx::jobs::RemoteEditCancelReason::Queued,
         };
     }
-}
-
-fn finish_remote_editor(
-    mut session: RemoteEditSession,
-    editor_result: io::Result<()>,
-    state: &mut AppState,
-) -> Option<Effect> {
-    if let Err(error) = editor_result {
-        session.state = RemoteEditState::Failed;
-        // #51: editor failure terminalizes the job as typed Failed (no leak).
-        terminate_remote_edit_job(
-            state,
-            arx::jobs::RemoteEditOutcome::Failed,
-            Some(error.to_string()),
-        );
-        state.message = Some(format!("Editor failed: {error}"));
-        return None;
-    }
-
-    session.state = RemoteEditState::WritingBack;
-    // #51/MAJOR#9: supply a narrow synchronous Send+Sync progress callback so
-    // Verifying is emitted at the real verification boundary inside the provider,
-    // in program order BEFORE the terminal event — no detached relay, no scheduler
-    // races. The callback captures only the Send+Sync handles (job_manager +
-    // event sink + id), never &AppState (AppState is not Sync). The provider never
-    // knows about JobManager; it just calls progress(phase).
-    publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::ValidatingWorkingCopy);
-    publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::WriteBack);
-    let job_manager = state.job_manager.clone();
-    let job_events = state.job_events.clone();
-    let job_id = session.job_id.clone();
-    let progress: arx::vfs::RemoteEditProgressFn = std::sync::Arc::new(move |phase| {
-        if let (Some(jm), Some(events), Some(id)) = (&job_manager, &job_events, &job_id) {
-            jm.publish_remote_edit_phase(events, id, phase);
-        }
-    });
-    Some(Effect::WriteBackRemoteFile {
-        session,
-        progress: ProgressSlot(Some(progress)),
-    })
 }
 
 fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent) {
@@ -5806,7 +4798,11 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
                 state.viewer_content = checksums
                     .into_iter()
                     .map(|checksum| {
-                        format!("{}  {}", checksum.sha256, display_safe_text(&checksum.name))
+                        format!(
+                            "{}  {}",
+                            checksum.sha256,
+                            quick_actions::display_safe_text(&checksum.name)
+                        )
                     })
                     .collect();
                 state.viewer_scroll = 0;
@@ -5815,13 +4811,13 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
             Ok(QuickActionOutcome::Touched { path }) => {
                 state.message = Some(format!(
                     "Touched {}",
-                    display_safe_text(path.to_string_lossy().as_ref())
+                    quick_actions::display_safe_text(path.to_string_lossy().as_ref())
                 ));
             }
             Ok(QuickActionOutcome::Compressed { path, entries }) => {
                 state.message = Some(format!(
                     "Created {} from {entries} entr{}",
-                    display_safe_text(path.to_string_lossy().as_ref()),
+                    quick_actions::display_safe_text(path.to_string_lossy().as_ref()),
                     if entries == 1 { "y" } else { "ies" }
                 ));
             }
@@ -5832,7 +4828,7 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
                     state.message = Some(format!(
                         "{} failed: {}",
                         failure.action.label(),
-                        display_safe_text(&failure.message)
+                        quick_actions::display_safe_text(&failure.message)
                     ));
                 }
             }
@@ -5845,7 +4841,10 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
             session.job_id = job_id;
             if session.job_id.is_some() {
                 // Downloaded: queued→awaiting-editor phase (TUI owns editor launch).
-                publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::AwaitingEditor);
+                remote_edit::publish_remote_edit_phase(
+                    state,
+                    arx::jobs::RemoteEditPhase::AwaitingEditor,
+                );
             }
             state.pending_remote_edit_session = Some(session);
         }
@@ -5854,17 +4853,25 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
             // #51/MAJOR#1: Verifying is NOT invented here — it was already
             // published at the real verification boundary by the provider
             // progress closure (before verify_remote_matches). Only terminate.
-            terminate_remote_edit_job(state, arx::jobs::RemoteEditOutcome::Completed, None);
+            remote_edit::terminate_remote_edit_job(
+                state,
+                arx::jobs::RemoteEditOutcome::Completed,
+                None,
+            );
         }
         EffectEvent::NoChange { name } => {
             state.message = Some(format!("No changes: {name}"));
-            terminate_remote_edit_job(state, arx::jobs::RemoteEditOutcome::NoChange, None);
+            remote_edit::terminate_remote_edit_job(
+                state,
+                arx::jobs::RemoteEditOutcome::NoChange,
+                None,
+            );
         }
         EffectEvent::RemoteConflict { name, reason } => {
             state.message = Some(format!(
                 "{name} changed on remote — write-back refused: {reason}"
             ));
-            terminate_remote_edit_job(
+            remote_edit::terminate_remote_edit_job(
                 state,
                 arx::jobs::RemoteEditOutcome::Failed,
                 Some(format!("remote conflict: {reason}")),
@@ -5874,8 +4881,11 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
             state.message = Some(format!("{name}: RECOVERY REQUIRED — {details}"));
             // #51: recovery path exposes RollbackOrRecovery before the typed
             // RecoveryRequired terminal so the phase model is observable end-to-end.
-            publish_remote_edit_phase(state, arx::jobs::RemoteEditPhase::RollbackOrRecovery);
-            terminate_remote_edit_job(
+            remote_edit::publish_remote_edit_phase(
+                state,
+                arx::jobs::RemoteEditPhase::RollbackOrRecovery,
+            );
+            remote_edit::terminate_remote_edit_job(
                 state,
                 arx::jobs::RemoteEditOutcome::RecoveryRequired,
                 Some(format!("recovery required: {details}")),
@@ -5883,7 +4893,7 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
         }
         EffectEvent::WrittenBackWarning { name, warning } => {
             state.message = Some(format!("Uploaded {name} with warning: {warning}"));
-            terminate_remote_edit_job(
+            remote_edit::terminate_remote_edit_job(
                 state,
                 arx::jobs::RemoteEditOutcome::CommittedWithWarning,
                 None,
@@ -5896,7 +4906,7 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
             // session's lifecycle, job status, or pending ownership.
             if lane == EffectLane::RemoteEdit {
                 state.message = Some(format!("{label} failed: {error}"));
-                terminate_remote_edit_job(
+                remote_edit::terminate_remote_edit_job(
                     state,
                     arx::jobs::RemoteEditOutcome::Failed,
                     Some(format!("{label} failed: {error}")),
@@ -5907,102 +4917,13 @@ fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent
         }
         EffectEvent::RemoteEditCancelled { name, reason } => {
             state.message = Some(format!("Remote edit cancelled: {name} ({reason:?})"));
-            terminate_remote_edit_job(
+            remote_edit::terminate_remote_edit_job(
                 state,
                 arx::jobs::RemoteEditOutcome::Cancelled,
                 Some(format!("{reason:?}")),
             );
         }
     }
-}
-
-/// Centralized RemoteEdit terminalization.
-///
-/// Session-scoped pending state (origin, session, deferred editor) is cleared
-/// UNCONDITIONALLY: once a Remote Edit reaches a terminal outcome, no leftover
-/// ownership may survive even when no JobId publication is available (e.g. an
-/// isolated lifecycle where the job id was never registered). Job terminal
-/// publication stays conditional on an actual job id so we never publish a
-/// terminal event for a job that does not exist.
-///
-/// Called from every terminal production path so no job leaks as Running and no
-/// stale session/origin remains.
-fn terminate_remote_edit_job(
-    state: &mut AppState,
-    outcome: arx::jobs::RemoteEditOutcome,
-    error: Option<String>,
-) {
-    // Unconditional cleanup of session-scoped pending ownership.
-    state.pending_remote_edit_origin = None;
-    state.pending_remote_edit_session = None;
-    state.pending_editor = false;
-    if let Some(jid) = state.pending_remote_edit_job_id.take() {
-        state
-            .job_manager
-            .as_ref()
-            .expect("job manager bound")
-            .terminate_remote_edit(
-                state.job_events.as_ref().expect("job events bound"),
-                &jid,
-                outcome,
-                error,
-            );
-    }
-}
-
-/// Publish an observable RemoteEdit phase on the shared Job Manager.
-fn publish_remote_edit_phase(state: &AppState, phase: arx::jobs::RemoteEditPhase) {
-    if let Some(jid) = &state.pending_remote_edit_job_id {
-        state
-            .job_manager
-            .as_ref()
-            .expect("job manager bound")
-            .publish_remote_edit_phase(
-                state.job_events.as_ref().expect("job events bound"),
-                jid,
-                phase,
-            );
-    }
-}
-
-/// Production stale/invalid terminalization for a deferred remote edit. Runs the
-/// exact same cancellation logic that `event_loop`'s deferred-launch branch
-/// uses: if the originating pane navigated away → Cancelled; if the session is
-/// no longer ReadyToEdit → Failed. Terminalizes exactly once and clears all
-/// in-flight ownership. Returns true if it handled the job (caller should skip
-/// launching the editor). Drives the real finalization path so tests exercise
-/// production behavior instead of poking fields.
-fn finalize_remote_edit_if_stale(state: &mut AppState) -> bool {
-    let Some(session) = state.pending_remote_edit_session.take() else {
-        return false;
-    };
-    let origin_matches =
-        state
-            .pending_remote_edit_origin
-            .as_ref()
-            .is_some_and(|(pane, location)| {
-                location == &session.location && pane_still_at_location(state, *pane, location)
-            });
-    if session.state != RemoteEditState::ReadyToEdit {
-        state.pending_remote_edit_origin = None;
-        terminate_remote_edit_job(
-            state,
-            arx::jobs::RemoteEditOutcome::Failed,
-            Some("remote edit session invalid".into()),
-        );
-        return true;
-    }
-    if !origin_matches {
-        state.pending_remote_edit_origin = None;
-        terminate_remote_edit_job(
-            state,
-            arx::jobs::RemoteEditOutcome::Cancelled,
-            Some("originating pane navigated away".into()),
-        );
-        return true;
-    }
-    state.pending_remote_edit_session = Some(session);
-    false
 }
 
 fn handle_effect_response(
@@ -6015,7 +4936,8 @@ fn handle_effect_response(
     if !state.accepts_effect(response.id, response.lane, &response.scope) {
         return;
     }
-    let quick_action_refresh = quick_action_refresh_location(&response.event, &response.scope);
+    let quick_action_refresh =
+        quick_actions::quick_action_refresh_location(&response.event, &response.scope);
     let refresh_origin = if matches!(
         &response.event,
         EffectEvent::WrittenBack { .. } | EffectEvent::WrittenBackWarning { .. }
@@ -6268,7 +5190,7 @@ mod tests {
         assert!(editor_result.is_err(), "editor must return non-zero");
         // No writeback effect is scheduled on editor failure.
         assert!(
-            finish_remote_editor(session, editor_result, &mut state).is_none(),
+            remote_edit::finish_remote_editor(session, editor_result, &mut state).is_none(),
             "editor failure must not schedule a writeback effect"
         );
         // Session-scoped pending state cleared (defensive, job-id-independent).
@@ -6457,15 +5379,22 @@ mod tests {
         // Production: download-complete sets the job Running before phases.
         let _ = mgr.publish_event(ev, arx::jobs::JobEvent::Running { id: id.clone() });
         // F4 production start (tui.rs deferred-launch path).
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Downloading);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::AwaitingEditor);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Editing);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Downloading);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::AwaitingEditor);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Editing);
         // finish_remote_editor: validation → writeback → verification.
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::ValidatingWorkingCopy);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::WriteBack);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Verifying);
-        terminate_remote_edit_job(&mut state, arx::jobs::RemoteEditOutcome::Completed, None);
+        remote_edit::publish_remote_edit_phase(
+            &state,
+            arx::jobs::RemoteEditPhase::ValidatingWorkingCopy,
+        );
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::WriteBack);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Verifying);
+        remote_edit::terminate_remote_edit_job(
+            &mut state,
+            arx::jobs::RemoteEditOutcome::Completed,
+            None,
+        );
 
         let mut phases = Vec::new();
         let mut terminal = None;
@@ -6525,10 +5454,13 @@ mod tests {
         let mgr = state.job_manager.as_ref().expect("job manager bound");
         let ev = state.job_events.as_ref().expect("job events bound");
         let _ = mgr.publish_event(ev, arx::jobs::JobEvent::Running { id: id.clone() });
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
         // RecoveryRequired handler emits RollbackOrRecovery first.
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::RollbackOrRecovery);
-        terminate_remote_edit_job(
+        remote_edit::publish_remote_edit_phase(
+            &state,
+            arx::jobs::RemoteEditPhase::RollbackOrRecovery,
+        );
+        remote_edit::terminate_remote_edit_job(
             &mut state,
             arx::jobs::RemoteEditOutcome::RecoveryRequired,
             Some("recovery required".into()),
@@ -6590,13 +5522,20 @@ mod tests {
         let mgr = state.job_manager.as_ref().expect("job manager bound");
         let ev = state.job_events.as_ref().expect("job events bound");
         let _ = mgr.publish_event(ev, arx::jobs::JobEvent::Running { id: id.clone() });
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Downloading);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::AwaitingEditor);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Editing);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::ValidatingWorkingCopy);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Downloading);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::AwaitingEditor);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Editing);
+        remote_edit::publish_remote_edit_phase(
+            &state,
+            arx::jobs::RemoteEditPhase::ValidatingWorkingCopy,
+        );
         // NoChange terminal — must NOT emit WriteBack/Verifying.
-        terminate_remote_edit_job(&mut state, arx::jobs::RemoteEditOutcome::NoChange, None);
+        remote_edit::terminate_remote_edit_job(
+            &mut state,
+            arx::jobs::RemoteEditOutcome::NoChange,
+            None,
+        );
 
         let mut phases = Vec::new();
         let mut terminal = None;
@@ -6651,10 +5590,10 @@ mod tests {
         let mgr = state.job_manager.as_ref().expect("job manager bound");
         let ev = state.job_events.as_ref().expect("job events bound");
         let _ = mgr.publish_event(ev, arx::jobs::JobEvent::Running { id: id.clone() });
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
-        publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Editing);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Queued);
+        remote_edit::publish_remote_edit_phase(&state, arx::jobs::RemoteEditPhase::Editing);
         // Editor failure → Failed terminal (finish_remote_editor Err arm).
-        terminate_remote_edit_job(
+        remote_edit::terminate_remote_edit_job(
             &mut state,
             arx::jobs::RemoteEditOutcome::Failed,
             Some("editor failed".into()),
@@ -6954,7 +5893,7 @@ mod tests {
         // stale check terminalize the job (Cancelled) and clear all ownership.
         state.left.location = Location::Local("/elsewhere".into());
         assert!(
-            finalize_remote_edit_if_stale(&mut state),
+            remote_edit::finalize_remote_edit_if_stale(&mut state),
             "stale-navigation must terminalize the in-flight job"
         );
         assert!(state.pending_remote_edit_job_id.is_none());
@@ -10089,47 +9028,6 @@ mod tests {
 #[cfg(test)]
 mod pack_o_quick_action_tests {
     use super::*;
-
-    #[test]
-    fn display_safe_text_escapes_controls_but_preserves_unicode() {
-        assert_eq!(
-            display_safe_text("a\nb\tc\rd\u{1b}ü"),
-            "a\\nb\\tc\\rd\\u{1b}ü"
-        );
-    }
-
-    #[test]
-    fn sha_name_collection_rejects_directory_and_stale_selection() {
-        let state = AppState::default();
-        let directory = Entry {
-            name: "dir".into(),
-            kind: EntryKind::Directory,
-            size: None,
-            modified_unix_ms: None,
-        };
-        let entries = [&directory];
-
-        let error =
-            collect_quick_action_names(&state, Some(&directory), &entries, true).unwrap_err();
-        assert!(error.contains("requires regular files"));
-
-        let mut state = AppState::default();
-        let location = state.active_pane().location.clone();
-        state.toggle_selection(state.active, &location, "missing\nname");
-
-        let file = Entry {
-            name: "present".into(),
-            kind: EntryKind::File,
-            size: Some(1),
-            modified_unix_ms: None,
-        };
-        let entries = [&file];
-
-        let error = collect_quick_action_names(&state, Some(&file), &entries, true).unwrap_err();
-        assert!(error.contains("Selection is stale"));
-        assert!(error.contains("missing\\nname"));
-        assert!(!error.contains("missing\nname"));
-    }
 
     #[test]
     fn sha_result_presentation_escapes_filename_controls() {

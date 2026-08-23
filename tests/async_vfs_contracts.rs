@@ -411,7 +411,11 @@ fn legacy_thread_local_registry_bridge_is_not_used_by_runtime() {
 
 #[test]
 fn workspace_sync_execution_stays_gated_behind_application_controller() {
-    let tui = include_str!("../src/tui.rs");
+    let tui = [
+        include_str!("../src/tui.rs"),
+        include_str!("../src/tui/workspace.rs"),
+    ]
+    .concat();
     let start = tui.find("fn prepare_workspace_sync(").unwrap();
     let end = tui[start..]
         .find("fn start_workspace_scan(")

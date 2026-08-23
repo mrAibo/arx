@@ -157,7 +157,11 @@ fn unresolved_conflict_is_not_executable() {
 
 #[test]
 fn launching_workspace_sync_is_supersedable_before_job_creation() {
-    let tui = include_str!("../src/tui.rs");
+    let tui = [
+        include_str!("../src/tui.rs"),
+        include_str!("../src/tui/workspace.rs"),
+    ]
+    .concat();
     let controller = include_str!("../src/services/workspace_sync_controller.rs");
 
     assert!(tui.contains("supersede_workspace_launch_for_new_action"));
@@ -169,7 +173,11 @@ fn launching_workspace_sync_is_supersedable_before_job_creation() {
 
 #[test]
 fn sync_preview_ui_routes_execution_through_workspace_sync_controller() {
-    let tui = include_str!("../src/tui.rs");
+    let tui = [
+        include_str!("../src/tui.rs"),
+        include_str!("../src/tui/workspace.rs"),
+    ]
+    .concat();
     let start = tui.find("fn prepare_workspace_sync(").unwrap();
     let end = tui[start..]
         .find("fn start_workspace_scan(")
@@ -217,7 +225,11 @@ fn direct_key_actions_share_action_availability_and_sync_ui_stays_orchestrated()
 
 #[test]
 fn verification_diff_is_bound_to_the_finished_job_not_generic_pane_diff() {
-    let tui = include_str!("../src/tui.rs");
+    let tui = [
+        include_str!("../src/tui.rs"),
+        include_str!("../src/tui/workspace.rs"),
+    ]
+    .concat();
     let start = tui
         .find("Action::ShowWorkspaceVerificationDiff =>")
         .unwrap();
