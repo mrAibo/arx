@@ -135,11 +135,11 @@ The final P3 transaction removes the remaining cohesive stateful feature orchest
 
 A fourth commit, `9967daa635786b1e696650ef908b52791e2c21b3`, is test-only mechanical repair after the full suite exposed two source-contract fixtures that still expected the pre-extraction Copy/Move location. The retarget keeps product delegation through `sync.transfers.enqueue(...)`; independent review confirmed the authoritative `TransferQueueRuntime` still obtains the cancellation token from its one JobManager and the behavioral transfer-queue contracts continue to exercise real queue cancellation.
 
-Hermes reported final locked local acceptance at 1210 passed / 12 ignored with fmt/check/clippy/Rust 1.88/diff-check green. Exact PR-head CI remains the merge gate for PR #208.
+Hermes reported final locked local acceptance at 1210 passed / 12 ignored with fmt/check/clippy/Rust 1.88/diff-check green. Final docs head `e0e339b3b29f371bd4f508784d90007d21ef326b` passed exact-head CI #673 / run `32639162619`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance all succeeded with exact-SHA evidence. PR #208 squash-merged as `a6b275e22b6d8e45b3f3f78f82e0eadc852353a5`.
 
 ## P3 boundary decision
 
-P3 is complete with PR #208 once its exact-head CI is accepted.
+P3 is complete at merge `a6b275e22b6d8e45b3f3f78f82e0eadc852353a5`.
 
 Stateful feature ownership is now explicit for SSH Hosts, Bookmarks, Hosts, Jobs, User Menu, Quick Actions, Remote Edit, Workspace Sync, Transfers, Mutations/Remote Delete, and Embedded Terminal. Transfer Center, Storage Inspector, and Filesystems already have their own existing UI modules and are deliberately not wrapped again solely to increase module count.
 
@@ -152,6 +152,20 @@ The later-phase boundaries remain frozen:
 - P6 owns final event-loop/composition-root thinning after P4/P5 establish those boundaries.
 
 No new provider/VFS semantics, keybindings, scheduler, JobManager, TransferQueueRuntime, EffectDispatcher, ProviderRegistry, terminal runtime, or generic controller framework were introduced by P3.
+
+## Completed: P4a/P4b authoritative Ctrl+\\ routing and Hotlist interaction
+
+Tracked by #206 through PR #209.
+
+This is an explicitly reviewed P4 bug-correction slice rather than a behavior-preserving extraction: three legacy `Ctrl+\\` arms had accumulated for external-open, Hotlist, and split, and match ordering made only the first reachable. Repository history plus the current README/#16 contract established **Ctrl+\\ = Toggle split pane** as the authoritative user-visible behavior.
+
+P4a moves that physical shortcut into the Browser `Keymap` with exactly one binding to `Action::ToggleSplitPane`, adds typed Action Catalog entries for `ToggleSplitPane`, `OpenHotlist`, and `OpenInFileManager`, and removes all three raw legacy `Ctrl+\\` arms from `src/tui.rs`. Hotlist and Open-in-file-manager remain discoverable through the Command Center without inventing replacement global shortcuts. Open-in-file-manager is explicitly Local-only through `ActionAvailability` and retains a fail-safe dispatch guard.
+
+P4b completes the previously incomplete Hotlist interaction as `src/tui/hotlist.rs`: entries load once on open, rendering performs no filesystem I/O, the controller owns Esc/Up/Down/Enter before KeyRouter, navigation reuses the existing PaneLoader path, and open/close transitions use the existing exclusive `OverlayKind::Hotlist` state machine. The pre-existing line-count-versus-percentage popup sizing defect was corrected to `centered_rect_lines`, including truthful empty-list rendering with a real content row.
+
+Hermes implementation heads were `ec1aea573072a7c7c9283e6b9f041fc4489c2311` and `bf0c2809a8c65fc0865d7ea897eeff6debd22345`; independent review added the empty-state, overlay-state-machine, render-contract, and final dispatch-delegation corrections. Final code head `ac76ef772132858b058c61087d853c988723f3b8` passed local acceptance at 1225 passed / 12 ignored and exact-head CI #677 / run `32644347131`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance all succeeded with exact-SHA evidence.
+
+P4 remains open. This slice deliberately leaves Help/Viewer/Command Center interaction extraction, Which-Key ownership, command-bar hitboxes, general mouse routing, and any further authoritative key-routing cleanup for later P4 work. P5 response ownership is unchanged.
 
 ## Acceptance
 
@@ -170,10 +184,9 @@ CI must retain quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical accepta
 
 ## Scope guards
 
-PACK P must not introduce:
+PACK P must not introduce unreviewed:
 
-- new product actions/features;
-- new shortcuts;
+- product actions/features or shortcut semantics outside a dedicated correction issue;
 - provider/VFS behavior changes;
 - duplicate JobManager / scheduler / Effect ownership;
 - Lua/WASM/native plugin runtime;

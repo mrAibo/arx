@@ -12,6 +12,7 @@ pub enum ActionId {
     Enter,
     Back,
     SwitchPane,
+    ToggleSplitPane,
     ToggleSelect,
     ToggleEmbeddedTerminal,
     ViewFile,
@@ -31,6 +32,8 @@ pub enum ActionId {
     OpenHosts,
     OpenSshHosts,
     OpenHelp,
+    OpenHotlist,
+    OpenInFileManager,
     BeginSymlink,
     BeginChmod,
     BeginHardLink,
@@ -62,6 +65,7 @@ pub enum Action {
     Enter,
     Back,
     SwitchPane,
+    ToggleSplitPane,
     ToggleSelect,
     ToggleEmbeddedTerminal,
     ViewFile,
@@ -81,6 +85,8 @@ pub enum Action {
     OpenHosts,
     OpenSshHosts,
     OpenHelp,
+    OpenHotlist,
+    OpenInFileManager,
     BeginSymlink,
     BeginChmod,
     BeginHardLink,
@@ -109,6 +115,7 @@ impl Action {
             Self::Enter => ActionId::Enter,
             Self::Back => ActionId::Back,
             Self::SwitchPane => ActionId::SwitchPane,
+            Self::ToggleSplitPane => ActionId::ToggleSplitPane,
             Self::ToggleSelect => ActionId::ToggleSelect,
             Self::ToggleEmbeddedTerminal => ActionId::ToggleEmbeddedTerminal,
             Self::ViewFile => ActionId::ViewFile,
@@ -128,6 +135,8 @@ impl Action {
             Self::OpenHosts => ActionId::OpenHosts,
             Self::OpenSshHosts => ActionId::OpenSshHosts,
             Self::OpenHelp => ActionId::OpenHelp,
+            Self::OpenHotlist => ActionId::OpenHotlist,
+            Self::OpenInFileManager => ActionId::OpenInFileManager,
             Self::BeginSymlink => ActionId::BeginSymlink,
             Self::BeginChmod => ActionId::BeginChmod,
             Self::BeginHardLink => ActionId::BeginHardLink,
@@ -156,6 +165,7 @@ pub const ALL_ACTIONS: &[Action] = &[
     Action::Enter,
     Action::Back,
     Action::SwitchPane,
+    Action::ToggleSplitPane,
     Action::ToggleSelect,
     Action::ToggleEmbeddedTerminal,
     Action::ViewFile,
@@ -175,6 +185,8 @@ pub const ALL_ACTIONS: &[Action] = &[
     Action::OpenHosts,
     Action::OpenSshHosts,
     Action::OpenHelp,
+    Action::OpenHotlist,
+    Action::OpenInFileManager,
     Action::BeginSymlink,
     Action::BeginChmod,
     Action::BeginHardLink,
@@ -255,6 +267,13 @@ pub const ACTION_CATALOG: &[ActionMeta] = &[
         id: ActionId::SwitchPane,
         label: "Switch pane",
         description: "Move focus to the opposite pane",
+        category: ActionCategory::Panels,
+        destructive: false,
+    },
+    ActionMeta {
+        id: ActionId::ToggleSplitPane,
+        label: "Toggle split pane",
+        description: "toggle vertical split for active pane",
         category: ActionCategory::Panels,
         destructive: false,
     },
@@ -389,6 +408,20 @@ pub const ACTION_CATALOG: &[ActionMeta] = &[
         label: "Help",
         description: "Open or close contextual help",
         category: ActionCategory::Panels,
+        destructive: false,
+    },
+    ActionMeta {
+        id: ActionId::OpenHotlist,
+        label: "Directory Hotlist",
+        description: "open configured favorite directories",
+        category: ActionCategory::Navigation,
+        destructive: false,
+    },
+    ActionMeta {
+        id: ActionId::OpenInFileManager,
+        label: "Open in file manager",
+        description: "open active local directory in desktop file manager",
+        category: ActionCategory::Files,
         destructive: false,
     },
     ActionMeta {
@@ -741,6 +774,36 @@ mod tests {
                 "duplicate action metadata for {:?}",
                 meta.id
             );
+        }
+    }
+
+    #[test]
+    fn ctrl_backslash_actions_have_catalog_metadata() {
+        for (id, label, description, category) in [
+            (
+                ActionId::ToggleSplitPane,
+                "Toggle split pane",
+                "toggle vertical split for active pane",
+                ActionCategory::Panels,
+            ),
+            (
+                ActionId::OpenHotlist,
+                "Directory Hotlist",
+                "open configured favorite directories",
+                ActionCategory::Navigation,
+            ),
+            (
+                ActionId::OpenInFileManager,
+                "Open in file manager",
+                "open active local directory in desktop file manager",
+                ActionCategory::Files,
+            ),
+        ] {
+            let meta = action_meta(id).unwrap_or_else(|| panic!("missing metadata for {id:?}"));
+            assert_eq!(meta.label, label);
+            assert_eq!(meta.description, description);
+            assert_eq!(meta.category, category);
+            assert!(!meta.destructive);
         }
     }
 

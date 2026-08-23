@@ -47,6 +47,7 @@ use presentation::{session_callout_text, workspace_ribbon_text};
 mod bookmarks;
 mod embedded_terminal;
 mod hosts;
+mod hotlist;
 mod jobs;
 mod mutations;
 mod overlays;
@@ -876,6 +877,10 @@ async fn event_loop(
                         continue;
                     }
 
+                    if hotlist::handle_key(&mut state, key, &pane_loader) {
+                        continue;
+                    }
+
                     if hosts::handle_key(&mut state, key, &pane_loader) {
                         continue;
                     }
@@ -1329,25 +1334,6 @@ async fn event_loop(
                                 state.message = Some("History back…".into());
                             }
                         }
-                        // Ctrl+\\: open active directory in file explorer
-                        KeyCode::Char('\\') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if let Location::Local(dir) = &state.active_pane().location {
-                                let dir_c = dir.clone();
-                                let id = effect_dispatcher.dispatch(
-                                    EffectLane::GlobalProcess,
-                                    EffectScope::Location(Location::Local(dir_c.clone())),
-                                    Effect::OpenPath {
-                                        path: dir_c.clone(),
-                                    },
-                                );
-                                state.register_effect(EffectLane::GlobalProcess, id);
-                                state.message = Some(format!("Opening {}", dir_c.display()));
-                                state.dir_history.push(dir_c);
-                                if state.dir_history.len() > 20 {
-                                    state.dir_history.remove(0);
-                                }
-                            }
-                        }
                         // Ctrl+Shift+Left/Right: resize panel ratio
                         KeyCode::Left
                             if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1379,11 +1365,6 @@ async fn event_loop(
                         // Alt+H: directory history
                         KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::ALT) => {
                             state.show_history = !state.show_history;
-                        }
-                        // Ctrl+\: hotlist
-                        KeyCode::Char('\\') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            state.show_hotlist = !state.show_hotlist;
-                            state.hotlist_cursor = 0;
                         }
                         // Ctrl+O: drop to subshell, restore on exit
                         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1582,21 +1563,6 @@ async fn event_loop(
                             state.pending_quick_action_prompt = None;
                             state.cmd.clear();
                             state.cmd_input = true;
-                        }
-                        KeyCode::Char('\\') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let pane = state.active_pane_mut();
-                            pane.split = !pane.split;
-                            if pane.split {
-                                pane.split_cursor = pane.cursor;
-                            }
-                            state.message = Some(format!(
-                                "Split {}",
-                                if pane.split {
-                                    "ON (Tab toggles)"
-                                } else {
-                                    "OFF"
-                                }
-                            ));
                         }
                         // Alt+1-9: switch to tab N
                         KeyCode::Char(c)
@@ -2748,34 +2714,7 @@ fn render(
 
     // Hotlist overlay
     if state.show_hotlist {
-        let hl = arx::app::AppState::load_hotlist();
-        let h = (hl.len() + 2).min(20) as u16;
-        let popup = centered_rect(60, h, area);
-        frame.render_widget(Clear, popup);
-        let items: Vec<ListItem> = if hl.is_empty() {
-            vec![ListItem::new("(empty - create ~/.config/arx/hotlist)")]
-        } else {
-            hl.iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    let pre = if i == state.hotlist_cursor {
-                        "> "
-                    } else {
-                        "  "
-                    };
-                    ListItem::new(format!("{pre}{}", p.display()))
-                })
-                .collect()
-        };
-        frame.render_widget(
-            List::new(items).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Hotlist (Ctrl+\\) ")
-                    .border_style(Style::default().fg(Color::Magenta)),
-            ),
-            popup,
-        );
+        hotlist::render(frame, area, state);
     }
     if state.show_tab_switcher {
         render_tab_switcher(frame, area, state);
@@ -3561,6 +3500,40 @@ async fn dispatch_ui_action(
             key_router.clear_pending();
             state.help_scroll = 0;
             state.toggle_overlay(OverlayKind::Help);
+        }
+        Action::ToggleSplitPane => {
+            let pane = state.active_pane_mut();
+            pane.split = !pane.split;
+            if pane.split {
+                pane.split_cursor = pane.cursor;
+            }
+            state.message = Some(format!(
+                "Split {}",
+                if pane.split {
+                    "ON (Tab toggles)"
+                } else {
+                    "OFF"
+                }
+            ));
+        }
+        Action::OpenHotlist => hotlist::open(state),
+        Action::OpenInFileManager => {
+            let Location::Local(dir) = &state.active_pane().location else {
+                state.message = Some("Open in file manager is currently local-only".into());
+                return Ok(());
+            };
+            let dir = dir.clone();
+            let id = effect_dispatcher.dispatch(
+                EffectLane::GlobalProcess,
+                EffectScope::Location(Location::Local(dir.clone())),
+                Effect::OpenPath { path: dir.clone() },
+            );
+            state.register_effect(EffectLane::GlobalProcess, id);
+            state.message = Some(format!("Opening {}", dir.display()));
+            state.dir_history.push(dir);
+            if state.dir_history.len() > 20 {
+                state.dir_history.remove(0);
+            }
         }
         Action::ToggleSelect => {
             toggle_selection_and_advance(state, focused, visible_count);
@@ -7607,6 +7580,21 @@ mod tests {
     // guarded arms and pin their production text, so a mirror cannot outlive the
     // guard it mirrors: delete the guard and every test here fails.
     const TUI_SOURCE: &str = include_str!("tui.rs");
+
+    #[test]
+    fn legacy_matcher_has_no_raw_ctrl_backslash_arm() {
+        let production = TUI_SOURCE
+            .split_once("mod tests {")
+            .expect("tests module marker")
+            .0;
+        let raw_arm = [
+            "KeyCode::Char(",
+            "'\\\\'",
+            ") if key.modifiers.contains(KeyModifiers::CONTROL)",
+        ]
+        .concat();
+        assert!(!production.contains(&raw_arm));
+    }
 
     fn pin(snippet: &str) {
         let production = TUI_SOURCE
