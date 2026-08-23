@@ -19,7 +19,7 @@ Decompose `src/tui.rs` incrementally so rendering, feature orchestration, input 
 - [ ] P1 — pure presentation-model extraction into `src/tui/` submodules
 - [x] P2 — frame/render-only extraction
 - [x] P3 — feature-controller extraction in independently green slices
-- [ ] P4 — keyboard/mouse routing extraction
+- [x] P4 — keyboard/mouse routing extraction
 - [ ] P5 — Effect/Job response handling extraction
 - [ ] P6 — thin runtime/event-loop composition root
 - [ ] P7 — docs/final exact-head acceptance and PACK P closure
@@ -182,6 +182,30 @@ Independent review confirmed the moved Help/Command Center close paths preserve 
 Hermes reported local acceptance at 1250 passed / 12 ignored with fmt/check/clippy/Rust 1.88/diff-check green. Exact implementation-head CI #680 / run `32651805160` on `e9b83b3ceed64730afa39f3fa10398da24436aab` passed quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance with exact-SHA evidence.
 
 P4 remains open after this slice only for the parent-owned mouse / command-bar hitbox routing boundary and any final authoritative legacy-routing audit. Feature additions from mouse follow-up #10 remain explicitly out of scope for PACK P refactoring. P5 response ownership remains unchanged.
+
+## Completed: P4 final routing ownership
+
+Tracked by semantic correction #212 and final ownership tracker #213 through PR #215.
+
+The final P4 transaction first resolves three proven legacy routing contradictions as an explicitly reviewed semantic correction: **Ctrl+T = New tab**, **Alt+T = Full/Brief panel mode**, and **Ctrl+I = File info/stat**. Smart Tree and Infrastructure Center remain product capabilities through stable typed Action/ActionId/Action Catalog entries and Command Center discovery, but they receive no replacement global shortcut. Their stale Ctrl+T/Ctrl+I title claims were removed, and Infrastructure gains an explicit Esc close after losing its unreachable toggle key.
+
+The subsequent ownership extraction is behavior-preserving:
+
+- `src/tui/browser_input.rs` classifies only the remaining post-KeyRouter legacy Browser routes and performs no provider/process/effect/navigation/job execution;
+- `src/tui/mouse.rs` owns existing mouse hitbox/pane/row classification while parent code still performs action dispatch, availability messaging, Viewer scroll mutation, context-menu mutation, selection and pane activation; no feature scope from #10 was added;
+- `src/tui/command_bar.rs` owns two-row command-bar rendering and hitbox geometry, with one `PositionedChip` layout driving both pixels and clickable rectangles while contextual rows still come from the shared runtime Keymap.
+
+Hermes implementation commits were `e09cf86b0d799464e210c44e5416c81d32de6571`, `15e77a878a829d95e6e7119585f594f67d9d4fe3`, `af85f2006b471bb9c1b5f23dafe9890c094406eb`, and `c45177cabf197b6fb7710685892a34dddec4c5c5`. Independent review added `96505300db669b0a1ae1aa557492d35f92e695c2`, removing a redundant second static shortcut-owner list from the legacy classifier and restoring authoritative Alt+T precedence while Smart Tree is open. CI #684 then exposed a self-referential source-contract assertion only; test-only commit `8bc75e5e6e7d741f32340c3a6cfcaefb7ca697a6` scopes that assertion to the production half of the module.
+
+Final implementation head `8bc75e5e6e7d741f32340c3a6cfcaefb7ca697a6` passed exact-head CI #685 / run `32656621687`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance all succeeded; both physical jobs passed exact-SHA evidence.
+
+## P4 boundary decision
+
+P4 is complete at the accepted PR #215 implementation boundary, pending only this documentation commit and final exact-head merge acceptance.
+
+Migrated shortcuts are owned by `KeyRouter`; remaining explicit legacy Browser classification is isolated in `browser_input.rs` after `KeyResolution::Unhandled`; mouse geometry/routing classification is isolated in `mouse.rs`; and command-bar rendering/hitboxes share one geometry source in `command_bar.rs`. Feature controllers retain their pre-KeyRouter ownership. The final audit found no unresolved documented shortcut collision after #212.
+
+Mouse feature additions remain in follow-up #10. User-configurable effective keymaps are separately documented in ROADMAP issue #214 and are intentionally not implemented by PACK P. P5 async response ownership remains unchanged and parent-owned.
 
 ## Acceptance
 
