@@ -45,6 +45,7 @@ mod presentation;
 use presentation::{session_callout_text, workspace_ribbon_text};
 
 mod bookmarks;
+mod command_center;
 mod embedded_terminal;
 mod help;
 mod hosts;
@@ -58,9 +59,10 @@ mod ssh_hosts;
 mod transfers;
 mod user_menu;
 mod viewer;
+mod which_key;
 mod workspace;
 use overlays::{
-    render_command_center, render_context_menu, render_directory_history, render_file_search,
+    render_context_menu, render_directory_history, render_file_search,
     render_infrastructure_center, render_rename_input, render_session_callout, render_smart_tree,
     render_tab_switcher,
 };
@@ -560,137 +562,74 @@ async fn event_loop(
                             }
                         }
                     }
-                    // Command Center owns keyboard input while open. Keep this
-                    // before generic text-input routing so Ctrl+P has a real,
-                    // usable interaction model.
-                    if state.show_command_center {
-                        match key.code {
-                            KeyCode::Esc => {
-                                state.show_command_center = false;
-                                state.filter.clear();
-                                state.command_matches.clear();
-                                state.overlay_list_state = ratatui::widgets::ListState::default();
-                            }
-                            KeyCode::Enter => {
-                                let idx = state.overlay_list_state.selected().unwrap_or(0);
-                                let idx = idx.min(state.command_matches.len().saturating_sub(1));
-                                if let Some(item) = state.command_matches.get(idx).cloned() {
-                                    if let ActionAvailability::Disabled { reason } =
-                                        &item.availability
-                                    {
-                                        state.message = Some(reason.clone());
-                                        continue;
-                                    }
-                                    state.show_command_center = false;
-                                    state.filter.clear();
-                                    state.command_matches.clear();
-                                    let cursor = {
-                                        let pane = state.active_pane();
-                                        if pane.split && pane.split_active {
-                                            pane.split_cursor
-                                        } else {
-                                            pane.cursor
-                                        }
-                                    };
-                                    let (focused_row, visible_count) = if state.active == Pane::Left
-                                    {
-                                        (left_visible.get(cursor).copied(), left_filtered.len())
-                                    } else {
-                                        (right_visible.get(cursor).copied(), right_filtered.len())
-                                    };
-                                    let active_entries: Vec<&Entry> = if state.active == Pane::Left
-                                    {
-                                        left_visible
-                                            .iter()
-                                            .filter_map(VisiblePaneRow::listed_entry)
-                                            .collect()
-                                    } else {
-                                        right_visible
-                                            .iter()
-                                            .filter_map(VisiblePaneRow::listed_entry)
-                                            .collect()
-                                    };
-                                    let other_focused_row = if state.active == Pane::Left {
-                                        right_visible.get(state.right.cursor).copied()
-                                    } else {
-                                        left_visible.get(state.left.cursor).copied()
-                                    };
-                                    if let Some(effect) = execute_command_target(
-                                        &mut state,
-                                        item.target,
-                                        focused_row,
-                                        other_focused_row,
-                                        &active_entries,
-                                        visible_count,
-                                        &workspace_scanner,
-                                        &pane_loader,
-                                        &sync_runtime,
-                                        &effect_dispatcher,
-                                        terminal_session,
-                                        editor.as_deref(),
-                                        &mut key_router,
-                                    )
-                                    .await?
-                                    {
-                                        let id = effect_dispatcher.dispatch(
-                                            EffectLane::GlobalProcess,
-                                            EffectScope::Global,
-                                            effect,
-                                        );
-                                        state.register_effect(EffectLane::GlobalProcess, id);
-                                    }
-                                    schedule_both_pane_loads(&pane_loader, &mut state);
+                    // Command Center owns keyboard input before generic text-input routing.
+                    let focused_kind = focused_visible_entry(&state, &left_visible, &right_visible)
+                        .map(|entry| entry.kind);
+                    match command_center::handle_key(
+                        &mut state,
+                        key,
+                        focused_kind,
+                        editor.is_some(),
+                    ) {
+                        command_center::KeyOutcome::NotHandled => {}
+                        command_center::KeyOutcome::Consumed => continue,
+                        command_center::KeyOutcome::Execute(target) => {
+                            let cursor = {
+                                let pane = state.active_pane();
+                                if pane.split && pane.split_active {
+                                    pane.split_cursor
+                                } else {
+                                    pane.cursor
                                 }
-                            }
-                            KeyCode::Up | KeyCode::Char('k')
-                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            };
+                            let (focused_row, visible_count) = if state.active == Pane::Left {
+                                (left_visible.get(cursor).copied(), left_filtered.len())
+                            } else {
+                                (right_visible.get(cursor).copied(), right_filtered.len())
+                            };
+                            let active_entries: Vec<&Entry> = if state.active == Pane::Left {
+                                left_visible
+                                    .iter()
+                                    .filter_map(VisiblePaneRow::listed_entry)
+                                    .collect()
+                            } else {
+                                right_visible
+                                    .iter()
+                                    .filter_map(VisiblePaneRow::listed_entry)
+                                    .collect()
+                            };
+                            let other_focused_row = if state.active == Pane::Left {
+                                right_visible.get(state.right.cursor).copied()
+                            } else {
+                                left_visible.get(state.left.cursor).copied()
+                            };
+                            if let Some(effect) = execute_command_target(
+                                &mut state,
+                                target,
+                                focused_row,
+                                other_focused_row,
+                                &active_entries,
+                                visible_count,
+                                &workspace_scanner,
+                                &pane_loader,
+                                &sync_runtime,
+                                &effect_dispatcher,
+                                terminal_session,
+                                editor.as_deref(),
+                                &mut key_router,
+                            )
+                            .await?
                             {
-                                let current = state.overlay_list_state.selected().unwrap_or(0);
-                                state
-                                    .overlay_list_state
-                                    .select(Some(current.saturating_sub(1)));
-                            }
-                            KeyCode::Down | KeyCode::Char('j')
-                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                let current = state.overlay_list_state.selected().unwrap_or(0);
-                                let max = state.command_matches.len().saturating_sub(1);
-                                state
-                                    .overlay_list_state
-                                    .select(Some((current + 1).min(max)));
-                            }
-                            KeyCode::Backspace => {
-                                state.filter.pop();
-                                state.command_matches = build_command_items_with_file_context(
-                                    &state.filter,
-                                    &state,
-                                    focused_visible_entry(&state, &left_visible, &right_visible)
-                                        .map(|entry| entry.kind),
-                                    editor.is_some(),
+                                let id = effect_dispatcher.dispatch(
+                                    EffectLane::GlobalProcess,
+                                    EffectScope::Global,
+                                    effect,
                                 );
-                                state
-                                    .overlay_list_state
-                                    .select((!state.command_matches.is_empty()).then_some(0));
+                                state.register_effect(EffectLane::GlobalProcess, id);
                             }
-                            KeyCode::Char(c)
-                                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                                    && !key.modifiers.contains(KeyModifiers::ALT) =>
-                            {
-                                state.filter.push(c);
-                                state.command_matches = build_command_items_with_file_context(
-                                    &state.filter,
-                                    &state,
-                                    focused_visible_entry(&state, &left_visible, &right_visible)
-                                        .map(|entry| entry.kind),
-                                    editor.is_some(),
-                                );
-                                state
-                                    .overlay_list_state
-                                    .select((!state.command_matches.is_empty()).then_some(0));
-                            }
-                            _ => {}
+                            schedule_both_pane_loads(&pane_loader, &mut state);
+                            continue;
                         }
-                        continue;
                     }
 
                     // If composing filter/glob/go-to, keys go to buffer
@@ -910,11 +849,7 @@ async fn event_loop(
                     // First migration slice: resolve stable app actions before
                     // falling back to the legacy key matcher below.
                     match key_router.resolve(state.input_context(), key) {
-                        KeyResolution::Pending => {
-                            // PR #4 will render key_router.continuations()
-                            // here as the Which-Key overlay.
-                            continue;
-                        }
+                        KeyResolution::Pending => continue,
                         KeyResolution::Action(action) => {
                             let context = ActionContext::from_state(&state).with_file_context(
                                 visible_rows
@@ -2580,53 +2515,7 @@ fn render(
         viewer::render(frame, area, state);
     }
 
-    // Which-Key is derived from the active KeyRouter prefix and the shared
-    // Action Catalog. There is intentionally no second shortcut table here.
-    let input_context = state.input_context();
-    let continuations = key_router.continuations(input_context);
-    if !continuations.is_empty() {
-        let prefix = key_router
-            .pending()
-            .iter()
-            .map(|stroke| stroke.label())
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let items: Vec<ListItem> = continuations
-            .iter()
-            .filter_map(|continuation| {
-                action_meta(continuation.action).map(|meta| {
-                    ListItem::new(format!(
-                        "{:<10} {}",
-                        continuation.stroke.label(),
-                        meta.label
-                    ))
-                })
-            })
-            .collect();
-
-        if !items.is_empty() {
-            let height = (items.len() as u16 + 2).min(area.height.max(1));
-            let width = area.width.saturating_mul(70).saturating_div(100).max(30);
-            let width = width.min(area.width);
-            let x = area.x + area.width.saturating_sub(width) / 2;
-            let y = area
-                .y
-                .saturating_add(area.height.saturating_sub(height).saturating_sub(1));
-            let popup = Rect::new(x, y, width, height);
-
-            frame.render_widget(Clear, popup);
-            frame.render_widget(
-                List::new(items).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!(" {prefix} … "))
-                        .border_style(Style::default().fg(Color::Cyan)),
-                ),
-                popup,
-            );
-        }
-    }
+    which_key::render(frame, area, state, key_router);
 
     if state.show_infra {
         render_infrastructure_center(frame, area, state);
@@ -2637,7 +2526,7 @@ fn render(
     }
 
     if state.show_command_center {
-        render_command_center(frame, area, state);
+        command_center::render(frame, area, state);
     }
 
     if state.show_context_menu {
@@ -3421,19 +3310,11 @@ async fn dispatch_ui_action(
 
     match action {
         Action::Quit => request_quit(state, effect_dispatcher),
-        Action::OpenCommandCenter => {
-            state.open_overlay(OverlayKind::CommandCenter);
-            state.filter.clear();
-            state.command_matches = build_command_items_with_file_context(
-                "",
-                state,
-                focused.map(|entry| entry.kind),
-                configured_editor.is_some(),
-            );
-            state
-                .overlay_list_state
-                .select((!state.command_matches.is_empty()).then_some(0));
-        }
+        Action::OpenCommandCenter => command_center::open(
+            state,
+            focused.map(|entry| entry.kind),
+            configured_editor.is_some(),
+        ),
         Action::OpenBookmarks => state.toggle_overlay(OverlayKind::Bookmarks),
         Action::OpenJobs => state.toggle_overlay(OverlayKind::Jobs),
         Action::OpenHosts => toggle_hosts_overlay(state),
@@ -4049,9 +3930,7 @@ fn selection_or_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arx::app::{
-        Action, ActionAvailability, CommandItem, CommandKind, CommandTarget, InputContext,
-    };
+    use arx::app::{Action, InputContext};
     use arx::input::{KeyBinding, KeyStroke, Keymap};
     use arx::jobs::{Job, JobKind, JobResult, JobStatus};
     use arx::process::ProcessService;
@@ -6725,47 +6604,6 @@ mod tests {
         assert!(text.contains(":needle_"));
         assert!(text.contains("Ctrl+T toggle"));
         assert!(text.contains("tree-child"));
-    }
-
-    #[test]
-    fn utility_overlay_command_center_characterization() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let backend = TestBackend::new(120, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut state = AppState {
-            filter: "needle".into(),
-            command_matches: vec![CommandItem {
-                title: "Blocked Demo".into(),
-                subtitle: Some("example subtitle".into()),
-                kind: CommandKind::UserCommand,
-                target: CommandTarget::ShellCommand("demo".into()),
-                score: 0,
-                availability: ActionAvailability::Disabled {
-                    reason: "char reason".into(),
-                },
-            }],
-            ..Default::default()
-        };
-
-        terminal
-            .draw(|f| render_command_center(f, f.area(), &mut state))
-            .unwrap();
-
-        let buf = terminal.backend().buffer();
-        let text = buf
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<Vec<_>>()
-            .join("");
-
-        assert!(text.contains("ARX Command Center"));
-        assert!(text.contains(":needle_"));
-        assert!(text.contains("[COMMAND] Blocked Demo"));
-        assert!(text.contains("example subtitle"));
-        assert!(text.contains("unavailable: char reason"));
     }
 
     #[test]

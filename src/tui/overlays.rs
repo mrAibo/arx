@@ -4,7 +4,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
-use arx::app::{AppState, CommandKind};
+use arx::app::AppState;
 use arx::vfs::Location;
 
 use super::centered_rect_lines;
@@ -48,43 +48,6 @@ pub(super) fn render_smart_tree(frame: &mut Frame, area: Rect, state: &mut AppSt
     let list = ratatui::widgets::List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().fg(Color::Green));
-    frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
-}
-
-pub(super) fn render_command_center(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    let h = (state.command_matches.len().max(1) + 3).min(20) as u16;
-    let popup = centered_rect_lines(70, h, area);
-    frame.render_widget(Clear, popup);
-    let items: Vec<ListItem> = state
-        .command_matches
-        .iter()
-        .map(|item| {
-            let style = if !item.availability.is_available() {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                match item.kind {
-                    CommandKind::Action => Style::default().fg(Color::Cyan),
-                    CommandKind::Host => Style::default().fg(Color::Green),
-                    CommandKind::Bookmark => Style::default().fg(Color::Magenta),
-                    CommandKind::History => Style::default(),
-                    CommandKind::Session => Style::default().fg(Color::Yellow),
-                    CommandKind::UserCommand => Style::default().fg(Color::Blue),
-                }
-            };
-            let line = match item.availability.reason() {
-                Some(reason) => format!("{}  —  unavailable: {reason}", item.display_line()),
-                None => item.display_line(),
-            };
-            ListItem::new(line).style(style)
-        })
-        .collect();
-
-    let list = ratatui::widgets::List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            " ARX Command Center — :{}_ | bat chafa pdftotext ffprobe 7z ",
-            state.filter
-        )))
-        .highlight_style(Style::default().fg(Color::Yellow));
     frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
 }
 
