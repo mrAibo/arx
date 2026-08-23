@@ -1,25 +1,29 @@
 use crate::tui_terminal::TuiTerminalSession;
+#[cfg(test)]
+use arx::app::CommandItem;
 use arx::app::InputContext;
 #[cfg(test)]
 use arx::app::PaneLoadUiError;
 use arx::app::{
-    Action, ActionAvailability, ActionContext, ActionId, AppState, CommandItem, CommandKind,
-    CommandTarget, OverlayKind, Pane, PaneState, PanelMode, SessionCallout, SortMode,
-    WorkspaceSyncUxState, action_availability, action_meta, build_command_items_with_file_context,
+    Action, ActionAvailability, ActionContext, ActionId, AppState, CommandKind, CommandTarget,
+    OverlayKind, Pane, PaneState, PanelMode, SessionCallout, SortMode, WorkspaceSyncUxState,
+    action_availability, action_meta, build_command_items_with_file_context,
     listed_entry_navigation_target, navigation_parent_target,
 };
-use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectResponse, EffectScope};
-use arx::effects::{Effect, EffectEvent, ProgressSlot};
+use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectScope};
+#[cfg(test)]
+use arx::effects::EffectEvent;
+use arx::effects::{Effect, ProgressSlot};
 #[cfg(test)]
 use arx::input::contextual_hints_with_file_context;
 use arx::input::{ContextHint, KeyResolution, KeyRouter, command_bar_rows};
 use arx::services::{
     DesktopService, FileInfoService, GitService, PaneListingContinuation, PaneLoadPurpose,
-    PaneLoader, QuickActionFailureKind, QuickActionOutcome, SyncLaunchId, WorkspaceScanError,
-    WorkspaceScanOptions, WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
+    PaneLoader, SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions, WorkspaceScanResponse,
+    WorkspaceScanner, WorkspaceSyncController,
 };
 #[cfg(test)]
-use arx::services::{PaneLoadResponse, PaneNextPageResponse};
+use arx::services::{PaneLoadResponse, PaneNextPageResponse, QuickActionOutcome};
 use arx::vfs::{
     Entry, EntryIdentity, EntryKind, ListedEntry, Location, ProviderId, ProviderRegistry,
     RemoteEditSession, RemoteEditState,
@@ -52,6 +56,7 @@ mod bookmarks;
 mod browser_input;
 mod command_bar;
 mod command_center;
+mod effect_responses;
 mod embedded_terminal;
 mod help;
 mod hosts;
@@ -69,6 +74,7 @@ mod user_menu;
 mod viewer;
 mod which_key;
 mod workspace;
+use effect_responses::pane_still_at_location;
 use overlays::{
     render_context_menu, render_directory_history, render_file_search,
     render_infrastructure_center, render_rename_input, render_session_callout, render_smart_tree,
@@ -265,13 +271,10 @@ async fn event_loop(
                 continue;
             }
             Some(response) = effect_rx.recv() => {
-                let mut response = response;
-                finalize_received_effect(&effect_dispatcher, &mut response);
-                handle_effect_response(
+                effect_responses::apply_received(
+                    &effect_dispatcher,
                     response,
                     &mut state,
-                    &mut left_entries,
-                    &mut right_entries,
                     &pane_loader,
                 );
 
@@ -3086,298 +3089,6 @@ fn handle_workspace_scan_response(response: WorkspaceScanResponse, state: &mut A
     }
 }
 
-fn finalize_received_effect(dispatcher: &EffectDispatcher, response: &mut EffectResponse) {
-    let was_cancelled = dispatcher
-        .finish(response.id)
-        .is_some_and(|cancellation| cancellation.is_cancelled());
-    // #48/MAJOR#1: an explicitly cancelled queued download is a typed Cancelled,
-    // never a generic Failed. apply_effect_event maps this to
-    // RemoteEditOutcome::Cancelled; the Failed branch is reserved for real
-    // provider/download errors.
-    if was_cancelled && let EffectEvent::Downloaded { session } = &response.event {
-        response.event = EffectEvent::RemoteEditCancelled {
-            name: session.name.clone(),
-            reason: arx::jobs::RemoteEditCancelReason::Queued,
-        };
-    }
-}
-
-fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: EffectEvent) {
-    match event {
-        EffectEvent::ShellCaptured {
-            command,
-            success,
-            stdout,
-            stderr,
-        } => {
-            let stdout = stdout.trim();
-            let stderr = stderr.trim();
-            let text = if !stdout.is_empty() {
-                stdout
-            } else if !stderr.is_empty() {
-                stderr
-            } else if success {
-                "ok"
-            } else {
-                "failed"
-            };
-            state.message = Some(format!(": {command} — {}", truncate_message(text, 80)));
-        }
-        EffectEvent::ProcessExited { label, success } => {
-            state.message = Some(format!(
-                "{label} — {}",
-                if success { "done" } else { "failed" }
-            ));
-        }
-        EffectEvent::Spawned { label } => {
-            state.message = Some(format!("{label} — started"));
-        }
-        EffectEvent::TmuxSessions { sessions } => {
-            if sessions.is_empty() {
-                state.message = Some("No tmux sessions found".into());
-                return;
-            }
-            state.command_matches = sessions
-                .into_iter()
-                .map(|name| CommandItem {
-                    title: name.clone(),
-                    subtitle: Some("Attach tmux session".into()),
-                    kind: CommandKind::Session,
-                    target: CommandTarget::TmuxSession(name),
-                    score: 0,
-                    availability: ActionAvailability::Available,
-                })
-                .collect();
-            state.open_overlay(OverlayKind::CommandCenter);
-            state.overlay_list_state.select(Some(0));
-        }
-        EffectEvent::ViewerLines { title, lines } => {
-            state.viewer_content = lines;
-            state.viewer_scroll = 0;
-            state.message = Some(title);
-        }
-        EffectEvent::InfrastructureLines { lines } => {
-            state.infrastructure_lines = if lines.is_empty() {
-                vec!["No SSH hosts discovered".into()]
-            } else {
-                lines
-            }
-        }
-        EffectEvent::TreeLines { lines } => {
-            state.tree_lines = if lines.is_empty() {
-                vec!["(empty)".into()]
-            } else {
-                lines
-            }
-        }
-        EffectEvent::PathOpened { path } => {
-            state.message = Some(format!("Opened {}", path.display()));
-        }
-        EffectEvent::QuickActionFinished { result } => match result {
-            Ok(QuickActionOutcome::Sha256 { checksums, .. }) => {
-                let count = checksums.len();
-                state.viewer_content = checksums
-                    .into_iter()
-                    .map(|checksum| {
-                        format!(
-                            "{}  {}",
-                            checksum.sha256,
-                            quick_actions::display_safe_text(&checksum.name)
-                        )
-                    })
-                    .collect();
-                state.viewer_scroll = 0;
-                state.message = Some(format!("SHA-256 computed for {count} file(s)"));
-            }
-            Ok(QuickActionOutcome::Touched { path }) => {
-                state.message = Some(format!(
-                    "Touched {}",
-                    quick_actions::display_safe_text(path.to_string_lossy().as_ref())
-                ));
-            }
-            Ok(QuickActionOutcome::Compressed { path, entries }) => {
-                state.message = Some(format!(
-                    "Created {} from {entries} entr{}",
-                    quick_actions::display_safe_text(path.to_string_lossy().as_ref()),
-                    if entries == 1 { "y" } else { "ies" }
-                ));
-            }
-            Err(failure) => {
-                if failure.kind == QuickActionFailureKind::Cancelled {
-                    state.message = Some(format!("{} cancelled", failure.action.label()));
-                } else {
-                    state.message = Some(format!(
-                        "{} failed: {}",
-                        failure.action.label(),
-                        quick_actions::display_safe_text(&failure.message)
-                    ));
-                }
-            }
-        },
-        EffectEvent::Downloaded { session } => {
-            let download_name = &session.name;
-            state.message = Some(format!("Downloaded: {download_name}"));
-            let job_id = state.pending_remote_edit_job_id.clone();
-            let mut session = session;
-            session.job_id = job_id;
-            if session.job_id.is_some() {
-                // Downloaded: queued→awaiting-editor phase (TUI owns editor launch).
-                remote_edit::publish_remote_edit_phase(
-                    state,
-                    arx::jobs::RemoteEditPhase::AwaitingEditor,
-                );
-            }
-            state.pending_remote_edit_session = Some(session);
-        }
-        EffectEvent::WrittenBack { name } => {
-            state.message = Some(format!("Uploaded: {name}"));
-            // #51/MAJOR#1: Verifying is NOT invented here — it was already
-            // published at the real verification boundary by the provider
-            // progress closure (before verify_remote_matches). Only terminate.
-            remote_edit::terminate_remote_edit_job(
-                state,
-                arx::jobs::RemoteEditOutcome::Completed,
-                None,
-            );
-        }
-        EffectEvent::NoChange { name } => {
-            state.message = Some(format!("No changes: {name}"));
-            remote_edit::terminate_remote_edit_job(
-                state,
-                arx::jobs::RemoteEditOutcome::NoChange,
-                None,
-            );
-        }
-        EffectEvent::RemoteConflict { name, reason } => {
-            state.message = Some(format!(
-                "{name} changed on remote — write-back refused: {reason}"
-            ));
-            remote_edit::terminate_remote_edit_job(
-                state,
-                arx::jobs::RemoteEditOutcome::Failed,
-                Some(format!("remote conflict: {reason}")),
-            );
-        }
-        EffectEvent::RecoveryRequired { name, details } => {
-            state.message = Some(format!("{name}: RECOVERY REQUIRED — {details}"));
-            // #51: recovery path exposes RollbackOrRecovery before the typed
-            // RecoveryRequired terminal so the phase model is observable end-to-end.
-            remote_edit::publish_remote_edit_phase(
-                state,
-                arx::jobs::RemoteEditPhase::RollbackOrRecovery,
-            );
-            remote_edit::terminate_remote_edit_job(
-                state,
-                arx::jobs::RemoteEditOutcome::RecoveryRequired,
-                Some(format!("recovery required: {details}")),
-            );
-        }
-        EffectEvent::WrittenBackWarning { name, warning } => {
-            state.message = Some(format!("Uploaded {name} with warning: {warning}"));
-            remote_edit::terminate_remote_edit_job(
-                state,
-                arx::jobs::RemoteEditOutcome::CommittedWithWarning,
-                None,
-            );
-        }
-        EffectEvent::Failed { label, error } => {
-            // #51/MAJOR: a generic failure only terminates an in-flight Remote
-            // Edit when it actually belongs to the RemoteEdit lane. An unrelated
-            // effect (LeftPane, GlobalProcess, …) must NOT mutate another
-            // session's lifecycle, job status, or pending ownership.
-            if lane == EffectLane::RemoteEdit {
-                state.message = Some(format!("{label} failed: {error}"));
-                remote_edit::terminate_remote_edit_job(
-                    state,
-                    arx::jobs::RemoteEditOutcome::Failed,
-                    Some(format!("{label} failed: {error}")),
-                );
-            } else {
-                state.message = Some(format!("{label} failed: {error}"));
-            }
-        }
-        EffectEvent::RemoteEditCancelled { name, reason } => {
-            state.message = Some(format!("Remote edit cancelled: {name} ({reason:?})"));
-            remote_edit::terminate_remote_edit_job(
-                state,
-                arx::jobs::RemoteEditOutcome::Cancelled,
-                Some(format!("{reason:?}")),
-            );
-        }
-    }
-}
-
-fn handle_effect_response(
-    response: EffectResponse,
-    state: &mut AppState,
-    _left_entries: &mut Vec<ListedEntry>,
-    _right_entries: &mut Vec<ListedEntry>,
-    pane_loader: &PaneLoader,
-) {
-    if !state.accepts_effect(response.id, response.lane, &response.scope) {
-        return;
-    }
-    let quick_action_refresh =
-        quick_actions::quick_action_refresh_location(&response.event, &response.scope);
-    let refresh_origin = if matches!(
-        &response.event,
-        EffectEvent::WrittenBack { .. } | EffectEvent::WrittenBackWarning { .. }
-    ) {
-        state.pending_remote_edit_origin.clone()
-    } else {
-        None
-    };
-    let remote_terminal = response.lane == EffectLane::RemoteEdit
-        && !matches!(&response.event, EffectEvent::Downloaded { .. });
-
-    state.finish_effect(response.lane, response.id);
-    apply_effect_event(state, response.lane, response.event);
-    if remote_terminal {
-        state.pending_remote_edit_origin = None;
-    }
-
-    if let Some((pane, location)) = refresh_origin
-        && pane_still_at_location(state, pane, &location)
-    {
-        schedule_pane_load(pane_loader, state, pane);
-    }
-
-    if let Some(location) = quick_action_refresh {
-        for pane in [Pane::Left, Pane::Right] {
-            if pane_still_at_location(state, pane, &location) {
-                schedule_pane_load(pane_loader, state, pane);
-            }
-        }
-    }
-
-    match response.lane {
-        EffectLane::LeftPane => {
-            schedule_pane_load(pane_loader, state, Pane::Left);
-        }
-        EffectLane::RightPane => {
-            schedule_pane_load(pane_loader, state, Pane::Right);
-        }
-        _ => {}
-    }
-}
-
-fn pane_still_at_location(state: &AppState, pane: Pane, location: &Location) -> bool {
-    match pane {
-        Pane::Left => &state.left.location == location,
-        Pane::Right => &state.right.location == location,
-    }
-}
-
-fn truncate_message(text: &str, max_chars: usize) -> String {
-    let mut chars = text.chars();
-    let prefix: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{prefix}...")
-    } else {
-        prefix
-    }
-}
-
 // ponytail: keep for test visibility; selection logic lives in dispatch_ui_action.
 #[allow(dead_code)]
 fn selection_or_cursor(
@@ -3553,14 +3264,8 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert!(matches!(&response.event, EffectEvent::Downloaded { .. }));
-        finalize_received_effect(&dispatcher, &mut response);
-        handle_effect_response(
-            response,
-            &mut state,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            &pane_loader,
-        );
+        effect_responses::finalize_received_effect(&dispatcher, &mut response);
+        effect_responses::handle_effect_response(response, &mut state, &pane_loader);
 
         let session = state.pending_remote_edit_session.take().unwrap();
         let temp_path = session.temp_dir.path().to_path_buf();
@@ -4032,7 +3737,7 @@ mod tests {
                 .id
                 .clone(),
         );
-        apply_effect_event(
+        effect_responses::apply_effect_event(
             &mut cancel_state,
             EffectLane::RemoteEdit,
             EffectEvent::RemoteEditCancelled {
@@ -4070,7 +3775,7 @@ mod tests {
                 .id
                 .clone(),
         );
-        apply_effect_event(
+        effect_responses::apply_effect_event(
             &mut fail_state,
             EffectLane::RemoteEdit,
             EffectEvent::Failed {
@@ -4116,7 +3821,7 @@ mod tests {
         state.pending_remote_edit_job_id = Some(re_id.clone());
 
         // Feed a generic failure on an unrelated lane (e.g. LeftPane).
-        apply_effect_event(
+        effect_responses::apply_effect_event(
             &mut state,
             EffectLane::LeftPane,
             EffectEvent::Failed {
@@ -4168,7 +3873,7 @@ mod tests {
         );
 
         // Now the same failure on the RemoteEdit lane DOES terminate it once.
-        apply_effect_event(
+        effect_responses::apply_effect_event(
             &mut state,
             EffectLane::RemoteEdit,
             EffectEvent::Failed {
@@ -4247,13 +3952,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(&response.event, EffectEvent::Downloaded { .. }));
-        handle_effect_response(
-            response,
-            &mut state,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            &pane_loader,
-        );
+        effect_responses::handle_effect_response(response, &mut state, &pane_loader);
         // Downloaded must have created exactly one RemoteEdit job id.
         let job_id = state
             .pending_remote_edit_job_id
@@ -4326,7 +4025,7 @@ mod tests {
             dispatcher.cancel(id),
             "queued response must remain cancellable"
         );
-        finalize_received_effect(&dispatcher, &mut response);
+        effect_responses::finalize_received_effect(&dispatcher, &mut response);
         assert!(
             matches!(
                 &response.event,
@@ -4337,13 +4036,7 @@ mod tests {
             ),
             "explicit queued cancel must be typed Cancelled, not generic Failed"
         );
-        handle_effect_response(
-            response,
-            &mut state,
-            &mut Vec::new(),
-            &mut Vec::new(),
-            &pane_loader,
-        );
+        effect_responses::handle_effect_response(response, &mut state, &pane_loader);
 
         assert!(state.pending_remote_edit_session.is_none());
         assert!(state.pending_remote_edit_origin.is_none());
@@ -4365,12 +4058,28 @@ mod tests {
         state.left.location = origin.clone();
         state.right.location = origin.clone();
 
-        assert!(pane_still_at_location(&state, Pane::Left, &origin));
-        assert!(pane_still_at_location(&state, Pane::Right, &origin));
+        assert!(effect_responses::pane_still_at_location(
+            &state,
+            Pane::Left,
+            &origin
+        ));
+        assert!(effect_responses::pane_still_at_location(
+            &state,
+            Pane::Right,
+            &origin
+        ));
 
         state.left.location = Location::Local("/elsewhere".into());
-        assert!(!pane_still_at_location(&state, Pane::Left, &origin));
-        assert!(pane_still_at_location(&state, Pane::Right, &origin));
+        assert!(!effect_responses::pane_still_at_location(
+            &state,
+            Pane::Left,
+            &origin
+        ));
+        assert!(effect_responses::pane_still_at_location(
+            &state,
+            Pane::Right,
+            &origin
+        ));
     }
 
     fn file(name: &str) -> Entry {
@@ -6953,7 +6662,7 @@ mod pack_o_quick_action_tests {
     fn sha_result_presentation_escapes_filename_controls() {
         let mut state = AppState::default();
 
-        apply_effect_event(
+        effect_responses::apply_effect_event(
             &mut state,
             EffectLane::QuickAction,
             EffectEvent::QuickActionFinished {
