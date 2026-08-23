@@ -49,7 +49,11 @@ pub(super) fn handle_key(state: &mut AppState, key: KeyEvent, pane_loader: &Pane
 }
 
 pub(super) fn render(frame: &mut Frame, area: Rect, state: &AppState) {
-    let h = (state.hotlist_entries.len() + 2).min(20) as u16;
+    // The empty state still renders one truthful placeholder row, so reserve
+    // one content line plus the two border lines even when the configured list
+    // has zero entries.
+    let content_lines = state.hotlist_entries.len().max(1);
+    let h = (content_lines + 2).min(20) as u16;
     let popup = centered_rect_lines(60, h, area);
     frame.render_widget(Clear, popup);
     let items: Vec<ListItem> = if state.hotlist_entries.is_empty() {
@@ -229,6 +233,38 @@ mod tests {
             .unwrap() as u16
             / buffer.area.width;
         assert_eq!((top, bottom, bottom - top + 1), (9, 13, 5));
+    }
+
+    #[test]
+    fn empty_render_reserves_a_content_row_for_truthful_placeholder() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let state = AppState {
+            show_hotlist: true,
+            ..Default::default()
+        };
+
+        terminal
+            .draw(|frame| render(frame, frame.area(), &state))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("(empty - create ~/.config/arx/hotlist)"));
+
+        let top = buffer
+            .content()
+            .iter()
+            .position(|cell| cell.symbol() == "┌")
+            .unwrap() as u16
+            / buffer.area.width;
+        let bottom = buffer
+            .content()
+            .iter()
+            .position(|cell| cell.symbol() == "└")
+            .unwrap() as u16
+            / buffer.area.width;
+        assert_eq!(bottom - top + 1, 3);
     }
 
     #[test]
