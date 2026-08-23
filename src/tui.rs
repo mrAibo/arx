@@ -45,12 +45,16 @@ use tokio::sync::mpsc;
 mod presentation;
 use presentation::{session_callout_text, workspace_ribbon_text};
 
+mod bookmarks;
+mod hosts;
+mod jobs;
 mod overlays;
 mod ssh_hosts;
+mod user_menu;
 use overlays::{
-    render_bookmarks, render_command_center, render_context_menu, render_directory_history,
-    render_file_search, render_help, render_infrastructure_center, render_rename_input,
-    render_session_callout, render_smart_tree, render_tab_switcher, render_viewer,
+    render_command_center, render_context_menu, render_directory_history, render_file_search,
+    render_help, render_infrastructure_center, render_rename_input, render_session_callout,
+    render_smart_tree, render_tab_switcher, render_viewer,
 };
 
 #[derive(Clone)]
@@ -1022,88 +1026,11 @@ async fn event_loop(
                         continue;
                     }
 
-                    // Bookmarks mode
-                    if state.show_bookmarks {
-                        match key.code {
-                            KeyCode::Esc | KeyCode::Char('b')
-                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                state.show_bookmarks = false;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                state.bookmark_cursor = state.bookmark_cursor.saturating_sub(1);
-                            }
-                            KeyCode::Down | KeyCode::Char('j')
-                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                let max = state.bookmarks.len().saturating_sub(1);
-                                if state.bookmark_cursor < max {
-                                    state.bookmark_cursor += 1;
-                                }
-                            }
-                            KeyCode::Enter => {
-                                let loc = state.bookmarks.get(state.bookmark_cursor).cloned();
-                                if let Some(loc) = loc {
-                                    let active = state.active;
-                                    state.close_all_overlays();
-                                    schedule_pane_navigation(
-                                        &pane_loader,
-                                        &mut state,
-                                        active,
-                                        loc,
-                                        PaneLoadPurpose::Navigate {
-                                            remember_current: true,
-                                        },
-                                    );
-                                    state.message = Some("Opening bookmark…".into());
-                                }
-                            }
-                            _ => {}
-                        }
+                    if bookmarks::handle_key(&mut state, key, &pane_loader) {
                         continue;
                     }
 
-                    // Hosts panel: Esc to close
-                    if state.show_hosts {
-                        match key.code {
-                            KeyCode::Esc => {
-                                state.show_hosts = false;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                state.host_cursor = state.host_cursor.saturating_sub(1);
-                            }
-                            KeyCode::Down | KeyCode::Char('j')
-                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                let max = state.hosts.len().saturating_sub(1);
-                                if state.host_cursor < max {
-                                    state.host_cursor += 1;
-                                }
-                            }
-                            KeyCode::Enter => {
-                                let host = state.hosts.get(state.host_cursor).cloned();
-                                if let Some(host) = host {
-                                    let default_path = host.default_path.as_deref().unwrap_or("/");
-                                    let target = Location::Sftp {
-                                        host: host.id.clone(),
-                                        path: default_path.into(),
-                                    };
-                                    let active = state.active;
-                                    state.close_all_overlays();
-                                    schedule_pane_navigation(
-                                        &pane_loader,
-                                        &mut state,
-                                        active,
-                                        target,
-                                        PaneLoadPurpose::Navigate {
-                                            remember_current: true,
-                                        },
-                                    );
-                                    state.message = Some(format!("Connecting to {}…", host.name));
-                                }
-                            }
-                            _ => {}
-                        }
+                    if hosts::handle_key(&mut state, key, &pane_loader) {
                         continue;
                     }
 
@@ -1111,47 +1038,7 @@ async fn event_loop(
                         continue;
                     }
 
-                    // Jobs panel: Ctrl+J
-                    if state.show_jobs {
-                        let sync = &sync_runtime;
-                        match key.code {
-                            KeyCode::Esc | KeyCode::Char('j')
-                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                state.show_jobs = false;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                state.job_cursor = state.job_cursor.saturating_sub(1);
-                            }
-                            KeyCode::Down | KeyCode::Char('j')
-                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                let max = state.jobs.len().saturating_sub(1);
-                                if state.job_cursor < max {
-                                    state.job_cursor += 1;
-                                }
-                            }
-                            KeyCode::Char('p') => {
-                                if let Some(job) = state.jobs.get(state.job_cursor)
-                                    && job.kind == arx::jobs::JobKind::Transfer
-                                    && sync.transfers.request_pause(&job.id).is_ok()
-                                {
-                                    state.message = Some(
-                                        "Pause requested (will checkpoint at next safe boundary)"
-                                            .into(),
-                                    );
-                                }
-                            }
-                            KeyCode::Char('r') => {
-                                if let Some(job) = state.jobs.get(state.job_cursor)
-                                    && job.kind == arx::jobs::JobKind::Transfer
-                                    && sync.transfers.resume(&job.id).is_ok()
-                                {
-                                    state.message = Some("Resume requested".into());
-                                }
-                            }
-                            _ => {}
-                        }
+                    if jobs::handle_key(&mut state, key, &sync_runtime) {
                         continue;
                     }
 
@@ -1164,37 +1051,7 @@ async fn event_loop(
                         continue;
                     }
 
-                    // User menu: F2
-                    if state.show_menu {
-                        match key.code {
-                            KeyCode::Esc | KeyCode::F(2) => {
-                                state.show_menu = false;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                state.menu_cursor = state.menu_cursor.saturating_sub(1);
-                            }
-                            KeyCode::Down | KeyCode::Char('j')
-                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                let max = state.menu.len().saturating_sub(1);
-                                if state.menu_cursor < max {
-                                    state.menu_cursor += 1;
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if let Some(entry) = state.menu.get(state.menu_cursor) {
-                                    let cmd = entry.command.clone();
-                                    state.close_all_overlays();
-                                    let id = effect_dispatcher.dispatch(
-                                        EffectLane::GlobalProcess,
-                                        EffectScope::Global,
-                                        Effect::RunShellCapture { command: cmd },
-                                    );
-                                    state.register_effect(EffectLane::GlobalProcess, id);
-                                }
-                            }
-                            _ => {}
-                        }
+                    if user_menu::handle_key(&mut state, key, &effect_dispatcher) {
                         continue;
                     }
 
@@ -3085,7 +2942,7 @@ fn render(
 
     // Bookmarks overlay
     if state.show_bookmarks {
-        render_bookmarks(frame, area, state);
+        bookmarks::render(frame, area, state);
     }
 
     // Directory history overlay (Alt+H)
@@ -3136,7 +2993,7 @@ fn render(
 
     // Hosts overlay
     if state.show_hosts {
-        render_hosts(frame, area, state);
+        hosts::render(frame, area, state);
     }
 
     // SSH Hosts overlay
@@ -3146,7 +3003,7 @@ fn render(
 
     // Jobs overlay
     if state.show_jobs {
-        render_jobs(frame, area, state);
+        jobs::render(frame, area, state);
     }
 
     if state.show_transfer_center {
@@ -3165,7 +3022,7 @@ fn render(
 
     // User menu overlay
     if state.show_menu {
-        render_menu(frame, area, state);
+        user_menu::render(frame, area, state);
     }
 
     // Remote delete confirmation overlay
@@ -3852,128 +3709,6 @@ fn render_verification_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>
             )));
         }
     }
-}
-
-const HOSTS_CONFIG_PATH: &str = "~/.config/arx/hosts.toml";
-
-fn empty_hosts_text() -> String {
-    format!("No hosts configured\n\nAdd hosts to:\n{HOSTS_CONFIG_PATH}\n\nEsc Close")
-}
-
-fn render_hosts(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
-    if state.hosts.is_empty() {
-        let popup_area = centered_rect(60, 40, area);
-        frame.render_widget(Clear, popup_area);
-        frame.render_widget(
-            Paragraph::new(empty_hosts_text())
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Remote Hosts ")
-                        .border_style(Style::default().fg(Color::Cyan)),
-                )
-                .wrap(Wrap { trim: false }),
-            popup_area,
-        );
-        return;
-    }
-    let popup_area = centered_rect(60, 70, area);
-    frame.render_widget(Clear, popup_area);
-
-    let items: Vec<ListItem> = state
-        .hosts
-        .iter()
-        .enumerate()
-        .map(|(i, h)| {
-            let prefix = if i == state.host_cursor { "> " } else { "  " };
-            let line = format!("{prefix}{} ({})", h.name, h.hostname);
-            ListItem::new(Line::from(line))
-        })
-        .collect();
-
-    let mut list_state = ListState::default();
-    list_state.select(Some(state.host_cursor));
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Hosts (F9: close, Enter: open) "),
-        )
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
-    frame.render_stateful_widget(list, popup_area, &mut list_state);
-}
-
-fn render_jobs(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
-    let popup_area = centered_rect(70, 70, area);
-    frame.render_widget(Clear, popup_area);
-
-    let items: Vec<ListItem> = if state.jobs.is_empty() {
-        vec![ListItem::new(Line::from(
-            "  No jobs yet — start a copy/move to see it here.",
-        ))]
-    } else {
-        state
-            .jobs
-            .iter()
-            .enumerate()
-            .map(|(i, j)| {
-                let prefix = if i == state.job_cursor { "> " } else { "  " };
-                let bar = if j.status == arx::jobs::JobStatus::Running {
-                    let filled = j.progress.percent().unwrap_or(0) as usize / 5; // 0-20 chars
-                    let empty = 20 - filled;
-                    format!(
-                        " [{}{}] {}%",
-                        "=".repeat(filled),
-                        " ".repeat(empty),
-                        j.progress
-                    )
-                } else {
-                    String::new()
-                };
-                ListItem::new(Line::from(format!("{prefix}{j} {bar}")))
-            })
-            .collect()
-    };
-
-    let mut list_state = ListState::default();
-    list_state.select(Some(state.job_cursor));
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Jobs (Ctrl+J: close) "),
-        )
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
-    frame.render_stateful_widget(list, popup_area, &mut list_state);
-}
-
-fn render_menu(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
-    let popup_area = centered_rect(60, 70, area);
-    frame.render_widget(Clear, popup_area);
-
-    let items: Vec<ListItem> = state
-        .menu
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let prefix = if i == state.menu_cursor { "> " } else { "  " };
-            ListItem::new(Line::from(format!("{prefix}{}", m.label)))
-        })
-        .collect();
-
-    let mut list_state = ListState::default();
-    list_state.select(Some(state.menu_cursor));
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" User Menu (F2: close, Enter: run) "),
-        )
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
-    frame.render_stateful_widget(list, popup_area, &mut list_state);
 }
 
 /// ponytail: simple centered rect helper; add flexible sizing when needed
@@ -8741,7 +8476,7 @@ mod tests {
         toggle_hosts_overlay(&mut state);
 
         assert_eq!(state.active_overlay(), Some(OverlayKind::Hosts));
-        let text = empty_hosts_text();
+        let text = hosts::empty_hosts_text();
         assert!(text.contains("~/.config/arx/hosts.toml"));
         assert!(!text.contains("~/.ssh/config"));
     }
@@ -9364,7 +9099,7 @@ mod tests {
         };
 
         terminal
-            .draw(|f| render_bookmarks(f, f.area(), &state))
+            .draw(|f| bookmarks::render(f, f.area(), &state))
             .unwrap();
 
         let buf = terminal.backend().buffer();
