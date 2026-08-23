@@ -57,11 +57,12 @@ mod remote_edit;
 mod ssh_hosts;
 mod transfers;
 mod user_menu;
+mod viewer;
 mod workspace;
 use overlays::{
     render_command_center, render_context_menu, render_directory_history, render_file_search,
     render_infrastructure_center, render_rename_input, render_session_callout, render_smart_tree,
-    render_tab_switcher, render_viewer,
+    render_tab_switcher,
 };
 
 #[derive(Clone)]
@@ -833,32 +834,7 @@ async fn event_loop(
                         continue;
                     }
 
-                    // Viewer mode: takes over until dismissed
-                    if !state.viewer_content.is_empty() {
-                        match key.code {
-                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(3) => {
-                                state.viewer_content.clear();
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                state.viewer_scroll = state.viewer_scroll.saturating_sub(1);
-                            }
-                            KeyCode::Down | KeyCode::Char('j')
-                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                let max = state.viewer_content.len().saturating_sub(1);
-                                if state.viewer_scroll < max {
-                                    state.viewer_scroll += 1;
-                                }
-                            }
-                            KeyCode::PageUp => {
-                                state.viewer_scroll = state.viewer_scroll.saturating_sub(20);
-                            }
-                            KeyCode::PageDown => {
-                                let max = state.viewer_content.len().saturating_sub(1);
-                                state.viewer_scroll = (state.viewer_scroll + 20).min(max);
-                            }
-                            _ => {}
-                        }
+                    if viewer::handle_key(&mut state, key) {
                         continue;
                     }
 
@@ -2601,7 +2577,7 @@ fn render(
 
     // Viewer overlay
     if !state.viewer_content.is_empty() {
-        render_viewer(frame, area, state);
+        viewer::render(frame, area, state);
     }
 
     // Which-Key is derived from the active KeyRouter prefix and the shared
@@ -6992,36 +6968,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
         assert!(text.contains("✓ characterization"));
-    }
-
-    #[test]
-    fn leaf_overlay_viewer_characterization() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let state = AppState {
-            viewer_content: vec!["alpha".into(), "beta".into(), "gamma".into()],
-            viewer_scroll: 1,
-            ..Default::default()
-        };
-
-        terminal
-            .draw(|f| render_viewer(f, f.area(), &state))
-            .unwrap();
-
-        let buf = terminal.backend().buffer();
-        let text = buf
-            .content()
-            .iter()
-            .map(|c| c.symbol().to_owned())
-            .collect::<Vec<_>>()
-            .join("");
-
-        assert!(text.contains("View (3 lines, 33%)"));
-        assert!(text.contains("1/2 | j/k:scroll q/Esc:close"));
-        assert!(text.contains("beta"));
     }
 
     #[test]

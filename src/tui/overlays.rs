@@ -1,13 +1,13 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
 use arx::app::{AppState, CommandKind};
 use arx::vfs::Location;
 
-use super::{centered_rect, centered_rect_lines};
+use super::centered_rect_lines;
 
 pub(super) fn render_session_callout(frame: &mut Frame, area: Rect, text: &str) {
     frame.render_widget(
@@ -17,48 +17,6 @@ pub(super) fn render_session_callout(frame: &mut Frame, area: Rect, text: &str) 
         )),
         area,
     );
-}
-
-pub(super) fn render_viewer(frame: &mut Frame, area: Rect, state: &AppState) {
-    let popup_area = centered_rect(80, 90, area);
-    frame.render_widget(Clear, popup_area);
-
-    let total = state.viewer_content.len();
-    let pct = if total > 0 {
-        ((state.viewer_scroll.min(total.saturating_sub(1)) as f64 / total as f64) * 100.0) as usize
-    } else {
-        0
-    };
-    let title = format!(" View ({} lines, {}%) ", total, pct);
-    let max_scroll = state.viewer_content.len().saturating_sub(1);
-    let visible: Vec<Line> = state
-        .viewer_content
-        .iter()
-        .skip(state.viewer_scroll)
-        .take(popup_area.height.saturating_sub(2) as usize)
-        .map(|l| Line::from(l.as_str()))
-        .collect();
-
-    let scroll_hint = if max_scroll > 0 {
-        format!(
-            " {}/{} | j/k:scroll q/Esc:close ",
-            state.viewer_scroll, max_scroll
-        )
-    } else {
-        " q/Esc:close ".into()
-    };
-
-    let viewer = Paragraph::new(visible)
-        .block(Block::default().borders(Borders::ALL).title(title.as_str()))
-        .style(Style::default().fg(Color::White));
-    frame.render_widget(viewer, popup_area);
-
-    let hint_area = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(popup_area);
-    let hint = Paragraph::new(Line::from(scroll_hint)).style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(hint, hint_area[1]);
 }
 
 pub(super) fn render_infrastructure_center(frame: &mut Frame, area: Rect, state: &mut AppState) {
