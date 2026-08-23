@@ -304,8 +304,12 @@ mod tests {
     #[test]
     fn classifier_does_not_embed_a_second_static_keymap() {
         const SOURCE: &str = include_str!("browser_input.rs");
-        assert!(!SOURCE.contains("fn key_router_owns"));
-        assert!(!SOURCE.contains("KeyResolution::"));
-        assert!(!SOURCE.contains("KeyBinding::"));
+        let production = SOURCE
+            .split_once("#[cfg(test)]")
+            .expect("production/test seam")
+            .0;
+        assert!(!production.contains("fn key_router_owns"));
+        assert!(!production.contains("KeyResolution::"));
+        assert!(!production.contains("KeyBinding::"));
     }
 }
