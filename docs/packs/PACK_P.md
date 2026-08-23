@@ -105,21 +105,23 @@ Final PR head `f73d19fff5d90c3458afb3347074f086049b66e2` passed CI #666 / run `3
 
 Squash merge on `main`: `e78f0f347764f7ec389908ced44e55d15d4e6359`.
 
-## Active macro-transaction: P3 orchestration controllers
+## Completed: P3 orchestration-controller macro-batch
 
-Tracked by canonical #202. Duplicate tracker creations #203/#204 were closed immediately without code changes.
+Tracked by canonical #202 through PR #205. Duplicate tracker creations #203/#204 were closed immediately without code changes.
 
-This transaction extracts the remaining large P3 feature-orchestration seams while preserving the P3/P5 boundary. It is one branch/PR with three independently reviewable commits:
+The transaction extracted three large feature-orchestration seams while preserving the P3/P5 boundary:
 
-1. Quick Actions orchestration into `src/tui/quick_actions.rs`;
-2. Remote Edit lifecycle/initiation/deferred editor into `src/tui/remote_edit.rs`;
-3. Workspace Sync action orchestration and feature rendering into `src/tui/workspace.rs`.
+1. Quick Actions orchestration into `src/tui/quick_actions.rs` — implementation commit `bfde833b0a21204baf6fd53e68c7690a7f2f58a2`;
+2. Remote Edit lifecycle/initiation/deferred editor into `src/tui/remote_edit.rs` — implementation commit `cbbd772e4eb65438e06cf90eb52e805d787c3c88`;
+3. Workspace Sync action orchestration and feature rendering into `src/tui/workspace.rs` — implementation commit `897a4716511a3e8c4273121d654191ace886c33c`.
 
-P3 owns feature initiation, lifecycle helpers, deferred feature driving, and feature-local rendering. P5 remains authoritative for async response application: `handle_effect_response`, `EffectEvent` application, `workspace_scan_rx`, `sync_launch_rx`, `verification_rx`, and `job_rx` stay parent-owned in this transaction.
+Quick Actions keeps generic command input, mkdir, and shell execution in the parent; only an already-frozen `QuickActionPrompt` is completed through the feature helper. Remote Edit preserves the one shared Job lifecycle, phase ordering, stale-origin fail-closed behavior, deferred editor placement, and existing `EffectLane::RemoteEdit`. Workspace preserves immutable-plan, confirmation, launch supersession, queue-boundary, and verification presentation truth while reusing the existing `WorkspaceSyncController` and JobManager.
 
-Quick Actions must not absorb generic command input, mkdir, or shell execution; only an already-frozen `QuickActionPrompt` may be completed through a narrow helper. Remote Edit must preserve the one shared Job lifecycle and exact phases. Workspace must preserve immutable-plan, confirmation, supersession, queue-boundary, and verification presentation truth.
+The P3/P5 ownership boundary remains explicit: `handle_effect_response`, generic `EffectEvent` application, `workspace_scan_rx`, `sync_launch_rx`, `verification_rx`, and `job_rx` remain parent-owned in `src/tui.rs`. No second EffectDispatcher, JobManager, TransferQueueRuntime, WorkspaceSyncController, scheduler, provider registry, or response loop was introduced.
 
-No second EffectDispatcher, JobManager, TransferQueueRuntime, WorkspaceSyncController, scheduler, provider registry, or response loop may be introduced.
+The implementation head `897a4716511a3e8c4273121d654191ace886c33c` passed the full locked local suite reported as 1204 passed / 12 ignored and exact-head CI #669 / run `32636005836`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO transfer retry physical acceptance.
+
+P3 remains open pending reassessment of the smaller feature-controller surfaces deliberately left out of this transaction, including remote delete and any remaining storage/filesystem/transfer ownership still embedded in the parent composition root.
 
 ## Acceptance
 
