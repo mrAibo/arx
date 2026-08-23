@@ -147,9 +147,9 @@ fn require_active_capability(
 }
 
 /// Exact set of provider pairs `TransferPlanner` can actually execute for
-/// Copy. Local↔SFTP and Local↔S3 (single-object basic transfer) are the only
-/// implemented directions; every other pair (Archive, SFTP↔SFTP, WebDAV, S3↔S3,
-/// S3↔SFTP) is disabled because the planner cannot execute it.
+/// Copy. Local↔Local, Local↔SFTP, Local↔S3, and Local↔WebDAV are the implemented
+/// directions; every other pair remains disabled until its planner/executor path
+/// exists with the same safety guarantees.
 fn copy_pair_supported(active: ProviderId, passive: ProviderId) -> bool {
     matches!(
         (active, passive),
@@ -158,6 +158,8 @@ fn copy_pair_supported(active: ProviderId, passive: ProviderId) -> bool {
             | (ProviderId::Sftp, ProviderId::Local)
             | (ProviderId::S3, ProviderId::Local)
             | (ProviderId::Local, ProviderId::S3)
+            | (ProviderId::WebDAV, ProviderId::Local)
+            | (ProviderId::Local, ProviderId::WebDAV)
     )
 }
 
@@ -259,8 +261,8 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
                 }
             } else if copy_pair_supported(ctx.active_provider, ctx.passive_provider) {
                 // copy_pair_supported is the exact executable Copy surface:
-                // Local↔Local, Local↔SFTP and Local↔S3. Other provider pairs
-                // remain disabled until their planners are implemented safely.
+                // Local↔Local, Local↔SFTP, Local↔S3 and Local↔WebDAV. Other
+                // provider pairs remain disabled until implemented safely.
                 ActionAvailability::Available
             } else {
                 ActionAvailability::Disabled {
@@ -425,7 +427,9 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vfs::capabilities::{ARCHIVE_CAPABILITIES, LOCAL_CAPABILITIES, SFTP_CAPABILITIES};
+    use crate::vfs::capabilities::{
+        ARCHIVE_CAPABILITIES, LOCAL_CAPABILITIES, SFTP_CAPABILITIES, WEBDAV_CAPABILITIES,
+    };
 
     fn context(active_provider: ProviderId, active_capabilities: CapabilitySet) -> ActionContext {
         ActionContext {
@@ -974,6 +978,41 @@ mod tests {
             action_availability(ActionId::Copy, &ctx),
             ActionAvailability::Available
         );
+    }
+
+    #[test]
+    fn copy_local_webdav_available() {
+        let mut ctx = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        ctx.passive_provider = ProviderId::WebDAV;
+        ctx.passive_capabilities = WEBDAV_CAPABILITIES;
+        ctx.focused_kind = Some(EntryKind::File);
+        assert_eq!(
+            action_availability(ActionId::Copy, &ctx),
+            ActionAvailability::Available
+        );
+    }
+
+    #[test]
+    fn copy_webdav_local_available() {
+        let mut ctx = context(ProviderId::WebDAV, WEBDAV_CAPABILITIES);
+        ctx.passive_provider = ProviderId::Local;
+        ctx.focused_kind = Some(EntryKind::File);
+        assert_eq!(
+            action_availability(ActionId::Copy, &ctx),
+            ActionAvailability::Available
+        );
+    }
+
+    #[test]
+    fn copy_webdav_webdav_disabled() {
+        let mut ctx = context(ProviderId::WebDAV, WEBDAV_CAPABILITIES);
+        ctx.passive_provider = ProviderId::WebDAV;
+        ctx.passive_capabilities = WEBDAV_CAPABILITIES;
+        ctx.focused_kind = Some(EntryKind::File);
+        assert!(matches!(
+            action_availability(ActionId::Copy, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
     }
 
     #[test]
