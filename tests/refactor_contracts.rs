@@ -214,7 +214,11 @@ fn tui_jobs_are_render_snapshots_not_a_second_lifecycle_store() {
 
 #[test]
 fn direct_key_actions_share_action_availability_and_sync_ui_stays_orchestrated() {
-    let tui = include_str!("../src/tui.rs");
+    let tui = [
+        include_str!("../src/tui.rs"),
+        include_str!("../src/tui/input_dispatch.rs"),
+    ]
+    .concat();
     let actions = include_str!("../src/app/actions.rs");
     assert!(tui.contains("action_availability(action.id(), &context)"));
     assert!(actions.contains("ShowWorkspaceVerificationDiff"));

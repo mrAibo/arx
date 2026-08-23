@@ -6,6 +6,7 @@
 //! regressing to a direct `JobManager::cancel()` call.
 
 const TUI_SOURCE: &str = include_str!("../src/tui.rs");
+const INPUT_DISPATCH_SOURCE: &str = include_str!("../src/tui/input_dispatch.rs");
 const JOBS_SOURCE: &str = include_str!("../src/tui/jobs.rs");
 
 fn function_block(name: &str) -> &'static str {
@@ -88,11 +89,12 @@ fn pause_resume_controls_wired_for_transfer_jobs() {
 #[test]
 fn parent_wires_controller_through_full_runtime() {
     assert!(
-        TUI_SOURCE.contains("jobs::handle_key(&mut state, key, &sync_runtime)"),
-        "tui.rs must delegate the whole Jobs panel to jobs::handle_key with the full runtime"
+        INPUT_DISPATCH_SOURCE.contains("jobs::handle_key(&mut *state, key, sync_runtime)"),
+        "input dispatch must delegate the whole Jobs panel with the full runtime"
     );
     assert!(
-        !TUI_SOURCE.contains("if state.show_jobs {\n                        match key.code {"),
+        !INPUT_DISPATCH_SOURCE
+            .contains("if state.show_jobs {\n                        match key.code {"),
         "the inline Jobs Delete arm must not shadow the extracted controller"
     );
 }
