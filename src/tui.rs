@@ -29,7 +29,7 @@ use arx::workspace_sync_execution::SyncPlanId;
 use arx::workspace_sync_verification::{
     SyncVerificationEvent, SyncVerificationStatus, SyncVerificationVerdict,
 };
-use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::{
     DefaultTerminal,
     layout::{Constraint, Direction, Layout, Rect},
@@ -45,6 +45,7 @@ mod presentation;
 use presentation::{session_callout_text, workspace_ribbon_text};
 
 mod bookmarks;
+mod browser_input;
 mod command_center;
 mod embedded_terminal;
 mod help;
@@ -892,47 +893,36 @@ async fn event_loop(
                         KeyResolution::Unhandled => {}
                     }
 
-                    #[cfg(target_os = "linux")]
-                    if key.code == KeyCode::Char('u')
-                        && key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
-                    {
-                        match arx::storage_inspector_ui::launch_storage_inspector(&mut state) {
-                            Ok(id) => {
-                                state.message = Some(format!("Storage Inspector: {id}"));
+                    match browser_input::classify(&state, key) {
+                        #[cfg(target_os = "linux")]
+                        browser_input::BrowserRoute::OpenStorageInspector => {
+                            match arx::storage_inspector_ui::launch_storage_inspector(&mut state) {
+                                Ok(id) => {
+                                    state.message = Some(format!("Storage Inspector: {id}"));
+                                }
+                                Err(message) => {
+                                    state.message = Some(message);
+                                }
                             }
-                            Err(message) => {
-                                state.message = Some(message);
-                            }
+                            continue;
                         }
-                        continue;
-                    }
-
-                    #[cfg(target_os = "linux")]
-                    if key.code == KeyCode::Char('d')
-                        && key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
-                    {
-                        match arx::filesystem_usage_ui::launch_filesystems(&mut state) {
-                            Ok(()) => {
-                                state.message = Some("Filesystems refreshed".into());
+                        #[cfg(target_os = "linux")]
+                        browser_input::BrowserRoute::OpenFilesystems => {
+                            match arx::filesystem_usage_ui::launch_filesystems(&mut state) {
+                                Ok(()) => {
+                                    state.message = Some("Filesystems refreshed".into());
+                                }
+                                Err(message) => {
+                                    state.message = Some(message);
+                                }
                             }
-                            Err(message) => {
-                                state.message = Some(message);
-                            }
+                            continue;
                         }
-                        continue;
-                    }
-
-                    // Handle tree-filter Backspace before borrowing the active pane.
-                    if key.code == KeyCode::Backspace && state.show_tree {
-                        state.tree_filter.pop();
-                        continue;
-                    }
-
-                    let pane = state.active_pane_mut();
-
-                    match key.code {
-                        KeyCode::Char('q') => request_quit(&mut state, &effect_dispatcher),
-                        KeyCode::Tab => {
+                        browser_input::BrowserRoute::TreeFilterBackspace => {
+                            state.tree_filter.pop();
+                            continue;
+                        }
+                        browser_input::BrowserRoute::SwitchPane => {
                             let pane = state.active_pane_mut();
                             if pane.split {
                                 pane.split_active = !pane.split_active;
@@ -940,7 +930,8 @@ async fn event_loop(
                                 state.apply(Action::SwitchPane);
                             }
                         }
-                        KeyCode::Up | KeyCode::Char('k') => {
+                        browser_input::BrowserRoute::MoveUp => {
+                            let pane = state.active_pane_mut();
                             if pane.split && pane.split_active {
                                 if pane.split_cursor > 0 {
                                     pane.split_cursor -= 1;
@@ -949,9 +940,8 @@ async fn event_loop(
                                 pane.cursor -= 1;
                             }
                         }
-                        KeyCode::Down | KeyCode::Char('j')
-                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
+                        browser_input::BrowserRoute::MoveDown => {
+                            let pane = state.active_pane_mut();
                             if pane.split && pane.split_active {
                                 if pane.split_cursor + 1 < entries.len() {
                                     pane.split_cursor += 1;
@@ -961,7 +951,8 @@ async fn event_loop(
                             }
                         }
                         // Ctrl+Space: hash for files, du/df for dirs
-                        KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        browser_input::BrowserRoute::InspectFocusedEntry => {
+                            let pane = state.active_pane();
                             if let Some(entry) = visible_rows
                                 .get(cursor)
                                 .and_then(VisiblePaneRow::listed_entry)
@@ -989,27 +980,18 @@ async fn event_loop(
                             }
                         }
                         // Alt+/ : recursive file search
-                        KeyCode::Char('/') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        browser_input::BrowserRoute::BeginRecursiveSearch => {
                             if let Location::Local(dir) = &state.active_pane().location {
                                 state.cmd = format!("find {} -name ''", dir.display());
                                 state.cmd_input = true;
                             }
                         }
-                        KeyCode::Char('/') => {
+                        browser_input::BrowserRoute::BeginFilter => {
                             state.filter.clear();
                             state.filtering = true;
                         }
-                        KeyCode::Char('?') => {
-                            state.show_help = !state.show_help;
-                        }
-                        KeyCode::F(1) => {
-                            state.show_help = !state.show_help;
-                            state.help_scroll = 0;
-                        }
-                        KeyCode::Enter
-                            if key.modifiers.contains(KeyModifiers::ALT)
-                                && key.modifiers.contains(KeyModifiers::SHIFT) =>
-                        {
+                        browser_input::BrowserRoute::MeasureDirectoryChildren => {
+                            let pane = state.active_pane();
                             if let Location::Local(dir) = &pane.location {
                                 let location = Location::Local(dir.clone());
                                 let id = effect_dispatcher.dispatch(
@@ -1021,7 +1003,8 @@ async fn event_loop(
                                 state.message = Some("Calculating directory sizes…".into());
                             }
                         }
-                        KeyCode::Enter => {
+                        browser_input::BrowserRoute::ActivateEntry => {
+                            let pane = state.active_pane();
                             if matches!(visible_rows.get(cursor), Some(VisiblePaneRow::LoadMore(_)))
                             {
                                 let active = state.active;
@@ -1090,7 +1073,8 @@ async fn event_loop(
                                 }
                             }
                         }
-                        KeyCode::Backspace => {
+                        browser_input::BrowserRoute::OpenParent => {
+                            let pane = state.active_pane();
                             let loc = pane.location.clone();
                             if let Some(new_loc) = navigation_parent_target(&loc, &state.registry) {
                                 let active = state.active;
@@ -1106,12 +1090,12 @@ async fn event_loop(
                                 state.message = Some("Opening parent…".into());
                             }
                         }
-                        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        browser_input::BrowserRoute::Refresh => {
                             schedule_both_pane_loads(&pane_loader, &mut state);
                             state.message = Some("Refreshing panes…".into());
                         }
                         // Ctrl+U: swap panes
-                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        browser_input::BrowserRoute::SwapPanes => {
                             std::mem::swap(&mut state.left, &mut state.right);
                             std::mem::swap(&mut left_entries, &mut right_entries);
                             state.clear_selection();
@@ -1121,7 +1105,8 @@ async fn event_loop(
                             schedule_both_pane_loads(&pane_loader, &mut state);
                         }
                         // Shift+F6: rename file under cursor (local-only)
-                        KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        browser_input::BrowserRoute::BeginRename => {
+                            let pane = state.active_pane();
                             if let Some(entry) = visible_rows
                                 .get(cursor)
                                 .and_then(VisiblePaneRow::listed)
@@ -1136,7 +1121,8 @@ async fn event_loop(
                             }
                         }
                         // Ctrl+A: file attributes (permissions/owner)
-                        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        browser_input::BrowserRoute::FileAttributes => {
+                            let pane = state.active_pane();
                             if let Some(entry) = visible_rows
                                 .get(cursor)
                                 .and_then(VisiblePaneRow::listed_entry)
@@ -1159,7 +1145,8 @@ async fn event_loop(
                             }
                         }
                         // Ctrl+I: file info (stat)
-                        KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        browser_input::BrowserRoute::FileInfo => {
+                            let pane = state.active_pane();
                             if let Some(entry) = visible_rows
                                 .get(cursor)
                                 .and_then(VisiblePaneRow::listed_entry)
@@ -1182,7 +1169,7 @@ async fn event_loop(
                             }
                         }
                         // Alt+O: sync other pane to active pane
-                        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        browser_input::BrowserRoute::SyncOtherPane => {
                             let src = state.active_pane().location.clone();
                             let destination_pane = match state.active {
                                 Pane::Left => Pane::Right,
@@ -1197,7 +1184,7 @@ async fn event_loop(
                             schedule_pane_load(&pane_loader, &mut state, destination_pane);
                         }
                         // Alt+Down: go back in directory history
-                        KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                        browser_input::BrowserRoute::HistoryBack => {
                             let pane = state.active_pane_mut();
                             if let Some(prev) = pane.dir_history.last().cloned() {
                                 let active = state.active;
@@ -1212,10 +1199,7 @@ async fn event_loop(
                             }
                         }
                         // Ctrl+Shift+Left/Right: resize panel ratio
-                        KeyCode::Left
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && key.modifiers.contains(KeyModifiers::SHIFT) =>
-                        {
+                        browser_input::BrowserRoute::ResizePanelLeft => {
                             state.panel_ratio = state.panel_ratio.saturating_sub(5).max(10);
                             state.message = Some(format!(
                                 "Panel: {}/{}",
@@ -1223,10 +1207,7 @@ async fn event_loop(
                                 100 - state.panel_ratio
                             ));
                         }
-                        KeyCode::Right
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && key.modifiers.contains(KeyModifiers::SHIFT) =>
-                        {
+                        browser_input::BrowserRoute::ResizePanelRight => {
                             state.panel_ratio = (state.panel_ratio + 5).min(90);
                             state.message = Some(format!(
                                 "Panel: {}/{}",
@@ -1235,16 +1216,16 @@ async fn event_loop(
                             ));
                         }
                         // Alt+`: tab switcher
-                        KeyCode::Char('`') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        browser_input::BrowserRoute::ToggleTabSwitcher => {
                             state.show_tab_switcher = !state.show_tab_switcher;
                             state.tab_switcher_cursor = 0;
                         }
                         // Alt+H: directory history
-                        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        browser_input::BrowserRoute::ToggleHistory => {
                             state.show_history = !state.show_history;
                         }
                         // Ctrl+O: drop to subshell, restore on exit
-                        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        browser_input::BrowserRoute::OpenSubshell => {
                             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
                             let shell_result = terminal_session
                                 .suspend_while(|| DesktopService::run_interactive_shell(&shell))
@@ -1253,11 +1234,11 @@ async fn event_loop(
                                 state.message = Some(format!("Shell failed: {error}"));
                             }
                         }
-                        KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        browser_input::BrowserRoute::BeginGoTo => {
                             state.filter.clear();
                             state.go_input = true;
                         }
-                        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        browser_input::BrowserRoute::ToggleHidden => {
                             state.show_hidden = !state.show_hidden;
                             state.message = Some(if state.show_hidden {
                                 "Hidden files shown".into()
@@ -1267,7 +1248,7 @@ async fn event_loop(
                             schedule_both_pane_loads(&pane_loader, &mut state);
                         }
                         // *: invert selection on visible entries (local/SFTP/archive only)
-                        KeyCode::Char('*') => {
+                        browser_input::BrowserRoute::InvertSelection => {
                             let active = state.active;
                             let location = state.active_pane().location.clone();
                             if !matches!(location, Location::S3 { .. }) {
@@ -1289,12 +1270,12 @@ async fn event_loop(
                             }
                         }
                         // +: enter glob-select mode (uses filter buffer)
-                        KeyCode::Char('+') => {
+                        browser_input::BrowserRoute::BeginGlob => {
                             state.filter.clear();
                             state.glob_input = true;
                         }
                         // F2: user menu (if loaded), otherwise cycle sort
-                        KeyCode::F(2) => {
+                        browser_input::BrowserRoute::UserMenuOrSort => {
                             if !state.menu.is_empty() {
                                 state.show_menu = !state.show_menu;
                                 state.menu_cursor = 0;
@@ -1306,7 +1287,8 @@ async fn event_loop(
                             }
                         }
                         // Shift+F3: page file with bat
-                        KeyCode::F(3) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        browser_input::BrowserRoute::PageWithBat => {
+                            let pane = state.active_pane();
                             if let Some(entry) = visible_rows
                                 .get(cursor)
                                 .and_then(VisiblePaneRow::listed_entry)
@@ -1321,7 +1303,8 @@ async fn event_loop(
                             }
                         }
                         // Ctrl+C: copy filename to clipboard
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        browser_input::BrowserRoute::CopyPathToClipboard => {
+                            let pane = state.active_pane();
                             if let Some(entry) = visible_rows
                                 .get(cursor)
                                 .and_then(VisiblePaneRow::listed_entry)
@@ -1340,47 +1323,26 @@ async fn event_loop(
                                 state.message = Some(format!("Copied: {name}"));
                             }
                         }
-                        // Ctrl+B: bookmarks
-                        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            state.show_bookmarks = !state.show_bookmarks;
-                            state.bookmark_cursor = 0;
-                        }
-                        // Ctrl+J: jobs panel
-                        KeyCode::Delete if state.show_jobs => {
-                            if let Some(job) = state.jobs.get(state.job_cursor) {
-                                let id = job.id.clone();
-                                if cancel_job_product_route(&mut state, &sync_runtime, &id) {
-                                    state.jobs = sync_runtime.jobs.snapshot();
-                                }
-                            }
-                        }
-                        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            state.show_jobs = !state.show_jobs;
-                            state.job_cursor = 0;
-                        }
                         // Ctrl+S: save workspace
-                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        browser_input::BrowserRoute::SaveWorkspace => {
                             match crate::workspace::save_workspace(&state) {
                                 Ok(()) => state.message = Some("Workspace saved".into()),
                                 Err(e) => state.message = Some(format!("Save failed: {e}")),
                             }
                         }
                         // Ctrl+Y: toggle Transfer Center
-                        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        browser_input::BrowserRoute::ToggleTransferCenter => {
                             state.toggle_overlay(OverlayKind::TransferCenter);
                         }
                         // Type in tree filter (when tree is shown) — Esc to close
-                        KeyCode::Esc if state.show_tree => {
+                        browser_input::BrowserRoute::TreeClose => {
                             state.show_tree = false;
                             state.tree_filter.clear();
                         }
-                        KeyCode::Esc if state.show_infra => {
+                        browser_input::BrowserRoute::CloseInfrastructure => {
                             state.close_overlay(OverlayKind::Infrastructure);
                         }
-                        KeyCode::Char(c)
-                            if state.show_tree
-                                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
+                        browser_input::BrowserRoute::TreeFilterChar(c) => {
                             state.tree_filter.push(c);
                             let location = state.active_pane().location.clone();
                             let id = effect_dispatcher.dispatch(
@@ -1395,33 +1357,21 @@ async fn event_loop(
                         }
                         // Ctrl+X D: toggle directory compare
                         // Alt+T: toggle panel mode (Full ↔ Brief)
-                        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        browser_input::BrowserRoute::TogglePanelMode => {
                             state.panel_mode = match state.panel_mode {
                                 PanelMode::Full => PanelMode::Brief,
                                 PanelMode::Brief => PanelMode::Full,
                             };
                         }
-                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            state.show_diff = !state.show_diff;
-                            state.message = Some(if state.show_diff {
-                                "Diff on — unique files highlighted".into()
-                            } else {
-                                "Diff off".into()
-                            });
-                        }
                         // :: command input
-                        KeyCode::Char(':') => {
+                        browser_input::BrowserRoute::BeginCommand => {
                             state.pending_mkdir_location = None;
                             state.pending_quick_action_prompt = None;
                             state.cmd.clear();
                             state.cmd_input = true;
                         }
                         // Alt+1-9: switch to tab N
-                        KeyCode::Char(c)
-                            if key.modifiers.contains(KeyModifiers::ALT)
-                                && ('1'..='9').contains(&c) =>
-                        {
-                            let idx = (c as u8 - b'1') as usize;
+                        browser_input::BrowserRoute::SwitchTabNumber(idx) => {
                             let pane = state.active_pane_mut();
                             if idx < pane.tabs.len() + 1 {
                                 if idx != 0 {
@@ -1439,7 +1389,7 @@ async fn event_loop(
                             }
                         }
                         // Ctrl+T: new tab in active pane
-                        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        browser_input::BrowserRoute::NewTab => {
                             state.active_pane_mut().new_tab();
                             let tabs = state.active_pane().tabs.len() + 1;
                             state.clear_selection();
@@ -1449,7 +1399,7 @@ async fn event_loop(
                             state.message = Some(format!("Tab {tabs}/{tabs}"));
                         }
                         // Ctrl+W: close tab in active pane
-                        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        browser_input::BrowserRoute::CloseTab => {
                             state.active_pane_mut().close_tab();
                             let tabs = state.active_pane().tabs.len() + 1;
                             state.clear_selection();
@@ -1459,7 +1409,7 @@ async fn event_loop(
                             state.message = Some(format!("Tab {}/{}", tabs.min(1), tabs));
                         }
                         // Ctrl+Left: previous tab
-                        KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        browser_input::BrowserRoute::PreviousTab => {
                             let tabs_len = state.active_pane().tabs.len();
                             if tabs_len > 0 {
                                 state.active_pane_mut().switch_tab(tabs_len - 1);
@@ -1471,10 +1421,7 @@ async fn event_loop(
                             }
                         }
                         // Ctrl+Right: next tab
-                        KeyCode::Right
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && state.active_pane().tabs.len() >= 2 =>
-                        {
+                        browser_input::BrowserRoute::NextTab => {
                             state.active_pane_mut().switch_tab(0);
                             state.clear_selection();
                             state.remote_workspace.disable();
@@ -1482,7 +1429,7 @@ async fn event_loop(
                             schedule_active_pane_load(&pane_loader, &mut state);
                             state.message = Some("Tab →".into());
                         }
-                        _ => {}
+                        browser_input::BrowserRoute::Unhandled => {}
                     }
                 }
                 _ => {}

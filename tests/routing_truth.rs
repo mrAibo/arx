@@ -62,6 +62,7 @@ fn keymap_has_no_routing_truth_panel_shortcuts() {
 #[test]
 fn legacy_action_routing_truth_is_reconciled() {
     let tui = include_str!("../src/tui.rs");
+    let browser_input = include_str!("../src/tui/browser_input.rs");
     let overlays = include_str!("../src/tui/overlays.rs");
     let event_loop = tui
         .split_once("async fn dispatch_ui_action(")
@@ -70,31 +71,37 @@ fn legacy_action_routing_truth_is_reconciled() {
 
     assert!(!event_loop.contains("// Ctrl+T: toggle Smart Tree"));
     assert_eq!(
-        event_loop
-            .matches("KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {")
+        browser_input
+            .matches(
+                "KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => NewTab"
+            )
             .count(),
         1,
         "Ctrl+T must have one physical owner"
     );
-    assert!(event_loop.contains("// Ctrl+T: new tab in active pane"));
+    assert!(event_loop.contains("browser_input::BrowserRoute::NewTab => {"));
     assert!(event_loop.contains("state.active_pane_mut().new_tab();"));
     assert!(event_loop.contains("state.message = Some(format!(\"Tab {tabs}/{tabs}\"));"));
 
-    let alt_t = "KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => {\n                            state.panel_mode = match state.panel_mode {";
+    let alt_t =
+        "KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => TogglePanelMode";
     assert!(
-        event_loop.contains(alt_t),
-        "Alt+T must be an executable arm"
+        browser_input.contains(alt_t),
+        "Alt+T must have a classifier route"
     );
+    assert!(event_loop.contains("browser_input::BrowserRoute::TogglePanelMode => {"));
     assert!(!event_loop.contains("// Alt+T: toggle panel mode (Full ↔ Brief) KeyCode::"));
 
     assert_eq!(
-        event_loop
-            .matches("KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {")
+        browser_input
+            .matches(
+                "KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => FileInfo"
+            )
             .count(),
         1,
         "Ctrl+I must have one physical owner"
     );
-    assert!(event_loop.contains("// Ctrl+I: file info (stat)"));
+    assert!(event_loop.contains("browser_input::BrowserRoute::FileInfo => {"));
     assert!(event_loop.contains("FileInfoService::metadata_summary("));
     assert!(!event_loop.contains("// Ctrl+I: toggle Infrastructure Center"));
     assert!(!event_loop.contains("Effect::InfrastructureSnapshot"));
@@ -108,8 +115,10 @@ fn legacy_action_routing_truth_is_reconciled() {
 #[test]
 fn action_infrastructure_escape_closes_through_overlay_state() {
     let tui = include_str!("../src/tui.rs");
+    let browser_input = include_str!("../src/tui/browser_input.rs");
+    assert!(browser_input.contains("KeyCode::Esc if state.show_infra => CloseInfrastructure"));
     assert!(tui.contains(
-        "KeyCode::Esc if state.show_infra => {\n                            state.close_overlay(OverlayKind::Infrastructure);"
+        "browser_input::BrowserRoute::CloseInfrastructure => {\n                            state.close_overlay(OverlayKind::Infrastructure);"
     ));
 
     let mut state = AppState::default();
