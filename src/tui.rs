@@ -33,7 +33,7 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::{
-    DefaultTerminal,
+    DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -48,6 +48,7 @@ use presentation::{session_callout_text, workspace_ribbon_text};
 
 mod bookmarks;
 mod browser_input;
+mod command_bar;
 mod command_center;
 mod embedded_terminal;
 mod help;
@@ -425,7 +426,7 @@ async fn event_loop(
                                         .map(|entry| entry.kind),
                                     editor.is_some(),
                                 );
-                                let action_id = action_to_id(action);
+                                let action_id = command_bar::action_to_id(action);
                                 let avail = action_availability(action_id, &ctx);
                                 state.message =
                                     Some(avail.reason().unwrap_or("unavailable").to_string());
@@ -1949,247 +1950,6 @@ fn pane_surface_state<'a>(
     }
 }
 
-// --- Commander core action helpers (ponytail: 7-variant match, covers hitbox set) ---
-
-fn action_id_to_action(id: ActionId) -> Option<Action> {
-    Some(match id {
-        ActionId::ViewFile => Action::ViewFile,
-        ActionId::EditFile => Action::EditFile,
-        ActionId::Copy => Action::Copy,
-        ActionId::Move => Action::Move,
-        ActionId::Mkdir => Action::Mkdir,
-        ActionId::Delete => Action::Delete,
-        ActionId::OpenHosts => Action::OpenHosts,
-        ActionId::OpenCommandCenter => Action::OpenCommandCenter,
-        ActionId::ToggleWorkspaceComparison => Action::ToggleWorkspaceComparison,
-        ActionId::PreviewWorkspaceSync => Action::PreviewWorkspaceSync,
-        ActionId::ToggleEmbeddedTerminal => Action::ToggleEmbeddedTerminal,
-        ActionId::OpenHelp => Action::OpenHelp,
-        ActionId::Quit => Action::Quit,
-        _ => return None,
-    })
-}
-
-fn action_to_id(a: Action) -> ActionId {
-    match a {
-        Action::ViewFile => ActionId::ViewFile,
-        Action::EditFile => ActionId::EditFile,
-        Action::Copy => ActionId::Copy,
-        Action::Move => ActionId::Move,
-        Action::Mkdir => ActionId::Mkdir,
-        Action::Delete => ActionId::Delete,
-        Action::OpenHosts => ActionId::OpenHosts,
-        Action::OpenCommandCenter => ActionId::OpenCommandCenter,
-        Action::ToggleWorkspaceComparison => ActionId::ToggleWorkspaceComparison,
-        Action::PreviewWorkspaceSync => ActionId::PreviewWorkspaceSync,
-        Action::ToggleEmbeddedTerminal => ActionId::ToggleEmbeddedTerminal,
-        Action::OpenHelp => ActionId::OpenHelp,
-        Action::Quit => ActionId::Quit,
-        _ => unreachable!("only commander core actions reach hitboxes"),
-    }
-}
-
-fn compact_action_label(action: ActionId) -> &'static str {
-    match action {
-        ActionId::ViewFile => "View",
-        ActionId::EditFile => "Edit",
-        ActionId::Copy => "Copy",
-        ActionId::Move => "Move",
-        ActionId::Mkdir => "MkDir",
-        ActionId::Delete => "Del",
-        ActionId::OpenHosts => "Hosts",
-        ActionId::OpenCommandCenter => "Cmd",
-        ActionId::ToggleWorkspaceComparison => "Diff",
-        ActionId::PreviewWorkspaceSync => "Sync",
-        ActionId::ToggleEmbeddedTerminal => "Term",
-        ActionId::OpenHelp => "Help",
-        ActionId::Quit => "Quit",
-        _ => "",
-    }
-}
-
-/// Format one command-bar row from hints, respecting width.
-#[allow(dead_code)] // used in test helpers
-fn format_command_row(hints: &[ContextHint], width: u16) -> String {
-    let mut text = String::new();
-    for hint in hints {
-        let item = format!("{} {}", hint.binding, hint.label);
-        let candidate = if text.is_empty() {
-            item
-        } else {
-            format!("{text}    {item}")
-        };
-        if Line::from(candidate.as_str()).width() > usize::from(width) {
-            break;
-        }
-        text = candidate;
-    }
-    text
-}
-
-fn render_command_bar(
-    frame: &mut ratatui::Frame,
-    row_a_area: Rect,
-    row_b_area: Rect,
-    hitboxes: &mut Vec<arx::app::CommandHitbox>,
-    row_a: &[ContextHint],
-    row_b: &[ContextHint],
-) {
-    hitboxes.clear();
-
-    // Row A — Commander core (always visible, dimmed if unavailable).
-    if !row_a.is_empty() && row_a_area.width > 0 {
-        let mut spans: Vec<Span> = Vec::new();
-        let compact = row_a_area.width < 90;
-        let mut col = row_a_area.x;
-        for (i, hint) in row_a.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw("  "));
-                col += 2;
-            }
-            let label = if compact {
-                compact_action_label(hint.action)
-            } else {
-                hint.label
-            };
-            let chip_text = format!("{} {}", hint.binding, label);
-            let chip_width = Line::from(chip_text.as_str()).width() as u16;
-            if let Some(action) = action_id_to_action(hint.action) {
-                hitboxes.push(arx::app::CommandHitbox {
-                    rect: Rect::new(col, row_a_area.y, chip_width, 1),
-                    action,
-                    available: hint.available,
-                });
-            }
-            col += chip_width;
-            let style = if !hint.available {
-                Style::default()
-                    .fg(Color::Gray)
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM)
-            } else {
-                Style::default().fg(Color::Black).bg(Color::DarkGray)
-            };
-            spans.push(Span::styled(chip_text, style));
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), row_a_area);
-    }
-
-    // Row B — Discovery (responsive, priority-based).
-    // Single layout model for both rendering and hitboxes.
-    if !row_b.is_empty() && row_b_area.width > 0 {
-        #[derive(Debug)]
-        #[allow(dead_code)]
-        struct PositionedChip {
-            text: String,
-            rect: Rect,
-            available: bool,
-        }
-
-        let mut chips = Vec::new();
-        let mut cursor = row_b_area.x;
-        let spacing = 3u16; // matches format_command_row spacing
-
-        for hint in row_b {
-            let chip_text = format!("{} {}", hint.binding, hint.label);
-            let chip_width = Line::from(chip_text.as_str()).width() as u16;
-
-            let chip_x = if chips.is_empty() {
-                cursor
-            } else {
-                cursor + spacing
-            };
-
-            if chip_x + chip_width > row_b_area.x + row_b_area.width {
-                break; // stop at first overflow — same as format_command_row
-            }
-
-            if let Some(action) = action_id_to_action(hint.action) {
-                let rect = Rect::new(chip_x, row_b_area.y, chip_width, 1);
-                chips.push(PositionedChip {
-                    text: chip_text,
-                    rect,
-                    available: hint.available,
-                });
-                hitboxes.push(arx::app::CommandHitbox {
-                    rect,
-                    action,
-                    available: hint.available,
-                });
-            }
-
-            cursor = chip_x + chip_width;
-        }
-
-        // Render from the same computed layout — geometry is source of truth
-        if !chips.is_empty() {
-            let mut spans: Vec<Span> = Vec::new();
-            let mut render_cursor = row_b_area.x;
-
-            for chip in chips.iter() {
-                // render padding to align with chip.rect.x (includes inter-chip spacing)
-                if chip.rect.x > render_cursor {
-                    let pad = chip.rect.x - render_cursor;
-                    spans.push(Span::styled(
-                        " ".repeat(pad as usize),
-                        Style::default().fg(Color::Black).bg(Color::DarkGray),
-                    ));
-                    render_cursor = chip.rect.x + chip.rect.width;
-                } else {
-                    render_cursor = chip.rect.x + chip.rect.width;
-                }
-                let style = if !chip.available {
-                    Style::default()
-                        .fg(Color::Gray)
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM)
-                } else {
-                    Style::default().fg(Color::Black).bg(Color::DarkGray)
-                };
-                spans.push(Span::styled(chip.text.clone(), style));
-            }
-            frame.render_widget(
-                Paragraph::new(Line::from(spans))
-                    .style(Style::default().fg(Color::Black).bg(Color::DarkGray)),
-                row_b_area,
-            );
-        }
-    }
-}
-
-/// Test-only wrapper — resolves the old `contextual_footer_text` signature
-/// using the new `command_bar_rows` + `format_command_row` machinery.
-#[cfg(test)]
-fn command_bar_text_wrapper(
-    state: &AppState,
-    key_router: &KeyRouter,
-    focused_kind: Option<EntryKind>,
-    editor_available: bool,
-    width: u16,
-) -> Option<String> {
-    if !key_router.pending().is_empty() || width == 0 {
-        return None;
-    }
-    let (row_a, row_b) =
-        command_bar_rows(state, key_router.keymap(), focused_kind, editor_available);
-    // If row_a has content (browser), return it. Otherwise return row_b.
-    let mut text = format_command_row(&row_a, width);
-    if text.is_empty() {
-        text = format_command_row(&row_b, width);
-    }
-    // If both rows are empty, fall back to raw contextual hints for non-browser contexts
-    if text.is_empty() {
-        let hints = contextual_hints_with_file_context(
-            state,
-            key_router.keymap(),
-            focused_kind,
-            editor_available,
-        );
-        text = format_command_row(&hints, width);
-    }
-    (!text.is_empty()).then_some(text)
-}
-
 /// Check if a filename looks like an archive (tar, tgz, zip).
 fn is_archive(name: &str) -> bool {
     name.ends_with(".tar")
@@ -2544,7 +2304,7 @@ fn render(
     // Derived from the same runtime Keymap that owns keyboard routing.
     let (row_a, row_b) =
         command_bar_rows(state, key_router.keymap(), focused_kind, editor_available);
-    render_command_bar(
+    command_bar::render(
         frame,
         footer_row_a,
         footer_row_b,
@@ -4820,153 +4580,6 @@ mod tests {
         assert!(pane_still_at_location(&state, Pane::Right, &origin));
     }
 
-    #[test]
-    fn footer_uses_remapped_file_action_bindings() {
-        let keymap = Keymap::new(vec![
-            KeyBinding::new(
-                InputContext::Browser,
-                vec![KeyStroke::new(KeyCode::F(12), KeyModifiers::NONE)],
-                Action::ViewFile,
-            ),
-            KeyBinding::new(
-                InputContext::Browser,
-                vec![KeyStroke::new(KeyCode::F(11), KeyModifiers::NONE)],
-                Action::EditFile,
-            ),
-            KeyBinding::new(
-                InputContext::Browser,
-                vec![
-                    KeyStroke::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
-                    KeyStroke::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                ],
-                Action::BeginChmod,
-            ),
-        ]);
-        let mut router = KeyRouter::new(keymap);
-
-        assert_eq!(
-            command_bar_text_wrapper(
-                &AppState::default(),
-                &router,
-                Some(EntryKind::File),
-                true,
-                u16::MAX,
-            )
-            .as_deref(),
-            Some("F12 View file    F11 Edit file")
-        );
-
-        assert_eq!(
-            router.resolve_stroke(
-                InputContext::Browser,
-                KeyStroke::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
-            ),
-            KeyResolution::Pending
-        );
-        assert!(
-            command_bar_text_wrapper(
-                &AppState::default(),
-                &router,
-                Some(EntryKind::File),
-                true,
-                u16::MAX,
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn footer_fits_priority_prefix_to_real_width() {
-        let state = AppState::default();
-        let router = KeyRouter::default();
-        let wide = command_bar_text_wrapper(&state, &router, Some(EntryKind::File), true, u16::MAX)
-            .unwrap();
-        // Row A has 7 chips (F3-F9)
-        assert_eq!(wide.split("    ").count(), 7);
-        assert!(wide.contains("F3 View file"));
-        assert!(wide.contains("F4 Edit file"));
-        assert!(wide.contains("F5 Copy"));
-        assert!(wide.contains("F6 Move"));
-        assert!(wide.contains("F7 New directory"));
-        assert!(wide.contains("F8 Delete"));
-        assert!(wide.contains("F9 Hosts"));
-
-        let first = wide.split("    ").next().unwrap();
-        let first_width = u16::try_from(Line::from(first).width()).unwrap();
-        assert_eq!(
-            command_bar_text_wrapper(&state, &router, Some(EntryKind::File), true, first_width,)
-                .as_deref(),
-            Some(first)
-        );
-        assert!(
-            command_bar_text_wrapper(
-                &state,
-                &router,
-                Some(EntryKind::File),
-                true,
-                first_width - 1,
-            )
-            .is_none()
-        );
-        // On directory focus, ViewFile is present but unavailable (dimmed)
-        let dir_text =
-            command_bar_text_wrapper(&state, &router, Some(EntryKind::Directory), true, u16::MAX)
-                .unwrap();
-        assert!(
-            dir_text.contains("F3 View file"),
-            "ViewFile should be visible even on directory focus"
-        );
-    }
-
-    #[test]
-    fn footer_derives_file_action_from_keymap_not_hardcoded() {
-        // Remap Copy to F10; footer must follow runtime Keymap, not hardcoded F5.
-        let state = AppState::default();
-        let base = Keymap::default();
-        let mut bindings: Vec<_> = base
-            .bindings()
-            .iter()
-            .filter(|b| {
-                !(b.context == InputContext::Browser
-                    && b.action == Action::Copy
-                    && b.sequence.len() == 1
-                    && matches!(b.sequence[0].code, KeyCode::F(5)))
-            })
-            .cloned()
-            .collect();
-        bindings.push(KeyBinding::new(
-            InputContext::Browser,
-            vec![KeyStroke::new(KeyCode::F(10), KeyModifiers::NONE)],
-            Action::Copy,
-        ));
-        let router = KeyRouter::new(Keymap::new(bindings));
-        let wide = command_bar_text_wrapper(&state, &router, Some(EntryKind::File), true, u16::MAX)
-            .unwrap();
-        assert!(
-            wide.contains("F10 Copy"),
-            "footer must derive copy key from remapped Keymap: {wide}"
-        );
-        assert!(
-            !wide.contains("F5 Copy"),
-            "footer must not show old F5 for Copy after remap: {wide}"
-        );
-    }
-
-    #[test]
-    fn pending_chord_leaves_discovery_to_which_key() {
-        let mut router = KeyRouter::default();
-        let resolution = router.resolve_stroke(
-            InputContext::Browser,
-            KeyStroke::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
-        );
-
-        assert_eq!(resolution, KeyResolution::Pending);
-        assert!(
-            command_bar_text_wrapper(&AppState::default(), &router, None, false, u16::MAX)
-                .is_none()
-        );
-    }
-
     fn file(name: &str) -> Entry {
         Entry {
             name: name.into(),
@@ -5845,71 +5458,6 @@ mod tests {
             &mut Vec::new(),
         );
         assert_eq!(left, original);
-    }
-
-    #[test]
-    fn footer_tracks_sync_preview_confirmation_and_running_contexts() {
-        let left = Location::Local("/left".into());
-        let right = Location::Local("/right".into());
-        let router = KeyRouter::default();
-
-        let mut preview = AppState::default();
-        preview.remote_workspace.preview_open = true;
-        preview.remote_workspace.refresh_visible(
-            left.clone(),
-            right.clone(),
-            &[file("source.txt")],
-            &[],
-        );
-        let preview_footer =
-            command_bar_text_wrapper(&preview, &router, None, false, u16::MAX).unwrap_or_default();
-        assert!(preview_footer.contains("Enter Execute workspace sync"));
-        assert!(preview_footer.contains("D Reverse sync direction"));
-        assert!(preview_footer.contains("M Toggle update/mirror"));
-
-        let mut confirmation = AppState::default();
-        confirmation.left.location = left.clone();
-        confirmation.right.location = right.clone();
-        confirmation.remote_workspace.preview_open = true;
-        confirmation.remote_workspace.refresh_visible(
-            left,
-            right,
-            &[],
-            &[file("destination-only.txt")],
-        );
-        confirmation.remote_workspace.toggle_mode();
-        let plan = confirmation
-            .remote_workspace
-            .plan
-            .clone()
-            .expect("mirror preview plan");
-        let diff = confirmation
-            .remote_workspace
-            .diff
-            .clone()
-            .expect("mirror preview diff");
-        let frozen = arx::workspace_sync_execution::SyncPlanValidator::freeze(
-            &plan,
-            &diff,
-            &arx::vfs::default_registry(),
-        )
-        .expect("freeze mirror preview");
-        confirmation.remote_workspace.set_frozen_plan(frozen);
-        let confirmation_footer =
-            command_bar_text_wrapper(&confirmation, &router, None, false, u16::MAX)
-                .unwrap_or_default();
-        assert!(confirmation_footer.contains("Enter Confirm workspace sync"));
-        assert!(confirmation_footer.contains("Esc Back in workspace sync"));
-
-        let mut running = AppState::default();
-        running.remote_workspace.preview_open = true;
-        running.remote_workspace.ux = WorkspaceSyncUxState::Running {
-            job_id: "sync-1".into(),
-        };
-        let running_footer =
-            command_bar_text_wrapper(&running, &router, None, false, u16::MAX).unwrap_or_default();
-        assert!(running_footer.contains("C Cancel workspace sync"));
-        assert!(running_footer.contains("Esc Hide workspace sync"));
     }
 
     #[test]
