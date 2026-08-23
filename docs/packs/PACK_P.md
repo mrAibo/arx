@@ -16,12 +16,12 @@ Decompose `src/tui.rs` incrementally so rendering, feature orchestration, input 
 ## Sequence
 
 - [x] P0 — characterization baseline for the seams that move first
-- [ ] P1 — pure presentation-model extraction into `src/tui/` submodules
+- [x] P1 — pure presentation-model extraction into `src/tui/` submodules
 - [x] P2 — frame/render-only extraction
 - [x] P3 — feature-controller extraction in independently green slices
 - [x] P4 — keyboard/mouse routing extraction
 - [x] P5 — Effect/Job response handling extraction
-- [ ] P6 — thin runtime/event-loop composition root
+- [x] P6 — thin runtime/event-loop composition root
 - [ ] P7 — docs/final exact-head acceptance and PACK P closure
 
 ## Completed: P0 + P1a
@@ -36,7 +36,13 @@ P0 added semantic characterization for the workspace ribbon while existing sessi
 
 P1a created `src/tui/presentation.rs` and moved only the workspace ribbon and session-callout presentation model. Frame rendering, routing, Action dispatch, Effect/Job handling, provider execution, and feature-controller ownership remained in `src/tui.rs`.
 
-P1 remains open because additional presentation-only seams may still move as later controller slices expose them.
+P1 remained open at that point only to allow later slices to reveal another meaningful presentation-model seam.
+
+## P1 boundary decision
+
+The final PACK P audit closes P1 at the accepted P1a boundary. No additional pure presentation-model seam emerged that justifies a separate P1 transaction: later visual work was correctly owned by P2 rendering/geometry extraction or by feature/routing modules with non-presentation responsibilities. Creating another P1 module solely to increase module count would not improve the architecture.
+
+`src/tui/presentation.rs` therefore remains the focused pure presentation-model boundary, while P2 and later phases own the distinct rendering, controller and routing concerns exposed during decomposition.
 
 ## Completed: P2a leaf overlays
 
@@ -220,15 +226,56 @@ P5 extracts response application while deliberately leaving channel/runtime owne
 
 Independent review confirmed the branch contains exactly these four real commits and only `src/tui.rs` plus the four response modules. No production response module constructs a JobManager, EffectDispatcher, WorkspaceSyncController, ProviderRegistry, TransferQueueRuntime, channel, scheduler or response loop; test-only fixtures may construct local managers/registries.
 
-The P5/P6 boundary remains explicit: `tokio::select!`, `workspace_scan_rx.recv()`, `pane_load_rx.recv()`, `pane_next_page_rx.recv()`, `effect_rx.recv()`, `sync_launch_rx.recv()`, `verification_rx.recv()`, `job_rx.recv()`, tick/input polling, deferred editor launch, notification spawning, post-job pane scheduling and terminal-drain placement remain physically parent-owned in `src/tui.rs`.
+The P5/P6 boundary remains explicit: `tokio::select!`, `workspace_scan_rx.recv()`, `pane_load_rx.recv()`, `pane_next_page_rx.recv()`, `effect_rx.recv()`, `sync_launch_rx.recv()`, `verification_rx.recv()`, `job_rx.recv()`, tick/input polling, deferred editor launch, notification spawning, post-job pane scheduling and terminal-drain placement remain physically parent-owned in `src/tui.rs` at the P5 boundary.
 
 Exact implementation head `012cef8cd07aae10b7c35ec344fa615aa36ac388` passed CI #690 / run `32661952951`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance all succeeded with exact-SHA evidence.
 
 ## P5 boundary decision
 
-P5 is complete at the accepted PR #217 implementation boundary, pending only this documentation commit and final exact-head merge acceptance.
+P5 is complete through PR #217. Final docs head `d68de74e2aea963049ded4e76d26646d0ceddbd8` passed exact-head CI #691 / run `32662141048`, and PR #217 squash-merged on `main` as `d5b244b51c47743d61dbe3edc6ebf3c0cb208cd1`, closing #216 as completed.
 
-Response semantics are now isolated behind four tested modules; P6 may thin only runtime/event-loop composition and must not reopen stale/correlation/refresh semantics.
+Response semantics are isolated behind four tested modules. P6 subsequently moved only runtime/event-source and input-dispatch composition; it did not reopen stale/correlation/refresh semantics.
+
+## Completed: P6 thin runtime/event-loop composition root
+
+Tracked by #219 through PR #220 from authoritative P5 merge `d5b244b51c47743d61dbe3edc6ebf3c0cb208cd1`.
+
+P6 completed in three implementation commits:
+
+1. `09569d127866f1a3a2487441006d11dc5d37d285` — `src/tui/runtime.rs` owns the single existing runtime authority set, all seven async response receivers and the 50ms Tick source behind typed `RuntimeEvent` multiplexing;
+2. `3cd1f18e3af713dec20d860c0a710b7818770361` — `src/tui/input_dispatch.rs` owns application of an already-read crossterm `Event` while preserving the established controller/routing priority;
+3. `d4239f8d240aabe4ea85de5481d9032329ee9507` — `src/tui.rs` is thinned to the composition lifecycle around render, typed runtime-event delegation, narrow root-owned pane-entry mutation, Tick polling and deferred editor drive.
+
+During input-dispatch extraction, the originally sketched immutable API exposed a real ownership contradiction: `SwapPanes` and `UserMenuOrSort` mutate event-loop-owned backing entry vectors that are simultaneously borrowed by visible-row views. The reviewed #219 clarification resolved this without moving ownership into `AppState` or cloning data: `InputDispatchOutcome` carries `InputFlow` plus a narrow `EntryMutation`, and the parent applies only `SwapPaneEntries` / `ResortPaneEntries` after borrowed views are released. Existing outer-loop `continue` versus deferred-editor fall-through semantics remain explicit.
+
+Independent GitHub review confirmed P5 response modules are absent from the P6 diff; `runtime.rs` performs receive/select only and no response application/crossterm polling; `input_dispatch.rs` performs no receive/select; and no duplicate JobManager, EffectDispatcher, WorkspaceSyncController, TransferQueueRuntime, ProviderRegistry, scheduler, channel family or terminal runtime was introduced.
+
+Exact implementation head `d4239f8d240aabe4ea85de5481d9032329ee9507` passed CI #693 / run `32670337850`: quality, Rust 1.88 MSRV, Apache mod_dav W1–W18 physical acceptance, and MinIO safe-read retry physical acceptance all succeeded; both physical jobs passed Exact-SHA evidence. PR #220 squash-merged on `main` as `b8a7181589091ecb17f8205d8311ac15028e7b27`; GitHub signature verification is `verified=true`; #219 closed completed.
+
+## P6 boundary decision
+
+P6 is complete at merge `b8a7181589091ecb17f8205d8311ac15028e7b27`.
+
+`src/tui.rs` remains the composition root rather than becoming empty indirection: it owns AppState/runtime setup, pane backing vectors and render ListState, frame derivation/render cadence, typed `RuntimeEvent` application to the existing P5 response modules, Tick `event::poll/read`, application of the narrow input outcome, terminal-drain/deferred-editor lifecycle and quit boundary. Runtime authority itself remains singular in `TuiRuntime`; feature, routing and response semantics remain in their established modules.
+
+## P7 final structural audit
+
+Tracked by #221. At accepted P6 `main` `b8a7181589091ecb17f8205d8311ac15028e7b27`, the final ownership map is:
+
+- presentation model — `presentation.rs`;
+- rendering/geometry — `overlays.rs`, `command_bar.rs`, and feature-owned renderers;
+- feature orchestration — Bookmarks, Hosts, SSH Hosts, Jobs, User Menu, Quick Actions, Remote Edit, Workspace Sync, Transfers, Mutations/Remote Delete, Embedded Terminal, plus the already-existing Transfer Center / Storage Inspector / Filesystems UI boundaries;
+- routing/interaction — authoritative `KeyRouter`, `browser_input.rs`, `mouse.rs`, Help, Viewer, Command Center, Which-Key and Hotlist boundaries;
+- async response application — `pane_responses.rs`, `effect_responses.rs`, `workspace_responses.rs`, `job_responses.rs`;
+- runtime event source — `runtime.rs`;
+- already-read crossterm input application — `input_dispatch.rs`;
+- composition lifecycle — `src/tui.rs`.
+
+The audit found no remaining PACK P ownership contradiction that requires production movement. In particular, no second runtime authority, provider/VFS semantic change, new shortcut system or feature framework is needed to close this pack. P7 is documentation/exact-head acceptance only.
+
+User-configurable effective keymaps remain future ROADMAP issue #214. Mouse feature additions remain #10. PACK Q ProviderRegistry / Location / CapabilitySet convergence and PACK R registration work remain subsequent scopes and are not pulled into PACK P.
+
+P7 remains open until this documentation head passes the required exact-head CI and final acceptance.
 
 ## Acceptance
 
