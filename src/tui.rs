@@ -62,6 +62,7 @@ mod embedded_terminal;
 mod help;
 mod hosts;
 mod hotlist;
+mod job_responses;
 mod jobs;
 mod mouse;
 mod mutations;
@@ -302,20 +303,13 @@ async fn event_loop(
                 continue;
             }
             Some(ev) = job_rx.recv() => {
-        // The manager already accepted this transition before publishing it.
-        state.jobs = job_manager.snapshot();
-        let sync_job_id = job_event_id(&ev);
-        if let Some(job) = job_manager.get(sync_job_id) {
-            state.remote_workspace.sync_from_job(&job);
-        }
-        if let arx::jobs::JobEvent::Failed { id, error, .. } = &ev {
-                    let body = format!("Job {id} failed: {error}");
+                let outcome = job_responses::apply_job_event(&ev, &mut state, &job_manager);
+                if let Some(body) = outcome.failure_notification {
                     tokio::spawn(async move {
                         DesktopService::notify("ARX", &body).await;
                     });
                 }
-                let refresh_panes = handle_job_event(&ev, &mut state);
-                if refresh_panes {
+                if outcome.refresh_panes {
                     schedule_pane_load(&pane_loader, &mut state, Pane::Left);
                     schedule_pane_load(&pane_loader, &mut state, Pane::Right);
                 }
@@ -2495,113 +2489,6 @@ fn parse_size(s: &str) -> Result<u64, ()> {
         (s, 1)
     };
     num_str.parse::<u64>().map(|n| n * mult).map_err(|_| ())
-}
-
-fn job_event_id(event: &arx::jobs::JobEvent) -> &str {
-    match event {
-        arx::jobs::JobEvent::Running { id }
-        | arx::jobs::JobEvent::PausePending { id }
-        | arx::jobs::JobEvent::Paused { id }
-        | arx::jobs::JobEvent::RetryWaiting { id }
-        | arx::jobs::JobEvent::Progress { id, .. }
-        | arx::jobs::JobEvent::Completed { id, .. }
-        | arx::jobs::JobEvent::Failed { id, .. }
-        | arx::jobs::JobEvent::Cancelled { id, .. } => id,
-    }
-}
-
-/// Present an already-accepted JobManager event. Lifecycle state lives in JobManager.
-fn handle_job_event(ev: &arx::jobs::JobEvent, state: &mut AppState) -> bool {
-    match ev {
-        arx::jobs::JobEvent::Completed { id, result } => {
-            match result {
-                arx::jobs::JobResult::Generic { message, .. } => {
-                    state.message = Some(
-                        message
-                            .clone()
-                            .unwrap_or_else(|| format!("Job {id} completed")),
-                    );
-                    true
-                }
-                arx::jobs::JobResult::WorkspaceSync(outcome) => {
-                    state.message = Some(format!(
-                        "Sync completed: {} physical step(s), {} bytes",
-                        outcome.completed.len(),
-                        outcome.transferred_bytes
-                    ));
-                    true
-                }
-                arx::jobs::JobResult::RemoteEdit(_) => {
-                    state.message = Some(format!("Remote edit job {id} completed"));
-                    true
-                }
-                #[cfg(target_os = "linux")]
-                arx::jobs::JobResult::StorageScan(summary) => {
-                    // Read-only scan: truthful message, never refresh panes.
-                    state.message = Some(match summary.outcome {
-                        arx::storage_inspector::UsageScanOutcome::Complete => {
-                            "Storage scan completed".to_string()
-                        }
-                        arx::storage_inspector::UsageScanOutcome::Partial => {
-                            format!("Storage scan partial: {} error(s)", summary.totals.errors)
-                        }
-                        arx::storage_inspector::UsageScanOutcome::Cancelled => {
-                            "Storage scan cancelled".to_string()
-                        }
-                    });
-                    false
-                }
-            }
-        }
-        arx::jobs::JobEvent::Failed { error, .. } => {
-            state.message = Some(error.clone());
-            true
-        }
-        arx::jobs::JobEvent::Cancelled { id, result } => {
-            match result {
-                arx::jobs::JobResult::Generic { message, .. } => {
-                    state.message = Some(
-                        message
-                            .clone()
-                            .unwrap_or_else(|| format!("Job {id} cancelled")),
-                    );
-                    true
-                }
-                arx::jobs::JobResult::WorkspaceSync(outcome) => {
-                    state.message = Some(format!(
-                        "Sync cancelled after {} completed physical step(s)",
-                        outcome.completed.len()
-                    ));
-                    true
-                }
-                arx::jobs::JobResult::RemoteEdit(_) => {
-                    state.message = Some(format!("Remote edit job {id} cancelled"));
-                    true
-                }
-                #[cfg(target_os = "linux")]
-                arx::jobs::JobResult::StorageScan(summary) => {
-                    // Read-only scan: truthful message, never refresh panes.
-                    state.message = Some(match summary.outcome {
-                        arx::storage_inspector::UsageScanOutcome::Complete => {
-                            "Storage scan completed".to_string()
-                        }
-                        arx::storage_inspector::UsageScanOutcome::Partial => {
-                            format!("Storage scan partial: {} error(s)", summary.totals.errors)
-                        }
-                        arx::storage_inspector::UsageScanOutcome::Cancelled => {
-                            "Storage scan cancelled".to_string()
-                        }
-                    });
-                    false
-                }
-            }
-        }
-        arx::jobs::JobEvent::Running { .. }
-        | arx::jobs::JobEvent::PausePending { .. }
-        | arx::jobs::JobEvent::Progress { .. }
-        | arx::jobs::JobEvent::Paused { .. }
-        | arx::jobs::JobEvent::RetryWaiting { .. } => false,
-    }
 }
 
 fn toggle_hosts_overlay(state: &mut AppState) {
