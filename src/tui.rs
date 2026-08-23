@@ -13,10 +13,10 @@ use arx::effects::{Effect, EffectEvent, ProgressSlot};
 use arx::input::contextual_hints_with_file_context;
 use arx::input::{ContextHint, KeyResolution, KeyRouter, command_bar_rows};
 use arx::services::{
-    DesktopService, FileInfoService, GitService, MutationError, MutationService,
-    PaneListingContinuation, PaneLoadPurpose, PaneLoadResponse, PaneLoader, PaneNextPageResponse,
-    QuickActionFailureKind, QuickActionOutcome, SyncLaunchId, WorkspaceScanError,
-    WorkspaceScanOptions, WorkspaceScanResponse, WorkspaceScanner, WorkspaceSyncController,
+    DesktopService, FileInfoService, GitService, PaneListingContinuation, PaneLoadPurpose,
+    PaneLoadResponse, PaneLoader, PaneNextPageResponse, QuickActionFailureKind, QuickActionOutcome,
+    SyncLaunchId, WorkspaceScanError, WorkspaceScanOptions, WorkspaceScanResponse,
+    WorkspaceScanner, WorkspaceSyncController,
 };
 use arx::vfs::{
     Entry, EntryIdentity, EntryKind, ListedEntry, Location, ProviderId, ProviderRegistry,
@@ -45,12 +45,15 @@ mod presentation;
 use presentation::{session_callout_text, workspace_ribbon_text};
 
 mod bookmarks;
+mod embedded_terminal;
 mod hosts;
 mod jobs;
+mod mutations;
 mod overlays;
 mod quick_actions;
 mod remote_edit;
 mod ssh_hosts;
+mod transfers;
 mod user_menu;
 mod workspace;
 use overlays::{
@@ -353,35 +356,7 @@ async fn event_loop(
             }
             match event {
                 Event::Key(key) if state.show_terminal && state.active == Pane::Right => {
-                    use crossterm::event::KeyCode as KC;
-                    if let Some(ref mut term) = state.term {
-                        match key.code {
-                            KC::Esc => {
-                                // Toggle back to file browser
-                                state.show_terminal = false;
-                                if let Some(ref mut t) = state.term {
-                                    t.kill();
-                                }
-                                state.term = None;
-                                state.message = Some("Terminal closed".into());
-                            }
-                            KC::Enter => term.write("\r\n"),
-                            KC::Backspace => term.write("\x7f"),
-                            KC::Tab => term.write("\t"),
-                            KC::Up => term.write("\x1b[A"),
-                            KC::Down => term.write("\x1b[B"),
-                            KC::Left => term.write("\x1b[D"),
-                            KC::Right => term.write("\x1b[C"),
-                            KC::Home => term.write("\x1b[H"),
-                            KC::End => term.write("\x1b[F"),
-                            KC::Char(c) => {
-                                let mut buf = [0u8; 4];
-                                let s = c.encode_utf8(&mut buf);
-                                term.write(s);
-                            }
-                            _ => {}
-                        }
-                    }
+                    embedded_terminal::handle_key(&mut state, key);
                 }
                 Event::Mouse(mouse) => {
                     // Check command bar hitboxes first (before pane area)
@@ -800,114 +775,15 @@ async fn event_loop(
                                             continue;
                                         }
                                     } else if let Some(loc) = pending_mkdir {
-                                        let name = command;
-                                        // Validate child name — reject empty, ".", "..", "/", NUL.
-                                        if let Err(e) = arx::vfs::validate_child_name(&name) {
-                                            state.message = Some(e.to_string());
+                                        if mutations::submit_mkdir(
+                                            &mut state,
+                                            loc,
+                                            command,
+                                            &sync_runtime,
+                                            &pane_loader,
+                                        ) {
                                             continue;
                                         }
-                                        // S3: direct-bypass guard — target root (bucket=None) MUST NOT schedule prefix creation.
-                                        if let Location::S3 { bucket: None, .. } = &loc {
-                                            state.message = Some(
-                                                "mkdir: bucket creation is not supported".into(),
-                                            );
-                                            continue;
-                                        }
-                                        let registry = state.registry.clone();
-                                        let name_for_msg = name.clone();
-                                        let pane = state.active;
-                                        let pane_location = loc.clone();
-                                        let loader = pane_loader.clone();
-                                        let job = job_manager.create_job(
-                                            "mkdir",
-                                            arx::jobs::JobKind::RemoteCommand,
-                                            format!("mkdir {name}"),
-                                            Some(loc.clone()),
-                                            None,
-                                        );
-                                        state.jobs = job_manager.snapshot();
-                                        let jobs = job_manager.clone();
-                                        let tx = job_tx.clone();
-                                        {
-                                            let jid = job.id.clone();
-                                            let _ = jobs.publish_event(
-                                                &job_tx,
-                                                arx::jobs::JobEvent::Running { id: jid },
-                                            );
-                                        }
-                                        // Dispatch based on location type
-                                        if let Location::S3 { .. } = &loc {
-                                            // S3: use create_s3_prefix_marker_at
-                                            tokio::spawn(async move {
-                                                let result = registry
-                                                    .create_s3_prefix_marker_at(&loc, &name)
-                                                    .await;
-                                                match result {
-                                                    Ok(_) => {
-                                                        let _ = jobs.publish_event(
-                                                            &tx,
-                                                            arx::jobs::JobEvent::Completed {
-                                                                id: job.id,
-                                                                result:
-                                                                    arx::jobs::JobResult::generic(
-                                                                        "created", 1,
-                                                                    ),
-                                                            },
-                                                        );
-                                                        let _ = loader.load(
-                                                            pane,
-                                                            pane_location,
-                                                            PaneLoadPurpose::Refresh,
-                                                        );
-                                                    }
-                                                    Err(e) => {
-                                                        let _ = jobs.publish_event(
-                                                            &tx,
-                                                            arx::jobs::JobEvent::Failed {
-                                                                id: job.id,
-                                                                error: e.to_string(),
-                                                                result: None,
-                                                            },
-                                                        );
-                                                    }
-                                                }
-                                            });
-                                        } else {
-                                            // SFTP (and Local, if ever routed here): use mkdir_at
-                                            tokio::spawn(async move {
-                                                let result = registry.mkdir_at(&loc, &name).await;
-                                                match result {
-                                                    Ok(()) => {
-                                                        let _ = jobs.publish_event(
-                                                            &tx,
-                                                            arx::jobs::JobEvent::Completed {
-                                                                id: job.id,
-                                                                result:
-                                                                    arx::jobs::JobResult::generic(
-                                                                        "created", 1,
-                                                                    ),
-                                                            },
-                                                        );
-                                                        let _ = loader.load(
-                                                            pane,
-                                                            pane_location,
-                                                            PaneLoadPurpose::Refresh,
-                                                        );
-                                                    }
-                                                    Err(e) => {
-                                                        let _ = jobs.publish_event(
-                                                            &tx,
-                                                            arx::jobs::JobEvent::Failed {
-                                                                id: job.id,
-                                                                error: e.to_string(),
-                                                                result: None,
-                                                            },
-                                                        );
-                                                    }
-                                                }
-                                            });
-                                        }
-                                        state.message = Some(format!("mkdir {name_for_msg}…"));
                                     } else {
                                         let id = effect_dispatcher.dispatch(
                                             EffectLane::GlobalProcess,
@@ -2732,32 +2608,7 @@ fn render(
             state.panel_mode,
         );
     }
-    if state.show_terminal {
-        if let Some(ref term) = state.term {
-            // Render terminal buffer in right pane
-            let border_style = if state.active == Pane::Right {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let lines: Vec<Line<'_>> = term
-                .buffer
-                .iter()
-                .skip(term.scroll)
-                .take(panes[1].height.saturating_sub(2) as usize)
-                .map(|s| Line::from(s.as_str()))
-                .collect();
-            frame.render_widget(
-                Paragraph::new(lines).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Terminal ")
-                        .border_style(border_style),
-                ),
-                panes[1],
-            );
-        }
-    } else {
+    if !embedded_terminal::render_if_active(frame, panes[1], state) {
         if state.right.split {
             let mid = panes[1].width / 2;
             let a1 = ratatui::layout::Rect::new(panes[1].x, panes[1].y, mid, panes[1].height);
@@ -2971,78 +2822,8 @@ fn render(
     }
 
     // Remote delete confirmation overlay
-    if let Some(plan) = &state.pending_delete {
-        let file_count = plan
-            .targets
-            .iter()
-            .filter(|t| t.kind == arx::vfs::EntryKind::File)
-            .count();
-        let symlink_count = plan
-            .targets
-            .iter()
-            .filter(|t| t.kind == arx::vfs::EntryKind::Symlink)
-            .count();
-        let dir_count = plan
-            .targets
-            .iter()
-            .filter(|t| t.kind == arx::vfs::EntryKind::Directory)
-            .count();
-
-        let name_lines: Vec<String> = {
-            let max_show = 10;
-            let mut names: Vec<String> = plan
-                .targets
-                .iter()
-                .take(max_show)
-                .map(|t| format!("  {}", t.name))
-                .collect();
-            if plan.targets.len() > max_show {
-                names.push(format!("  ...and {} more", plan.targets.len() - max_show));
-            }
-            names
-        };
-
-        let breakdown = {
-            let mut parts = Vec::new();
-            if file_count > 0 {
-                parts.push(format!("{file_count} file(s)"));
-            }
-            if symlink_count > 0 {
-                parts.push(format!("{symlink_count} symlink(s)"));
-            }
-            if dir_count > 0 {
-                parts.push(format!("{dir_count} empty dir(s)"));
-            }
-            if parts.is_empty() {
-                "".into()
-            } else {
-                parts.join(", ")
-            }
-        };
-
-        let msg = format!(
-            "PERMANENT REMOTE DELETE\n\n{} target(s) at {}\n{}\n\nNo Trash / Undo  Enter=Confirm  Esc=Cancel",
-            plan.targets.len(),
-            plan.location,
-            breakdown,
-        );
-
-        // Append name lines
-        let body = format!("{msg}\n\n{}", name_lines.join("\n"));
-
-        // ponytail: enough room for msg (6 lines) + 2-separator + name_lines + 2-border
-        let height = (name_lines.len() + msg.lines().count() + 4).min(area.height as usize) as u16;
-        let popup = centered_rect_lines(60, height.max(8), area);
-        frame.render_widget(Clear, popup);
-        let p = ratatui::widgets::Paragraph::new(body)
-            .block(
-                ratatui::widgets::Block::default()
-                    .borders(ratatui::widgets::Borders::ALL)
-                    .border_style(Style::default().fg(Color::Red))
-                    .title(" Confirm Remote Delete "),
-            )
-            .alignment(ratatui::layout::Alignment::Left);
-        frame.render_widget(p, popup);
+    if state.pending_delete.is_some() {
+        mutations::render_confirmation(frame, area, state);
     }
 
     // Status bar
@@ -3717,50 +3498,6 @@ fn request_quit(state: &mut AppState, effect_dispatcher: &EffectDispatcher) {
     }
 }
 
-// Build a frozen Local<->S3 single-object copy spec from the S3 pane's focused
-// identity and the Local pane's focused entry. The S3 `S3ObjectRef` is the sole
-// authority for bucket/key — `entry.name` is never used to derive S3 identity.
-// ponytail: one-file-per-op basic transfer; multi-object needs a later card
-fn build_s3_copy_spec(
-    src_provider: ProviderId,
-    s3_listed: &ListedEntry,
-    local_listed: Option<&ListedEntry>,
-    s3_prefix: &str,
-    local_path: &std::path::Path,
-) -> Result<arx::transfer::S3TransferSpec, String> {
-    let EntryIdentity::S3Object(s3_ref) = &s3_listed.identity else {
-        return Err("Copy supports a single S3 object only".into());
-    };
-    if src_provider == ProviderId::S3 {
-        // Download: S3 -> Local. Destination key is the S3 key verbatim.
-        let basename = s3_ref.key.rsplit('/').next().unwrap_or(s3_ref.key.as_str());
-        let local_name =
-            arx::transfer::s3_download_local_name(s3_ref, basename).map_err(|e| e.to_string())?;
-        Ok(arx::transfer::S3TransferSpec::DownloadOne {
-            source: s3_ref.clone(),
-            local_destination: local_path.join(local_name),
-        })
-    } else {
-        // Upload: Local -> S3. Key is nav_prefix + local filename; target/bucket
-        // come from the frozen S3 identity.
-        let Some(local_listed) = local_listed else {
-            return Err("Select a local file to upload".into());
-        };
-        let filename = local_listed.entry.name.as_str();
-        let destination = arx::transfer::s3_upload_destination_ref(
-            &s3_ref.target,
-            &s3_ref.bucket,
-            s3_prefix,
-            filename,
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(arx::transfer::S3TransferSpec::UploadOne {
-            local_source: local_path.join(filename),
-            destination,
-        })
-    }
-}
-
 // ponytail: keep the one action seam instead of wrapping runtime services in a one-use context.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_ui_action(
@@ -3778,6 +3515,9 @@ async fn dispatch_ui_action(
     configured_editor: Option<&str>,
     key_router: &mut KeyRouter,
 ) -> io::Result<()> {
+    if embedded_terminal::handle_action(state, &action) {
+        return Ok(());
+    }
     let focused = focused_row
         .and_then(|row| row.listed())
         .map(|listed| &listed.entry);
@@ -3788,7 +3528,13 @@ async fn dispatch_ui_action(
     let focused_listed = focused_row.and_then(|row| row.listed());
     // ponytail: passive pane's focused entry — needed for cross-pane S3 transfer
     let other_listed = other_focused_row.and_then(|row| row.listed());
+    if transfers::handle_action(state, &action, focused, focused_listed, other_listed, sync) {
+        return Ok(());
+    }
     if workspace::handle_action(state, &action, workspace_scanner, sync) {
+        return Ok(());
+    }
+    if mutations::handle_action(state, &action, focused, active_entries, sync, pane_loader) {
         return Ok(());
     }
 
@@ -3908,372 +3654,6 @@ async fn dispatch_ui_action(
             state.cmd = "chown ".into();
             state.cmd_input = true;
         }
-        Action::Copy => {
-            let names: Vec<String> = state
-                .selection_names(state.active, &state.active_pane().location)
-                .map(|names| names.iter().cloned().collect())
-                .or_else(|| focused.map(|entry| vec![entry.name.clone()]))
-                .unwrap_or_default();
-            if names.is_empty() {
-                state.message = Some("Select a file or directory to copy".into());
-                return Ok(());
-            }
-            let src_loc = state.active_pane().location.clone();
-            let dst_loc = state.other_pane().location.clone();
-            let src_provider = src_loc.provider_id();
-            let dst_provider = dst_loc.provider_id();
-            let src_caps = state
-                .registry
-                .capabilities(&src_provider)
-                .unwrap_or_default();
-            let dst_caps = state
-                .registry
-                .capabilities(&dst_provider)
-                .unwrap_or_default();
-            // S3 basic transfer: a single S3 object paired with a Local pane.
-            let s3_spec: Option<arx::transfer::S3TransferSpec> =
-                if src_provider == ProviderId::S3 || dst_provider == ProviderId::S3 {
-                    // The S3 object identity comes from the S3 pane's focused entry
-                    // (active or passive) — never reconstructed from entry.name.
-                    let s3_is_source = src_provider == ProviderId::S3;
-                    let (s3_listed, local_listed, local_path, s3_prefix) = if s3_is_source {
-                        let Location::Local(p) = &dst_loc else {
-                            state.message = Some("S3 download requires a Local destination".into());
-                            return Ok(());
-                        };
-                        (focused_listed, other_listed, p.clone(), String::new())
-                    } else {
-                        let Location::S3 { prefix, .. } = &dst_loc else {
-                            state.message = Some("S3 upload requires an S3 destination".into());
-                            return Ok(());
-                        };
-                        let Location::Local(p) = &src_loc else {
-                            state.message = Some("S3 upload requires a Local source".into());
-                            return Ok(());
-                        };
-                        (other_listed, focused_listed, p.clone(), prefix.clone())
-                    };
-                    let Some(s3_listed) = s3_listed else {
-                        state.message = Some("Focus an S3 object to copy".into());
-                        return Ok(());
-                    };
-                    match build_s3_copy_spec(
-                        src_provider,
-                        s3_listed,
-                        local_listed,
-                        &s3_prefix,
-                        &local_path,
-                    ) {
-                        Ok(spec) => Some(spec),
-                        Err(msg) => {
-                            state.message = Some(msg);
-                            return Ok(());
-                        }
-                    }
-                } else {
-                    None
-                };
-
-            // WebDAV basic transfer: a single WebDAV object paired with a Local pane.
-            let webdav_spec: Option<arx::transfer::WebDavTransferSpec> =
-                if src_provider == ProviderId::WebDAV || dst_provider == ProviderId::WebDAV {
-                    match arx::transfer::build_webdav_copy_spec(
-                        src_provider,
-                        dst_provider,
-                        &src_loc,
-                        &dst_loc,
-                        focused_listed,
-                        other_listed,
-                    ) {
-                        Ok(spec) => Some(spec),
-                        Err(msg) => {
-                            state.message = Some(msg);
-                            return Ok(());
-                        }
-                    }
-                } else {
-                    None
-                };
-
-            let mut executors =
-                arx::transfer::probe::local_executors(arx::transfer::probe::detect_local_tools());
-            if s3_spec.is_some() {
-                executors.s3 = true;
-            }
-            if webdav_spec.is_some() {
-                executors.webdav = true;
-            }
-            let request = arx::transfer::TransferRequest {
-                source: src_loc.clone(),
-                destination: dst_loc.clone(),
-                source_provider: src_provider,
-                destination_provider: dst_provider,
-                source_capabilities: src_caps,
-                destination_capabilities: dst_caps,
-                intent: arx::transfer::TransferIntent::Copy,
-                executors,
-                delete_extraneous: false,
-                s3_spec,
-                webdav_spec,
-            };
-            let plan = match arx::transfer::TransferPlanner::plan(request) {
-                Ok(p) => p,
-                Err(e) => {
-                    state.message = Some(e.to_string());
-                    return Ok(());
-                }
-            };
-            let id = match sync.transfers.enqueue(plan, names) {
-                Ok(id) => id,
-                Err(e) => {
-                    state.message = Some(e.to_string());
-                    return Ok(());
-                }
-            };
-            state.jobs = sync.jobs.snapshot();
-            state.message = Some(format!("Copy queued ({id})"));
-            state.clear_selection();
-        }
-        Action::Move => {
-            let names: Vec<String> = state
-                .selection_names(state.active, &state.active_pane().location)
-                .map(|names| names.iter().cloned().collect())
-                .or_else(|| focused.map(|entry| vec![entry.name.clone()]))
-                .unwrap_or_default();
-            if names.is_empty() {
-                state.message = Some("Select a file or directory to move".into());
-                return Ok(());
-            }
-            // S3 move not supported — no destructive S3 move.
-            if state.active_pane().location.provider_id() == ProviderId::S3
-                || state.other_pane().location.provider_id() == ProviderId::S3
-            {
-                state.message = Some("S3 move not supported (use copy)".into());
-                return Ok(());
-            }
-            let src_loc = state.active_pane().location.clone();
-            let dst_loc = state.other_pane().location.clone();
-            let src_provider = src_loc.provider_id();
-            let dst_provider = dst_loc.provider_id();
-            let src_caps = state
-                .registry
-                .capabilities(&src_provider)
-                .unwrap_or_default();
-            let dst_caps = state
-                .registry
-                .capabilities(&dst_provider)
-                .unwrap_or_default();
-            let executors =
-                arx::transfer::probe::local_executors(arx::transfer::probe::detect_local_tools());
-            let request = arx::transfer::TransferRequest {
-                source: src_loc.clone(),
-                destination: dst_loc.clone(),
-                source_provider: src_provider,
-                destination_provider: dst_provider,
-                source_capabilities: src_caps,
-                destination_capabilities: dst_caps,
-                intent: arx::transfer::TransferIntent::Move,
-                executors,
-                delete_extraneous: false,
-                s3_spec: None,
-                webdav_spec: None,
-            };
-            let plan = match arx::transfer::TransferPlanner::plan(request) {
-                Ok(p) => p,
-                Err(e) => {
-                    state.message = Some(e.to_string());
-                    return Ok(());
-                }
-            };
-            let id = match sync.transfers.enqueue(plan, names) {
-                Ok(id) => id,
-                Err(e) => {
-                    state.message = Some(e.to_string());
-                    return Ok(());
-                }
-            };
-            state.jobs = sync.jobs.snapshot();
-            state.message = Some(format!("Move queued ({id})"));
-            state.clear_selection();
-        }
-        Action::Mkdir => {
-            state.pending_quick_action_prompt = None;
-            let provider_id = state.active_pane().location.provider_id();
-            if provider_id == arx::vfs::ProviderId::Sftp {
-                // SFTP: use provider-backed mkdir via frozen location
-                state.pending_mkdir_location = Some(state.active_pane().location.clone());
-                state.cmd = String::new();
-                state.cmd_input = true;
-            } else if provider_id == arx::vfs::ProviderId::S3 {
-                // S3: freeze exact Location::S3 at prompt start; provider call on Enter.
-                state.pending_mkdir_location = Some(state.active_pane().location.clone());
-                state.cmd = String::new();
-                state.cmd_input = true;
-            } else {
-                // Local: keep existing shell-based mkdir (no regression)
-                state.cmd = "mkdir ".into();
-                state.cmd_input = true;
-            }
-        }
-        Action::Delete => {
-            let names: Vec<String> = state
-                .selection_names(state.active, &state.active_pane().location)
-                .map(|names| names.iter().cloned().collect())
-                .or_else(|| focused.map(|entry| vec![entry.name.clone()]))
-                .unwrap_or_default();
-            if names.is_empty() {
-                state.message = Some("Select a file or directory to delete".into());
-                return Ok(());
-            }
-
-            // SFTP: freeze plan for confirmation (no mutation yet)
-            if state.active_pane().location.provider_id() == arx::vfs::ProviderId::Sftp {
-                let targets: Vec<arx::vfs::RemoteDeleteTarget> = names
-                    .iter()
-                    .filter_map(|name| {
-                        // Resolve real EntryKind from active pane listing
-                        let entry = active_entries.iter().find(|e| e.name == *name)?;
-                        let path = match &state.active_pane().location {
-                            arx::vfs::Location::Sftp { path: p, .. } => {
-                                format!("{p}/{name}")
-                            }
-                            _ => unreachable!(),
-                        };
-                        Some(arx::vfs::RemoteDeleteTarget {
-                            name: name.clone(),
-                            kind: entry.kind,
-                            path,
-                        })
-                    })
-                    .collect();
-                if targets.len() != names.len() {
-                    state.message = Some("Selection no longer matches directory contents".into());
-                    return Ok(());
-                }
-                state.pending_delete = Some(arx::vfs::RemoteDeletePlan {
-                    location: state.active_pane().location.clone(),
-                    targets,
-                    created_at: std::time::Instant::now(),
-                });
-                state.message =
-                    Some("Press Enter to confirm permanent deletion, Escape to cancel".into());
-                return Ok(());
-            }
-
-            // S3: freeze plan for confirmation (no mutation yet). Key is derived
-            // from the frozen Location prefix + selected name — no dependency on
-            // the (currently deferred) S3 listing path. A trailing-slash name is
-            // a prefix marker (Directory); everything else is a File object.
-            if let arx::vfs::Location::S3 { prefix, .. } = &state.active_pane().location {
-                let targets: Vec<arx::vfs::RemoteDeleteTarget> = names
-                    .iter()
-                    .map(|name| {
-                        if name.ends_with('/') {
-                            arx::vfs::RemoteDeleteTarget {
-                                name: name.clone(),
-                                kind: arx::vfs::EntryKind::Directory,
-                                path: name.clone(),
-                            }
-                        } else {
-                            let key = if prefix.is_empty() {
-                                name.clone()
-                            } else {
-                                format!("{prefix}/{name}")
-                            };
-                            arx::vfs::RemoteDeleteTarget {
-                                name: name.clone(),
-                                kind: arx::vfs::EntryKind::File,
-                                path: key,
-                            }
-                        }
-                    })
-                    .collect();
-                state.pending_delete = Some(arx::vfs::RemoteDeletePlan {
-                    location: state.active_pane().location.clone(),
-                    targets,
-                    created_at: std::time::Instant::now(),
-                });
-                state.message =
-                    Some("Press Enter to confirm permanent deletion, Escape to cancel".into());
-                return Ok(());
-            }
-
-            // Local: existing trash path
-            let Location::Local(dir) = state.active_pane().location.clone() else {
-                state.message = Some("Trash is currently available for local files only".into());
-                return Ok(());
-            };
-            let job = sync.jobs.create_job(
-                "trash",
-                arx::jobs::JobKind::Delete,
-                format!("Trash {}", names.join(", ")),
-                Some(Location::Local(dir.clone())),
-                None,
-            );
-            let id = job.id.clone();
-            let cancel = job.cancel.clone();
-            state.jobs = sync.jobs.snapshot();
-            let jobs = sync.jobs.clone();
-            let tx = sync.job_events.clone();
-            let job_id = id.clone();
-            tokio::spawn(async move {
-                if !jobs.publish_event(&tx, arx::jobs::JobEvent::Running { id: job_id.clone() }) {
-                    return;
-                }
-                let tx_progress = tx.clone();
-                let progress_id = job_id.clone();
-                let progress_jobs = jobs.clone();
-                let result = MutationService::trash_local(dir, names, cancel, move |progress| {
-                    let percent = progress.completed.saturating_mul(100) / progress.total.max(1);
-                    let _ = progress_jobs.publish_event(
-                        &tx_progress,
-                        arx::jobs::JobEvent::Progress {
-                            id: progress_id.clone(),
-                            progress: arx::jobs::Progress::Percent(percent as u8).into(),
-                        },
-                    );
-                })
-                .await;
-                match result {
-                    Ok(outcome) => {
-                        let _ = jobs.publish_event(
-                            &tx,
-                            arx::jobs::JobEvent::Completed {
-                                id: job_id,
-                                result: arx::jobs::JobResult::generic(
-                                    format!("Trashed {} item(s)", outcome.completed),
-                                    outcome.completed,
-                                ),
-                            },
-                        );
-                    }
-                    Err(MutationError::Cancelled { completed }) => {
-                        let _ = jobs.publish_event(
-                            &tx,
-                            arx::jobs::JobEvent::Cancelled {
-                                id: job_id,
-                                result: arx::jobs::JobResult::generic(
-                                    format!("Cancelled after {completed} item(s)"),
-                                    completed,
-                                ),
-                            },
-                        );
-                    }
-                    Err(error) => {
-                        let _ = jobs.publish_event(
-                            &tx,
-                            arx::jobs::JobEvent::Failed {
-                                id: job_id,
-                                error: error.to_string(),
-                                result: None,
-                            },
-                        );
-                    }
-                }
-            });
-            state.clear_selection();
-            state.message = Some(format!("Trash queued ({id})"));
-        }
         Action::ListTmuxSessions => {
             let id = effect_dispatcher.dispatch(
                 EffectLane::TmuxDiscovery,
@@ -4282,273 +3662,6 @@ async fn dispatch_ui_action(
             );
             state.register_effect(EffectLane::TmuxDiscovery, id);
             state.message = Some("Discovering tmux sessions…".into());
-        }
-        Action::ConfirmRemoteDelete => {
-            let Some(plan) = state.pending_delete.take() else {
-                return Ok(());
-            };
-            let registry = state.registry.clone();
-            let pane = state.active;
-            let loader = pane_loader.clone();
-            let location = plan.location.clone();
-            let targets = plan.targets;
-            let target_count = targets.len();
-            let jobs = sync.jobs.clone();
-            let tx = sync.job_events.clone();
-
-            let job = jobs.create_job(
-                "remote-delete",
-                arx::jobs::JobKind::Delete,
-                format!("Permanent delete {} target(s)", targets.len()),
-                Some(location.clone()),
-                None,
-            );
-
-            let _ = jobs.publish_event(&tx, arx::jobs::JobEvent::Running { id: job.id.clone() });
-
-            tokio::spawn(async move {
-                let mut completed: usize = 0;
-                let mut failed: usize = 0;
-                let mut cancelled = false;
-
-                // ── Preflight: revalidate all frozen targets ──────────────
-                let (provider, parent_path) = match registry.provider_for_location(&location) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let _ = jobs.publish_event(
-                            &tx,
-                            arx::jobs::JobEvent::Failed {
-                                id: job.id.clone(),
-                                error: format!("Cannot access location: {e}"),
-                                result: None,
-                            },
-                        );
-                        return;
-                    }
-                };
-
-                let fresh_listing = match provider.list_async(&parent_path).await {
-                    Ok(entries) => entries,
-                    Err(e) => {
-                        let _ = jobs.publish_event(
-                            &tx,
-                            arx::jobs::JobEvent::Failed {
-                                id: job.id.clone(),
-                                error: format!("Cannot re-list directory: {e}"),
-                                result: None,
-                            },
-                        );
-                        return;
-                    }
-                };
-
-                for target in &targets {
-                    match fresh_listing.iter().find(|e| e.name == target.name) {
-                        None => {
-                            let _ = jobs.publish_event(
-                                &tx,
-                                arx::jobs::JobEvent::Failed {
-                                    id: job.id.clone(),
-                                    error: format!(
-                                        "Remote contents changed: '{}' no longer exists. Review selection.",
-                                        target.name
-                                    ),
-                                    result: None,
-                                },
-                            );
-                            return;
-                        }
-                        Some(entry) if entry.kind != target.kind => {
-                            let _ = jobs.publish_event(
-                                &tx,
-                                arx::jobs::JobEvent::Failed {
-                                    id: job.id.clone(),
-                                    error: format!(
-                                        "Remote contents changed: '{}' type changed. Review selection.",
-                                        target.name
-                                    ),
-                                    result: None,
-                                },
-                            );
-                            return;
-                        }
-                        Some(entry) if entry.kind == arx::vfs::EntryKind::Directory => {
-                            // S3: a "directory" is a prefix. Deletion is only safe
-                            // when it is an empty marker (exactly one zero-byte
-                            // object equal to the prefix). Anything else fails
-                            // closed — no recursive prefix deletion.
-                            if let arx::vfs::Location::S3 { .. } = &location {
-                                match registry
-                                    .prove_empty_s3_prefix_at(&location, &target.path)
-                                    .await
-                                {
-                                    Ok(true) => {} // empty marker — allowed
-                                    Ok(false) => {
-                                        let _ = jobs.publish_event(
-                                            &tx,
-                                            arx::jobs::JobEvent::Failed {
-                                                id: job.id.clone(),
-                                                error: format!(
-                                                    "S3 prefix '{}' is not an empty marker. Recursive prefix delete is not supported. Nothing was deleted.",
-                                                    target.name
-                                                ),
-                                                result: None,
-                                            },
-                                        );
-                                        return;
-                                    }
-                                    Err(e) => {
-                                        let _ = jobs.publish_event(
-                                            &tx,
-                                            arx::jobs::JobEvent::Failed {
-                                                id: job.id.clone(),
-                                                error: format!(
-                                                    "Cannot verify S3 prefix '{}' is empty: {}. Nothing was deleted.",
-                                                    target.name, e
-                                                ),
-                                                result: None,
-                                            },
-                                        );
-                                        return;
-                                    }
-                                }
-                            } else {
-                                match provider.list_async(&target.path).await {
-                                    Ok(children) if !children.is_empty() => {
-                                        let _ = jobs.publish_event(
-                                        &tx,
-                                        arx::jobs::JobEvent::Failed {
-                                            id: job.id.clone(),
-                                            error: format!(
-                                                "Recursive remote delete is not supported: '{}' is not empty",
-                                                target.name
-                                            ),
-                                            result: None,
-                                        },
-                                    );
-                                        return;
-                                    }
-                                    Ok(_) => {} // empty directory — allowed
-                                    Err(e) => {
-                                        let _ = jobs.publish_event(
-                                        &tx,
-                                        arx::jobs::JobEvent::Failed {
-                                            id: job.id.clone(),
-                                            error: format!(
-                                                "Cannot verify that remote directory '{}' is empty: {}. Nothing was deleted.",
-                                                target.name, e
-                                            ),
-                                            result: None,
-                                        },
-                                    );
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                // ── All targets validated — proceed with deletion ────────
-
-                for target in &targets {
-                    if let Some(j) = jobs.get(&job.id)
-                        && j.cancel.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        cancelled = true;
-                        break;
-                    }
-
-                    let result = if let arx::vfs::Location::S3 { .. } = &location {
-                        // S3: one exact DeleteObject per frozen target key.
-                        // No prefix recursion, no bucket delete. The key is the
-                        // frozen selection path, taken verbatim.
-                        registry.delete_s3_at(&location, &target.path).await
-                    } else {
-                        match target.kind {
-                            arx::vfs::EntryKind::Directory => {
-                                registry.remove_dir_at(&location, &target.path).await
-                            }
-                            _ => registry.remove_file_at(&location, &target.path).await,
-                        }
-                    };
-
-                    match result {
-                        Ok(()) => completed += 1,
-                        Err(_e) => {
-                            failed += 1;
-                        }
-                    }
-                }
-
-                // Refresh pane after any physical mutations
-                if completed > 0 || failed > 0 {
-                    let _ = loader.load(pane, location, PaneLoadPurpose::Refresh);
-                }
-
-                if cancelled {
-                    let _ = jobs.publish_event(
-                        &tx,
-                        arx::jobs::JobEvent::Cancelled {
-                            id: job.id,
-                            result: arx::jobs::JobResult::generic(
-                                format!("Cancelled after {completed} deleted, {failed} failed"),
-                                completed,
-                            ),
-                        },
-                    );
-                } else if failed > 0 {
-                    let _ = jobs.publish_event(
-                        &tx,
-                        arx::jobs::JobEvent::Failed {
-                            id: job.id,
-                            error: format!("{completed} deleted, {failed} failed"),
-                            result: Some(arx::jobs::JobResult::generic(
-                                format!("Partial: {completed} deleted, {failed} failed"),
-                                completed,
-                            )),
-                        },
-                    );
-                } else {
-                    let _ = jobs.publish_event(
-                        &tx,
-                        arx::jobs::JobEvent::Completed {
-                            id: job.id,
-                            result: arx::jobs::JobResult::generic(
-                                format!("{completed} deleted"),
-                                completed,
-                            ),
-                        },
-                    );
-                }
-            });
-            state.message = Some(format!("Remote delete: {target_count} target(s) queued"));
-        }
-        Action::CancelRemoteDelete => {
-            state.pending_delete = None;
-            state.message = Some("Remote delete cancelled".into());
-        }
-        Action::ToggleEmbeddedTerminal => {
-            if state.show_terminal {
-                state.show_terminal = false;
-                if let Some(ref mut t) = state.term {
-                    t.kill();
-                }
-                state.term = None;
-                state.message = Some("Terminal closed".into());
-            } else if let Location::Local(dir) = &state.right.location {
-                match arx::terminal::TermPane::spawn(dir) {
-                    Ok(t) => {
-                        state.term = Some(t);
-                        state.show_terminal = true;
-                        state.active = Pane::Right;
-                        state.message = Some("Terminal started — Esc to close".into());
-                    }
-                    Err(e) => {
-                        state.message = Some(format!("Terminal error: {e}"));
-                    }
-                }
-            }
         }
         _ => state.apply(action),
     }
@@ -8851,155 +7964,6 @@ mod tests {
 
         invert_selection(&mut state, &rows);
         assert_eq!(state.selection_count(Pane::Left, &location), 0);
-    }
-
-    // S3-40/41 F5 wiring: upload spec uses frozen S3ObjectRef, never entry.name.
-    #[cfg(test)]
-    mod s3_transfer_tests {
-        use super::*;
-        use arx::transfer::{
-            ExecutorAvailability, S3TransferSpec, TransferIntent, TransferMethod, TransferPlanner,
-            TransferRequest,
-        };
-        use arx::vfs::CapabilitySet;
-
-        // Upload: destination key = nav_prefix + local filename, target/bucket
-        // from the frozen S3ObjectRef. entry.name is never consulted for S3 identity.
-        #[test]
-        fn upload_spec_preserves_frozen_s3_ref_key() {
-            let s3_ref = arx::vfs::s3::S3ObjectRef {
-                target: "tgt".into(),
-                bucket: "bk".into(),
-                key: "deep/existing/key".into(),
-            };
-            let s3_listed = ListedEntry {
-                entry: Entry {
-                    name: "display-name".into(), // must NOT become the S3 key
-                    kind: EntryKind::File,
-                    size: Some(42),
-                    modified_unix_ms: Some(1),
-                },
-                identity: EntryIdentity::S3Object(s3_ref.clone()),
-            };
-            let local_listed = ListedEntry {
-                entry: Entry {
-                    name: "local.txt".into(),
-                    kind: EntryKind::File,
-                    size: Some(10),
-                    modified_unix_ms: Some(2),
-                },
-                identity: EntryIdentity::Other,
-            };
-            let spec = build_s3_copy_spec(
-                ProviderId::Local,
-                &s3_listed,
-                Some(&local_listed),
-                "prefix",
-                &PathBuf::from("/local/src"),
-            )
-            .unwrap();
-            let S3TransferSpec::UploadOne {
-                local_source,
-                destination,
-            } = spec
-            else {
-                panic!("expected UploadOne");
-            };
-            assert_eq!(local_source, PathBuf::from("/local/src/local.txt"));
-            assert_eq!(destination.key, "prefix/local.txt");
-            assert_eq!(destination.target, "tgt");
-            assert_eq!(destination.bucket, "bk");
-            assert_eq!(
-                destination,
-                arx::transfer::s3_upload_destination_ref("tgt", "bk", "prefix", "local.txt")
-                    .unwrap()
-            );
-        }
-
-        // Download: source is the frozen ref verbatim — key never reconstructed.
-        #[test]
-        fn download_spec_preserves_frozen_s3_ref_verbatim() {
-            let s3_ref = arx::vfs::s3::S3ObjectRef {
-                target: "tgt".into(),
-                bucket: "bk".into(),
-                key: "deep/existing/key".into(),
-            };
-            let s3_listed = ListedEntry {
-                entry: Entry {
-                    name: "display-name".into(), // must NOT override the key
-                    kind: EntryKind::File,
-                    size: Some(42),
-                    modified_unix_ms: Some(1),
-                },
-                identity: EntryIdentity::S3Object(s3_ref.clone()),
-            };
-            let spec = build_s3_copy_spec(
-                ProviderId::S3,
-                &s3_listed,
-                None,
-                "",
-                &PathBuf::from("/local/dst"),
-            )
-            .unwrap();
-            let S3TransferSpec::DownloadOne {
-                source,
-                local_destination,
-            } = spec
-            else {
-                panic!("expected DownloadOne");
-            };
-            assert_eq!(source.key, "deep/existing/key");
-            assert_eq!(source, s3_ref);
-            assert_eq!(local_destination, PathBuf::from("/local/dst/key"));
-        }
-
-        // Planner selects TransferMethod::S3 when the request carries a frozen spec
-        // and executors.s3 == true.
-        #[test]
-        fn planner_selects_s3_method_for_frozen_copy_request() {
-            let s3_ref = arx::vfs::s3::S3ObjectRef {
-                target: "tgt".into(),
-                bucket: "bk".into(),
-                key: "path/file".into(),
-            };
-            let spec = S3TransferSpec::DownloadOne {
-                source: s3_ref.clone(),
-                local_destination: PathBuf::from("/dst/file"),
-            };
-            let request = TransferRequest {
-                source: Location::S3 {
-                    target: "tgt".into(),
-                    bucket: Some("bk".into()),
-                    prefix: String::new(),
-                },
-                destination: Location::Local(PathBuf::from("/dst")),
-                source_provider: ProviderId::S3,
-                destination_provider: ProviderId::Local,
-                source_capabilities: CapabilitySet::NONE,
-                destination_capabilities: CapabilitySet::NONE,
-                intent: TransferIntent::Copy,
-                executors: ExecutorAvailability {
-                    native: true,
-                    rsync: false,
-                    sftp: false,
-                    s3: true,
-                    webdav: false,
-                },
-                delete_extraneous: false,
-                s3_spec: Some(spec),
-                webdav_spec: None,
-            };
-            let plan = TransferPlanner::plan(request).unwrap();
-            assert_eq!(plan.method, TransferMethod::S3);
-            assert!(plan.s3_spec.is_some());
-            assert_eq!(
-                plan.s3_spec.unwrap(),
-                S3TransferSpec::DownloadOne {
-                    source: s3_ref,
-                    local_destination: PathBuf::from("/dst/file")
-                }
-            );
-        }
     }
 
     // S3-27R G: Parent/LoadMore cannot create a preview target because they
