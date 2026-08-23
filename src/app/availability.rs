@@ -168,9 +168,11 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
                 reason: "Open in file manager is currently local-only".into(),
             }
         }
-        ActionId::ToggleSplitPane | ActionId::OpenHotlist | ActionId::OpenInFileManager => {
-            ActionAvailability::Available
-        }
+        ActionId::ToggleSplitPane
+        | ActionId::OpenHotlist
+        | ActionId::OpenInFileManager
+        | ActionId::OpenSmartTree
+        | ActionId::OpenInfrastructureCenter => ActionAvailability::Available,
         ActionId::ComputeSha256 | ActionId::TouchFile | ActionId::CompressTarGz
             if ctx.active_provider != ProviderId::Local =>
         {

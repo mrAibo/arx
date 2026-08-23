@@ -29,7 +29,7 @@ pub(super) fn render_infrastructure_center(frame: &mut Frame, area: Rect, state:
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Infrastructure Center — Ctrl+I toggle "),
+                .title(" Infrastructure Center — Esc close "),
         )
         .highlight_style(Style::default().fg(Color::Cyan));
     frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
@@ -41,10 +41,7 @@ pub(super) fn render_smart_tree(frame: &mut Frame, area: Rect, state: &mut AppSt
     let popup = centered_rect_lines(80, h, area);
     frame.render_widget(Clear, popup);
     let items: Vec<ListItem> = tl.iter().map(|l| ListItem::new(l.as_str())).collect();
-    let title = format!(
-        " ARX Smart Tree — :{}_ | Ctrl+T toggle, Esc close ",
-        state.tree_filter
-    );
+    let title = format!(" ARX Smart Tree — :{}_ | Esc close ", state.tree_filter);
     let list = ratatui::widgets::List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().fg(Color::Green));

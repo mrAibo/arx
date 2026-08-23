@@ -1358,45 +1358,11 @@ async fn event_loop(
                             state.show_jobs = !state.show_jobs;
                             state.job_cursor = 0;
                         }
-                        // Ctrl+I: toggle Infrastructure Center
                         // Ctrl+S: save workspace
                         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             match crate::workspace::save_workspace(&state) {
                                 Ok(()) => state.message = Some("Workspace saved".into()),
                                 Err(e) => state.message = Some(format!("Save failed: {e}")),
-                            }
-                        }
-                        KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let opening =
-                                state.active_overlay() != Some(OverlayKind::Infrastructure);
-                            state.toggle_overlay(OverlayKind::Infrastructure);
-                            if opening {
-                                state.infrastructure_lines = vec!["Checking SSH hosts…".into()];
-                                let id = effect_dispatcher.dispatch(
-                                    EffectLane::Infrastructure,
-                                    EffectScope::Global,
-                                    Effect::InfrastructureSnapshot,
-                                );
-                                state.register_effect(EffectLane::Infrastructure, id);
-                            }
-                        }
-                        // Ctrl+T: toggle Smart Tree
-                        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let opening = state.active_overlay() != Some(OverlayKind::Tree);
-                            state.toggle_overlay(OverlayKind::Tree);
-                            state.tree_filter.clear();
-                            if opening {
-                                let location = state.active_pane().location.clone();
-                                state.tree_lines = vec!["Loading tree…".into()];
-                                let id = effect_dispatcher.dispatch(
-                                    EffectLane::Tree,
-                                    EffectScope::Location(location.clone()),
-                                    Effect::TreeSnapshot {
-                                        location,
-                                        filter: String::new(),
-                                    },
-                                );
-                                state.register_effect(EffectLane::Tree, id);
                             }
                         }
                         // Ctrl+Y: toggle Transfer Center
@@ -1407,6 +1373,9 @@ async fn event_loop(
                         KeyCode::Esc if state.show_tree => {
                             state.show_tree = false;
                             state.tree_filter.clear();
+                        }
+                        KeyCode::Esc if state.show_infra => {
+                            state.close_overlay(OverlayKind::Infrastructure);
                         }
                         KeyCode::Char(c)
                             if state.show_tree
@@ -1425,7 +1394,13 @@ async fn event_loop(
                             state.register_effect(EffectLane::Tree, id);
                         }
                         // Ctrl+X D: toggle directory compare
-                        // Alt+T: toggle panel mode (Full ↔ Brief) KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => { state.panel_mode = match state.panel_mode { PanelMode::Full => PanelMode::Brief, PanelMode::Brief => PanelMode::Full, }; }
+                        // Alt+T: toggle panel mode (Full ↔ Brief)
+                        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => {
+                            state.panel_mode = match state.panel_mode {
+                                PanelMode::Full => PanelMode::Brief,
+                                PanelMode::Brief => PanelMode::Full,
+                            };
+                        }
                         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.show_diff = !state.show_diff;
                             state.message = Some(if state.show_diff {
@@ -3317,6 +3292,37 @@ async fn dispatch_ui_action(
         ),
         Action::OpenBookmarks => state.toggle_overlay(OverlayKind::Bookmarks),
         Action::OpenJobs => state.toggle_overlay(OverlayKind::Jobs),
+        Action::OpenSmartTree => {
+            let opening = state.active_overlay() != Some(OverlayKind::Tree);
+            state.toggle_overlay(OverlayKind::Tree);
+            state.tree_filter.clear();
+            if opening {
+                let location = state.active_pane().location.clone();
+                state.tree_lines = vec!["Loading tree…".into()];
+                let id = effect_dispatcher.dispatch(
+                    EffectLane::Tree,
+                    EffectScope::Location(location.clone()),
+                    Effect::TreeSnapshot {
+                        location,
+                        filter: String::new(),
+                    },
+                );
+                state.register_effect(EffectLane::Tree, id);
+            }
+        }
+        Action::OpenInfrastructureCenter => {
+            let opening = state.active_overlay() != Some(OverlayKind::Infrastructure);
+            state.toggle_overlay(OverlayKind::Infrastructure);
+            if opening {
+                state.infrastructure_lines = vec!["Checking SSH hosts…".into()];
+                let id = effect_dispatcher.dispatch(
+                    EffectLane::Infrastructure,
+                    EffectScope::Global,
+                    Effect::InfrastructureSnapshot,
+                );
+                state.register_effect(EffectLane::Infrastructure, id);
+            }
+        }
         Action::OpenHosts => toggle_hosts_overlay(state),
         Action::OpenSshHosts => state.toggle_overlay(OverlayKind::SshHosts),
         Action::OpenHelp => {
@@ -6571,7 +6577,8 @@ mod tests {
             .join("");
 
         assert!(text.contains("Infrastructure Center"));
-        assert!(text.contains("Ctrl+I toggle"));
+        assert!(text.contains("Esc close"));
+        assert!(!text.contains("Ctrl+I"));
         assert!(text.contains("infra-alpha"));
     }
 
@@ -6602,7 +6609,8 @@ mod tests {
 
         assert!(text.contains("ARX Smart Tree"));
         assert!(text.contains(":needle_"));
-        assert!(text.contains("Ctrl+T toggle"));
+        assert!(text.contains("Esc close"));
+        assert!(!text.contains("Ctrl+T"));
         assert!(text.contains("tree-child"));
     }
 
