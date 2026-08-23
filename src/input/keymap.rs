@@ -173,6 +173,7 @@ impl Default for Keymap {
                 Action::Delete,
             ),
             KeyBinding::new(Browser, vec![ctrl('p')], Action::OpenCommandCenter),
+            KeyBinding::new(Browser, vec![ctrl('\\')], Action::ToggleSplitPane),
             // Ctrl+X T: embedded terminal (safe across emulators, unlike Ctrl+Shift+T)
             KeyBinding::new(
                 Browser,
@@ -445,6 +446,28 @@ mod tests {
             router.resolve_stroke(InputContext::Browser, plain(' ')),
             KeyResolution::Action(Action::ToggleSelect)
         );
+    }
+
+    #[test]
+    fn ctrl_backslash_resolves_toggle_split_pane() {
+        let mut router = KeyRouter::default();
+        assert_eq!(
+            router.resolve_stroke(InputContext::Browser, ctrl('\\')),
+            KeyResolution::Action(Action::ToggleSplitPane)
+        );
+    }
+
+    #[test]
+    fn browser_has_exactly_one_ctrl_backslash_binding() {
+        let keymap = Keymap::default();
+        let count = keymap
+            .bindings()
+            .iter()
+            .filter(|binding| {
+                binding.context == InputContext::Browser && binding.sequence == [ctrl('\\')]
+            })
+            .count();
+        assert_eq!(count, 1);
     }
 
     #[test]

@@ -163,6 +163,14 @@ fn copy_pair_supported(active: ProviderId, passive: ProviderId) -> bool {
 
 pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailability {
     match id {
+        ActionId::OpenInFileManager if ctx.active_provider != ProviderId::Local => {
+            ActionAvailability::Disabled {
+                reason: "Open in file manager is currently local-only".into(),
+            }
+        }
+        ActionId::ToggleSplitPane | ActionId::OpenHotlist | ActionId::OpenInFileManager => {
+            ActionAvailability::Available
+        }
         ActionId::ComputeSha256 | ActionId::TouchFile | ActionId::CompressTarGz
             if ctx.active_provider != ProviderId::Local =>
         {
@@ -444,6 +452,25 @@ mod tests {
             action_availability(ActionId::BeginHardLink, &ctx),
             ActionAvailability::Disabled { .. }
         ));
+    }
+
+    #[test]
+    fn open_in_file_manager_is_local_only() {
+        let local = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        assert_eq!(
+            action_availability(ActionId::OpenInFileManager, &local),
+            ActionAvailability::Available
+        );
+
+        for provider in [ProviderId::Sftp, ProviderId::S3] {
+            let remote = context(provider, CapabilitySet::NONE);
+            let availability = action_availability(ActionId::OpenInFileManager, &remote);
+            assert_eq!(
+                availability.reason(),
+                Some("Open in file manager is currently local-only")
+            );
+            assert!(matches!(availability, ActionAvailability::Disabled { .. }));
+        }
     }
 
     #[test]
