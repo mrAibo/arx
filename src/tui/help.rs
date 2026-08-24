@@ -34,12 +34,18 @@ pub(super) fn handle_key(state: &mut AppState, key: KeyEvent, key_router: &mut K
     true
 }
 
-pub(super) fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
+pub(super) fn render(
+    frame: &mut Frame,
+    area: Rect,
+    state: &mut AppState,
+    keymap: &arx::input::Keymap,
+) {
     let popup_area = centered_rect(68, 90, area);
     frame.render_widget(Clear, popup_area);
 
-    // Full help content (Getting Started first, then full reference)
-    let full_lines = help_full_lines();
+    // Full help content (Getting Started first, then full reference).
+    // #214: physical keys for MANAGED actions come from the effective Keymap.
+    let full_lines = help_full_lines(Some(keymap));
 
     // Compute visible slice
     let content_height = popup_area.height.saturating_sub(2) as usize; // minus borders
@@ -86,7 +92,19 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &mut AppState) {
     frame.render_widget(hint, hint_area[1]);
 }
 
-fn help_full_lines() -> Vec<Line<'static>> {
+/// Managed-action key label from the effective Keymap, or "—" when unbound.
+fn dyn_key(keymap: Option<&arx::input::Keymap>, action_id: arx::app::ActionId) -> String {
+    match keymap.and_then(|km| km.primary_binding_label(arx::app::InputContext::Browser, action_id))
+    {
+        Some(label) => format!("{:<12}", label),
+        None => format!("{:<12}", "—"),
+    }
+}
+
+fn help_full_lines(keymap: Option<&arx::input::Keymap>) -> Vec<Line<'static>> {
+    use arx::app::ActionId;
+    let k = |id: ActionId| dyn_key(keymap, id);
+    let _ = &k;
     vec![
         // Getting Started (short, first)
         Line::from(Span::styled(
@@ -103,13 +121,25 @@ fn help_full_lines() -> Vec<Line<'static>> {
             Style::default().fg(Color::Cyan),
         )),
         Line::from("  Tab           Switch pane (left ↔ right)"),
-        Line::from("  F9            Hosts / SFTP (connect remote)"),
-        Line::from("  Ctrl+D        Compare workspace (diff)"),
-        Line::from("  Ctrl+X P      Sync Preview (after compare)"),
+        Line::from(format!(
+            "  {}Hosts / SFTP (connect remote)",
+            k(ActionId::OpenHosts)
+        )),
+        Line::from(format!(
+            "  {}Compare workspace (diff)",
+            k(ActionId::ToggleWorkspaceComparison)
+        )),
+        Line::from(format!(
+            "  {}Sync Preview (after compare)",
+            k(ActionId::PreviewWorkspaceSync)
+        )),
         Line::from("  Enter         Execute preview"),
-        Line::from("  Ctrl+P        Command Center"),
+        Line::from(format!(
+            "  {}Command Center",
+            k(ActionId::OpenCommandCenter)
+        )),
         Line::from("  F1/?          This help"),
-        Line::from("  F10 / q       Quit"),
+        Line::from(format!("  {} / q       Quit", k(ActionId::Quit).trim_end())),
         Line::from(""),
         Line::from(Span::styled("Navigation", Style::default().fg(Color::Cyan))),
         Line::from("  j / ↓ / k / ↑      Move cursor"),
@@ -117,7 +147,10 @@ fn help_full_lines() -> Vec<Line<'static>> {
         Line::from("  Backspace          Parent directory"),
         Line::from("  Ctrl+G             Go to path"),
         Line::from("  Ctrl+U             Swap panes"),
-        Line::from("  Alt+U              Storage Inspector (local, read-only)"),
+        Line::from(format!(
+            "  {}Storage Inspector (local, read-only)",
+            k(ActionId::OpenStorageInspector)
+        )),
         Line::from("  Alt+D              Filesystems (df++, read-only)"),
         Line::from("  Alt+O              Sync other pane to active"),
         Line::from("  Alt+Down           Go back in directory history"),
@@ -146,10 +179,10 @@ fn help_full_lines() -> Vec<Line<'static>> {
             "File Operations",
             Style::default().fg(Color::Cyan),
         )),
-        Line::from("  F5             Copy to other pane"),
-        Line::from("  F6             Move to other pane"),
-        Line::from("  F7             Create directory"),
-        Line::from("  F8             Delete"),
+        Line::from(format!("  {}Copy to other pane", k(ActionId::Copy))),
+        Line::from(format!("  {}Move to other pane", k(ActionId::Move))),
+        Line::from(format!("  {}Create directory", k(ActionId::Mkdir))),
+        Line::from(format!("  {}Delete", k(ActionId::Delete))),
         Line::from("  Shift+F6       Rename file"),
         Line::from("  Ctrl+I         File info (stat)"),
         Line::from("  Ctrl+Space     Directory size / free space"),
@@ -158,9 +191,12 @@ fn help_full_lines() -> Vec<Line<'static>> {
             "View & Edit",
             Style::default().fg(Color::Cyan),
         )),
-        Line::from("  F3             View file (built-in)"),
+        Line::from(format!("  {}View file (built-in)", k(ActionId::ViewFile))),
         Line::from("  Shift+F3       View with bat (syntax highlight)"),
-        Line::from("  F4             Edit (configurable editor)"),
+        Line::from(format!(
+            "  {}Edit (configurable editor)",
+            k(ActionId::EditFile)
+        )),
         Line::from(""),
         Line::from(Span::styled(
             "Ctrl+X Prefix (MC-style)",
@@ -219,7 +255,7 @@ mod tests {
     }
 
     fn source_text() -> String {
-        help_full_lines()
+        help_full_lines(None)
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
@@ -323,7 +359,14 @@ mod tests {
         let mut state = help_state(usize::MAX);
 
         terminal
-            .draw(|frame| render(frame, frame.area(), &mut state))
+            .draw(|frame| {
+                render(
+                    frame,
+                    frame.area(),
+                    &mut state,
+                    &arx::input::Keymap::default(),
+                )
+            })
             .unwrap();
         assert_ne!(state.help_scroll, usize::MAX);
         let bottom = buffer_text(&terminal);
@@ -332,7 +375,14 @@ mod tests {
 
         state.help_scroll = 0;
         terminal
-            .draw(|frame| render(frame, frame.area(), &mut state))
+            .draw(|frame| {
+                render(
+                    frame,
+                    frame.area(),
+                    &mut state,
+                    &arx::input::Keymap::default(),
+                )
+            })
             .unwrap();
         assert_eq!(state.help_scroll, 0);
         let rendered = buffer_text(&terminal);

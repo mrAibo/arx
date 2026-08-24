@@ -18,6 +18,25 @@ pub struct ArxConfig {
     /// Transfer queue tuning. Bounds/fallbacks live in `validate_transfer`.
     #[serde(default)]
     pub transfer: TransferConfig,
+    /// User keybinding overrides (#214). Raw strings only; parsing/validation
+    /// and conflict detection happen in the effective-keymap builder.
+    #[serde(default)]
+    pub keybindings: Vec<KeybindingConfig>,
+}
+
+/// One raw user keybinding override row (#214).
+///
+/// Exactly one of `keys` (non-empty sequence) or `disabled = true` is
+/// required. Physical routing conflicts are NOT decided here — that belongs
+/// to effective-keymap construction.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KeybindingConfig {
+    pub context: String,
+    pub action: String,
+    #[serde(default)]
+    pub keys: Option<String>,
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// Transfer queue configuration.
@@ -81,6 +100,7 @@ impl Default for ArxConfig {
             s3: S3Config::default(),
             webdav: WebDavConfig::default(),
             transfer: TransferConfig::default(),
+            keybindings: Vec::new(),
         }
     }
 }
@@ -105,6 +125,16 @@ pub fn load() -> ArxConfig {
     } else {
         ArxConfig::default()
     }
+}
+
+/// Strictly load the config from an EXPLICIT path (#214).
+///
+/// Unlike [`load`], a missing/unreadable/malformed file is a hard error: when
+/// the user names a file we must never silently substitute defaults.
+pub fn load_from_path(path: &std::path::Path) -> Result<ArxConfig, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read config {}: {e}", path.display()))?;
+    parse_config(&content).map_err(|e| format!("invalid config {}: {e}", path.display()))
 }
 
 // ponytail: single well-known path; add XDG_CONFIG_HOME override when needed

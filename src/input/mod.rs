@@ -13,4 +13,7 @@ pub use hints::{
     ContextHint, HintPriority, command_bar_rows, contextual_hints,
     contextual_hints_with_file_context,
 };
-pub use keymap::{KeyBinding, KeyContinuation, KeyResolution, KeyRouter, KeyStroke, Keymap};
+pub use keymap::{
+    BindingSource, ConfigContext, KeyBinding, KeyContinuation, KeyResolution, KeyRouter, KeyStroke,
+    Keymap, parse_chord, parse_stroke,
+};

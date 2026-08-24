@@ -81,7 +81,8 @@ pub fn contextual_hints_with_file_context(
 
 /// Returns two rows of command-bar chips.
 ///
-/// Row A — Commander core: F3-F9 always visible, dimmed when unavailable.
+/// Row A — Commander core actions: always listed. The displayed physical keys
+/// come from the effective Keymap (#214); rows dim when unavailable.
 /// Row B — Discovery: Ctrl+P Commands, Ctrl+D Compare, Ctrl+X P Sync,
 ///         Ctrl+X T Terminal, F1 Help, F10 Quit.
 pub fn command_bar_rows(

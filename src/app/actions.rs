@@ -192,6 +192,15 @@ pub fn action_meta(id: ActionId) -> Option<&'static ActionMeta> {
     crate::app::registration::registration_for(id).map(|r| &r.meta)
 }
 
+/// Crate-internal ActionId -> Action resolution backed ONLY by the canonical
+/// PACK R registration table. No duplicated full match; unregistered id -> None.
+pub(crate) fn action_for_id(id: ActionId) -> Option<Action> {
+    crate::app::registration::registrations()
+        .iter()
+        .find(|r| r.meta.id == id)
+        .map(|r| r.action)
+}
+
 pub fn listed_entry_navigation_target(
     current: &crate::vfs::Location,
     listed: &crate::vfs::ListedEntry,

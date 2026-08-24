@@ -20,10 +20,16 @@ use crate::vfs::{Location, ProviderRegistry};
 use crate::vfs::{RemoteDeletePlan, RemoteEditSession};
 
 mod actions;
+pub(crate) use actions::action_for_id;
+#[cfg(test)]
+pub(crate) fn registrations_for_test() -> &'static [registration::Registration] {
+    registration::registrations()
+}
 pub use actions::{
     Action, ActionCategory, ActionId, ActionMeta, InputContext, action_meta,
     listed_entry_navigation_target, navigation_parent_target,
 };
+pub(crate) use registration::sanitize_config_token;
 mod availability;
 mod registration;
 pub use availability::{ActionAvailability, ActionContext, action_availability};

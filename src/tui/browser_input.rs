@@ -106,7 +106,13 @@ pub(super) fn classify(state: &AppState, key: KeyEvent) -> BrowserRoute {
         KeyCode::F(2) => UserMenuOrSort,
         KeyCode::F(3) if key.modifiers.contains(KeyModifiers::SHIFT) => PageWithBat,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => CopyPathToClipboard,
-        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => SaveWorkspace,
+        // #214: plain Ctrl+S only — Shift must not fall through to save.
+        KeyCode::Char('s')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            SaveWorkspace
+        }
         KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => ToggleTransferCenter,
         KeyCode::Esc if state.show_tree => TreeClose,
         KeyCode::Esc if state.show_infra => CloseInfrastructure,
@@ -139,6 +145,89 @@ pub(super) fn classify(state: &AppState, key: KeyEvent) -> BrowserRoute {
         }
         _ => Unhandled,
     }
+}
+
+// ── #214 §13: browser legacy collision validation (real classifier, no copy) ──
+
+fn arx_location(path: &str) -> arx::vfs::Location {
+    arx::vfs::Location::Local(std::path::PathBuf::from(path))
+}
+
+/// Conservative representative Browser states used to probe the real legacy
+/// classifier. Conditional claims (tree text keys, Esc while overlays open,
+/// Ctrl+Left/Right with tabs) must be exposed.
+fn representative_states() -> Vec<AppState> {
+    let mut states = Vec::new();
+
+    // 1) default browser state
+    states.push(AppState::default());
+
+    // 2) Smart Tree active
+    states.push(AppState {
+        show_tree: true,
+        ..AppState::default()
+    });
+
+    // 3) Infrastructure active
+    states.push(AppState {
+        show_infra: true,
+        ..AppState::default()
+    });
+
+    // 4) active pane with one tab
+    #[allow(clippy::field_reassign_with_default)]
+    let mut one_tab = AppState::default();
+    one_tab.left.tabs = vec![(arx_location("/tmp"), 0)];
+    states.push(one_tab);
+
+    // 5) active pane with two tabs
+    #[allow(clippy::field_reassign_with_default)]
+    let mut two_tabs = AppState::default();
+    two_tabs.left.tabs = vec![(arx_location("/tmp"), 0), (arx_location("/home"), 0)];
+    states.push(two_tabs);
+
+    states
+}
+
+fn to_key_event(stroke: arx::input::KeyStroke) -> crossterm::event::KeyEvent {
+    // Real terminals deliver Ctrl+letter as the LOWERCASE char with CONTROL.
+    // The config parser normalizes to uppercase, so probe with lowercase when
+    // CONTROL is present to mirror genuine key events.
+    let code = match (
+        stroke.code,
+        stroke.modifiers.contains(KeyModifiers::CONTROL),
+    ) {
+        (KeyCode::Char(c), true) => KeyCode::Char(c.to_ascii_lowercase()),
+        (code, _) => code,
+    };
+    crossterm::event::KeyEvent::new(code, stroke.modifiers)
+}
+
+/// Reject user Browser overrides whose FIRST stroke is claimed by the real
+/// legacy classifier under any representative state. Uses `classify` directly —
+/// no duplicate reserved-key table.
+pub fn validate_user_browser_bindings(keymap: &arx::input::Keymap) -> Result<(), String> {
+    for binding in keymap.bindings() {
+        if binding.source != arx::input::BindingSource::User
+            || binding.context != InputContext::Browser
+        {
+            continue;
+        }
+        let Some(first) = binding.sequence.first().copied() else {
+            continue;
+        };
+        let event = to_key_event(first);
+        for state in representative_states().iter() {
+            if !matches!(classify(state, event), BrowserRoute::Unhandled) {
+                return Err(format!(
+                    "{} conflicts with a built-in browser route for {}",
+                    first.label(),
+                    binding.action.id().config_name(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

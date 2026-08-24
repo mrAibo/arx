@@ -578,6 +578,142 @@ pub fn registrations() -> &'static [Registration] {
     REGISTRATIONS
 }
 
+impl ActionId {
+    /// Stable snake_case configuration identity (#214).
+    ///
+    /// Explicitly enumerated — never derived from Debug formatting or
+    /// automatic case conversion — so renaming a Rust variant cannot silently
+    /// change an accepted config file's meaning.
+    pub fn config_name(self) -> &'static str {
+        match self {
+            ActionId::Quit => "quit",
+            ActionId::Up => "up",
+            ActionId::Down => "down",
+            ActionId::Enter => "enter",
+            ActionId::Back => "back",
+            ActionId::SwitchPane => "switch_pane",
+            ActionId::ToggleSplitPane => "toggle_split_pane",
+            ActionId::ToggleSelect => "toggle_select",
+            ActionId::ViewFile => "view_file",
+            ActionId::EditFile => "edit_file",
+            ActionId::Copy => "copy",
+            ActionId::Move => "move",
+            ActionId::Mkdir => "mkdir",
+            ActionId::Delete => "delete",
+            ActionId::ComputeSha256 => "compute_sha256",
+            ActionId::TouchFile => "touch_file",
+            ActionId::CompressTarGz => "compress_tar_gz",
+            ActionId::ListTmuxSessions => "list_tmux_sessions",
+            ActionId::ToggleEmbeddedTerminal => "toggle_embedded_terminal",
+            ActionId::Refresh => "refresh",
+            ActionId::OpenCommandCenter => "open_command_center",
+            ActionId::OpenBookmarks => "open_bookmarks",
+            ActionId::OpenJobs => "open_jobs",
+            ActionId::OpenSmartTree => "open_smart_tree",
+            ActionId::OpenInfrastructureCenter => "open_infrastructure_center",
+            ActionId::OpenHosts => "open_hosts",
+            ActionId::OpenSshHosts => "open_ssh_hosts",
+            ActionId::OpenHelp => "open_help",
+            ActionId::OpenHotlist => "open_hotlist",
+            ActionId::OpenInFileManager => "open_in_file_manager",
+            ActionId::BeginSymlink => "begin_symlink",
+            ActionId::BeginChmod => "begin_chmod",
+            ActionId::BeginHardLink => "begin_hard_link",
+            ActionId::BeginChown => "begin_chown",
+            ActionId::ToggleWorkspaceComparison => "toggle_workspace_comparison",
+            ActionId::PreviewWorkspaceSync => "preview_workspace_sync",
+            ActionId::ReverseWorkspaceDirection => "reverse_workspace_direction",
+            ActionId::ToggleWorkspaceSyncMode => "toggle_workspace_sync_mode",
+            ActionId::CloseWorkspaceSyncOverlay => "close_workspace_sync_overlay",
+            ActionId::ExecuteWorkspaceSync => "execute_workspace_sync",
+            ActionId::ConfirmWorkspaceSync => "confirm_workspace_sync",
+            ActionId::CancelWorkspaceSync => "cancel_workspace_sync",
+            ActionId::ShowWorkspaceSyncDetails => "show_workspace_sync_details",
+            ActionId::ShowWorkspaceVerificationDiff => "show_workspace_verification_diff",
+            ActionId::ReturnToWorkspaceSyncPreview => "return_to_workspace_sync_preview",
+            ActionId::ConfirmRemoteDelete => "confirm_remote_delete",
+            ActionId::CancelRemoteDelete => "cancel_remote_delete",
+            ActionId::OpenStorageInspector => "open_storage_inspector",
+        }
+    }
+}
+
+impl std::str::FromStr for ActionId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "quit" => Ok(ActionId::Quit),
+            "up" => Ok(ActionId::Up),
+            "down" => Ok(ActionId::Down),
+            "enter" => Ok(ActionId::Enter),
+            "back" => Ok(ActionId::Back),
+            "switch_pane" => Ok(ActionId::SwitchPane),
+            "toggle_split_pane" => Ok(ActionId::ToggleSplitPane),
+            "toggle_select" => Ok(ActionId::ToggleSelect),
+            "view_file" => Ok(ActionId::ViewFile),
+            "edit_file" => Ok(ActionId::EditFile),
+            "copy" => Ok(ActionId::Copy),
+            "move" => Ok(ActionId::Move),
+            "mkdir" => Ok(ActionId::Mkdir),
+            "delete" => Ok(ActionId::Delete),
+            "compute_sha256" => Ok(ActionId::ComputeSha256),
+            "touch_file" => Ok(ActionId::TouchFile),
+            "compress_tar_gz" => Ok(ActionId::CompressTarGz),
+            "list_tmux_sessions" => Ok(ActionId::ListTmuxSessions),
+            "toggle_embedded_terminal" => Ok(ActionId::ToggleEmbeddedTerminal),
+            "refresh" => Ok(ActionId::Refresh),
+            "open_command_center" => Ok(ActionId::OpenCommandCenter),
+            "open_bookmarks" => Ok(ActionId::OpenBookmarks),
+            "open_jobs" => Ok(ActionId::OpenJobs),
+            "open_smart_tree" => Ok(ActionId::OpenSmartTree),
+            "open_infrastructure_center" => Ok(ActionId::OpenInfrastructureCenter),
+            "open_hosts" => Ok(ActionId::OpenHosts),
+            "open_ssh_hosts" => Ok(ActionId::OpenSshHosts),
+            "open_help" => Ok(ActionId::OpenHelp),
+            "open_hotlist" => Ok(ActionId::OpenHotlist),
+            "open_in_file_manager" => Ok(ActionId::OpenInFileManager),
+            "begin_symlink" => Ok(ActionId::BeginSymlink),
+            "begin_chmod" => Ok(ActionId::BeginChmod),
+            "begin_hard_link" => Ok(ActionId::BeginHardLink),
+            "begin_chown" => Ok(ActionId::BeginChown),
+            "toggle_workspace_comparison" => Ok(ActionId::ToggleWorkspaceComparison),
+            "preview_workspace_sync" => Ok(ActionId::PreviewWorkspaceSync),
+            "reverse_workspace_direction" => Ok(ActionId::ReverseWorkspaceDirection),
+            "toggle_workspace_sync_mode" => Ok(ActionId::ToggleWorkspaceSyncMode),
+            "close_workspace_sync_overlay" => Ok(ActionId::CloseWorkspaceSyncOverlay),
+            "execute_workspace_sync" => Ok(ActionId::ExecuteWorkspaceSync),
+            "confirm_workspace_sync" => Ok(ActionId::ConfirmWorkspaceSync),
+            "cancel_workspace_sync" => Ok(ActionId::CancelWorkspaceSync),
+            "show_workspace_sync_details" => Ok(ActionId::ShowWorkspaceSyncDetails),
+            "show_workspace_verification_diff" => Ok(ActionId::ShowWorkspaceVerificationDiff),
+            "return_to_workspace_sync_preview" => Ok(ActionId::ReturnToWorkspaceSyncPreview),
+            "confirm_remote_delete" => Ok(ActionId::ConfirmRemoteDelete),
+            "cancel_remote_delete" => Ok(ActionId::CancelRemoteDelete),
+            "open_storage_inspector" => Ok(ActionId::OpenStorageInspector),
+            other => Err(format!("unknown action: {}", sanitize_config_token(other))),
+        }
+    }
+}
+
+/// Output-only escaping so hostile control characters in config text can never
+/// inject newlines/ESC into terminal diagnostics (#214).
+pub(crate) fn sanitize_config_token(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u8));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Resolve the registration for an exact action id.
 pub fn registration_for(id: ActionId) -> Option<&'static Registration> {
     REGISTRATIONS.iter().find(|r| r.meta.id == id)
