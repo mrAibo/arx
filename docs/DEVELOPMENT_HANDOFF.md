@@ -9,7 +9,7 @@ working rules, and next sequence from GitHub without reconstructing chat history
 > re-fetch current `main` before making changes; this snapshot is evidence, not
 > eternal truth.
 
-## 1. Current baseline — 2026-08-24
+## 1. Current baseline — 2026-08-24 (PACK R)
 
 Repository: `mrAibo/arx`
 
@@ -18,9 +18,10 @@ Repository: `mrAibo/arx`
   release has shipped since this snapshot).
 - Rust MSRV: **1.88**
 - Product platform: **Linux only**; published artifact target is Linux x86_64.
-- Baseline entering Q3: `b8e5f9a5761875d6b25dfa047d9b93af5619b1f6` (= `main` at Q3
-  branch-off; includes PACK M reconciliation, PACK N hardening, all of PACK P, and
-  PACK Q1 + Q2).
+- Baseline entering R: `578d52d685dec7454025521e6d06491273503239`. Its tree is
+  exactly the accepted Q3 tree (`bf53c33807be918996d35b45fb4ebbfa7f37abf6`); the two
+  housekeeping commits between the accepted Q3 merge (`c2f30feaf76a405c111f2996387113d6a93d2064`)
+  and this baseline have a NET zero file diff.
 
 Important merge evidence (historical record):
 
@@ -44,8 +45,8 @@ tracked by umbrella issue **#224**.
 | PACK P | TUI decomposition into controllers/runtime | COMPLETE |
 | PACK Q1 | concrete-location capability authority (#225) | COMPLETE |
 | PACK Q2 | remove legacy Location execution bridge (#227) | COMPLETE |
-| PACK Q3 | finalize resolver authority + docs truth (#229) | THIS closeout; do not invent its merge SHA |
-| PACK R | internal feature/command registration | NEXT after the Q3 merge |
+| PACK Q3 | finalize resolver authority + docs truth (#229) | COMPLETE (accepted merge `c2f30feaf76a405c111f2996387113d6a93d2064`) |
+| PACK R | internal feature/command registration (#231) | THIS closeout; do not invent its future merge SHA |
 
 Deferred by explicit decision, not forgotten:
 
@@ -81,33 +82,23 @@ Do NOT merge them, add a third resolver, or flatten typed identity. The legacy
 and `with_registry_mut` were removed in PACK Q2 and a source-contract test keeps them
 out (`tests/async_vfs_contracts.rs::vfs_module_has_no_legacy_execution_bridge`).
 
-## 4. PACK R — next architecture pack (after Q3 merges)
+## 4. After PACK R
 
-Introduce only the smallest internal registration layer needed so built-in features
-stop requiring bespoke composition wiring. Possible internal concepts:
-`ActionRegistry`, `CommandRegistry`, registered feature controllers.
+The O → P → Q → R architecture sequence is complete after the PACK R merge. Return to
+the product backlog (§8) and explicit, separately reviewed future decisions:
 
-Do not prematurely freeze a universal public `FeatureModule` trait — a broad
-commands/availability/execution/rendering/jobs/events trait would only replace one God
-object with another abstraction bottleneck.
-
-Proof consumers:
-
-1. Quick Actions
-2. Storage Inspector
-3. SSH Host Manager
-
-PACK R is successful when those built-ins share one registration mechanism and new
-built-in functionality no longer needs edits across old composition funnels merely to
-be discoverable and dispatchable.
+- #214 configurable effective keymap remains separate/later — PACK R only migrated
+  one hard-coded Alt+U route onto the existing fixed Keymap; no remapping work.
+- #10 mouse follow-ups remain separate.
+- External plugins remain **no GO** (see §5). Any evaluation after R is a fresh
+  decision gate, not a scheduled implementation.
 
 ## 5. External plugins — explicitly deferred
 
 There is **no GO** for an external plugin runtime.
 
-Do not reintroduce Lua, WASM, or Rust `.so` plugins during PACK R or after it without a
-fresh reviewed decision. After PACK R, external plugins may be evaluated only if real
-user/ecosystem demand exists; the preferred direction would be read-only first and
+Do not reintroduce Lua, WASM, or Rust `.so` plugins without a fresh reviewed decision.
+External plugins may be evaluated only if real user/ecosystem demand exists; the preferred direction would be read-only first and
 either a genuinely sandboxed out-of-process protocol or capability-constrained
 WASI-style execution.
 

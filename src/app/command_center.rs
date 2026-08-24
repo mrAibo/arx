@@ -1,8 +1,7 @@
 use std::cmp::Reverse;
 
 use super::{
-    ALL_ACTIONS, Action, ActionAvailability, ActionContext, ActionId, AppState,
-    action_availability, action_meta,
+    Action, ActionAvailability, ActionContext, ActionId, AppState, action_availability, action_meta,
 };
 use crate::vfs::{EntryKind, Location};
 
@@ -101,8 +100,8 @@ fn kind_bias(kind: CommandKind) -> i64 {
 
 /// Empty Command Center is a discovery surface, not an alphabetic dump.
 ///
-/// This is ranking only: labels and execution still come from the shared
-/// Action Catalog and typed `Action` targets. Once the user types a query,
+/// This is ranking only: labels and execution still come from the canonical
+/// action registration and typed `Action` targets. Once the user types a query,
 /// normal text relevance owns ranking again.
 fn empty_query_action_bias(id: ActionId, state: &AppState) -> i64 {
     if state.remote_workspace.plan.is_some() {
@@ -160,7 +159,8 @@ pub fn build_command_items_with_file_context(
     let action_context =
         ActionContext::from_state(state).with_file_context(focused_kind, editor_available);
 
-    for action in ALL_ACTIONS.iter().copied() {
+    for registration in super::registration::registrations() {
+        let action = registration.action;
         // Invoking Command Center from inside itself adds no value and creates
         // a surprising close/reopen cycle, so it is intentionally hidden.
         if action.id() == ActionId::OpenCommandCenter {
@@ -275,6 +275,78 @@ pub fn build_command_items_with_file_context(
 mod tests {
     use super::*;
     use crate::app::MenuEntry;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn r_storage_inspector_discoverable_on_local_pane() {
+        let state = AppState::default();
+        let items = build_command_items("storage inspector", &state);
+        let hit = items
+            .iter()
+            .find(|item| item.target == CommandTarget::Action(Action::OpenStorageInspector));
+        let hit = hit.expect("Storage Inspector must be discoverable");
+        assert_eq!(hit.kind, CommandKind::Action);
+        assert!(hit.availability.is_available());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn r_storage_inspector_disabled_on_remote_pane() {
+        use crate::vfs::Location;
+        let mut state = AppState::default();
+        state.right.location = Location::Sftp {
+            host: "prod".into(),
+            path: "/srv".into(),
+        };
+        state.active = crate::app::Pane::Right;
+        let items = build_command_items("storage inspector", &state);
+        let hit = items
+            .iter()
+            .find(|item| item.target == CommandTarget::Action(Action::OpenStorageInspector))
+            .expect("must still appear on remote pane");
+        assert!(!hit.availability.is_available());
+        assert!(hit.availability.reason().is_some());
+    }
+
+    #[test]
+    fn r_quick_actions_still_appear() {
+        let state = AppState::default();
+        for (query, action) in [
+            ("sha-256", Action::ComputeSha256),
+            ("touch", Action::TouchFile),
+            ("compress", Action::CompressTarGz),
+        ] {
+            let items = build_command_items(query, &state);
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.target == CommandTarget::Action(action)),
+                "{query} must stay discoverable"
+            );
+        }
+    }
+
+    #[test]
+    fn r_ssh_hosts_still_appears() {
+        let state = AppState::default();
+        let items = build_command_items("ssh hosts", &state);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.target == CommandTarget::Action(Action::OpenSshHosts))
+        );
+    }
+
+    #[test]
+    fn r_command_center_hides_itself() {
+        let state = AppState::default();
+        let items = build_command_items("command center", &state);
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.target == CommandTarget::Action(Action::OpenCommandCenter))
+        );
+    }
 
     #[test]
     fn action_search_returns_typed_action() {

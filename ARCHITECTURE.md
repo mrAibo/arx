@@ -88,8 +88,10 @@ drives Jobs and the render snapshot.
 
 ## Typed local Quick Actions
 
-PACK O adds three built-in local-only actions through the same shared
-`Action` / `ActionId` / `ACTION_CATALOG` / availability model used by Command Center:
+PACK O adds three built-in local-only actions through the shared `Action` /
+`ActionId` / availability model. (PACK R: the former `ACTION_CATALOG` constant is
+superseded by the canonical app action-registration table that Command Center
+iterates directly.)
 
 - **Compute SHA-256** — focused/selected regular files are hashed in Rust with `sha2`
   inside a blocking worker. Filenames remain data, never shell syntax.

@@ -192,6 +192,12 @@ impl Default for Keymap {
                 vec![KeyStroke::new(F(12), KeyModifiers::NONE)],
                 Action::OpenSshHosts,
             ),
+            // Storage Inspector: fixed default binding (formerly hard-coded Alt+U)
+            KeyBinding::new(
+                Browser,
+                vec![KeyStroke::new(Char('u'), KeyModifiers::ALT)],
+                Action::OpenStorageInspector,
+            ),
             KeyBinding::new(
                 Browser,
                 vec![KeyStroke::new(F(10), KeyModifiers::NONE)],
@@ -428,6 +434,19 @@ mod tests {
 
     fn plain(c: char) -> KeyStroke {
         KeyStroke::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn r_browser_alt_u_resolves_open_storage_inspector() {
+        let mut router = KeyRouter::default();
+        assert_eq!(
+            router.resolve_stroke(
+                InputContext::Browser,
+                KeyStroke::new(KeyCode::Char('u'), KeyModifiers::ALT)
+            ),
+            KeyResolution::Action(Action::OpenStorageInspector)
+        );
     }
 
     #[test]

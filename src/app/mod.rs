@@ -21,10 +21,11 @@ use crate::vfs::{RemoteDeletePlan, RemoteEditSession};
 
 mod actions;
 pub use actions::{
-    ACTION_CATALOG, ALL_ACTIONS, Action, ActionCategory, ActionId, ActionMeta, InputContext,
-    action_meta, listed_entry_navigation_target, navigation_parent_target,
+    Action, ActionCategory, ActionId, ActionMeta, InputContext, action_meta,
+    listed_entry_navigation_target, navigation_parent_target,
 };
 mod availability;
+mod registration;
 pub use availability::{ActionAvailability, ActionContext, action_availability};
 mod command_center;
 pub use command_center::{

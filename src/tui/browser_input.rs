@@ -4,8 +4,6 @@ use super::*;
 pub(super) enum BrowserRoute {
     Unhandled,
     #[cfg(target_os = "linux")]
-    OpenStorageInspector,
-    #[cfg(target_os = "linux")]
     OpenFilesystems,
     TreeFilterBackspace,
     SwitchPane,
@@ -52,11 +50,6 @@ pub(super) enum BrowserRoute {
 
 pub(super) fn classify(state: &AppState, key: KeyEvent) -> BrowserRoute {
     use BrowserRoute::*;
-
-    #[cfg(target_os = "linux")]
-    if key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::ALT) {
-        return OpenStorageInspector;
-    }
 
     #[cfg(target_os = "linux")]
     if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::ALT) {
@@ -277,10 +270,6 @@ mod tests {
             show_tree: true,
             ..AppState::default()
         };
-        assert_eq!(
-            classify(&state, key(KeyCode::Char('u'), KeyModifiers::ALT)),
-            BrowserRoute::OpenStorageInspector
-        );
         assert_eq!(
             classify(&state, key(KeyCode::Char('d'), KeyModifiers::ALT)),
             BrowserRoute::OpenFilesystems

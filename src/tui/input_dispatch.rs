@@ -439,6 +439,8 @@ pub(super) async fn handle_event(
                 });
             }
 
+            // Active-overlay input owner (PACK R review fix): distinct from the
+            // Alt+U launch route. Once the overlay is up, this consumes keys.
             #[cfg(target_os = "linux")]
             if state.show_storage_inspector {
                 arx::storage_inspector_ui::handle_storage_inspector_key(&mut *state, key);
@@ -594,21 +596,6 @@ pub(super) async fn handle_event(
             }
 
             match browser_input::classify(state, key) {
-                #[cfg(target_os = "linux")]
-                browser_input::BrowserRoute::OpenStorageInspector => {
-                    match arx::storage_inspector_ui::launch_storage_inspector(&mut *state) {
-                        Ok(id) => {
-                            state.message = Some(format!("Storage Inspector: {id}"));
-                        }
-                        Err(message) => {
-                            state.message = Some(message);
-                        }
-                    }
-                    return Ok(InputDispatchOutcome {
-                        flow: InputFlow::ContinueLoop,
-                        entry_mutation: EntryMutation::None,
-                    });
-                }
                 #[cfg(target_os = "linux")]
                 browser_input::BrowserRoute::OpenFilesystems => {
                     match arx::filesystem_usage_ui::launch_filesystems(&mut *state) {
