@@ -276,8 +276,8 @@ extension mechanism. ARX does not ship an embedded Lua or WASM plugin runtime.
 | WebDAV backend | ✅ **SUPPORTED MVP** — Apache mod_dav PHYSICAL PASS (W1–W18); Basic auth only; Nextcloud/ownCloud UNVERIFIED |
 | Native Linux release packages | ✅ tar.gz + `.deb` + `.rpm`, one validated ELF + SHA256SUMS |
 
-The partial rows above are intentionally explicit. They reflect the current shared
-Action Catalog/runtime rather than old issue titles or prototype code.
+The partial rows above are intentionally explicit. They reflect the current canonical
+action-registration/runtime truth rather than old issue titles or prototype code.
 
 ## Typed local Quick Actions
 
