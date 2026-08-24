@@ -45,6 +45,30 @@ pub(super) async fn handle_event(
             embedded_terminal::handle_key(&mut *state, key);
         }
         Event::Mouse(mouse) => {
+            // #10 review fix: while the context menu is open it is the FIRST
+            // mouse owner — before CommandBar hitboxes and pane classification.
+            // Nothing underneath executes in the same event.
+            if state.show_context_menu {
+                handle_context_menu_mouse(
+                    &mut *state,
+                    mouse_ui,
+                    mouse,
+                    left_visible,
+                    right_visible,
+                    workspace_scanner,
+                    sync,
+                    effect_dispatcher,
+                    pane_loader,
+                    terminal_session,
+                    configured_editor,
+                    key_router,
+                )
+                .await?;
+                return Ok(InputDispatchOutcome {
+                    flow: InputFlow::ContinueLoop,
+                    entry_mutation: EntryMutation::None,
+                });
+            }
             match mouse::classify(state, mouse) {
                 mouse::MouseRoute::Ignore => {}
                 mouse::MouseRoute::CommandBar { action, available } => {
@@ -111,88 +135,6 @@ pub(super) async fn handle_event(
                         entry_mutation: EntryMutation::None,
                     });
                 }
-                // While the context menu is open it owns ALL mouse input:
-                // item clicks route/close; outside clicks close; wheel is
-                // consumed. No pane action underneath in the same event.
-                _route if state.show_context_menu => {
-                    let Some(rect) = mouse_ui.context_menu_rect() else {
-                        return Ok(InputDispatchOutcome {
-                            flow: InputFlow::ContinueLoop,
-                            entry_mutation: EntryMutation::None,
-                        });
-                    };
-                    let Event::Mouse(m) = event else {
-                        return Ok(InputDispatchOutcome {
-                            flow: InputFlow::ContinueLoop,
-                            entry_mutation: EntryMutation::None,
-                        });
-                    };
-                    match m.kind {
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            match mouse::context_menu_hit(rect, m.column, m.row) {
-                                Some(item_index) => {
-                                    let available = mouse_ui
-                                        .context_menu
-                                        .as_ref()
-                                        .and_then(|menu| menu.items.get(item_index))
-                                        .map(|item| {
-                                            (item.action, item.availability.is_available())
-                                        });
-                                    let Some((action, true)) = available else {
-                                        // Disabled item: canonical reason, stay open.
-                                        if let Some(reason) = mouse_ui
-                                            .context_menu
-                                            .as_ref()
-                                            .and_then(|menu| menu.items.get(item_index))
-                                            .and_then(|item| item.availability.reason())
-                                        {
-                                            state.message = Some(reason.to_string());
-                                        }
-                                        return Ok(InputDispatchOutcome {
-                                            flow: InputFlow::ContinueLoop,
-                                            entry_mutation: EntryMutation::None,
-                                        });
-                                    };
-                                    // Fresh availability re-check happens inside.
-                                    execute_context_action(
-                                        &mut *state,
-                                        mouse_ui,
-                                        left_visible,
-                                        right_visible,
-                                        workspace_scanner,
-                                        sync,
-                                        effect_dispatcher,
-                                        pane_loader,
-                                        terminal_session,
-                                        configured_editor,
-                                        key_router,
-                                        action,
-                                    )
-                                    .await?;
-                                }
-                                None => {
-                                    // Outside popup: close only, no pane action.
-                                    mouse_ui.close_context_menu();
-                                    state.close_overlay(arx::app::OverlayKind::ContextMenu);
-                                }
-                            }
-                        }
-                        MouseEventKind::Down(MouseButton::Right)
-                            if mouse::context_menu_hit(rect, m.column, m.row).is_none() =>
-                        {
-                            // Right-click outside closes without click-through;
-                            // a right-click on the menu itself keeps it open.
-                            mouse_ui.close_context_menu();
-                            state.close_overlay(arx::app::OverlayKind::ContextMenu);
-                        }
-                        // Wheel/drag/other: consumed while menu is open.
-                        _ => {}
-                    }
-                    return Ok(InputDispatchOutcome {
-                        flow: InputFlow::ContinueLoop,
-                        entry_mutation: EntryMutation::None,
-                    });
-                }
                 mouse::MouseRoute::ViewerScrollDown => {
                     state.viewer_scroll =
                         (state.viewer_scroll + 1).min(state.viewer_content.len().saturating_sub(1));
@@ -221,6 +163,9 @@ pub(super) async fn handle_event(
                 // Wheel over an active overlay: consumed, no pane scroll (#10 §14).
                 mouse::MouseRoute::PaneScrollDown { .. } => {}
                 mouse::MouseRoute::PaneScrollUp { .. } => {}
+                // #10 review fix: new pane routes must not operate through
+                // another active overlay — consume instead.
+                mouse::MouseRoute::RangeSelect { .. } if state.active_overlay().is_some() => {}
                 mouse::MouseRoute::RangeSelect { pane, row } => {
                     let rows = if pane == Pane::Left {
                         &left_visible
@@ -229,6 +174,7 @@ pub(super) async fn handle_event(
                     };
                     range_select(&mut *state, pane, rows, row);
                 }
+                mouse::MouseRoute::ContextMenu { .. } if state.active_overlay().is_some() => {}
                 mouse::MouseRoute::ContextMenu { column, row, pane } => {
                     let rows: &[VisiblePaneRow<'_>] = if pane == Pane::Left {
                         left_visible
@@ -294,6 +240,19 @@ pub(super) async fn handle_event(
             }
         }
         Event::Key(key) => {
+            // #10 review fix: while the context menu is open it owns keys —
+            // Esc closes; every other key is consumed. No keymap/browser
+            // mutation leaks through a mouse-only menu.
+            if state.show_context_menu {
+                if key.code == KeyCode::Esc {
+                    mouse_ui.close_context_menu();
+                    state.close_overlay(arx::app::OverlayKind::ContextMenu);
+                }
+                return Ok(InputDispatchOutcome {
+                    flow: InputFlow::ContinueLoop,
+                    entry_mutation: EntryMutation::None,
+                });
+            }
             // Remote delete confirmation intercepts Enter/Escape
             if state.pending_delete.is_some() {
                 match key.code {
@@ -1284,7 +1243,95 @@ pub(super) async fn handle_event(
 /// Move the pane cursor by `delta` VISIBLE rows (Parent/Listed/LoadMore all
 /// count — they are rendered rows). Clamps to 0..visible.len()-1. Wheel never
 /// activates Parent, executes LoadMore, navigates, or touches selection.
+/// Context-menu mouse ownership (runs BEFORE normal classification while the
+/// menu is open): item click routes/dispatches, disabled shows reason, outside
+/// click or right-click-outside closes, wheel/drag consumed. No pane action,
+/// no CommandBar execution, no viewer scroll underneath.
+#[allow(clippy::too_many_arguments)]
+async fn handle_context_menu_mouse(
+    state: &mut AppState,
+    mouse_ui: &mut MouseUiState,
+    mouse: MouseEvent,
+    left_visible: &[VisiblePaneRow<'_>],
+    right_visible: &[VisiblePaneRow<'_>],
+    workspace_scanner: &WorkspaceScanner,
+    sync: &SyncUiRuntime,
+    effect_dispatcher: &EffectDispatcher,
+    pane_loader: &PaneLoader,
+    terminal_session: &mut TuiTerminalSession,
+    configured_editor: Option<&str>,
+    key_router: &mut KeyRouter,
+) -> io::Result<()> {
+    let close = |state: &mut AppState, mouse_ui: &mut MouseUiState| {
+        mouse_ui.close_context_menu();
+        state.close_overlay(arx::app::OverlayKind::ContextMenu);
+    };
+    let Some(rect) = mouse_ui.context_menu_rect() else {
+        close(state, mouse_ui);
+        return Ok(());
+    };
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            match mouse::context_menu_hit(rect, mouse.column, mouse.row) {
+                Some(item_index) => {
+                    let available = mouse_ui
+                        .context_menu
+                        .as_ref()
+                        .and_then(|menu| menu.items.get(item_index))
+                        .map(|item| (item.action, item.availability.is_available()));
+                    let Some((action, true)) = available else {
+                        // Disabled item: canonical reason, menu stays open.
+                        if let Some(reason) = mouse_ui
+                            .context_menu
+                            .as_ref()
+                            .and_then(|menu| menu.items.get(item_index))
+                            .and_then(|item| item.availability.reason())
+                        {
+                            state.message = Some(reason.to_string());
+                        }
+                        return Ok(());
+                    };
+                    execute_context_action(
+                        state,
+                        mouse_ui,
+                        left_visible,
+                        right_visible,
+                        workspace_scanner,
+                        sync,
+                        effect_dispatcher,
+                        pane_loader,
+                        terminal_session,
+                        configured_editor,
+                        key_router,
+                        action,
+                    )
+                    .await?;
+                }
+                None => {
+                    // Outside popup: close only — never click through to panes
+                    // or command bar in the same event.
+                    close(state, mouse_ui);
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right)
+            if mouse::context_menu_hit(rect, mouse.column, mouse.row).is_none() =>
+        {
+            // Right-click outside closes; inside keeps the menu.
+            close(state, mouse_ui);
+        }
+        // Wheel/drag/other: fully consumed while the menu is open.
+        _ => {}
+    }
+    Ok(())
+}
+
 fn pane_wheel(state: &mut AppState, pane: Pane, delta: i32, visible_len: usize) {
+    // #10 v1 frozen rule: wheel over the passive pane does nothing — no cursor
+    // change, no focus change, no selection change. Active pane scrolls.
+    if pane != state.active {
+        return;
+    }
     let pane_state = if pane == Pane::Left {
         &mut state.left
     } else {
@@ -1503,13 +1550,16 @@ async fn execute_context_action(
     } else {
         right_visible
     };
-    let frozen_name = {
+    // Exact frozen ListedEntry equality (#10 review fix): entry.name is
+    // presentation only — EntryIdentity is operational truth, so revalidation
+    // must compare the full frozen ListedEntry, never the name alone.
+    let frozen_listed = {
         let menu = mouse_ui.context_menu.as_ref().expect("checked above");
-        menu.target.listed.entry.name.clone()
+        menu.target.listed.clone()
     };
     let focused_row = visible.iter().copied().find(|row| {
         row.listed()
-            .is_some_and(|listed| listed.entry.name == frozen_name)
+            .is_some_and(|current| current == &frozen_listed)
     });
     let Some(focused_row) = focused_row else {
         // The exact target vanished after an async refresh. Never resolve by

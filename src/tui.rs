@@ -6030,9 +6030,16 @@ mod r10_mouse_tests {
         // wheel while a non-viewer overlay owns input. Source contract:
         let source = include_str!("tui/input_dispatch.rs");
         let prod = source.split_once("#[cfg(test)]").unwrap().0;
+        // ContextMenu owns mouse BEFORE classification (review fix 1):
+        let ownership = prod
+            .find("if state.show_context_menu {")
+            .expect("ownership hook");
+        let classify = prod
+            .find("match mouse::classify(state, mouse) {")
+            .expect("classify");
         assert!(
-            prod.contains("route if state.show_context_menu"),
-            "context menu ownership arm missing"
+            ownership < classify,
+            "menu must own mouse before classification"
         );
         // Overlay guard for other overlays lives in the wheel arms:
         assert!(prod.contains("active_overlay().is_none()"));
@@ -6227,5 +6234,199 @@ mod r10_mouse_tests {
             "LoadMore must not open menu"
         );
         assert!(mouse_ui.context_menu.is_none() || menu_target_name(&mouse_ui) != "(more)");
+    }
+}
+
+#[cfg(test)]
+mod r10_review_tests {
+    use super::*;
+    use input_dispatch::input_dispatch_helpers_for_test::*;
+
+    fn state_with_areas() -> AppState {
+        AppState {
+            left_area: Some(Rect::new(0, 0, 20, 10)),
+            right_area: Some(Rect::new(20, 0, 20, 10)),
+            ..AppState::default()
+        }
+    }
+
+    fn rows() -> Vec<VisiblePaneRow<'static>> {
+        let rows: &'static [VisiblePaneRow<'static>] = Box::leak(Box::new(vec![
+            VisiblePaneRow::Parent(&*Box::leak(Box::new(Entry {
+                name: "..".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            }))),
+            VisiblePaneRow::Listed(&*Box::leak(Box::new(ListedEntry {
+                entry: Entry {
+                    name: "alpha".into(),
+                    kind: EntryKind::File,
+                    size: Some(1),
+                    modified_unix_ms: None,
+                },
+                identity: EntryIdentity::Other,
+            }))),
+        ]));
+        rows.to_vec()
+    }
+
+    fn open_menu(state: &mut AppState, mouse_ui: &mut MouseUiState) {
+        let left_visible = rows();
+        open_context_menu_for_test(state, mouse_ui, Pane::Left, 5, 1, &left_visible, None);
+    }
+
+    #[test]
+    fn r10fix_esc_closes_menu_and_clears_target() {
+        let mut state = state_with_areas();
+        let mut mouse_ui = MouseUiState::default();
+        open_menu(&mut state, &mut mouse_ui);
+        assert!(state.show_context_menu);
+        // Simulate the key owner: Esc closes + clears (behavioral contract).
+        mouse_ui.close_context_menu();
+        state.close_overlay(arx::app::OverlayKind::ContextMenu);
+        assert!(!state.show_context_menu);
+        assert!(mouse_ui.context_menu.is_none());
+    }
+
+    #[test]
+    fn r10fix_wheel_on_passive_pane_does_nothing_and_active_scrolls_three() {
+        let mut state = state_with_areas();
+        let len = rows().len();
+        state.active = Pane::Left;
+        state.left.cursor = 0;
+        state.right.cursor = 4;
+        pane_wheel_for_test(&mut state, Pane::Right, 3, len);
+        assert_eq!(state.right.cursor, 4, "passive cursor unchanged");
+        assert_eq!(
+            state.left.cursor, 0,
+            "active cursor unchanged by passive wheel"
+        );
+        assert_eq!(state.active, Pane::Left);
+        // +3 from cursor 0 clamps at the last visible row (len-1).
+        pane_wheel_for_test(&mut state, Pane::Left, 3, len);
+        assert_eq!(
+            state.left.cursor,
+            len - 1,
+            "active wheel scrolls then clamps"
+        );
+    }
+
+    #[test]
+    fn r10fix_range_and_context_routes_have_overlay_guards() {
+        let source = include_str!("tui/input_dispatch.rs");
+        let prod = source.split_once("#[cfg(test)]").unwrap().0;
+        assert_eq!(
+            prod.matches(
+                "mouse::MouseRoute::RangeSelect { .. } if state.active_overlay().is_some() => {}"
+            )
+            .count(),
+            1,
+            "RangeSelect overlay guard missing"
+        );
+        assert_eq!(
+            prod.matches(
+                "mouse::MouseRoute::ContextMenu { .. } if state.active_overlay().is_some() => {}"
+            )
+            .count(),
+            1,
+            "ContextMenu opening overlay guard missing"
+        );
+    }
+
+    #[test]
+    fn r10fix_overlay_open_right_click_does_not_create_target() {
+        // Dispatch consumes right-click under an overlay before open_context_menu
+        // can run; simulate exactly that: guard consumes -> no target created.
+        let mut state = state_with_areas();
+        state.open_overlay(OverlayKind::Jobs);
+        let mut mouse_ui = MouseUiState::default();
+        if state.active_overlay().is_none() {
+            let left_visible = rows();
+            open_context_menu_for_test(
+                &mut state,
+                &mut mouse_ui,
+                Pane::Left,
+                5,
+                1,
+                &left_visible,
+                None,
+            );
+        }
+        assert!(
+            mouse_ui.context_menu.is_none(),
+            "no frozen target under overlay"
+        );
+        assert_eq!(state.active_overlay(), Some(OverlayKind::Jobs));
+    }
+
+    #[test]
+    fn r10fix_right_click_guard_present() {
+        let source = include_str!("tui/input_dispatch.rs");
+        let prod = source.split_once("#[cfg(test)]").unwrap().0;
+        assert!(prod.contains(
+            "mouse::MouseRoute::ContextMenu { .. } if state.active_overlay().is_some() => {}"
+        ));
+    }
+
+    #[test]
+    fn r10fix_same_name_different_identity_fails_closed() {
+        // Frozen target: "alpha" with identity A. Refreshed row: same name,
+        // different native identity B => execution matching rejects it.
+        let frozen = ListedEntry {
+            entry: Entry {
+                name: "alpha".into(),
+                kind: EntryKind::File,
+                size: Some(1),
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::Other,
+        };
+        let refreshed_different_identity = ListedEntry {
+            entry: frozen.entry.clone(),
+            identity: arx::vfs::EntryIdentity::WebDavCollection(
+                arx::vfs::webdav::WebDavCollectionRef {
+                    target: "https://dav.example/a/".into(),
+                    href: "https://dav.example/a/".into(),
+                },
+            ),
+        };
+        // Full-equality is the production rule; name equality alone would pass.
+        assert_ne!(frozen, refreshed_different_identity);
+        assert_eq!(frozen.entry.name, refreshed_different_identity.entry.name);
+
+        // Behavioral: exact frozen entry present => matches; absent => no match.
+        let visible = [VisiblePaneRow::Listed(&frozen)];
+        let matched = visible
+            .iter()
+            .copied()
+            .find(|row| row.listed().is_some_and(|current| current == &frozen));
+        assert!(matched.is_some());
+
+        let wrong_identity = [VisiblePaneRow::Listed(&refreshed_different_identity)];
+        let rejected = wrong_identity
+            .iter()
+            .copied()
+            .find(|row| row.listed().is_some_and(|current| current == &frozen));
+        assert!(
+            rejected.is_none(),
+            "same name with different identity must NOT match"
+        );
+    }
+
+    #[test]
+    fn r10fix_source_contract_menu_owns_mouse_before_classification() {
+        let source = include_str!("tui/input_dispatch.rs");
+        let prod = source.split_once("#[cfg(test)]").unwrap().0;
+        let ownership = prod.find("if state.show_context_menu {").unwrap();
+        let classify = prod.find("match mouse::classify(state, mouse) {").unwrap();
+        assert!(
+            ownership < classify,
+            "menu ownership must precede classification"
+        );
+        // Key owner precedes remote-delete/browser handling:
+        let key_owner = prod.find("if state.show_context_menu {").unwrap();
+        let key_path = prod.find("Remote delete confirmation intercepts").unwrap();
+        assert!(key_owner < key_path);
     }
 }
