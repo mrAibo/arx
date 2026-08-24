@@ -1705,6 +1705,16 @@ async fn dispatch_ui_action(
             state.register_effect(EffectLane::TmuxDiscovery, id);
             state.message = Some("Discovering tmux sessions…".into());
         }
+        // #7: same single multiplexer-discovery lane — one replaceable slot.
+        Action::ListScreenSessions => {
+            let id = effect_dispatcher.dispatch(
+                EffectLane::TmuxDiscovery,
+                EffectScope::Global,
+                Effect::ListScreenSessions,
+            );
+            state.register_effect(EffectLane::TmuxDiscovery, id);
+            state.message = Some("Discovering screen sessions…".into());
+        }
         _ => state.apply(action),
     }
     Ok(())
@@ -1729,6 +1739,51 @@ fn cancel_job_product_route(state: &mut AppState, sync: &SyncUiRuntime, job_id: 
         state.message = Some(format!("Job {job_id} cancellation requested"));
     }
     cancelled
+}
+
+/// #7: the ONE interactive multiplexer attach seam.
+///
+/// Releases the terminal (raw/alternate/mouse) via
+/// `TuiTerminalSession::suspend_while`, runs the REAL attach through
+/// `ProcessService` (argv authority), and reacquires the terminal afterwards —
+/// on success AND on failure. Never creates a GlobalProcess EffectId; the
+/// returned typed `EffectEvent` is fed through the existing presentation seam.
+async fn execute_multiplexer_attach(
+    state: &mut AppState,
+    multiplexer: Multiplexer,
+    session: String,
+    terminal_session: &mut TuiTerminalSession,
+    pane_loader: &PaneLoader,
+) -> io::Result<()> {
+    let (program, label) = match multiplexer {
+        Multiplexer::Tmux => ("tmux", format!("Attaching tmux: {session}")),
+        Multiplexer::Screen => ("screen", format!("Attaching screen: {session}")),
+    };
+    // Neutral message only — ARX claims nothing about multiplexer prefixes.
+    state.message = Some(label.clone());
+
+    let event = terminal_session
+        .suspend_while(move || async move {
+            arx::process::ProcessService::attach_multiplexer(program, &session).await
+        })
+        .await?;
+
+    // Existing presentation semantics for the typed result.
+    match &event {
+        arx::effects::EffectEvent::Failed { error, .. } => {
+            state.message = Some(format!("{label}: {error}"));
+        }
+        _ => schedule_pane_load(pane_loader, state, state.active),
+    }
+    effect_responses::apply_effect_event(state, EffectLane::GlobalProcess, event);
+    Ok(())
+}
+
+/// Which interactive multiplexer to attach to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Multiplexer {
+    Tmux,
+    Screen,
 }
 
 // ponytail: a context struct would only hide these already-scoped runtime services.
@@ -1797,13 +1852,31 @@ async fn execute_command_target(
             );
             None
         }
+        // #7 review fix: interactive multiplexer attach NEVER returns an Effect
+        // to the generic GlobalProcess dispatcher. It runs directly through the
+        // terminal-lifecycle seam below (execute_multiplexer_attach), which owns
+        // TuiTerminalSession::suspend_while.
         CommandTarget::TmuxSession(session) => {
-            state.message = Some(format!("Attaching tmux: {session} (Ctrl+B D to detach)"));
-            Some(Effect::AttachTmux { session })
+            execute_multiplexer_attach(
+                state,
+                Multiplexer::Tmux,
+                session,
+                terminal_session,
+                pane_loader,
+            )
+            .await?;
+            None
         }
         CommandTarget::ScreenSession(session) => {
-            state.message = Some(format!("Attaching screen: {session}"));
-            Some(Effect::AttachScreen { session })
+            execute_multiplexer_attach(
+                state,
+                Multiplexer::Screen,
+                session,
+                terminal_session,
+                pane_loader,
+            )
+            .await?;
+            None
         }
         CommandTarget::ShellCommand(command) => Some(Effect::SpawnShell { command }),
     };

@@ -157,6 +157,7 @@ impl ProcessService {
             | Effect::AttachTmux { .. }
             | Effect::AttachScreen { .. }
             | Effect::ListTmuxSessions
+            | Effect::ListScreenSessions
             | Effect::DirectoryChildrenSizes { .. }
             | Effect::UnifiedDiff { .. }
             | Effect::InfrastructureSnapshot
@@ -444,40 +445,28 @@ impl ProcessService {
                     },
                 }
             }
-            Effect::AttachTmux { session } => {
-                let label = format!("tmux:{session}");
-                match Command::new("tmux")
-                    .args(["attach-session", "-t", &session])
-                    .status()
-                    .await
-                {
-                    Ok(status) => EffectEvent::ProcessExited {
-                        label,
-                        success: status.success(),
-                    },
-                    Err(error) => EffectEvent::Failed {
-                        label,
-                        error: error.to_string(),
-                    },
-                }
-            }
-            Effect::AttachScreen { session } => {
-                let label = format!("screen:{session}");
-                match Command::new("screen").args(["-r", &session]).status().await {
-                    Ok(status) => EffectEvent::ProcessExited {
-                        label,
-                        success: status.success(),
-                    },
-                    Err(error) => EffectEvent::Failed {
-                        label,
-                        error: error.to_string(),
-                    },
-                }
-            }
+            // #7: interactive multiplexer attach must NEVER execute through the
+            // background effect path — it requires terminal suspend. The TUI
+            // orchestration handles these variants directly via
+            // TuiTerminalSession::suspend_while; reaching this arm is a routing
+            // bug, so fail closed.
+            e @ (Effect::AttachTmux { .. } | Effect::AttachScreen { .. }) => EffectEvent::Failed {
+                label: "multiplexer attach".into(),
+                error: format!(
+                    "interactive attach must run through the terminal lifecycle seam, got {e:?}"
+                ),
+            },
             Effect::ListTmuxSessions => match Self::list_tmux_sessions().await {
                 Ok(sessions) => EffectEvent::TmuxSessions { sessions },
                 Err(error) => EffectEvent::Failed {
                     label: "tmux session discovery".into(),
+                    error,
+                },
+            },
+            Effect::ListScreenSessions => match Self::list_screen_sessions().await {
+                Ok(sessions) => EffectEvent::ScreenSessions { sessions },
+                Err(error) => EffectEvent::Failed {
+                    label: "screen session discovery".into(),
                     error,
                 },
             },
@@ -536,9 +525,10 @@ impl ProcessService {
             .args(["list-sessions", "-F", "#{session_name}"])
             .output()
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| Self::missing_binary_message("tmux", error))?;
 
         if !output.status.success() {
+            // tmux exits nonzero when the server has no sessions: truthful empty.
             return Ok(Vec::new());
         }
 
@@ -549,11 +539,183 @@ impl ProcessService {
             .map(str::to_string)
             .collect())
     }
+
+    /// GNU Screen discovery via `screen -ls` (#7).
+    ///
+    /// - binary missing (NotFound) => clear "not installed / not in PATH" error,
+    ///   never a misleading "no sessions"
+    /// - normal exit with no sessions => empty typed result
+    /// - real failure (nonzero + no parseable rows) => factual error
+    pub async fn list_screen_sessions() -> Result<Vec<crate::effects::ScreenSessionInfo>, String> {
+        let output = Command::new("screen")
+            .args(["-ls"])
+            .output()
+            .await
+            .map_err(|error| Self::missing_binary_message("screen", error))?;
+
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let sessions = crate::effects::parse_screen_ls(&combined);
+        if sessions.is_empty() && !output.status.success() && !combined.contains("No Sockets") {
+            return Err(format!(
+                "screen -ls failed (exit {})",
+                output.status.code().unwrap_or(-1)
+            ));
+        }
+        Ok(sessions)
+    }
+
+    /// Interactive multiplexer attach (#7): argv construction stays HERE.
+    ///
+    /// Runs the real interactive attach (`tmux attach-session -t <id>` /
+    /// `screen -r <id>`) and returns a typed event. The TUI wraps this call in
+    /// `TuiTerminalSession::suspend_while`; this function never touches the
+    /// terminal itself.
+    pub async fn attach_multiplexer(program: &str, session: &str) -> EffectEvent {
+        let label = format!("{program}:{session}");
+        let args: &[&str] = if program == "tmux" {
+            &["attach-session", "-t", session]
+        } else {
+            &["-r", session]
+        };
+        let owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+        match Self::status(program, &owned, None).await {
+            Ok(status) => EffectEvent::ProcessExited {
+                label,
+                success: status.success(),
+            },
+            Err(error) => EffectEvent::Failed {
+                label,
+                error: Self::missing_binary_message(program, error),
+            },
+        }
+    }
+
+    /// Clear missing-binary truth instead of an opaque io error string.
+    fn missing_binary_message(binary: &str, error: std::io::Error) -> String {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("{binary} is not installed or not in PATH")
+        } else {
+            error.to_string()
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(test)]
+    mod r7_multiplexer_tests {
+        use super::*;
+        use crate::app::ActionId;
+        use crate::effects::{ScreenSessionStatus, parse_screen_ls};
+
+        // ── tmux identity preservation (#214) ──
+        #[test]
+        fn r7_list_tmux_sessions_identity_stable() {
+            let id: ActionId = "list_tmux_sessions".parse().unwrap();
+            assert_eq!(id, ActionId::ListTmuxSessions);
+            assert_eq!(
+                ActionId::ListTmuxSessions.config_name(),
+                "list_tmux_sessions"
+            );
+        }
+
+        #[test]
+        fn r7_screen_action_identity_round_trip() {
+            let id: ActionId = "list_screen_sessions".parse().unwrap();
+            assert_eq!(id, ActionId::ListScreenSessions);
+            assert_eq!(
+                ActionId::ListScreenSessions.config_name(),
+                "list_screen_sessions"
+            );
+            // canonical registration exists
+            assert!(
+                crate::app::registrations_for_test()
+                    .iter()
+                    .any(|r| r.meta.id == ActionId::ListScreenSessions)
+            );
+        }
+
+        // ── screen -ls parser ──
+        #[test]
+        fn r7_parser_preserves_exact_raw_id_detached() {
+            let out = "There is a screen on:\r\n\t1736918.r7a\t(Detached)\r\n1 Socket in /run/screen.\r\n";
+            let parsed = parse_screen_ls(out);
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].id, "1736918.r7a");
+            assert_eq!(parsed[0].status, ScreenSessionStatus::Detached);
+        }
+
+        #[test]
+        fn r7_parser_statuses() {
+            let out = concat!(
+                "\t111.aaa\t(Detached)\n",
+                "\t222.bbb\t(Attached)\n",
+                "\t333.ccc\t(Multi)\n",
+                "\t444.ddd\t(Dead)\n",
+                "\t555.eee\t(Unreachable)\n",
+                "\t666.fff\t(WeirdState)\n",
+            );
+            let parsed = parse_screen_ls(out);
+            assert_eq!(parsed.len(), 6);
+            assert_eq!(parsed[0].status, ScreenSessionStatus::Detached);
+            assert_eq!(parsed[1].status, ScreenSessionStatus::Attached);
+            assert_eq!(parsed[2].status, ScreenSessionStatus::Multi);
+            assert_eq!(parsed[3].status, ScreenSessionStatus::Dead);
+            assert_eq!(parsed[4].status, ScreenSessionStatus::Unreachable);
+            assert_eq!(parsed[5].status, ScreenSessionStatus::Unknown);
+            // raw ids exact
+            assert_eq!(parsed[0].id, "111.aaa");
+            assert_eq!(parsed[5].id, "666.fff");
+        }
+
+        #[test]
+        fn r7_parser_headers_and_malformed_never_become_targets() {
+            let out = concat!(
+                "No Sockets found in /home/user/.screen.\n",
+                "There is a screen on:\n",
+                "\t123.good\t(Detached)\n",
+                "1 Socket in /home/user/.screen.\n",
+                "garbage line without tabs\n",
+                "\tnotapid.noid\t(Detached)\n", // no pid prefix
+                "abc.badpid\t(Detached)\n",     // non-numeric pid
+            );
+            let parsed = parse_screen_ls(out);
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].id, "123.good");
+        }
+
+        #[test]
+        fn r7_parser_empty_output_yields_no_sessions() {
+            assert!(parse_screen_ls("No Sockets found in /run/screen.").is_empty());
+            assert!(parse_screen_ls("").is_empty());
+        }
+
+        #[test]
+        fn r7_parser_multiple_sessions_deterministic() {
+            let out = "\t2.beta\t(Detached)\n\t1.alpha\t(Detached)\n";
+            let parsed = parse_screen_ls(out);
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].id, "2.beta"); // input order preserved
+            assert_eq!(parsed[1].id, "1.alpha");
+            assert_eq!(parsed, parse_screen_ls(out));
+        }
+
+        #[test]
+        fn r7_missing_binary_message_is_clear_not_opaque() {
+            let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+            let message = ProcessService::missing_binary_message("screen", not_found);
+            assert!(message.contains("screen"));
+            assert!(message.contains("not installed") || message.contains("not in PATH"));
+            assert!(!message.contains("Os {")); // no opaque debug dump
+        }
+    }
+
     use crate::effect_dispatcher::{EffectDispatcher, EffectLane, EffectScope};
     use crate::vfs::capabilities;
     use crate::vfs::{

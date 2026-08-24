@@ -85,6 +85,41 @@ pub(super) fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: 
             state.open_overlay(OverlayKind::CommandCenter);
             state.overlay_list_state.select(Some(0));
         }
+        EffectEvent::ScreenSessions { sessions } => {
+            if sessions.is_empty() {
+                state.message = Some("No screen sessions found".into());
+                return;
+            }
+            state.command_matches = sessions
+                .into_iter()
+                .map(|session| {
+                    let (subtitle, availability) = match session.status.unavailable_reason() {
+                        Some(reason) => (
+                            format!("GNU Screen — {reason}"),
+                            ActionAvailability::Disabled {
+                                reason: reason.to_string(),
+                            },
+                        ),
+                        None => (
+                            "Attach GNU Screen session".to_string(),
+                            ActionAvailability::Available,
+                        ),
+                    };
+                    CommandItem {
+                        // Display-safe title (name without pid); the raw id
+                        // stays in the target identity untouched.
+                        title: session.id.clone(),
+                        subtitle: Some(subtitle),
+                        kind: CommandKind::Session,
+                        target: CommandTarget::ScreenSession(session.id),
+                        score: 0,
+                        availability,
+                    }
+                })
+                .collect();
+            state.open_overlay(OverlayKind::CommandCenter);
+            state.overlay_list_state.select(Some(0));
+        }
         EffectEvent::ViewerLines { title, lines } => {
             state.viewer_content = lines;
             state.viewer_scroll = 0;
