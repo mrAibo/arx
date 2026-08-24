@@ -148,3 +148,18 @@ fn storage_input_ownership_is_separate_from_launch_route() {
         "input_dispatch must not keep the legacy direct-launch branch"
     );
 }
+
+#[test]
+fn sync_contexts_fail_closed_after_keyrouter_unhandled() {
+    let dispatch = include_str!("../src/tui/input_dispatch.rs");
+    // The routed context must be captured BEFORE resolve...
+    assert!(dispatch.contains("let routed_context = state.input_context();"));
+    assert!(dispatch.contains("key_router.resolve(routed_context, key)"));
+    // ...and Sync contexts must consume Unhandled instead of falling through.
+    for context in ["SyncPreview", "SyncConfirmation", "SyncJob"] {
+        assert!(
+            dispatch.contains(&format!("InputContext::{context}")),
+            "{context} fail-closed guard missing"
+        );
+    }
+}

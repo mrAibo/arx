@@ -543,7 +543,8 @@ pub(super) async fn handle_event(
 
             // First migration slice: resolve stable app actions before
             // falling back to the legacy key matcher below.
-            match key_router.resolve(state.input_context(), key) {
+            let routed_context = state.input_context();
+            match key_router.resolve(routed_context, key) {
                 KeyResolution::Pending => {
                     return Ok(InputDispatchOutcome {
                         flow: InputFlow::ContinueLoop,
@@ -593,6 +594,20 @@ pub(super) async fn handle_event(
                     });
                 }
                 KeyResolution::Unhandled => {}
+            }
+
+            // #214: sync contexts fail CLOSED — an unhandled (e.g. disabled)
+            // key must never leak into the browser fallback classifier.
+            if matches!(
+                routed_context,
+                arx::app::InputContext::SyncPreview
+                    | arx::app::InputContext::SyncConfirmation
+                    | arx::app::InputContext::SyncJob
+            ) {
+                return Ok(InputDispatchOutcome {
+                    flow: InputFlow::ContinueLoop,
+                    entry_mutation: EntryMutation::None,
+                });
             }
 
             match browser_input::classify(state, key) {

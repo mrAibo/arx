@@ -89,7 +89,7 @@ fn rebuild(state: &mut AppState, focused_kind: Option<EntryKind>, editor_availab
         .select((!state.command_matches.is_empty()).then_some(0));
 }
 
-pub(super) fn render(frame: &mut Frame, area: Rect, state: &AppState) {
+pub(super) fn render(frame: &mut Frame, area: Rect, state: &AppState, keymap: &arx::input::Keymap) {
     let h = (state.command_matches.len().max(1) + 3).min(20) as u16;
     let popup = centered_rect_lines(70, h, area);
     frame.render_widget(Clear, popup);
@@ -109,9 +109,23 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &AppState) {
                     CommandKind::UserCommand => Style::default().fg(Color::Blue),
                 }
             };
+            // #214: managed-action shortcut labels come from the effective
+            // Keymap; unbound/disabled actions show no fabricated key.
+            let shortcut = match (&item.target, &item.kind) {
+                (CommandTarget::Action(action), CommandKind::Action) => keymap
+                    .primary_binding_label(arx::app::InputContext::Browser, action.id())
+                    .map(|label| format!(" [{label}]"))
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
             let line = match item.availability.reason() {
-                Some(reason) => format!("{}  —  unavailable: {reason}", item.display_line()),
-                None => item.display_line(),
+                Some(reason) => {
+                    format!(
+                        "{}{shortcut}  —  unavailable: {reason}",
+                        item.display_line()
+                    )
+                }
+                None => format!("{}{shortcut}", item.display_line()),
             };
             ListItem::new(line).style(style)
         })
@@ -321,7 +335,7 @@ mod tests {
         };
 
         terminal
-            .draw(|frame| render(frame, frame.area(), &state))
+            .draw(|frame| render(frame, frame.area(), &state, &arx::input::Keymap::default()))
             .unwrap();
         let text = terminal
             .backend()

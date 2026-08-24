@@ -61,12 +61,20 @@ impl From<KeyEvent> for KeyStroke {
     }
 }
 
+/// Where a binding came from (#214). Never inferred from strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingSource {
+    BuiltIn,
+    User,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyBinding {
     pub context: InputContext,
     pub sequence: Vec<KeyStroke>,
     pub action: Action,
     pub discoverable: bool,
+    pub source: BindingSource,
 }
 
 impl KeyBinding {
@@ -80,6 +88,7 @@ impl KeyBinding {
             sequence,
             action,
             discoverable: true,
+            source: BindingSource::BuiltIn,
         }
     }
 
@@ -88,6 +97,13 @@ impl KeyBinding {
     pub fn alias(context: InputContext, sequence: Vec<KeyStroke>, action: Action) -> Self {
         let mut binding = Self::new(context, sequence, action);
         binding.discoverable = false;
+        binding
+    }
+
+    /// User-provided override binding (#214): always discoverable.
+    pub fn user(context: InputContext, sequence: Vec<KeyStroke>, action: Action) -> Self {
+        let mut binding = Self::new(context, sequence, action);
+        binding.source = BindingSource::User;
         binding
     }
 }
@@ -424,6 +440,441 @@ impl Default for KeyRouter {
     }
 }
 
+// ── #214: key syntax parsing, effective-keymap construction, conflict rules ──
+
+/// One parse failure with sanitized, injection-free text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeymapError {
+    pub message: String,
+}
+
+impl KeymapError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: crate::app::sanitize_config_token(&message.into()),
+        }
+    }
+}
+
+impl std::fmt::Display for KeymapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+/// Parse one stroke token like `Ctrl+Shift+S`, `Alt+U`, `F11`, `Space`, `Plus`.
+///
+/// Case-insensitive modifier/key names; canonical modifier order is
+/// Ctrl+Alt+Shift+KEY. Exactly one non-modifier key is required.
+pub fn parse_stroke(token: &str) -> Result<KeyStroke, KeymapError> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(KeymapError::new("empty key token"));
+    }
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut parts: Vec<&str> = token.split('+').collect();
+    // Literal Plus: "Ctrl+Plus" has 2 parts where last is the key name.
+    let key_token = parts.pop().expect("non-empty split");
+    for part in &parts {
+        match part.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => {
+                if ctrl {
+                    return Err(KeymapError::new(format!("duplicate Ctrl in {token}")));
+                }
+                ctrl = true;
+            }
+            "alt" => {
+                if alt {
+                    return Err(KeymapError::new(format!("duplicate Alt in {token}")));
+                }
+                alt = true;
+            }
+            "shift" => {
+                if shift {
+                    return Err(KeymapError::new(format!("duplicate Shift in {token}")));
+                }
+                shift = true;
+            }
+            other => {
+                return Err(KeymapError::new(format!(
+                    "{other:?} is not a modifier in {token}"
+                )));
+            }
+        }
+    }
+    if parts.len() > 3 {
+        return Err(KeymapError::new(format!("too many modifiers in {token}")));
+    }
+
+    let lower = key_token.to_ascii_lowercase();
+    let (code, needs_shift_from_name) = match lower.as_str() {
+        "space" => (KeyCode::Char(' '), false),
+        "plus" => (KeyCode::Char('+'), false),
+        "enter" => (KeyCode::Enter, false),
+        "esc" | "escape" => (KeyCode::Esc, false),
+        "tab" => (KeyCode::Tab, false),
+        "backtab" => (KeyCode::BackTab, false),
+        "backspace" => (KeyCode::Backspace, false),
+        "delete" => (KeyCode::Delete, false),
+        "insert" => (KeyCode::Insert, false),
+        "up" => (KeyCode::Up, false),
+        "down" => (KeyCode::Down, false),
+        "left" => (KeyCode::Left, false),
+        "right" => (KeyCode::Right, false),
+        "home" => (KeyCode::Home, false),
+        "end" => (KeyCode::End, false),
+        "pageup" => (KeyCode::PageUp, false),
+        "pagedown" => (KeyCode::PageDown, false),
+        f if f.len() >= 2 && f.starts_with('f') && f[1..].parse::<u8>().is_ok() => {
+            let n: u8 = f[1..].parse().map_err(|_| KeymapError::new("bad F-key"))?;
+            if !(1..=12).contains(&n) {
+                return Err(KeymapError::new(format!("unsupported function key F{n}")));
+            }
+            (KeyCode::F(n), false)
+        }
+        c if c.chars().count() == 1 => {
+            let ch = c.chars().next().expect("single char");
+            if ch.is_control() {
+                return Err(KeymapError::new("control characters are not bindable"));
+            }
+            // ASCII letters normalize to uppercase so parser output matches
+            // the built-in defaults' KeyStroke shape.
+            if ch.is_ascii_alphabetic() {
+                (KeyCode::Char(ch.to_ascii_uppercase()), true)
+            } else {
+                (KeyCode::Char(ch), false)
+            }
+        }
+        _ => {
+            return Err(KeymapError::new(format!(
+                "unsupported key name {key_token}"
+            )));
+        }
+    };
+    let _ = needs_shift_from_name;
+    let mut modifiers = KeyModifiers::NONE;
+    if ctrl {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+    if alt {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if shift {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    Ok(KeyStroke::new(code, modifiers))
+}
+
+/// Canonical label for one stroke: Ctrl+Alt+Shift+KEY (KeyStroke::label order).
+#[allow(dead_code)]
+fn stroke_canonical(stroke: KeyStroke) -> String {
+    stroke.label()
+}
+
+/// Parse a whitespace-separated chord like `Ctrl+X P` or `Ctrl+X Ctrl+C`.
+pub fn parse_chord(value: &str) -> Result<Vec<KeyStroke>, KeymapError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(KeymapError::new("empty key sequence"));
+    }
+    value.split_whitespace().map(parse_stroke).collect()
+}
+
+// ── #214: effective keymap construction (one builder) ──
+
+/// User-configurable input contexts in #214 v1. Everything else stays owned
+/// by its direct controller / overlay handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigContext {
+    Browser,
+    SyncPreview,
+    SyncConfirmation,
+    SyncJob,
+}
+
+impl ConfigContext {
+    pub fn input_context(self) -> InputContext {
+        match self {
+            ConfigContext::Browser => InputContext::Browser,
+            ConfigContext::SyncPreview => InputContext::SyncPreview,
+            ConfigContext::SyncConfirmation => InputContext::SyncConfirmation,
+            ConfigContext::SyncJob => InputContext::SyncJob,
+        }
+    }
+
+    pub fn config_name(self) -> &'static str {
+        match self {
+            ConfigContext::Browser => "browser",
+            ConfigContext::SyncPreview => "sync_preview",
+            ConfigContext::SyncConfirmation => "sync_confirmation",
+            ConfigContext::SyncJob => "sync_job",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, KeymapError> {
+        match value.trim() {
+            "browser" => Ok(ConfigContext::Browser),
+            "sync_preview" => Ok(ConfigContext::SyncPreview),
+            "sync_confirmation" => Ok(ConfigContext::SyncConfirmation),
+            "sync_job" => Ok(ConfigContext::SyncJob),
+            other => Err(KeymapError::new(format!(
+                "unsupported context {:?}: configurable contexts are browser, sync_preview, sync_confirmation, sync_job",
+                crate::app::sanitize_config_token(other)
+            ))),
+        }
+    }
+}
+
+/// V1 bindability policy (#214): capability/policy list, NOT a shortcut table.
+///
+/// Browser v1 binds actions genuinely owned by KeyRouter dispatch plus safe
+/// typed/registered-controller actions. Legacy navigation whose semantics live
+/// in BrowserRoute (Up/Down/Enter/Back/SwitchPane/Refresh) and confirmation
+/// flows that own their own input are deliberately excluded.
+fn is_bindable(context: ConfigContext, id: ActionId) -> bool {
+    use ActionId::*;
+    match context {
+        ConfigContext::Browser => matches!(
+            id,
+            Quit | ToggleSelect
+                | OpenHelp
+                | ViewFile
+                | EditFile
+                | Copy
+                | Move
+                | Mkdir
+                | Delete
+                | OpenCommandCenter
+                | ToggleSplitPane
+                | ToggleEmbeddedTerminal
+                | OpenBookmarks
+                | OpenJobs
+                | OpenHosts
+                | OpenSshHosts
+                | OpenStorageInspector
+                | ToggleWorkspaceComparison
+                | PreviewWorkspaceSync
+                | BeginSymlink
+                | BeginChmod
+                | BeginHardLink
+                | BeginChown
+                | ComputeSha256
+                | TouchFile
+                | CompressTarGz
+                | ListTmuxSessions
+                | OpenSmartTree
+                | OpenInfrastructureCenter
+                | OpenHotlist
+                | OpenInFileManager
+        ),
+        ConfigContext::SyncPreview => matches!(
+            id,
+            ReverseWorkspaceDirection
+                | ToggleWorkspaceSyncMode
+                | CloseWorkspaceSyncOverlay
+                | ExecuteWorkspaceSync
+        ),
+        ConfigContext::SyncConfirmation => {
+            matches!(id, ConfirmWorkspaceSync | ReturnToWorkspaceSyncPreview)
+        }
+        ConfigContext::SyncJob => matches!(
+            id,
+            CancelWorkspaceSync
+                | ShowWorkspaceVerificationDiff
+                | CloseWorkspaceSyncOverlay
+                | ReturnToWorkspaceSyncPreview
+        ),
+    }
+}
+
+impl Keymap {
+    /// Build ONE effective keymap from built-in defaults + validated user
+    /// overrides (#214). No overrides => behaviorally identical to `default()`.
+    pub fn effective(overrides: &[crate::config::KeybindingConfig]) -> Result<Keymap, KeymapError> {
+        let mut bindings: Vec<KeyBinding> = Keymap::default().bindings.to_vec();
+        // Canonical typed identity — raw strings would let whitespace variants
+        // bypass duplicate detection.
+        let mut seen_pairs: std::collections::HashSet<(InputContext, ActionId)> =
+            std::collections::HashSet::new();
+
+        for override_row in overrides {
+            let context = ConfigContext::parse(&override_row.context)?;
+            let action_id: ActionId = override_row
+                .action
+                .parse()
+                .map_err(|e: String| KeymapError::new(e))?;
+
+            if !is_bindable(context, action_id) {
+                return Err(KeymapError::new(format!(
+                    "action {} is not configurable in context {}",
+                    crate::app::sanitize_config_token(&override_row.action),
+                    context.config_name(),
+                )));
+            }
+            let ctx_input = context.input_context();
+            if !seen_pairs.insert((ctx_input, action_id)) {
+                return Err(KeymapError::new(format!(
+                    "duplicate override for {}:{}",
+                    context.config_name(),
+                    action_id.config_name(),
+                )));
+            }
+
+            // keys XOR disabled
+            let keys_trimmed = override_row.keys.as_deref().map(str::trim);
+            let has_keys = keys_trimmed.is_some_and(|k| !k.is_empty());
+            if override_row.disabled && has_keys {
+                return Err(KeymapError::new(format!(
+                    "{}:{} must set exactly one of keys or disabled = true",
+                    context.config_name(),
+                    crate::app::sanitize_config_token(&override_row.action),
+                )));
+            }
+            if !override_row.disabled && !has_keys {
+                return Err(KeymapError::new(format!(
+                    "{}:{} requires either non-empty keys or disabled = true",
+                    context.config_name(),
+                    crate::app::sanitize_config_token(&override_row.action),
+                )));
+            }
+            if override_row.keys.is_some() && !has_keys {
+                return Err(KeymapError::new(format!(
+                    "{}:{} keys must not be empty",
+                    context.config_name(),
+                    crate::app::sanitize_config_token(&override_row.action),
+                )));
+            }
+
+            // Remove ALL built-in bindings for exactly this pair (incl. aliases).
+            bindings.retain(|binding| {
+                !(binding.context == ctx_input && binding.action.id() == action_id)
+            });
+
+            if override_row.disabled {
+                continue;
+            }
+            let sequence = parse_chord(keys_trimmed.expect("checked above"))?;
+            bindings.push(KeyBinding::user(
+                ctx_input,
+                sequence,
+                crate::app::action_for_id(action_id)
+                    .ok_or_else(|| KeymapError::new("unregistered action"))?,
+            ));
+        }
+
+        let effective = Keymap::new(bindings);
+        effective.validate_conflicts()?;
+        Ok(effective.into_sorted())
+    }
+
+    /// Deterministic presentation order (context, sequence labels, source).
+    pub fn into_sorted(mut self) -> Keymap {
+        self.bindings.sort_by_key(|binding| {
+            (
+                format!("{:?}", binding.context),
+                binding
+                    .sequence
+                    .iter()
+                    .map(|s| s.label())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                format!("{:?}", binding.source),
+            )
+        });
+        self
+    }
+
+    /// Conflict rules within ONE context (#214 §11):
+    /// exact duplicates and prefix ambiguity in either direction are errors;
+    /// cross-context reuse of a sequence is valid.
+    fn validate_conflicts(&self) -> Result<(), KeymapError> {
+        for i in 0..self.bindings.len() {
+            for j in (i + 1)..self.bindings.len() {
+                let a = &self.bindings[i];
+                let b = &self.bindings[j];
+                if a.context != b.context {
+                    continue;
+                }
+                let shorter = a.sequence.len().min(b.sequence.len());
+                let prefix_equal = a.sequence[..shorter] == b.sequence[..shorter];
+                if !prefix_equal {
+                    continue;
+                }
+                let label = |b: &KeyBinding| -> String {
+                    b.sequence
+                        .iter()
+                        .map(|s| s.label())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                let kind = if a.sequence.len() == b.sequence.len() {
+                    "conflicts with an existing binding"
+                } else if a.sequence.len() < b.sequence.len() {
+                    "is a prefix of another binding"
+                } else {
+                    "would be shadowed by a longer binding"
+                };
+                let context_name = format!("{:?}", a.context);
+                return Err(KeymapError::new(format!(
+                    "{context_name}: {} -> {} {kind} {} -> {}",
+                    label(a),
+                    a.action.id().config_name(),
+                    label(b),
+                    b.action.id().config_name(),
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Primary user-facing shortcut label for (context, action): the first
+    /// DISCOVERABLE binding; aliases never become the displayed shortcut.
+    /// None when unbound/disabled.
+    pub fn primary_binding_label(
+        &self,
+        context: InputContext,
+        action_id: ActionId,
+    ) -> Option<String> {
+        self.bindings
+            .iter()
+            .find(|binding| {
+                binding.context == context
+                    && binding.discoverable
+                    && binding.action.id() == action_id
+            })
+            .map(|binding| {
+                binding
+                    .sequence
+                    .iter()
+                    .map(|s| s.label())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+    }
+
+    /// All discoverable binding labels for (context, action), deterministic.
+    pub fn discoverable_bindings(&self, context: InputContext, action_id: ActionId) -> Vec<String> {
+        self.bindings
+            .iter()
+            .filter(|binding| {
+                binding.context == context
+                    && binding.discoverable
+                    && binding.action.id() == action_id
+            })
+            .map(|binding| {
+                binding
+                    .sequence
+                    .iter()
+                    .map(|s| s.label())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,6 +1079,287 @@ mod tests {
                 KeyStroke::new(KeyCode::F(9), KeyModifiers::NONE)
             ),
             KeyResolution::Action(Action::OpenHosts)
+        );
+    }
+}
+
+// ── #214 test matrix ──
+#[cfg(test)]
+mod r214_tests {
+    use super::*;
+    use crate::app::{Action, ActionId};
+    use crate::config::KeybindingConfig;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    fn kb(context: &str, action: &str, keys: Option<&str>, disabled: bool) -> KeybindingConfig {
+        KeybindingConfig {
+            context: context.into(),
+            action: action.into(),
+            keys: keys.map(|k| k.into()),
+            disabled,
+        }
+    }
+
+    // ── ACTION IDENTITY ──
+    #[test]
+    fn r214_every_registered_action_has_unique_stable_config_name() {
+        let mut names = Vec::new();
+        for registration in crate::app::registrations_for_test() {
+            let name = registration.meta.id.config_name();
+            assert!(!name.is_empty());
+            names.push(name);
+        }
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "config names must be unique");
+    }
+
+    #[test]
+    fn r214_config_name_round_trip_and_unknown_rejected() {
+        for registration in crate::app::registrations_for_test() {
+            let id = registration.meta.id;
+            let parsed: ActionId = id.config_name().parse().expect("round trip");
+            assert_eq!(parsed, id);
+        }
+        assert!("no_such_action".parse::<ActionId>().is_err());
+        assert!("Quit; rm -rf /".parse::<ActionId>().is_err());
+    }
+
+    #[test]
+    fn r214_action_for_id_backed_by_registration() {
+        assert_eq!(
+            crate::app::action_for_id(ActionId::OpenStorageInspector),
+            Some(Action::OpenStorageInspector)
+        );
+    }
+
+    // ── KEY PARSER ──
+    #[test]
+    fn r214_parser_shapes() {
+        let s = parse_stroke("Ctrl+P").unwrap();
+        assert_eq!(s.code, KeyCode::Char('P'));
+        assert_eq!(s.modifiers, KeyModifiers::CONTROL);
+
+        let s = parse_stroke("alt+u").unwrap(); // case-insensitive
+        assert_eq!(s.code, KeyCode::Char('U'));
+        assert_eq!(s.modifiers, KeyModifiers::ALT);
+
+        let s = parse_stroke("Ctrl+Shift+S").unwrap();
+        assert_eq!(s.code, KeyCode::Char('S'));
+        assert_eq!(s.modifiers, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+
+        let s = parse_stroke("F12").unwrap();
+        assert_eq!(s.code, KeyCode::F(12));
+        let s = parse_stroke("f1").unwrap();
+        assert_eq!(s.code, KeyCode::F(1));
+
+        assert!(parse_chord("Down").is_ok());
+        assert!(parse_chord("Space").is_ok());
+        assert_eq!(parse_stroke("Plus").unwrap().code, KeyCode::Char('+'));
+        assert_eq!(parse_stroke("ctrl+plus").unwrap().code, KeyCode::Char('+'));
+        assert_eq!(parse_stroke("\\").unwrap().code, KeyCode::Char('\\'));
+
+        // canonical round trip
+        for token in ["Ctrl+Shift+S", "Alt+U", "Ctrl+X P", "F11", "Space"] {
+            for stroke in parse_chord(token).unwrap() {
+                let label = stroke.label();
+                let reparsed: Vec<KeyStroke> = label
+                    .split_whitespace()
+                    .map(parse_stroke)
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                assert_eq!(reparsed, vec![stroke], "round trip failed for {token}");
+            }
+        }
+    }
+
+    #[test]
+    fn r214_parser_rejects_malformed() {
+        assert!(parse_stroke("").is_err());
+        assert!(parse_stroke("Ctrl").is_err()); // modifier without key
+        assert!(parse_stroke("Ctrl+Alt+X P").is_err()); // two keys in one token? split by whitespace -> separate strokes; single token has one key only
+        assert!(parse_stroke("Ctrl+Ctrl+P").is_err()); // duplicate modifier
+        assert!(parse_stroke("NotAKey").is_err());
+        assert!(parse_stroke("F99").is_err());
+        assert!(parse_chord("   ").is_err()); // empty chord
+    }
+
+    // ── CONFIG / EFFECTIVE KEYMAP ──
+    #[test]
+    fn r214_no_overrides_equals_defaults() {
+        let defaults = Keymap::default().into_sorted();
+        let effective = Keymap::effective(&[]).unwrap();
+        assert_eq!(
+            format!("{:?}", defaults.bindings()),
+            format!("{:?}", effective.bindings())
+        );
+    }
+
+    #[test]
+    fn r214_replacement_removes_all_builtins_and_records_user_source() {
+        let overrides = [kb("browser", "open_storage_inspector", Some("F11"), false)];
+        let km = Keymap::effective(&overrides).unwrap();
+        let alt_u = parse_stroke("Alt+U").unwrap();
+        assert!(
+            !km.bindings()
+                .iter()
+                .any(|b| b.context == InputContext::Browser
+                    && b.action.id() == ActionId::OpenStorageInspector
+                    && b.sequence == vec![alt_u]),
+            "old Alt+U binding must be gone"
+        );
+        let user_bindings: Vec<_> = km
+            .bindings()
+            .iter()
+            .filter(|b| b.action.id() == ActionId::OpenStorageInspector)
+            .collect();
+        assert_eq!(user_bindings.len(), 1);
+        assert_eq!(user_bindings[0].source, BindingSource::User);
+        assert_eq!(
+            user_bindings[0].sequence,
+            vec![parse_stroke("F11").unwrap()]
+        );
+    }
+
+    #[test]
+    fn r214_disabled_removes_pair_completely() {
+        let overrides = [kb("browser", "open_storage_inspector", None, true)];
+        let km = Keymap::effective(&overrides).unwrap();
+        assert!(
+            !km.bindings()
+                .iter()
+                .any(|b| b.action.id() == ActionId::OpenStorageInspector
+                    && b.context == InputContext::Browser)
+        );
+        assert_eq!(
+            km.primary_binding_label(InputContext::Browser, ActionId::OpenStorageInspector),
+            None,
+            "unbound action must not fabricate the old shortcut"
+        );
+    }
+
+    #[test]
+    fn r214_whitespace_normalized_duplicate_rejected() {
+        let overrides = [
+            kb("browser", "open_storage_inspector", Some("F11"), false),
+            kb(" browser ", " open_storage_inspector ", Some("F12"), false),
+        ];
+        let err = Keymap::effective(&overrides).unwrap_err();
+        assert!(
+            err.message.contains("duplicate override"),
+            "must fail as duplicate, not last-write-win: {err}"
+        );
+    }
+
+    #[test]
+    fn r214_same_action_in_two_contexts_is_not_a_duplicate() {
+        // CloseWorkspaceSyncOverlay is bindable in both sync contexts; the
+        // canonical pair identity must treat them as distinct.
+        let overrides = [
+            kb(
+                "sync_preview",
+                "close_workspace_sync_overlay",
+                Some("F11"),
+                false,
+            ),
+            kb(
+                "sync_job",
+                "close_workspace_sync_overlay",
+                Some("F11"),
+                false,
+            ),
+        ];
+        assert!(Keymap::effective(&overrides).is_ok());
+    }
+
+    #[test]
+    fn r214_duplicate_override_pair_rejected() {
+        let overrides = [
+            kb("browser", "open_smart_tree", Some("F11"), false),
+            kb("browser", "open_smart_tree", Some("F12"), false),
+        ];
+        assert!(Keymap::effective(&overrides).is_err());
+    }
+
+    #[test]
+    fn r214_invalid_context_action_xor_rules() {
+        assert!(Keymap::effective(&[kb("help", "quit", Some("Q"), false)]).is_err());
+        assert!(Keymap::effective(&[kb("browser", "not_an_action", Some("Q"), false)]).is_err());
+        assert!(Keymap::effective(&[kb("browser", "quit", None, false)]).is_err());
+        assert!(Keymap::effective(&[kb("browser", "quit", None, true)]).is_ok());
+        assert!(Keymap::effective(&[kb("browser", "quit", Some(""), true)]).is_err());
+        assert!(Keymap::effective(&[kb("browser", "quit", Some("Q"), true)]).is_err());
+    }
+
+    #[test]
+    fn r214_non_bindable_browser_actions_rejected() {
+        for action in ["up", "down", "enter", "back", "switch_pane", "refresh"] {
+            assert!(
+                Keymap::effective(&[kb("browser", action, Some("F9"), false)]).is_err(),
+                "{action} must not be bindable"
+            );
+        }
+        assert!(
+            Keymap::effective(&[kb("browser", "confirm_remote_delete", Some("F9"), false)])
+                .is_err()
+        );
+        assert!(Keymap::effective(&[kb("sync_preview", "quit", Some("Q"), false)]).is_err());
+    }
+
+    // ── CONFLICTS ──
+    #[test]
+    fn r214_exact_collision_same_context_rejected() {
+        let overrides = [
+            kb("browser", "open_jobs", Some("F11"), false),
+            kb("browser", "open_smart_tree", Some("F11"), false),
+        ];
+        assert!(Keymap::effective(&overrides).is_err());
+    }
+
+    #[test]
+    fn r214_prefix_collisions_rejected_both_directions() {
+        let overrides = [
+            kb("browser", "open_smart_tree", Some("Ctrl+X"), false),
+            kb("browser", "preview_workspace_sync", Some("Ctrl+X P"), false),
+        ];
+        assert!(Keymap::effective(&overrides).is_err());
+
+        let reversed = [overrides[1].clone(), overrides[0].clone()];
+        assert!(Keymap::effective(&reversed).is_err());
+    }
+
+    #[test]
+    fn r214_cross_context_sequence_reuse_allowed() {
+        let overrides = [
+            kb("browser", "open_smart_tree", Some("F11"), false),
+            kb(
+                "sync_preview",
+                "close_workspace_sync_overlay",
+                Some("F11"),
+                false,
+            ),
+        ];
+        assert!(Keymap::effective(&overrides).is_ok());
+    }
+
+    // ── BROWSER LEGACY SAFETY: behavioral tests live in src/tui.rs (binary-side). ──
+
+    // ── SYNC FAIL-CLOSED + CTRL+S GUARD are behavioral in input_dispatch /
+    //    browser_input and covered by the source-contract + unit tests there. ──
+
+    #[test]
+    fn r214_lookup_helpers_deterministic() {
+        let km = Keymap::default();
+        let label = km.primary_binding_label(InputContext::Browser, ActionId::ViewFile);
+        assert_eq!(label.as_deref(), Some("F3"));
+        // alias must never become the primary label:
+        let labels = km.discoverable_bindings(InputContext::Browser, ActionId::BeginSymlink);
+        assert!(!labels.is_empty());
+        assert!(
+            labels
+                .iter()
+                .all(|l| l.starts_with("Ctrl+X S") || !l.contains("Ctrl"))
         );
     }
 }

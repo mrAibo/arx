@@ -4,7 +4,7 @@ use super::*;
 
 pub(super) fn render(frame: &mut Frame, area: Rect, state: &AppState, key_router: &KeyRouter) {
     // Which-Key is derived from the active KeyRouter prefix and the shared
-    // Action Catalog. There is intentionally no second shortcut table here.
+    // canonical action registration. There is intentionally no second shortcut table here.
     let input_context = state.input_context();
     let continuations = key_router.continuations(input_context);
     if continuations.is_empty() {

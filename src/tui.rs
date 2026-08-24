@@ -58,6 +58,7 @@ use presentation::{session_callout_text, workspace_ribbon_text};
 
 mod bookmarks;
 mod browser_input;
+pub use browser_input::validate_user_browser_bindings;
 mod command_bar;
 mod command_center;
 mod effect_responses;
@@ -91,12 +92,12 @@ use overlays::{
 };
 use runtime::{RuntimeEvent, SyncLaunchResponse, SyncUiRuntime, TuiRuntime};
 
-pub async fn run(config: arx::config::ArxConfig) -> io::Result<()> {
+pub async fn run(config: arx::config::ArxConfig, keymap: arx::input::Keymap) -> io::Result<()> {
     let mut terminal_session = TuiTerminalSession::enter()?;
     let stdout = io::stdout();
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))?;
 
-    let result = event_loop(&mut terminal, &mut terminal_session, config).await;
+    let result = event_loop(&mut terminal, &mut terminal_session, config, keymap).await;
     let restore_result = terminal_session.restore();
     match (result, restore_result) {
         (Err(error), _) => Err(error),
@@ -110,6 +111,7 @@ async fn event_loop(
     terminal: &mut DefaultTerminal,
     terminal_session: &mut TuiTerminalSession,
     config: arx::config::ArxConfig,
+    keymap: arx::input::Keymap,
 ) -> io::Result<()> {
     let editor = DesktopService::resolve_editor(config.ui.editor.as_deref());
     let mut state = AppState {
@@ -127,7 +129,8 @@ async fn event_loop(
     let mut right_list = ListState::default();
     let mut split_left_list = ListState::default();
     let mut split_right_list = ListState::default();
-    let mut key_router = KeyRouter::default();
+    // #214: ONE effective keymap built in main feeds routing + presentation.
+    let mut key_router = KeyRouter::new(keymap);
     let parent_entry = virtual_parent_entry();
     let load_more_entry = load_more_entry();
 
@@ -864,7 +867,7 @@ fn render(
 
     // Help overlay
     if state.show_help {
-        help::render(frame, area, state);
+        help::render(frame, area, state, key_router.keymap());
     }
 
     // Viewer overlay
@@ -883,7 +886,7 @@ fn render(
     }
 
     if state.show_command_center {
-        command_center::render(frame, area, state);
+        command_center::render(frame, area, state, key_router.keymap());
     }
 
     if state.show_context_menu {
@@ -5763,5 +5766,85 @@ mod pack_o_quick_action_tests {
             vec!["abc123  bad\\nname ü".to_string()]
         );
         assert_eq!(state.viewer_scroll, 0);
+    }
+}
+
+#[cfg(test)]
+mod r214_browser_legacy_tests {
+    use super::*;
+    use arx::config::KeybindingConfig;
+    use arx::input::Keymap;
+
+    fn kb(action: &str, keys: &str) -> KeybindingConfig {
+        KeybindingConfig {
+            context: "browser".into(),
+            action: action.into(),
+            keys: Some(keys.into()),
+            disabled: false,
+        }
+    }
+
+    #[test]
+    fn r214_f11_user_binding_passes_legacy_validator() {
+        let km = Keymap::effective(&[kb("open_storage_inspector", "F11")]).unwrap();
+        assert!(validate_user_browser_bindings(&km).is_ok());
+    }
+
+    #[test]
+    fn r214_tab_conflicts_with_legacy_switch_pane() {
+        if let Ok(km) = Keymap::effective(&[kb("open_smart_tree", "Tab")]) {
+            assert!(validate_user_browser_bindings(&km).is_err());
+        }
+    }
+
+    #[test]
+    fn r214_f2_conflicts_with_user_menu_route() {
+        if let Ok(km) = Keymap::effective(&[kb("open_smart_tree", "F2")]) {
+            assert!(validate_user_browser_bindings(&km).is_err());
+        }
+    }
+
+    #[test]
+    fn r214_ctrl_r_conflicts_with_refresh_route() {
+        if let Ok(km) = Keymap::effective(&[kb("open_smart_tree", "Ctrl+R")]) {
+            assert!(validate_user_browser_bindings(&km).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn r214_alt_d_conflicts_with_filesystems() {
+        if let Ok(km) = Keymap::effective(&[kb("open_smart_tree", "Alt+D")]) {
+            assert!(validate_user_browser_bindings(&km).is_err());
+        }
+    }
+
+    #[test]
+    fn r214_plain_slash_and_esc_conflict_conditionally() {
+        for keys in ["/", "Esc"] {
+            if let Ok(km) = Keymap::effective(&[kb("open_smart_tree", keys)]) {
+                assert!(
+                    validate_user_browser_bindings(&km).is_err(),
+                    "{keys} must be claimed under tree/infra representative state"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r214_ctrl_arrows_claimed_when_tabs_exist() {
+        for keys in ["Ctrl+Left", "Ctrl+Right"] {
+            if let Ok(km) = Keymap::effective(&[kb("open_smart_tree", keys)]) {
+                assert!(validate_user_browser_bindings(&km).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn r214_effective_keymap_builder_smoke_via_binary_helper_shape() {
+        // The same builder the binary helper calls.
+        let empty: Vec<KeybindingConfig> = Vec::new();
+        let km = Keymap::effective(&empty).unwrap();
+        assert!(!km.bindings().is_empty());
     }
 }

@@ -282,10 +282,12 @@ Near-term product follow-ups after the architecture sequence:
 - #10 mouse follow-up: pane wheel, Shift+Click range selection, context availability.
 - #16 split-pane follow-up: horizontal mode, resize, explicit close semantics.
 
-### Configurable effective keymap (#214)
+### Configurable effective keymap (#214) — CURRENT PRODUCT WORK
 
-After the P/Q/R architecture seams are stable, add a conflict-safe user-configurable
-keymap without returning shortcut ownership to individual features.
+The P/Q/R architecture seams are stable; #214 implements the conflict-safe
+user-configurable keymap without returning shortcut ownership to individual features.
+Status: implementation on `feat/214-effective-keymap` — not COMPLETE until an accepted
+pinned merge (no merge SHA invented here).
 
 - Stable `ActionId` / canonical action-registration entries remain the only user-addressable actions.
 - Built-in defaults are layered with user overrides into one **effective runtime
