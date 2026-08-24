@@ -92,15 +92,42 @@ pub(super) fn build_context_menu_items(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MouseRoute {
     Ignore,
-    CommandBar { action: Action, available: bool },
+    CommandBar {
+        action: Action,
+        available: bool,
+    },
     ViewerScrollDown,
     ViewerScrollUp,
-    PaneScrollDown { pane: Pane },
-    PaneScrollUp { pane: Pane },
-    ContextMenu { column: u16, row: u16, pane: Pane },
-    RangeSelect { pane: Pane, row: usize },
-    DragSelect { pane: Pane, row: usize },
-    ActivatePaneRow { pane: Pane, row: usize },
+    // #16: section = which same-location subview the pointer is in.
+    PaneScrollDown {
+        pane: Pane,
+        section: SplitSection,
+    },
+    PaneScrollUp {
+        pane: Pane,
+        section: SplitSection,
+    },
+    ContextMenu {
+        column: u16,
+        row: u16,
+        pane: Pane,
+        section: SplitSection,
+    },
+    RangeSelect {
+        pane: Pane,
+        section: SplitSection,
+        row: usize,
+    },
+    DragSelect {
+        pane: Pane,
+        section: SplitSection,
+        row: usize,
+    },
+    ActivatePaneRow {
+        pane: Pane,
+        section: SplitSection,
+        row: usize,
+    },
 }
 
 pub(super) fn classify(state: &AppState, mouse: MouseEvent) -> MouseRoute {
@@ -142,7 +169,25 @@ pub(super) fn classify(state: &AppState, mouse: MouseEvent) -> MouseRoute {
     } else {
         return MouseRoute::Ignore;
     };
-    let row = mouse.row.saturating_sub(area.y + 1) as usize;
+    // #16: resolve WHICH subview of this outer pane holds the pointer and
+    // compute the row relative to THAT subview's own origin (horizontal
+    // secondary has a different y-origin).
+    let pane_state = match pane {
+        Pane::Left => &state.left,
+        Pane::Right => &state.right,
+    };
+    let rects = super::split_layout::split_rects(
+        area,
+        pane_state.split,
+        pane_state.split_orientation,
+        pane_state.split_ratio,
+    );
+    let Some((section, section_rect)) =
+        super::split_layout::section_at_point(&rects, mouse.column, mouse.row)
+    else {
+        return MouseRoute::Ignore;
+    };
+    let row = mouse.row.saturating_sub(section_rect.y + 1) as usize;
 
     // #10: wheel over the viewer stays viewer-owned regardless of position;
     // otherwise it becomes a pane scroll for the pane under the pointer.
@@ -151,21 +196,22 @@ pub(super) fn classify(state: &AppState, mouse: MouseEvent) -> MouseRoute {
             MouseRoute::ViewerScrollDown
         }
         MouseEventKind::ScrollUp if !state.viewer_content.is_empty() => MouseRoute::ViewerScrollUp,
-        MouseEventKind::ScrollDown => MouseRoute::PaneScrollDown { pane },
-        MouseEventKind::ScrollUp => MouseRoute::PaneScrollUp { pane },
+        MouseEventKind::ScrollDown => MouseRoute::PaneScrollDown { pane, section },
+        MouseEventKind::ScrollUp => MouseRoute::PaneScrollUp { pane, section },
         MouseEventKind::Down(MouseButton::Right) => MouseRoute::ContextMenu {
             column: mouse.column,
             row: mouse.row,
             pane,
+            section,
         },
         // Shift+Click is an explicit inclusive range selection.
         MouseEventKind::Down(MouseButton::Left)
             if mouse.modifiers.contains(KeyModifiers::SHIFT) =>
         {
-            MouseRoute::RangeSelect { pane, row }
+            MouseRoute::RangeSelect { pane, section, row }
         }
-        MouseEventKind::Drag(MouseButton::Left) => MouseRoute::DragSelect { pane, row },
-        MouseEventKind::Down(_) => MouseRoute::ActivatePaneRow { pane, row },
+        MouseEventKind::Drag(MouseButton::Left) => MouseRoute::DragSelect { pane, section, row },
+        MouseEventKind::Down(_) => MouseRoute::ActivatePaneRow { pane, section, row },
         _ => MouseRoute::Ignore,
     }
 }
@@ -267,6 +313,7 @@ mod tests {
             ),
             MouseRoute::ActivatePaneRow {
                 pane: Pane::Left,
+                section: SplitSection::Primary,
                 row: 1,
             }
         );
@@ -277,6 +324,7 @@ mod tests {
             ),
             MouseRoute::ActivatePaneRow {
                 pane: Pane::Right,
+                section: SplitSection::Primary,
                 row: 1,
             }
         );
@@ -291,6 +339,7 @@ mod tests {
             ),
             MouseRoute::ActivatePaneRow {
                 pane: Pane::Left,
+                section: SplitSection::Primary,
                 row: 0,
             }
         );
@@ -332,7 +381,8 @@ mod tests {
             MouseRoute::ContextMenu {
                 column: 11,
                 row: 7,
-                pane: Pane::Left
+                pane: Pane::Left,
+                section: SplitSection::Primary
             }
         );
     }
@@ -346,6 +396,7 @@ mod tests {
             ),
             MouseRoute::DragSelect {
                 pane: Pane::Right,
+                section: SplitSection::Primary,
                 row: 2,
             }
         );
@@ -360,6 +411,7 @@ mod tests {
             ),
             MouseRoute::ActivatePaneRow {
                 pane: Pane::Left,
+                section: SplitSection::Primary,
                 row: 3,
             }
         );

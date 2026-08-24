@@ -267,7 +267,10 @@ pub fn build_command_items_with_file_context(
             item.kind.label(),
         )
     });
-    items.truncate(50);
+    // #16: five new split actions pushed the canonical action count past the
+    // old 50-item cap, which silently hid real actions (ViewFile) from empty
+    // queries. The list is scrollable; the cap only bounds worst-case size.
+    items.truncate(80);
     items
 }
 

@@ -147,6 +147,19 @@ impl SortMode {
     }
 }
 
+/// #16 v1: presentation orientation of a pane's same-location split view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SplitOrientation {
+    #[default]
+    Vertical,
+    Horizontal,
+}
+
+/// Shared split-ratio contract (#16): percentage of the PRIMARY subview.
+pub const SPLIT_RATIO_MIN: u16 = 20;
+pub const SPLIT_RATIO_MAX: u16 = 80;
+pub const SPLIT_RATIO_STEP: u16 = 5;
+
 #[derive(Debug, Clone)]
 pub struct PaneState {
     pub location: Location,
@@ -157,6 +170,8 @@ pub struct PaneState {
     /// Directory history stack. Push before entering a directory; Alt+Down pops.
     pub dir_history: Vec<Location>,
     pub split: bool,
+    pub split_orientation: SplitOrientation,
+    pub split_ratio: u16,
     pub split_cursor: usize,
     pub split_active: bool,
 }
@@ -170,6 +185,9 @@ impl PaneState {
             .unwrap_or_else(|_| PathBuf::from("/"));
         self.location = Location::Local(home);
         self.cursor = 0;
+        // #16: both subviews show the SAME new listing — no stale secondary
+        // cursor from the previous Location survives into another tab.
+        self.split_cursor = self.cursor;
     }
 
     /// Close active tab. Falls back to last saved tab.
@@ -178,6 +196,7 @@ impl PaneState {
             self.location = loc;
             self.cursor = cur;
         }
+        self.split_cursor = self.cursor;
     }
 
     /// Switch to tab at index. Swaps current state with saved[idx].
@@ -188,6 +207,7 @@ impl PaneState {
             self.tabs[idx] = saved;
             self.location = target.0;
             self.cursor = target.1;
+            self.split_cursor = self.cursor;
         }
     }
 }
@@ -404,7 +424,6 @@ pub struct AppState {
     pub hotlist_entries: Vec<PathBuf>,
     pub show_tab_switcher: bool,
     pub tab_switcher_cursor: usize,
-    pub split: bool, // Ctrl+\ split pane vertically
     pub rename_input: bool,
     pub rename_pattern: String,
     pub show_command_center: bool,
@@ -434,6 +453,8 @@ impl Default for AppState {
                 tabs: Vec::new(),
                 dir_history: Vec::new(),
                 split: false,
+                split_orientation: SplitOrientation::default(),
+                split_ratio: 50,
                 split_cursor: 0,
                 split_active: false,
             },
@@ -443,6 +464,8 @@ impl Default for AppState {
                 tabs: Vec::new(),
                 dir_history: Vec::new(),
                 split: false,
+                split_orientation: SplitOrientation::default(),
+                split_ratio: 50,
                 split_cursor: 0,
                 split_active: false,
             },
@@ -536,7 +559,6 @@ impl Default for AppState {
             hotlist_entries: Vec::new(),
             show_tab_switcher: false,
             tab_switcher_cursor: 0,
-            split: false,
             rename_input: false,
             rename_pattern: String::new(),
             show_command_center: false,
@@ -1170,6 +1192,8 @@ mod tests {
                 tabs: vec![],
                 dir_history: vec![],
                 split: false,
+                split_orientation: SplitOrientation::default(),
+                split_ratio: 50,
                 split_cursor: 0,
                 split_active: false,
             },
@@ -1179,6 +1203,8 @@ mod tests {
                 tabs: vec![],
                 dir_history: vec![],
                 split: false,
+                split_orientation: SplitOrientation::default(),
+                split_ratio: 50,
                 split_cursor: 0,
                 split_active: false,
             },

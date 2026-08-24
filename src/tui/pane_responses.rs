@@ -164,6 +164,8 @@ pub(super) fn apply_pane_load_response(
                         }
                         state.left.location = response.location.clone();
                         state.left.cursor = 0;
+                        // #16: both subviews show the new shared listing.
+                        state.left.split_cursor = 0;
                     }
                     *left_entries = entries;
                     state.left.cursor = state.left.cursor.min(left_entries.len().saturating_sub(1));
@@ -182,6 +184,8 @@ pub(super) fn apply_pane_load_response(
                         }
                         state.right.location = response.location.clone();
                         state.right.cursor = 0;
+                        // #16: both subviews show the new shared listing.
+                        state.right.split_cursor = 0;
                     }
                     *right_entries = entries;
                     state.right.cursor = state

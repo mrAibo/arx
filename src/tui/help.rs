@@ -171,6 +171,23 @@ fn help_full_lines(keymap: Option<&arx::input::Keymap>) -> Vec<Line<'static>> {
             k(ActionId::ToggleSplitPane)
         )),
         Line::from(format!(
+            "  {}Vertical split",
+            k(ActionId::OpenVerticalSplit)
+        )),
+        Line::from(format!(
+            "  {}Horizontal split",
+            k(ActionId::OpenHorizontalSplit)
+        )),
+        Line::from(format!("  {}Close split", k(ActionId::CloseSplitPane))),
+        Line::from(format!(
+            "  {}Move split boundary backward",
+            k(ActionId::DecreaseSplitRatio)
+        )),
+        Line::from(format!(
+            "  {}Move split boundary forward",
+            k(ActionId::IncreaseSplitRatio)
+        )),
+        Line::from(format!(
             "  {}Command Center (incl. Open in file manager)",
             k(ActionId::OpenCommandCenter)
         )),

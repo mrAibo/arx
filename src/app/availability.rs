@@ -38,6 +38,9 @@ pub struct ActionContext {
     pub sync_return_preview_ready: bool,
     pub right_location: Location,
     pub active_location: Location,
+    /// #16: active-pane split facts (populated ONLY from state.active_pane()).
+    pub split_open: bool,
+    pub split_ratio: u16,
 }
 
 impl ActionContext {
@@ -117,6 +120,8 @@ impl ActionContext {
             sync_return_preview_ready,
             right_location: state.right.location.clone(),
             active_location: state.active_pane().location.clone(),
+            split_open: state.active_pane().split,
+            split_ratio: state.active_pane().split_ratio,
         }
     }
 
@@ -233,7 +238,28 @@ pub(crate) fn default_action_availability(id: ActionId, ctx: &ActionContext) -> 
                 reason: "Open in file manager is currently local-only".into(),
             }
         }
+        // #16: split actions — one availability table, active-pane facts.
+        ActionId::CloseSplitPane if !ctx.split_open => ActionAvailability::Disabled {
+            reason: "No split is open in the active pane".into(),
+        },
+        ActionId::DecreaseSplitRatio if !ctx.split_open => ActionAvailability::Disabled {
+            reason: "No split is open in the active pane".into(),
+        },
+        ActionId::DecreaseSplitRatio if ctx.split_ratio <= 20 => ActionAvailability::Disabled {
+            reason: "Split ratio already at the minimum (20%)".into(),
+        },
+        ActionId::IncreaseSplitRatio if !ctx.split_open => ActionAvailability::Disabled {
+            reason: "No split is open in the active pane".into(),
+        },
+        ActionId::IncreaseSplitRatio if ctx.split_ratio >= 80 => ActionAvailability::Disabled {
+            reason: "Split ratio already at the maximum (80%)".into(),
+        },
         ActionId::ToggleSplitPane
+        | ActionId::OpenVerticalSplit
+        | ActionId::OpenHorizontalSplit
+        | ActionId::CloseSplitPane
+        | ActionId::DecreaseSplitRatio
+        | ActionId::IncreaseSplitRatio
         | ActionId::OpenHotlist
         | ActionId::OpenInFileManager
         | ActionId::OpenSmartTree
@@ -489,6 +515,8 @@ mod tests {
             sync_return_preview_ready: false,
             right_location: Location::Local(std::path::PathBuf::from("/")),
             active_location: Location::Local(std::path::PathBuf::from("/")),
+            split_open: false,
+            split_ratio: 50,
         }
     }
 
