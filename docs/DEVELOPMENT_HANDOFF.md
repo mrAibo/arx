@@ -28,10 +28,16 @@ Repository: `mrAibo/arx`
 - #214 configurable effective keymap: COMPLETE via PR #235, accepted merge
   `dad59ac7ae8b80c680767de7c7f95f506078bf44` (baseline entering #214 was
   `8444820bcb6b392e77a2cffad326b80b39d880b3`).
-- Current product work: **#7 multiplexer lifecycle** on
-  `feat/7-multiplexer-lifecycle`; baseline entering #7:
-  `80093fc5cdd1f4bb6e1bd16c55e117d257d327dc` — no future merge SHA invented.
-- #16 remains separate later product work; plugins remain no-GO; #233 remains separate.
+- Current product work: **#16 split-pane layout follow-up** on
+  `feat/16-split-pane-layout`; baseline entering #16:
+  `616b48b6eafbc9dea55b76428b70beab1941b877` (= accepted main after #7). No
+  future merge SHA invented. v1 frozen model: same outer `PaneState` Location /
+  listing / provider / pagination authority, TWO split cursors/views only,
+  `SplitOrientation::{Vertical,Horizontal}`, ratio 20..=80 step 5, explicit
+  close + keyboard resize, section-aware mouse (presentation identity only);
+  NO split_location, no extra Pane enum, no second loader/runtime/selection
+  store; mouse boundary drag resize deferred.
+- Plugins remain no-GO; #233 remains separate; #16 is the active product work above.
 - Earlier provenance — accepted PACK R merge
   `1def3adf382978491ce11590470f56d844bcce07` (PR #232 / #231).
 - Provenance entering R: `578d52d685dec7454025521e6d06491273503239`. Its tree was
