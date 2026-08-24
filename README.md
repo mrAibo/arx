@@ -159,7 +159,7 @@ of truth.
 | Shift+F6 | Rename |
 | Ctrl+U | Swap panes |
 | Ctrl+X C / L / O / S | chmod / hardlink / chown / symlink |
-| Ctrl+\\ | Toggle split pane |
+| Ctrl+\\\\ | Toggle split pane |
 
 ### View & Preview
 
