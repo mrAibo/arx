@@ -664,6 +664,7 @@ fn is_bindable(context: ConfigContext, id: ActionId) -> bool {
                 | TouchFile
                 | CompressTarGz
                 | ListTmuxSessions
+                | ListScreenSessions
                 | OpenSmartTree
                 | OpenInfrastructureCenter
                 | OpenHotlist

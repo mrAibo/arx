@@ -240,6 +240,17 @@ static REGISTRATIONS: &[Registration] = &[
         policy: AvailabilityPolicy::Default,
     },
     Registration {
+        action: Action::ListScreenSessions,
+        meta: ActionMeta {
+            id: ActionId::ListScreenSessions,
+            label: "List screen sessions",
+            description: "Discover and attach to a GNU Screen session",
+            category: ActionCategory::Application,
+            destructive: false,
+        },
+        policy: AvailabilityPolicy::Default,
+    },
+    Registration {
         action: Action::ToggleEmbeddedTerminal,
         meta: ActionMeta {
             id: ActionId::ToggleEmbeddedTerminal,
@@ -604,6 +615,7 @@ impl ActionId {
             ActionId::TouchFile => "touch_file",
             ActionId::CompressTarGz => "compress_tar_gz",
             ActionId::ListTmuxSessions => "list_tmux_sessions",
+            ActionId::ListScreenSessions => "list_screen_sessions",
             ActionId::ToggleEmbeddedTerminal => "toggle_embedded_terminal",
             ActionId::Refresh => "refresh",
             ActionId::OpenCommandCenter => "open_command_center",
@@ -661,6 +673,7 @@ impl std::str::FromStr for ActionId {
             "touch_file" => Ok(ActionId::TouchFile),
             "compress_tar_gz" => Ok(ActionId::CompressTarGz),
             "list_tmux_sessions" => Ok(ActionId::ListTmuxSessions),
+            "list_screen_sessions" => Ok(ActionId::ListScreenSessions),
             "toggle_embedded_terminal" => Ok(ActionId::ToggleEmbeddedTerminal),
             "refresh" => Ok(ActionId::Refresh),
             "open_command_center" => Ok(ActionId::OpenCommandCenter),
