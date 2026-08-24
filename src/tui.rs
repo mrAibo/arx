@@ -73,7 +73,7 @@ mod jobs;
 mod mouse;
 mod split_layout;
 use mouse::{ContextMenuState, ContextMenuTarget, MouseUiState};
-use split_layout::{SplitRects, SplitSection, section_at_point, split_rects};
+use split_layout::SplitSection;
 mod mutations;
 mod overlays;
 mod pane_responses;
@@ -6217,7 +6217,6 @@ mod r10_mouse_tests {
 
     #[tokio::test]
     async fn r16_mouse_secondary_click_sets_focus_and_cursor() {
-        use input_dispatch::input_dispatch_helpers_for_test::*;
         let mut state = pane_state_with_area();
         state.active = Pane::Left;
         state.left.split = true;
@@ -6730,7 +6729,7 @@ mod r16_split_tests {
         assert_eq!(state.left.split_orientation, SplitOrientation::Vertical);
         assert_eq!(state.left.split_ratio, 50);
         // one Location only — no independent split location exists anywhere
-        let source = std::fs::read_to_string("src/app/mod.rs").unwrap();
+        let source = include_str!("app/mod.rs");
         assert!(
             !source.contains("split_location") && !source.contains("secondary_location"),
             "no independent split Location authority"
@@ -6799,7 +6798,6 @@ mod r16_split_tests {
 
     #[tokio::test]
     async fn r16_keymap_defaults_exact_and_distinct_from_ctrl_w() {
-        use input_dispatch::input_dispatch_helpers_for_test::*;
         let source = include_str!("input/keymap.rs");
         // Defaults present:
         for chord in ["ctrl('x'), plain('v')", "ctrl('x'), plain('h')"] {

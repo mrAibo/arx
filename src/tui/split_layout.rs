@@ -89,10 +89,10 @@ pub(super) fn section_at_point(
     if inside(rects.primary) {
         return Some((SplitSection::Primary, rects.primary));
     }
-    if let Some(secondary) = rects.secondary {
-        if inside(secondary) {
-            return Some((SplitSection::Secondary, secondary));
-        }
+    if let Some(secondary) = rects.secondary
+        && inside(secondary)
+    {
+        return Some((SplitSection::Secondary, secondary));
     }
     None
 }
