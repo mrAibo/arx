@@ -113,12 +113,18 @@ pub fn load() -> ArxConfig {
                 Ok(cfg) => cfg,
                 Err(e) => {
                     // ponytail: malformed/invalid config → preserve existing fallback
-                    eprintln!("arx: invalid config {}: {e}", path.display());
+                    eprintln!(
+                        "arx: invalid config {}: {e}",
+                        sanitize_diag(&path.to_string_lossy())
+                    );
                     ArxConfig::default()
                 }
             },
             Err(e) => {
-                eprintln!("arx: cannot read config {}: {e}", path.display());
+                eprintln!(
+                    "arx: cannot read config {}: {e}",
+                    sanitize_diag(&path.to_string_lossy())
+                );
                 ArxConfig::default()
             }
         }
@@ -132,9 +138,12 @@ pub fn load() -> ArxConfig {
 /// Unlike [`load`], a missing/unreadable/malformed file is a hard error: when
 /// the user names a file we must never silently substitute defaults.
 pub fn load_from_path(path: &std::path::Path) -> Result<ArxConfig, String> {
+    // Sanitize only the RENDERED diagnostic; the real path is used untouched
+    // for I/O. Control characters in a path must never reach the terminal.
+    let safe_path = sanitize_diag(&path.to_string_lossy());
     let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read config {}: {e}", path.display()))?;
-    parse_config(&content).map_err(|e| format!("invalid config {}: {e}", path.display()))
+        .map_err(|e| format!("cannot read config {safe_path}: {e}"))?;
+    parse_config(&content).map_err(|e| format!("invalid config {safe_path}: {e}"))
 }
 
 // ponytail: single well-known path; add XDG_CONFIG_HOME override when needed
@@ -357,6 +366,15 @@ pub(crate) fn sanitize_diag(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn r214_explicit_path_control_chars_are_sanitized_in_error() {
+        let hostile = String::from("/tmp/no_such\u{1b}[31m_dir\nline2.toml");
+        let err = load_from_path(std::path::Path::new(&hostile)).unwrap_err();
+        assert!(err.contains("cannot read config"));
+        assert!(!err.contains('\n'), "newline must be escaped: {err:?}");
+        assert!(!err.contains('\u{1b}'), "ESC must be escaped: {err:?}");
+    }
     use super::*;
 
     // helper: TOML root is always a table, so a bare Vec needs a wrapper

@@ -694,7 +694,9 @@ impl Keymap {
     /// overrides (#214). No overrides => behaviorally identical to `default()`.
     pub fn effective(overrides: &[crate::config::KeybindingConfig]) -> Result<Keymap, KeymapError> {
         let mut bindings: Vec<KeyBinding> = Keymap::default().bindings.to_vec();
-        let mut seen_pairs: std::collections::HashSet<(String, String)> =
+        // Canonical typed identity — raw strings would let whitespace variants
+        // bypass duplicate detection.
+        let mut seen_pairs: std::collections::HashSet<(InputContext, ActionId)> =
             std::collections::HashSet::new();
 
         for override_row in overrides {
@@ -711,11 +713,12 @@ impl Keymap {
                     context.config_name(),
                 )));
             }
-            if !seen_pairs.insert((override_row.context.clone(), override_row.action.clone())) {
+            let ctx_input = context.input_context();
+            if !seen_pairs.insert((ctx_input, action_id)) {
                 return Err(KeymapError::new(format!(
                     "duplicate override for {}:{}",
-                    crate::app::sanitize_config_token(&override_row.context),
-                    crate::app::sanitize_config_token(&override_row.action),
+                    context.config_name(),
+                    action_id.config_name(),
                 )));
             }
 
@@ -745,7 +748,6 @@ impl Keymap {
             }
 
             // Remove ALL built-in bindings for exactly this pair (incl. aliases).
-            let ctx_input = context.input_context();
             bindings.retain(|binding| {
                 !(binding.context == ctx_input && binding.action.id() == action_id)
             });
@@ -1235,6 +1237,40 @@ mod r214_tests {
             None,
             "unbound action must not fabricate the old shortcut"
         );
+    }
+
+    #[test]
+    fn r214_whitespace_normalized_duplicate_rejected() {
+        let overrides = [
+            kb("browser", "open_storage_inspector", Some("F11"), false),
+            kb(" browser ", " open_storage_inspector ", Some("F12"), false),
+        ];
+        let err = Keymap::effective(&overrides).unwrap_err();
+        assert!(
+            err.message.contains("duplicate override"),
+            "must fail as duplicate, not last-write-win: {err}"
+        );
+    }
+
+    #[test]
+    fn r214_same_action_in_two_contexts_is_not_a_duplicate() {
+        // CloseWorkspaceSyncOverlay is bindable in both sync contexts; the
+        // canonical pair identity must treat them as distinct.
+        let overrides = [
+            kb(
+                "sync_preview",
+                "close_workspace_sync_overlay",
+                Some("F11"),
+                false,
+            ),
+            kb(
+                "sync_job",
+                "close_workspace_sync_overlay",
+                Some("F11"),
+                false,
+            ),
+        ];
+        assert!(Keymap::effective(&overrides).is_ok());
     }
 
     #[test]

@@ -93,9 +93,12 @@ pub(super) fn render(
 }
 
 /// Managed-action key label from the effective Keymap, or "—" when unbound.
-fn dyn_key(keymap: Option<&arx::input::Keymap>, action_id: arx::app::ActionId) -> String {
-    match keymap.and_then(|km| km.primary_binding_label(arx::app::InputContext::Browser, action_id))
-    {
+fn dyn_key(
+    keymap: Option<&arx::input::Keymap>,
+    context: arx::app::InputContext,
+    action_id: arx::app::ActionId,
+) -> String {
+    match keymap.and_then(|km| km.primary_binding_label(context, action_id)) {
         Some(label) => format!("{:<12}", label),
         None => format!("{:<12}", "—"),
     }
@@ -103,8 +106,9 @@ fn dyn_key(keymap: Option<&arx::input::Keymap>, action_id: arx::app::ActionId) -
 
 fn help_full_lines(keymap: Option<&arx::input::Keymap>) -> Vec<Line<'static>> {
     use arx::app::ActionId;
-    let k = |id: ActionId| dyn_key(keymap, id);
-    let _ = &k;
+    // Browser-managed actions + SyncPreview-managed rows resolve through the
+    // effective Keymap; genuine legacy/direct-controller keys stay literal.
+    let k = |id: ActionId| dyn_key(keymap, InputContext::Browser, id);
     vec![
         // Getting Started (short, first)
         Line::from(Span::styled(
@@ -133,13 +137,20 @@ fn help_full_lines(keymap: Option<&arx::input::Keymap>) -> Vec<Line<'static>> {
             "  {}Sync Preview (after compare)",
             k(ActionId::PreviewWorkspaceSync)
         )),
-        Line::from("  Enter         Execute preview"),
+        Line::from(format!(
+            "  {}Execute preview",
+            dyn_key(
+                keymap,
+                InputContext::SyncPreview,
+                ActionId::ExecuteWorkspaceSync
+            )
+        )),
         Line::from(format!(
             "  {}Command Center",
             k(ActionId::OpenCommandCenter)
         )),
-        Line::from("  F1/?          This help"),
-        Line::from(format!("  {} / q       Quit", k(ActionId::Quit).trim_end())),
+        Line::from(format!("  {}This help", k(ActionId::OpenHelp))),
+        Line::from(format!("  {}Quit", k(ActionId::Quit))),
         Line::from(""),
         Line::from(Span::styled("Navigation", Style::default().fg(Color::Cyan))),
         Line::from("  j / ↓ / k / ↑      Move cursor"),
@@ -155,8 +166,14 @@ fn help_full_lines(keymap: Option<&arx::input::Keymap>) -> Vec<Line<'static>> {
         Line::from("  Alt+O              Sync other pane to active"),
         Line::from("  Alt+Down           Go back in directory history"),
         Line::from("  Alt+/              Recursive file search (find)"),
-        Line::from("  Ctrl+\\             Toggle split pane"),
-        Line::from("  Ctrl+P             Command Center (incl. Open in file manager)"),
+        Line::from(format!(
+            "  {}Toggle split pane",
+            k(ActionId::ToggleSplitPane)
+        )),
+        Line::from(format!(
+            "  {}Command Center (incl. Open in file manager)",
+            k(ActionId::OpenCommandCenter)
+        )),
         Line::from(""),
         Line::from(Span::styled("Tabs", Style::default().fg(Color::Cyan))),
         Line::from("  Ctrl+T         New tab"),
@@ -168,7 +185,7 @@ fn help_full_lines(keymap: Option<&arx::input::Keymap>) -> Vec<Line<'static>> {
             "Selection & Filter",
             Style::default().fg(Color::Cyan),
         )),
-        Line::from("  Space          Toggle selection"),
+        Line::from(format!("  {}Toggle selection", k(ActionId::ToggleSelect))),
         Line::from("  *              Invert selection"),
         Line::from("  +              Select by glob pattern"),
         Line::from("  /              Quick filter by name"),
@@ -199,28 +216,27 @@ fn help_full_lines(keymap: Option<&arx::input::Keymap>) -> Vec<Line<'static>> {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "Ctrl+X Prefix (MC-style)",
+            "File links & permissions",
             Style::default().fg(Color::Cyan),
         )),
-        Line::from("  Ctrl+X S       Symlink (ln -s)"),
-        Line::from("  Ctrl+X L       Hard link (ln)"),
-        Line::from("  Ctrl+X C       chmod"),
-        Line::from("  Ctrl+X O       chown"),
+        Line::from(format!("  {}Symlink (ln -s)", k(ActionId::BeginSymlink))),
+        Line::from(format!("  {}Hard link (ln)", k(ActionId::BeginHardLink))),
+        Line::from(format!("  {}chmod", k(ActionId::BeginChmod))),
+        Line::from(format!("  {}chown", k(ActionId::BeginChown))),
         Line::from(""),
         Line::from(Span::styled(
             "Panels & Tools",
             Style::default().fg(Color::Cyan),
         )),
         Line::from("  F2             User menu (arx.menu)"),
-        Line::from("  Ctrl+B         Bookmarks"),
-        Line::from("  Ctrl+J         Background jobs"),
+        Line::from(format!("  {}Bookmarks", k(ActionId::OpenBookmarks))),
+        Line::from(format!("  {}Background jobs", k(ActionId::OpenJobs))),
         Line::from("  Ctrl+O         Shell (drop to subshell)"),
         Line::from("  :              Command line"),
         Line::from(""),
         Line::from(Span::styled("Other", Style::default().fg(Color::Cyan))),
         Line::from("  Ctrl+R         Refresh"),
-        Line::from("  q              Quit"),
-        Line::from("  F1 / ?         This help"),
+        Line::from(format!("  {}This help", k(ActionId::OpenHelp))),
     ]
 }
 
@@ -391,8 +407,132 @@ mod tests {
         assert!(!rendered.contains("Ctrl+\\             Open in file manager"));
 
         let source = source_text();
-        assert!(source.contains("Ctrl+\\             Toggle split pane"));
+        // #214: managed rows must NOT embed stale physical truth.
+        assert!(!source.contains("Ctrl+\\             Toggle split pane"));
+        assert!(source.contains("Toggle split pane"));
         assert!(source.contains("Command Center (incl. Open in file manager)"));
         assert!(!source.contains("Ctrl+\\             Open in file manager"));
+    }
+
+    // ── #214 review correction: dynamic managed-action rows ──
+
+    fn kb(
+        context: &str,
+        action: &str,
+        keys: Option<&str>,
+        disabled: bool,
+    ) -> arx::config::KeybindingConfig {
+        arx::config::KeybindingConfig {
+            context: context.into(),
+            action: action.into(),
+            keys: keys.map(|k| k.into()),
+            disabled,
+        }
+    }
+
+    fn help_text_for(keymap: &arx::input::Keymap) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+        let backend = TestBackend::new(120, 80);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::default();
+        terminal
+            .draw(|frame| render(frame, frame.area(), &mut state, keymap))
+            .unwrap();
+        buffer_text(&terminal)
+    }
+
+    #[test]
+    fn r214_help_follows_rebind_toggle_split_pane() {
+        let km = arx::input::Keymap::effective(&[kb(
+            "browser",
+            "toggle_split_pane",
+            Some("F11"),
+            false,
+        )])
+        .unwrap();
+        let text = help_text_for(&km);
+        assert!(text.contains("F11"), "rebound split-pane key must render");
+        assert!(!text.contains("Ctrl+\\"), "stale Ctrl+\\ must be gone");
+    }
+
+    #[test]
+    fn r214_help_follows_rebind_chmod_and_bookmarks() {
+        // Separate fixtures: two different Browser actions may not share one key.
+        let chmod_km =
+            arx::input::Keymap::effective(&[kb("browser", "begin_chmod", Some("F11"), false)])
+                .unwrap();
+        let chmod_text = help_text_for(&chmod_km);
+        assert!(chmod_text.contains("chmod"));
+        assert!(!chmod_text.contains("Ctrl+X C"));
+
+        let bookmarks_km =
+            arx::input::Keymap::effective(&[kb("browser", "open_bookmarks", Some("F11"), false)])
+                .unwrap();
+        let bookmarks_text = help_text_for(&bookmarks_km);
+        assert!(bookmarks_text.contains("Bookmarks"));
+        assert!(!bookmarks_text.contains("Ctrl+B"));
+    }
+
+    #[test]
+    fn r214_help_quit_row_uses_effective_binding_only() {
+        let km =
+            arx::input::Keymap::effective(&[kb("browser", "quit", Some("F11"), false)]).unwrap();
+        let text = help_text_for(&km);
+        assert!(text.contains("Quit"));
+        assert!(
+            !text.contains("/ q"),
+            "literal q fallback next to dynamic Quit is forbidden"
+        );
+    }
+
+    #[test]
+    fn r214_help_open_help_browser_row_follows_keymap() {
+        let km = arx::input::Keymap::effective(&[kb("browser", "open_help", Some("F11"), false)])
+            .unwrap();
+        let text = help_text_for(&km);
+        // Discovery rows follow the effective binding; Help-overlay close
+        // controls (Esc/F1/?/q) are direct controller truth and may remain.
+        let discovery_rows_stale = text
+            .lines()
+            .filter(|line| line.contains("This help") && line.trim_start().starts_with("F1"));
+        assert_eq!(
+            discovery_rows_stale.count(),
+            0,
+            "OpenHelp discovery rows must derive from the effective Keymap"
+        );
+    }
+
+    #[test]
+    fn r214_help_sync_preview_execute_row_dynamic() {
+        let km = arx::input::Keymap::effective(&[kb(
+            "sync_preview",
+            "execute_workspace_sync",
+            Some("F11"),
+            false,
+        )])
+        .unwrap();
+        let text = help_text_for(&km);
+        assert!(text.contains("Execute preview"));
+        assert!(!text.lines().any(|line| {
+            line.contains("Execute preview") && line.trim_start().starts_with("Enter")
+        }));
+    }
+
+    #[test]
+    fn r214_help_disabled_action_shows_unbound_truth() {
+        let km =
+            arx::input::Keymap::effective(&[kb("browser", "toggle_select", None, true)]).unwrap();
+        let text = help_text_for(&km);
+        assert!(text.contains("Toggle selection"));
+        // The test-backend buffer flattens rows; slice between row markers.
+        let row = text
+            .split("Toggle selection")
+            .next()
+            .map(|before| before.rsplit('│').next().unwrap_or(before))
+            .unwrap();
+        assert!(
+            !row.contains("Space"),
+            "disabled action must not show its old default key: {row:?}"
+        );
     }
 }
