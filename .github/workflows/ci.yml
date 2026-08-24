@@ -96,6 +96,45 @@ jobs:
           source "$ENV_FILE"
           cargo test --locked --lib --features physical-webdav physical_w1_through_w18 -- --nocapture
 
+  # #7: real PTY + real tmux/GNU screen interactive lifecycle acceptance.
+  # Checks out the exact PR head, creates disposable sessions, drives normal
+  # detach, and proves TuiTerminalSession reacquires raw/alternate/mouse.
+  multiplexer-terminal-physical:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Exact-SHA evidence (PR head)
+        run: |
+          set -euo pipefail
+          TESTED_SHA="$(git rev-parse HEAD)"
+          echo "TESTED_SHA=$TESTED_SHA"
+          EXPECTED="${{ github.event.pull_request.head.sha }}"
+          if [ -n "$EXPECTED" ] && [ "$EXPECTED" != "$TESTED_SHA" ]; then
+            echo "::error::checked-out SHA ($TESTED_SHA) != PR head ($EXPECTED)"
+            exit 1
+          fi
+
+      - name: Install multiplexer fixtures
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tmux screen
+
+      - name: Real PTY multiplexer lifecycle
+        env:
+          ARX_MULTIPLEXER_PHYSICAL: "1"
+        run: |
+          set -euo pipefail
+          cargo test --locked --test multiplexer_terminal_physical -- --nocapture --test-threads=1
+
   # Physical S3 safe-read retry (PACK G P8) against real MinIO.
   # Drives S3TransferSpec::DownloadOne through the REAL TransferQueueRuntime
   # with the S3 endpoint pointed at a one-shot TCP fault proxy: the first

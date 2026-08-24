@@ -39,8 +39,11 @@ Current product truth:
 
 Current follow-up truth:
 
-- **tmux/screen:** tmux discovery + attach are shipped; screen discovery and attach
-  lifecycle hardening remain in #7.
+- **tmux/screen (#7) — CURRENT PRODUCT WORK:** typed GNU Screen discovery
+  (`list_screen_sessions`), missing-binary truth, and terminal-suspending
+  interactive attach. Implementation on `feat/7-multiplexer-lifecycle`; baseline
+  entering #7: `80093fc5cdd1f4bb6e1bd16c55e117d257d327dc`. Not COMPLETE until an
+  accepted pinned merge (no future merge SHA invented here).
 - **Mouse:** #10 is COMPLETE via PR #236, accepted merge
   `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`. Shipped: visible-row-correct pane
   clicks, active-pane wheel scrolling, Shift+Click range selection, drag-selection
@@ -280,10 +283,11 @@ lost during later work.
 
 Near-term product follow-ups after the architecture sequence:
 
-- #7 tmux/screen follow-up: screen discovery and real-terminal attach/detach lifecycle.
+- #7 multiplexer lifecycle — CURRENT implementation on `feat/7-multiplexer-lifecycle`
+  (baseline entering #7: `80093fc5cdd1f4bb6e1bd16c55e117d257d327dc`).
 - #10 mouse follow-up — COMPLETE via PR #236, accepted merge
   `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`.
-- #16 split-pane follow-up: horizontal mode, resize, explicit close semantics.
+- #16 split-pane follow-up: horizontal mode, resize, explicit close semantics (separate).
 
 ### Configurable effective keymap (#214) — COMPLETE
 
