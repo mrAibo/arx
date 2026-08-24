@@ -3,7 +3,7 @@ use crate::config::S3TargetConfig;
 use crate::config::sanitize_diag;
 use crate::vfs::{
     BoundedRead, Entry, EntryIdentity, EntryKind, ListedEntry, Location, ProviderContinuation,
-    ProviderListingPage, VfsOps, VfsProvider,
+    ProviderListingPage, VfsProvider,
 };
 use aws_config::BehaviorVersion;
 use aws_config::Region;
@@ -1280,24 +1280,6 @@ fn map_list_objects_v2_page(
         continuation: None, // handled by next_list_objects_v2_continuation
     })
 }
-impl VfsOps for S3Fs {
-    fn list(&self) -> anyhow::Result<Vec<Entry>> {
-        Err(anyhow::anyhow!("S3: not implemented"))
-    }
-    fn read_head(&self, _path: &str, _lines: usize) -> anyhow::Result<Vec<String>> {
-        Err(anyhow::anyhow!("S3: not implemented"))
-    }
-    fn copy_files(&self, _from: &str, _to: &str, _names: &[String]) -> io::Result<usize> {
-        Err(io::Error::other("S3: not implemented"))
-    }
-    fn move_files(&self, _from: &str, _to: &str, _names: &[String]) -> io::Result<usize> {
-        Err(io::Error::other("S3: not implemented"))
-    }
-    fn delete_files(&self, _dir: &str, _names: &[String]) -> io::Result<usize> {
-        Err(io::Error::other("S3: not implemented"))
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::collapsible_if)]
 mod tests {
