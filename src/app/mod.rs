@@ -409,7 +409,7 @@ pub struct AppState {
     pub context_menu_pos: (u16, u16),
     pub command_matches: Vec<CommandItem>,
     pub overlay_list_state: ratatui::widgets::ListState,
-    /// Provider registry — phased replacement of match-Location dispatch
+    /// Provider registry — explicit VFS execution authority (PACK Q final model)
     pub registry: crate::vfs::ProviderRegistry,
 }
 
