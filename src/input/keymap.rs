@@ -664,6 +664,7 @@ fn is_bindable(context: ConfigContext, id: ActionId) -> bool {
                 | TouchFile
                 | CompressTarGz
                 | ListTmuxSessions
+                | ListScreenSessions
                 | OpenSmartTree
                 | OpenInfrastructureCenter
                 | OpenHotlist
@@ -1347,6 +1348,35 @@ mod r214_tests {
 
     // ── SYNC FAIL-CLOSED + CTRL+S GUARD are behavioral in input_dispatch /
     //    browser_input and covered by the source-contract + unit tests there. ──
+
+    // ── #7 review: ListScreenSessions keymap contract ──
+    #[test]
+    fn r7_screen_discovery_has_zero_default_bindings() {
+        let keymap = Keymap::default();
+        let count = keymap
+            .bindings()
+            .iter()
+            .filter(|binding| binding.action.id() == ActionId::ListScreenSessions)
+            .count();
+        assert_eq!(count, 0, "ListScreenSessions must have NO default binding");
+    }
+
+    #[test]
+    fn r7_user_can_bind_list_screen_sessions() {
+        let overrides = vec![kb("browser", "list_screen_sessions", Some("F11"), false)];
+        let effective = Keymap::effective(&overrides).expect("user binding must be accepted");
+        let user_bindings: Vec<_> = effective
+            .bindings()
+            .iter()
+            .filter(|binding| binding.action.id() == ActionId::ListScreenSessions)
+            .collect();
+        assert_eq!(
+            user_bindings.len(),
+            1,
+            "user override yields exactly one User binding"
+        );
+        assert_eq!(user_bindings[0].source, BindingSource::User);
+    }
 
     #[test]
     fn r214_lookup_helpers_deterministic() {

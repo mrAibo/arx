@@ -22,6 +22,7 @@ pub enum Effect {
         session: String,
     },
     ListTmuxSessions,
+    ListScreenSessions,
     DirectoryChildrenSizes {
         path: PathBuf,
     },
@@ -82,6 +83,93 @@ impl PartialEq for ProgressSlot {
 impl Eq for ProgressSlot {}
 
 /// Typed result sent back across the effect boundary.
+/// One GNU Screen session from `screen -ls` (#7).
+///
+/// `id` preserves the EXACT raw identifier required by `screen -r <id>`;
+/// presentation must never reconstruct or reformat it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenSessionInfo {
+    pub id: String,
+    pub status: ScreenSessionStatus,
+}
+
+/// Real GNU screen session states; anything unproven stays Unknown (fail-closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenSessionStatus {
+    Detached,
+    Attached,
+    Multi,
+    Dead,
+    Unreachable,
+    Unknown,
+}
+
+impl ScreenSessionStatus {
+    /// Factual, user-facing reason for non-attachable states.
+    pub fn unavailable_reason(self) -> Option<&'static str> {
+        match self {
+            ScreenSessionStatus::Detached => None,
+            ScreenSessionStatus::Attached => Some("session is attached elsewhere"),
+            ScreenSessionStatus::Multi => Some("session is multi-attached"),
+            ScreenSessionStatus::Dead => Some("session is dead"),
+            ScreenSessionStatus::Unreachable => Some("session is unreachable"),
+            ScreenSessionStatus::Unknown => Some("session state unknown"),
+        }
+    }
+}
+
+/// Pure parser for `screen -ls` output (#7).
+///
+/// - preserves the exact raw `<pid>.<name>` id used by `screen -r`
+/// - recognizes Detached/Attached/Multi/Dead/Unreachable
+/// - header/summary/malformed lines never become targets
+/// - formatting whitespace never alters the raw id
+pub fn parse_screen_ls(output: &str) -> Vec<ScreenSessionInfo> {
+    const TAB: char = '\u{0009}';
+    let mut sessions = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut fields = trimmed.split_whitespace();
+        // Session rows look like: "<pid>.<name>\t(Status)" (possibly with
+        // date/extra columns). Header/summary lines have no tab-separated
+        // "<digits>.<name>" first field and never become targets.
+        let Some(raw_id) = fields.next() else {
+            continue;
+        };
+        let Some((pid, name)) = raw_id.split_once('.') else {
+            continue;
+        };
+        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) || name.is_empty() {
+            continue;
+        }
+        let _ = TAB; // formatting whitespace is handled by split_whitespace
+
+        // Status token: "(Status)" anywhere after the id.
+        let status = fields
+            .find_map(|token| {
+                let inner = token.trim_start_matches('(').trim_end_matches(')');
+                match inner {
+                    "Detached" => Some(ScreenSessionStatus::Detached),
+                    "Attached" => Some(ScreenSessionStatus::Attached),
+                    "Multi" | "Multiuser" => Some(ScreenSessionStatus::Multi),
+                    "Dead" => Some(ScreenSessionStatus::Dead),
+                    "Unreachable" => Some(ScreenSessionStatus::Unreachable),
+                    _ => None,
+                }
+            })
+            .unwrap_or(ScreenSessionStatus::Unknown);
+        // Preserve the EXACT raw id — `screen -r <id>` needs pid.name verbatim.
+        sessions.push(ScreenSessionInfo {
+            id: raw_id.to_string(),
+            status,
+        });
+    }
+    sessions
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectEvent {
     ShellCaptured {
@@ -99,6 +187,9 @@ pub enum EffectEvent {
     },
     TmuxSessions {
         sessions: Vec<String>,
+    },
+    ScreenSessions {
+        sessions: Vec<ScreenSessionInfo>,
     },
     ViewerLines {
         title: String,

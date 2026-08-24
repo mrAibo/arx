@@ -236,6 +236,13 @@ impl<O: TerminalOps> TuiTerminalSession<O> {
         self.resume()?;
         Ok(output)
     }
+
+    /// Observable terminal-ownership postcondition for physical acceptance.
+    /// This exposes no second state: it reads the existing authority flags.
+    #[allow(dead_code)] // used by tests/multiplexer_terminal_physical.rs child process
+    pub(crate) fn lifecycle_state(&self) -> (bool, bool, bool) {
+        (self.raw_active, self.alternate_active, self.mouse_active)
+    }
 }
 
 impl<O: TerminalOps> Drop for TuiTerminalSession<O> {
@@ -523,6 +530,63 @@ mod tests {
                 DISABLE_RAW,
                 SHOW_CURSOR,
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn r7_suspend_cycle_reacquires_terminal_after_normal_detach() {
+        // Physical postcondition (#10/#7): after the suspend window closes —
+        // exactly what returning from `tmux detach` / `screen detach` does —
+        // raw mode + alternate screen + mouse capture must ALL be reacquired.
+        let (mut session, handle) = entered();
+        assert!(session.raw_active);
+        assert!(session.alternate_active);
+        assert!(session.mouse_active);
+        handle.clear_calls();
+
+        session
+            .suspend_while(|| async {
+                // Interactive multiplexer owns the terminal here (real attach
+                // runs in this window in production).
+            })
+            .await
+            .expect("suspend_while failed");
+
+        assert!(session.raw_active, "raw mode not reacquired");
+        assert!(session.alternate_active, "alternate screen not reacquired");
+        assert!(session.mouse_active, "mouse capture not reacquired");
+        assert!(
+            handle
+                .calls()
+                .ends_with(&[ENABLE_RAW, ENTER_ALTERNATE, ENABLE_MOUSE])
+        );
+    }
+
+    #[tokio::test]
+    async fn r7_suspend_cycle_reacquires_terminal_even_when_attach_fails() {
+        // Attach failure (e.g. binary error) must still reacquire the terminal.
+        let (mut session, handle) = entered();
+        handle.clear_calls();
+        let result: io::Result<io::Result<()>> = session
+            .suspend_while(|| async { Err(io::Error::other("attach exploded")) })
+            .await;
+        assert!(
+            result.expect("resume must succeed").is_err(),
+            "inner failure must propagate"
+        );
+        assert!(session.raw_active, "raw mode not reacquired after failure");
+        assert!(
+            session.alternate_active,
+            "alternate screen not reacquired after failure"
+        );
+        assert!(
+            session.mouse_active,
+            "mouse capture not reacquired after failure"
+        );
+        assert!(
+            handle
+                .calls()
+                .ends_with(&[ENABLE_RAW, ENTER_ALTERNATE, ENABLE_MOUSE])
         );
     }
 

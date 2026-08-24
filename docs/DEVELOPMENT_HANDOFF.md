@@ -18,17 +18,20 @@ Repository: `mrAibo/arx`
   release has shipped since this snapshot).
 - Rust MSRV: **1.88**
 - Product platform: **Linux only**; published artifact target is Linux x86_64.
-- Current accepted `main`: `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f` — #10 mouse
-  follow-up accepted via PR #236.
+- Accepted #10 runtime merge baseline: `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`
+  (#10 / PR #236). After it, docs-only PR #237 landed and the branch state entering
+  #7 is `80093fc5cdd1f4bb6e1bd16c55e117d257d327dc`. No self-referential "future
+  current main" claim is made here.
 - #10 mouse follow-up: COMPLETE via PR #236, accepted merge
   `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`; baseline entering #10 was
   `dad59ac7ae8b80c680767de7c7f95f506078bf44`.
 - #214 configurable effective keymap: COMPLETE via PR #235, accepted merge
   `dad59ac7ae8b80c680767de7c7f95f506078bf44` (baseline entering #214 was
   `8444820bcb6b392e77a2cffad326b80b39d880b3`).
-- No active product implementation branch is recorded by this snapshot after #10
-  closeout. #7 and #16 remain separate product candidates; choose only after a fresh
-  current-main review.
+- Current product work: **#7 multiplexer lifecycle** on
+  `feat/7-multiplexer-lifecycle`; baseline entering #7:
+  `80093fc5cdd1f4bb6e1bd16c55e117d257d327dc` — no future merge SHA invented.
+- #16 remains separate later product work; plugins remain no-GO; #233 remains separate.
 - Earlier provenance — accepted PACK R merge
   `1def3adf382978491ce11590470f56d844bcce07` (PR #232 / #231).
 - Provenance entering R: `578d52d685dec7454025521e6d06491273503239`. Its tree was

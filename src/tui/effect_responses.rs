@@ -74,12 +74,48 @@ pub(super) fn apply_effect_event(state: &mut AppState, lane: EffectLane, event: 
             state.command_matches = sessions
                 .into_iter()
                 .map(|name| CommandItem {
-                    title: name.clone(),
+                    // Display-safe title; exact raw name stays in the target.
+                    title: super::quick_actions::display_safe_text(&name),
                     subtitle: Some("Attach tmux session".into()),
                     kind: CommandKind::Session,
                     target: CommandTarget::TmuxSession(name),
                     score: 0,
                     availability: ActionAvailability::Available,
+                })
+                .collect();
+            state.open_overlay(OverlayKind::CommandCenter);
+            state.overlay_list_state.select(Some(0));
+        }
+        EffectEvent::ScreenSessions { sessions } => {
+            if sessions.is_empty() {
+                state.message = Some("No screen sessions found".into());
+                return;
+            }
+            state.command_matches = sessions
+                .into_iter()
+                .map(|session| {
+                    let (subtitle, availability) = match session.status.unavailable_reason() {
+                        Some(reason) => (
+                            format!("GNU Screen — {reason}"),
+                            ActionAvailability::Disabled {
+                                reason: reason.to_string(),
+                            },
+                        ),
+                        None => (
+                            "Attach GNU Screen session".to_string(),
+                            ActionAvailability::Available,
+                        ),
+                    };
+                    CommandItem {
+                        // Presentation is control-safe; the target keeps the
+                        // EXACT raw id — never reconstructed from the title.
+                        title: quick_actions::display_safe_text(&session.id),
+                        subtitle: Some(subtitle),
+                        kind: CommandKind::Session,
+                        target: CommandTarget::ScreenSession(session.id),
+                        score: 0,
+                        availability,
+                    }
                 })
                 .collect();
             state.open_overlay(OverlayKind::CommandCenter);
@@ -335,6 +371,61 @@ mod tests {
             lane,
             scope,
             event,
+        }
+    }
+
+    // ── #7 review: display-safe multiplexer presentation, exact raw targets ──
+    #[test]
+    fn r7_screen_rows_escape_control_chars_but_target_stays_exact() {
+        let raw = "123.demo\u{1b}[31m".to_string();
+        let mut state = AppState::default();
+        apply_effect_event(
+            &mut state,
+            EffectLane::TmuxDiscovery,
+            EffectEvent::ScreenSessions {
+                sessions: vec![arx::effects::ScreenSessionInfo {
+                    id: raw.clone(),
+                    status: arx::effects::ScreenSessionStatus::Detached,
+                }],
+            },
+        );
+        assert_eq!(state.command_matches.len(), 1);
+        let row = &state.command_matches[0];
+        // Presentation escaped:
+        assert!(
+            row.title.contains("\\u{1b}"),
+            "title must escape ESC: {:?}",
+            row.title
+        );
+        assert!(!row.title.contains('\u{1b}'), "no literal ESC in title");
+        // Operational identity exact:
+        match &row.target {
+            CommandTarget::ScreenSession(id) => assert_eq!(id, &raw),
+            other => panic!("wrong target: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn r7_tmux_rows_escape_control_chars_but_target_stays_exact() {
+        let raw = "sess\n;rm".to_string();
+        let mut state = AppState::default();
+        apply_effect_event(
+            &mut state,
+            EffectLane::TmuxDiscovery,
+            EffectEvent::TmuxSessions {
+                sessions: vec![raw.clone()],
+            },
+        );
+        let row = &state.command_matches[0];
+        assert!(
+            row.title.contains("\\n"),
+            "newline escaped: {:?}",
+            row.title
+        );
+        assert!(!row.title.contains('\n'));
+        match &row.target {
+            CommandTarget::TmuxSession(name) => assert_eq!(name, &raw),
+            other => panic!("wrong target: {other:?}"),
         }
     }
 
