@@ -6606,6 +6606,71 @@ mod r10_review_tests {
         rows.to_vec()
     }
 
+    #[test]
+    fn r16fix_synthetic_right_click_leaves_cursors_unchanged() {
+        use input_dispatch::input_dispatch_helpers_for_test::*;
+        let mut state = state_with_areas();
+        let mut mouse_ui = MouseUiState::default();
+        state.active = Pane::Left;
+        state.left.split = true;
+        state.left.cursor = 2;
+        state.left.split_cursor = 1;
+        let left_visible = rows(); // 0=Parent, 1=alpha(Listed), 2=beta? (see rows()), 3=LoadMore
+
+        // Right-click Parent (Primary section): menu closed, primary cursor unchanged.
+        open_context_menu_for_test(
+            &mut state,
+            &mut mouse_ui,
+            Pane::Left,
+            5,
+            7,
+            0, // target_row = Parent
+            &left_visible,
+            None,
+        );
+        assert!(mouse_ui.context_menu.is_none(), "Parent must not open menu");
+        assert_eq!(
+            state.left.cursor, 2,
+            "primary cursor unchanged by synthetic right-click"
+        );
+
+        // LoadMore: menu closed, cursors unchanged.
+        open_context_menu_for_test(
+            &mut state,
+            &mut mouse_ui,
+            Pane::Left,
+            5,
+            9,
+            3, // target_row = LoadMore
+            &left_visible,
+            None,
+        );
+        assert!(
+            mouse_ui.context_menu.is_none(),
+            "LoadMore must not open menu"
+        );
+        assert_eq!(state.left.cursor, 2);
+        assert_eq!(state.left.split_cursor, 1);
+
+        // Secondary synthetic: split_cursor unchanged too.
+        mouse_ui.close_context_menu();
+        open_context_menu_for_test(
+            &mut state,
+            &mut mouse_ui,
+            Pane::Left,
+            5,
+            9,
+            usize::MAX - 1, // out-of-range secondary target
+            &left_visible,
+            None,
+        );
+        assert!(mouse_ui.context_menu.is_none());
+        assert_eq!(
+            state.left.split_cursor, 1,
+            "secondary synthetic leaves split_cursor"
+        );
+    }
+
     fn open_menu(state: &mut AppState, mouse_ui: &mut MouseUiState) {
         let left_visible = rows();
         open_context_menu_for_test(state, mouse_ui, Pane::Left, 5, 7, 1, &left_visible, None);

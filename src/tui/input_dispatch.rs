@@ -199,8 +199,11 @@ pub(super) async fn handle_event(
                     // #16 review fix: activate clicked pane+section first;
                     // the popup anchors at the RAW pointer while the frozen
                     // operational target resolves from target_row.
+                    // #16 review fix: NO cursor write before validation —
+                    // open_context_menu sets the section cursor only after a
+                    // real Listed target is confirmed. Synthetic rows leave
+                    // both cursors untouched.
                     activate_section(&mut *state, pane, section);
-                    set_section_cursor(&mut *state, pane, section, target_row);
                     open_context_menu(
                         &mut *state,
                         mouse_ui,
