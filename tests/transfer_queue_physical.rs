@@ -243,7 +243,17 @@ async fn p1_p12_real_local_transfer_queue_acceptance() {
         runtime.request_pause(&id),
         Ok(PauseAction::AwaitSafeCheckpoint)
     );
-    assert_eq!(status(&runtime, &id), JobStatus::PausePending);
+    // The checkpoint waiter is spawned before request_pause() returns, so a fast
+    // executor may already have completed the truthful PausePending -> Paused
+    // transition by the caller's first status read.
+    let immediate_pause_status = status(&runtime, &id);
+    assert!(
+        matches!(
+            immediate_pause_status,
+            JobStatus::PausePending | JobStatus::Paused
+        ),
+        "pause request must be pending or already confirmed, got {immediate_pause_status:?}"
+    );
     wait_until(
         || status(&runtime, &id) == JobStatus::Paused,
         "pause reaches a real executor checkpoint",
