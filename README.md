@@ -279,6 +279,41 @@ extension mechanism. ARX does not ship an embedded Lua or WASM plugin runtime.
 The partial rows above are intentionally explicit. They reflect the current canonical
 action-registration/runtime truth rather than old issue titles or prototype code.
 
+## Configurable keybindings
+
+Key bindings for the KeyRouter-managed contexts (`browser`, `sync_preview`,
+`sync_confirmation`, `sync_job`) can be overridden in the config file:
+
+```toml
+[[keybindings]]
+context = "browser"
+action = "open_storage_inspector"
+keys = "F11"
+
+[[keybindings]]
+context = "browser"
+action = "open_smart_tree"
+disabled = true
+```
+
+- Exactly one of `keys` (non-empty sequence, e.g. `"F11"`, `"Ctrl+X P"`) or
+  `disabled = true` is required per entry.
+- Overrides replace all built-in bindings (including compatibility aliases) for that
+  context/action pair and appear as `user` bindings in `arx --print-keymap`.
+- Only KeyRouter-managed action/context pairs are configurable; navigation keys owned
+  by legacy browser routes (Tab, Enter, arrows, …) cannot be rebound and conflicts with
+  them fail startup clearly instead of silently misbehaving.
+- Duplicate or prefix-conflicting sequences inside one context are configuration
+  errors; reusing a sequence across different contexts is fine.
+- Inspect the effective map any time with:
+
+```
+arx --print-keymap
+```
+
+`--config <path>` loads exactly that file — a missing or malformed explicit config is
+an error, never silently replaced by defaults.
+
 ## Typed local Quick Actions
 
 Quick Actions are built-in typed actions discovered through **Ctrl+P Command Center**;

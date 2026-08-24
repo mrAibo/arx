@@ -18,6 +18,9 @@ Repository: `mrAibo/arx`
   release has shipped since this snapshot).
 - Rust MSRV: **1.88**
 - Product platform: **Linux only**; published artifact target is Linux x86_64.
+- Current product work: **#214 configurable effective keymap** on branch
+  `feat/214-effective-keymap`; baseline entering #214:
+  `8444820bcb6b392e77a2cffad326b80b39d880b3`. Do NOT invent its future merge SHA.
 - Current `main` / accepted PACK R merge: `1def3adf382978491ce11590470f56d844bcce07`
   (PR #232 / #231).
 - Provenance entering R: `578d52d685dec7454025521e6d06491273503239`. Its tree was
@@ -98,6 +101,8 @@ and explicit, separately reviewed future decisions:
 - #10 mouse follow-ups remain separate.
 - External plugins remain **no GO** (see §5). Any evaluation after R is a fresh
   decision gate, not a scheduled implementation.
+- #233 remains a separate reliability observation (transfer-queue timing test);
+  do NOT fold it into #214.
 
 ## 5. External plugins — explicitly deferred
 
