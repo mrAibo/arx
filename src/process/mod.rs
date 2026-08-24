@@ -528,8 +528,16 @@ impl ProcessService {
             .map_err(|error| Self::missing_binary_message("tmux", error))?;
 
         if !output.status.success() {
-            // tmux exits nonzero when the server has no sessions: truthful empty.
-            return Ok(Vec::new());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !tmux_nonzero_means_no_sessions(&stderr) {
+                // Genuine failure (permission/protocol/anything unexpected):
+                // never disguise it as "no sessions".
+                return Err(format!(
+                    "tmux list-sessions failed (exit {})",
+                    output.status.code().unwrap_or(-1)
+                ));
+            }
+            return Ok(Vec::new()); // known normal absence
         }
 
         Ok(String::from_utf8_lossy(&output.stdout)
@@ -568,27 +576,40 @@ impl ProcessService {
         Ok(sessions)
     }
 
-    /// Interactive multiplexer attach (#7): argv construction stays HERE.
+    /// Interactive multiplexer attach (#7 review fix): TYPED input only.
     ///
-    /// Runs the real interactive attach (`tmux attach-session -t <id>` /
-    /// `screen -r <id>`) and returns a typed event. The TUI wraps this call in
-    /// `TuiTerminalSession::suspend_while`; this function never touches the
-    /// terminal itself.
-    pub async fn attach_multiplexer(program: &str, session: &str) -> EffectEvent {
-        let label = format!("{program}:{session}");
-        let args: &[&str] = if program == "tmux" {
-            &["attach-session", "-t", session]
-        } else {
-            &["-r", session]
+    /// Accepts exactly `Effect::AttachTmux` / `Effect::AttachScreen`; anything
+    /// else fails closed without spawning a process. Argv construction stays
+    /// HERE (argv authority); labels are STATIC — the raw external session id
+    /// is operational argv identity and must never leak into presentation.
+    /// The TUI wraps this call in `TuiTerminalSession::suspend_while`.
+    pub async fn attach_multiplexer(effect: Effect) -> EffectEvent {
+        // Typed dispatch only — no program-string selection authority.
+        let (program, owned_args, label): (&str, Vec<String>, &'static str) = match effect {
+            Effect::AttachTmux { session } => (
+                "tmux",
+                vec!["attach-session".into(), "-t".into(), session.clone()],
+                "tmux attach",
+            ),
+            Effect::AttachScreen { session } => {
+                ("screen", vec!["-r".into(), session], "screen attach")
+            }
+            other => {
+                return EffectEvent::Failed {
+                    label: "multiplexer attach".into(),
+                    error: format!(
+                        "unexpected effect for interactive multiplexer attach: {other:?}"
+                    ),
+                };
+            }
         };
-        let owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
-        match Self::status(program, &owned, None).await {
+        match Self::status(program, &owned_args, None).await {
             Ok(status) => EffectEvent::ProcessExited {
-                label,
+                label: label.into(),
                 success: status.success(),
             },
             Err(error) => EffectEvent::Failed {
-                label,
+                label: label.into(),
                 error: Self::missing_binary_message(program, error),
             },
         }
@@ -602,6 +623,14 @@ impl ProcessService {
             error.to_string()
         }
     }
+}
+
+/// Pure classification (#7 review fix): tmux exits nonzero for normal
+/// no-server / no-sessions absence. Only those known phrases mean "empty";
+/// everything else (permissions, protocol errors, ...) is a real failure.
+fn tmux_nonzero_means_no_sessions(stderr: &str) -> bool {
+    let normalized = stderr.to_lowercase();
+    normalized.contains("no server running") || normalized.contains("no sessions")
 }
 
 #[cfg(test)]
@@ -704,6 +733,70 @@ mod tests {
             assert_eq!(parsed[0].id, "2.beta"); // input order preserved
             assert_eq!(parsed[1].id, "1.alpha");
             assert_eq!(parsed, parse_screen_ls(out));
+        }
+
+        // ── tmux nonzero-exit classification (#7 review fix) ──
+        #[test]
+        fn r7_tmux_no_server_means_absence() {
+            assert!(tmux_nonzero_means_no_sessions(
+                "no server running on /tmp/tmux-0/default"
+            ));
+            assert!(tmux_nonzero_means_no_sessions("NO SESSIONS"));
+        }
+
+        #[test]
+        fn r7_tmux_real_failures_never_mean_no_sessions() {
+            assert!(!tmux_nonzero_means_no_sessions(
+                "permission denied connecting to socket"
+            ));
+            assert!(!tmux_nonzero_means_no_sessions("protocol version mismatch"));
+            assert!(!tmux_nonzero_means_no_sessions(
+                "server exited unexpectedly"
+            ));
+            assert!(!tmux_nonzero_means_no_sessions(""));
+        }
+
+        #[tokio::test]
+        async fn r7_attach_rejects_unexpected_effect_without_spawning() {
+            let event = ProcessService::attach_multiplexer(Effect::ListScreenSessions).await;
+            match event {
+                EffectEvent::Failed { label, error } => {
+                    assert_eq!(label, "multiplexer attach");
+                    assert!(
+                        error.contains("unexpected effect"),
+                        "bounded routing error expected: {error}"
+                    );
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn r7_screen_parser_raw_id_survives_control_chars() {
+            // Raw identity with an embedded control char stays EXACT for argv.
+            let out = "\t123.demo\u{1b}[31m\t(Detached)\n";
+            let parsed = parse_screen_ls(out);
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].id, "123.demo\u{1b}[31m");
+        }
+
+        #[tokio::test]
+        async fn r7_attach_labels_are_static_never_interpolate_session() {
+            let hostile = "x\u{1b}\n;rm".to_string();
+            let effect = Effect::AttachTmux {
+                session: hostile.clone(),
+            };
+            // NotFound locally (no tmux in unit-test PATH guarantee) OR success:
+            // either way the label must be the static one with no raw id.
+            match ProcessService::attach_multiplexer(effect).await {
+                EffectEvent::ProcessExited { label, .. } => {
+                    assert_eq!(label, "tmux attach");
+                }
+                EffectEvent::Failed { label, .. } => {
+                    assert_eq!(label, "tmux attach");
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
         }
 
         #[test]

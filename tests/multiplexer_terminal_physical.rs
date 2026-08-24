@@ -88,8 +88,13 @@ async fn physical_attach_child() {
     assert!(matches!(kind.as_str(), "tmux" | "screen"));
 
     let mut terminal = TuiTerminalSession::enter().expect("enter terminal lifecycle");
+    let effect = match kind.as_str() {
+        "tmux" => arx::effects::Effect::AttachTmux { session },
+        "screen" => arx::effects::Effect::AttachScreen { session },
+        other => panic!("unexpected CHILD multiplexer kind: {other}"),
+    };
     let event = terminal
-        .suspend_while(|| async { ProcessService::attach_multiplexer(&kind, &session).await })
+        .suspend_while(move || async move { ProcessService::attach_multiplexer(effect).await })
         .await
         .expect("terminal resume failed");
 

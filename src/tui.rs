@@ -1750,21 +1750,32 @@ fn cancel_job_product_route(state: &mut AppState, sync: &SyncUiRuntime, job_id: 
 /// returned typed `EffectEvent` is fed through the existing presentation seam.
 async fn execute_multiplexer_attach(
     state: &mut AppState,
-    multiplexer: Multiplexer,
-    session: String,
+    effect: Effect,
     terminal_session: &mut TuiTerminalSession,
     pane_loader: &PaneLoader,
 ) -> io::Result<()> {
-    let (program, label) = match multiplexer {
-        Multiplexer::Tmux => ("tmux", format!("Attaching tmux: {session}")),
-        Multiplexer::Screen => ("screen", format!("Attaching screen: {session}")),
+    // Fail closed BEFORE suspend for anything but the two attach variants.
+    let (raw_session, verb): (&str, &str) = match &effect {
+        Effect::AttachTmux { session } => (session, "tmux"),
+        Effect::AttachScreen { session } => (session, "screen"),
+        other => {
+            state.message = Some(format!(
+                "unexpected effect for interactive multiplexer attach: {other:?}"
+            ));
+            return Ok(());
+        }
     };
+    // Display-safe presentation only; the raw Effect payload stays exact.
+    let label = format!(
+        "Attaching {verb}: {}",
+        quick_actions::display_safe_text(raw_session)
+    );
     // Neutral message only — ARX claims nothing about multiplexer prefixes.
     state.message = Some(label.clone());
 
     let event = terminal_session
         .suspend_while(move || async move {
-            arx::process::ProcessService::attach_multiplexer(program, &session).await
+            arx::process::ProcessService::attach_multiplexer(effect).await
         })
         .await?;
 
@@ -1777,13 +1788,6 @@ async fn execute_multiplexer_attach(
     }
     effect_responses::apply_effect_event(state, EffectLane::GlobalProcess, event);
     Ok(())
-}
-
-/// Which interactive multiplexer to attach to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Multiplexer {
-    Tmux,
-    Screen,
 }
 
 // ponytail: a context struct would only hide these already-scoped runtime services.
@@ -1859,8 +1863,7 @@ async fn execute_command_target(
         CommandTarget::TmuxSession(session) => {
             execute_multiplexer_attach(
                 state,
-                Multiplexer::Tmux,
-                session,
+                Effect::AttachTmux { session },
                 terminal_session,
                 pane_loader,
             )
@@ -1870,8 +1873,7 @@ async fn execute_command_target(
         CommandTarget::ScreenSession(session) => {
             execute_multiplexer_attach(
                 state,
-                Multiplexer::Screen,
-                session,
+                Effect::AttachScreen { session },
                 terminal_session,
                 pane_loader,
             )
