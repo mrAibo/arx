@@ -97,6 +97,24 @@ pub(super) fn section_at_point(
     None
 }
 
+/// One rendered subview surface plus its active-border flag.
+pub(super) type SurfacePlan = (Rect, bool);
+/// Primary plan + optional secondary plan (None => primary-only render).
+pub(super) type RenderPlan = Option<(SurfacePlan, Option<SurfacePlan>)>;
+
+/// #16 review fix: derive the RENDER PLAN from geometry + focus state.
+///
+/// `secondary == None` (axis < 2) means primary-only: exactly one surface,
+/// always active when the outer pane is active, regardless of the hidden
+/// split_active. Pure derivation — no state mutation.
+pub(super) fn render_plan(rects: SplitRects, outer_active: bool, split_active: bool) -> RenderPlan {
+    let secondary = rects.secondary?;
+    Some((
+        (rects.primary, outer_active && !split_active),
+        Some((secondary, outer_active && split_active)),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +205,59 @@ mod tests {
         assert_eq!(section, SplitSection::Secondary);
         assert_eq!(sec_rect.y, 5);
         assert!(section_at_point(&rects, 200, 200).is_none());
+    }
+}
+
+#[cfg(test)]
+mod r16fix_tests {
+    use super::*;
+
+    /// Behavioral contract: with split_active=true but a degenerate split axis
+    /// (secondary=None), the visible render plan is PRIMARY-only — the hidden
+    /// secondary cursor/focus can never overwrite the primary surface.
+    #[test]
+    fn narrow_split_renders_primary_only_even_when_secondary_has_focus() {
+        let area = Rect::new(0, 0, 1, 30); // width 1 => vertical axis < 2
+        let rects = split_rects(area, true, SplitOrientation::Vertical, 50);
+        assert!(
+            rects.secondary.is_none(),
+            "precondition: axis<2 hides secondary"
+        );
+
+        // split_active=true & hidden: None plan == primary-only render.
+        assert!(
+            render_plan(rects, true, true).is_none(),
+            "hidden secondary must not be rendered"
+        );
+        // The visible primary surface is the full pane area (from geometry).
+        assert_eq!(rects.primary, area);
+
+        // And the same for horizontal orientation.
+        let rects = split_rects(
+            Rect::new(0, 0, 40, 1),
+            true,
+            SplitOrientation::Horizontal,
+            50,
+        );
+        assert!(render_plan(rects, true, true).is_none());
+        assert_eq!(rects.secondary, None);
+    }
+
+    /// Both-visible case: focus follows split_active exactly as before.
+    #[test]
+    fn wide_split_focus_follows_split_active() {
+        let rects = split_rects(
+            Rect::new(0, 0, 100, 10),
+            true,
+            SplitOrientation::Vertical,
+            50,
+        );
+        let (primary, secondary) = render_plan(rects, true, false).unwrap();
+        assert!(primary.1 && !secondary.unwrap().1);
+        let (primary, secondary) = render_plan(rects, true, true).unwrap();
+        assert!(!primary.1 && secondary.unwrap().1);
+        // Inactive outer pane: neither subview shows active borders.
+        let (primary, secondary) = render_plan(rects, false, true).unwrap();
+        assert!(!primary.1 && !secondary.unwrap().1);
     }
 }

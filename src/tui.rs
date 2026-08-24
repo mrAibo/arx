@@ -774,6 +774,11 @@ fn render(
         .selection_names(Pane::Right, &state.right.location)
         .unwrap_or(&empty_selection);
 
+    // #16 review fix: when the split axis is too small, split_rects returns
+    // secondary=None — render EXACTLY ONE primary surface; the hidden
+    // secondary cursor/focus must never overwrite it. Hidden split state is
+    // preserved for a later terminal resize. Focus plan comes from the pure
+    // split_layout::render_plan helper.
     if state.left.split {
         let rects = split_layout::split_rects(
             panes[0],
@@ -781,39 +786,60 @@ fn render(
             state.left.split_orientation,
             state.left.split_ratio,
         );
-        let (a1, a2) = match rects.secondary {
-            Some(sec) => (rects.primary, sec),
-            None => (rects.primary, rects.primary), // narrow terminal: primary-only
-        };
-        let act1 = state.active == Pane::Left && !state.left.split_active
-            || rects.secondary.is_none() && state.active == Pane::Left;
-        let act2 = state.active == Pane::Left && state.left.split_active;
-        left_list.select(Some(state.left.cursor));
-        split_left_list.select(Some(state.left.split_cursor));
-        render_pane(
-            frame,
-            a1,
-            &state.left,
-            left_entries,
-            pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
-            left_list,
-            act1,
-            left_selection,
-            &left_only,
-            state.panel_mode,
-        );
-        render_pane(
-            frame,
-            a2,
-            &state.left,
-            left_entries,
-            pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
-            split_left_list,
-            act2,
-            left_selection,
-            &left_only,
-            state.panel_mode,
-        );
+        let secondary_plan =
+            split_layout::render_plan(rects, state.active == Pane::Left, state.left.split_active);
+        if let Some(((a1, act1), _)) = secondary_plan {
+            left_list.select(Some(state.left.cursor));
+            render_pane(
+                frame,
+                a1,
+                &state.left,
+                left_entries,
+                pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
+                left_list,
+                act1,
+                left_selection,
+                &left_only,
+                state.panel_mode,
+            );
+            if let Some(secondary) = rects.secondary {
+                let (_, act2) = split_layout::render_plan(
+                    rects,
+                    state.active == Pane::Left,
+                    state.left.split_active,
+                )
+                .unwrap()
+                .1
+                .unwrap();
+                split_left_list.select(Some(state.left.split_cursor));
+                render_pane(
+                    frame,
+                    secondary,
+                    &state.left,
+                    left_entries,
+                    pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
+                    split_left_list,
+                    act2,
+                    left_selection,
+                    &left_only,
+                    state.panel_mode,
+                );
+            }
+        } else {
+            // Narrow axis: primary-only, active with the outer pane.
+            render_pane(
+                frame,
+                panes[0],
+                &state.left,
+                left_entries,
+                pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
+                left_list,
+                state.active == Pane::Left,
+                left_selection,
+                &left_only,
+                state.panel_mode,
+            );
+        }
     } else {
         render_pane(
             frame,
@@ -836,39 +862,78 @@ fn render(
                 state.right.split_orientation,
                 state.right.split_ratio,
             );
-            let (a1, a2) = match rects.secondary {
-                Some(sec) => (rects.primary, sec),
-                None => (rects.primary, rects.primary), // narrow: primary-only
-            };
-            let act1 = state.active == Pane::Right && !state.right.split_active
-                || rects.secondary.is_none() && state.active == Pane::Right;
-            let act2 = state.active == Pane::Right && state.right.split_active;
-            right_list.select(Some(state.right.cursor));
-            split_right_list.select(Some(state.right.split_cursor));
-            render_pane(
-                frame,
-                a1,
-                &state.right,
-                right_entries,
-                pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
-                right_list,
-                act1,
-                right_selection,
-                &right_only,
-                state.panel_mode,
+            let secondary_plan = split_layout::render_plan(
+                rects,
+                state.active == Pane::Right,
+                state.right.split_active,
             );
-            render_pane(
-                frame,
-                a2,
-                &state.right,
-                right_entries,
-                pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
-                split_right_list,
-                act2,
-                right_selection,
-                &right_only,
-                state.panel_mode,
-            );
+            if let Some(((a1, act1), _)) = secondary_plan {
+                right_list.select(Some(state.right.cursor));
+                render_pane(
+                    frame,
+                    a1,
+                    &state.right,
+                    right_entries,
+                    pane_surface_state(
+                        state,
+                        Pane::Right,
+                        right_total_entries,
+                        right_entries.len(),
+                    ),
+                    right_list,
+                    act1,
+                    right_selection,
+                    &right_only,
+                    state.panel_mode,
+                );
+                if let Some(secondary) = rects.secondary {
+                    let (_, act2) = split_layout::render_plan(
+                        rects,
+                        state.active == Pane::Right,
+                        state.right.split_active,
+                    )
+                    .unwrap()
+                    .1
+                    .unwrap();
+                    split_right_list.select(Some(state.right.split_cursor));
+                    render_pane(
+                        frame,
+                        secondary,
+                        &state.right,
+                        right_entries,
+                        pane_surface_state(
+                            state,
+                            Pane::Right,
+                            right_total_entries,
+                            right_entries.len(),
+                        ),
+                        split_right_list,
+                        act2,
+                        right_selection,
+                        &right_only,
+                        state.panel_mode,
+                    );
+                }
+            } else {
+                // Narrow axis: primary-only.
+                render_pane(
+                    frame,
+                    panes[1],
+                    &state.right,
+                    right_entries,
+                    pane_surface_state(
+                        state,
+                        Pane::Right,
+                        right_total_entries,
+                        right_entries.len(),
+                    ),
+                    right_list,
+                    state.active == Pane::Right,
+                    right_selection,
+                    &right_only,
+                    state.panel_mode,
+                );
+            }
         } else {
             render_pane(
                 frame,
@@ -6419,6 +6484,7 @@ mod r10_mouse_tests {
             &mut mouse_ui,
             Pane::Left,
             7,
+            7, // absolute pointer row
             1, // pane row 1 = Listed "alpha" (row 0 is Parent)
             &left_visible,
             None,
@@ -6444,7 +6510,8 @@ mod r10_mouse_tests {
             &mut mouse_ui,
             Pane::Left,
             7,
-            1,
+            7, // absolute pointer row
+            1, // pane row 1 = "alpha"
             &left_visible,
             None,
         );
@@ -6460,8 +6527,9 @@ mod r10_mouse_tests {
             &mut state,
             &mut mouse_ui,
             Pane::Left,
-            7,
-            2,
+            8,
+            8, // absolute pointer row
+            2, // pane row 2 = "beta"
             &left_visible,
             None,
         );
@@ -6479,8 +6547,9 @@ mod r10_mouse_tests {
             &mut state,
             &mut mouse_ui,
             Pane::Left,
-            7,
-            0,
+            6,
+            6, // absolute pointer over first visible row
+            0, // target = Parent
             &left_visible,
             None,
         );
@@ -6489,8 +6558,9 @@ mod r10_mouse_tests {
             &mut state,
             &mut mouse_ui,
             Pane::Left,
-            7,
-            3,
+            9,
+            9, // absolute pointer row (unused for target)
+            3, // target = LoadMore
             &left_visible,
             None,
         );
@@ -6538,7 +6608,7 @@ mod r10_review_tests {
 
     fn open_menu(state: &mut AppState, mouse_ui: &mut MouseUiState) {
         let left_visible = rows();
-        open_context_menu_for_test(state, mouse_ui, Pane::Left, 5, 1, &left_visible, None);
+        open_context_menu_for_test(state, mouse_ui, Pane::Left, 5, 7, 1, &left_visible, None);
     }
 
     #[test]
@@ -6613,7 +6683,8 @@ mod r10_review_tests {
                 &mut mouse_ui,
                 Pane::Left,
                 5,
-                1,
+                7, // absolute pointer row
+                1, // target = "alpha"
                 &left_visible,
                 None,
             );

@@ -108,10 +108,11 @@ pub(super) enum MouseRoute {
         section: SplitSection,
     },
     ContextMenu {
-        column: u16,
-        row: u16,
+        anchor_column: u16,
+        anchor_row: u16,
         pane: Pane,
         section: SplitSection,
+        target_row: usize,
     },
     RangeSelect {
         pane: Pane,
@@ -198,11 +199,14 @@ pub(super) fn classify(state: &AppState, mouse: MouseEvent) -> MouseRoute {
         MouseEventKind::ScrollUp if !state.viewer_content.is_empty() => MouseRoute::ViewerScrollUp,
         MouseEventKind::ScrollDown => MouseRoute::PaneScrollDown { pane, section },
         MouseEventKind::ScrollUp => MouseRoute::PaneScrollUp { pane, section },
+        // #16 review fix: anchor (raw pointer, for popup placement) is kept
+        // SEPARATE from target_row (section-relative listing index).
         MouseEventKind::Down(MouseButton::Right) => MouseRoute::ContextMenu {
-            column: mouse.column,
-            row: mouse.row,
+            anchor_column: mouse.column,
+            anchor_row: mouse.row,
             pane,
             section,
+            target_row: row,
         },
         // Shift+Click is an explicit inclusive range selection.
         MouseEventKind::Down(MouseButton::Left)
@@ -379,10 +383,11 @@ mod tests {
                 mouse(MouseEventKind::Down(MouseButton::Right), 11, 7)
             ),
             MouseRoute::ContextMenu {
-                column: 11,
-                row: 7,
+                anchor_column: 11,
+                anchor_row: 7,
                 pane: Pane::Left,
-                section: SplitSection::Primary
+                section: SplitSection::Primary,
+                target_row: 1,
             }
         );
     }

@@ -183,10 +183,11 @@ pub(super) async fn handle_event(
                 }
                 mouse::MouseRoute::ContextMenu { .. } if state.active_overlay().is_some() => {}
                 mouse::MouseRoute::ContextMenu {
-                    column,
-                    row,
+                    anchor_column,
+                    anchor_row,
                     pane,
                     section,
+                    target_row,
                 } => {
                     let rows: &[VisiblePaneRow<'_>] = if pane == Pane::Left {
                         left_visible
@@ -195,13 +196,17 @@ pub(super) async fn handle_event(
                     };
                     // #16 11E: activate clicked pane+section first; the frozen
                     // operational target stays (Pane, Location, ListedEntry).
+                    // #16 review fix: activate clicked pane+section first;
+                    // the popup anchors at the RAW pointer while the frozen
+                    // operational target resolves from target_row.
                     activate_section(&mut *state, pane, section);
+                    set_section_cursor(&mut *state, pane, section, target_row);
                     open_context_menu(
                         &mut *state,
                         mouse_ui,
                         pane,
-                        column,
-                        row,
+                        (anchor_column, anchor_row),
+                        target_row,
                         rows,
                         configured_editor,
                     );
@@ -1339,6 +1344,20 @@ async fn handle_context_menu_mouse(
 
 /// #16 11B: explicit pointer interaction — activate the clicked outer pane,
 /// set section focus, return the pane state fields for that section.
+/// Current presentation focus of the pane (#16): Secondary when a split is
+/// open and the secondary subview holds focus.
+fn split_section_of(state: &AppState, _pane: Pane) -> SplitSection {
+    let pane_state = match _pane {
+        Pane::Left => &state.left,
+        Pane::Right => &state.right,
+    };
+    if pane_state.split && pane_state.split_active {
+        SplitSection::Secondary
+    } else {
+        SplitSection::Primary
+    }
+}
+
 fn activate_section(state: &mut AppState, pane: Pane, section: SplitSection) {
     state.active = pane;
     let pane_state = match pane {
@@ -1460,14 +1479,17 @@ fn open_context_menu(
     state: &mut AppState,
     mouse_ui: &mut MouseUiState,
     pane: Pane,
-    column: u16,
-    row: u16,
+    anchor: (u16, u16),
+    target_row: usize,
     visible: &[VisiblePaneRow<'_>],
     configured_editor: Option<&str>,
 ) {
-    let _ = column; // anchor uses the raw pointer position from the route
+    let _ = anchor; // popup placement uses the RAW pointer coordinates only
+    let _ = configured_editor;
     mouse_ui.frame_area = None;
-    let Some(listed_entry) = visible.get(row as usize).and_then(|row| row.listed()) else {
+    // #16 review fix: the listing target resolves from the SECTION-RELATIVE
+    // row — NEVER from the absolute terminal pointer row.
+    let Some(listed_entry) = visible.get(target_row).and_then(|row| row.listed()) else {
         // Parent / LoadMore / out of range: never a file-action target.
         state.close_overlay(arx::app::OverlayKind::ContextMenu);
         mouse_ui.close_context_menu();
@@ -1488,22 +1510,15 @@ fn open_context_menu(
         state.clear_selection();
     }
 
-    let pane_state = if pane == Pane::Left {
-        &mut state.left
-    } else {
-        &mut state.right
-    };
-    if pane_state.split && pane_state.split_active {
-        pane_state.split_cursor = row as usize;
-    } else {
-        pane_state.cursor = row as usize;
-    }
+    // Cursor of the clicked section follows the target row.
+    let focus_section = split_section_of(state, pane);
+    set_section_cursor(state, pane, focus_section, target_row);
     state.active = pane;
 
     let items = mouse::build_context_menu_items(state, listed_entry.entry.kind, configured_editor);
     state.open_overlay(arx::app::OverlayKind::ContextMenu);
     mouse_ui.context_menu = Some(ContextMenuState {
-        anchor: (column, row),
+        anchor,
         items,
         target: ContextMenuTarget {
             pane,
@@ -1668,8 +1683,9 @@ pub(crate) mod input_dispatch_helpers_for_test {
         state: &mut AppState,
         mouse_ui: &mut MouseUiState,
         pane: Pane,
-        column: u16,
-        row: u16,
+        anchor_column: u16,
+        anchor_row: u16,
+        target_row: usize,
         visible: &[VisiblePaneRow<'_>],
         configured_editor: Option<&str>,
     ) {
@@ -1677,8 +1693,8 @@ pub(crate) mod input_dispatch_helpers_for_test {
             state,
             mouse_ui,
             pane,
-            column,
-            row,
+            (anchor_column, anchor_row),
+            target_row,
             visible,
             configured_editor,
         )
