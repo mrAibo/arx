@@ -48,22 +48,27 @@ Backlog truth after PACK O:
 - **WebDAV:** the supported Apache mod_dav MVP is shipped; #13 tracks only post-MVP
   auth/interoperability/recursive-operation work.
 
-## ACTIVE DEVELOPMENT SEQUENCE — PACK P → Q → R
+## ACTIVE DEVELOPMENT SEQUENCE — ARCHITECTURE PACKS
 
 The canonical continuation document is [`docs/DEVELOPMENT_HANDOFF.md`](docs/DEVELOPMENT_HANDOFF.md).
-The architecture sequence is tracked by umbrella issue **#180**.
+The original sequence was tracked by umbrella issue **#180**; PACK Q is tracked by
+umbrella issue **#224**.
 
-The approved order after PACK O is strict:
+Status truth (PACK Q3 closeout):
 
-1. **PACK P — TUI decomposition.** Behavior-preserving decomposition of the >10k-line
-   `src/tui.rs` composition bottleneck: characterization tests, rendering extraction,
-   feature controllers, keyboard/mouse routing, Effect/Job response handling, then a
-   thin runtime/event loop. No product features and no public plugin API.
-2. **PACK Q — VFS convergence.** Finish the phased ProviderRegistry migration by
-   removing duplicate execution authority. Preserve `Location` as typed identity/address
-   where useful; make `ProviderRegistry` the execution authority and `CapabilitySet`
-   the capability truth.
-3. **PACK R — internal feature/command registration.** Introduce only the smallest
+1. **PACK P — TUI decomposition.** COMPLETE. Behavior-preserving decomposition of the
+   >10k-line `src/tui.rs` composition bottleneck: characterization tests, rendering
+   extraction, feature controllers, keyboard/mouse routing, Effect/Job response
+   handling, then a thin runtime/event loop. No product features and no public plugin API.
+2. **PACK Q — VFS convergence.** COMPLETE with Q3 (#229). Q1 made capability truth
+   concrete-location aware (merge `872298913640a7add5ed4a19748a66f9a8de3113`);
+   Q2 removed the legacy `Location` execution bridge and the thread-local registry
+   (merge `b8e5f9a5761875d6b25dfa047d9b93af5619b1f6`); Q3 finalizes resolver
+   authority and documentation truth. `Location` remains typed identity/address,
+   `ProviderRegistry` is the execution authority, `CapabilitySet` is exact-location
+   capability truth, and both provider resolver seams are a deliberate design.
+3. **PACK R — internal feature/command registration.** NEXT after the Q3 merge.
+   Introduce only the smallest
    internal registration layer proven necessary after P/Q. Migrate Quick Actions,
    Storage Inspector, and SSH Host Manager as proof consumers. Do not freeze a broad
    public `FeatureModule` plugin trait prematurely.
@@ -73,7 +78,7 @@ The approved order after PACK O is strict:
 
 GitHub state and exact SHAs are authoritative over stale chat summaries or cached
 reviews. A new development session should read the handoff document, this roadmap,
-issue #180, and the current PACK P planning state before changing code.
+issue #180, and the current state of umbrella issue #224 before changing code.
 
 ## RELEASED — v0.17.0 (2026-08-16)
 
@@ -263,9 +268,9 @@ invent X11 forwarding state.
 
 ## FUTURE PRODUCT BACKLOG
 
-Architecture packs P/Q/R take precedence after PACK O because they reduce the current
-composition and dispatch bottlenecks. The product backlog remains active and should not
-be lost during those refactors.
+The architecture packs O → P → Q removed the largest composition and dispatch
+bottlenecks; PACK R completes that sequence after the Q3 closeout merge. The product
+backlog remains active and should not be lost during those refactors.
 
 Near-term product follow-ups after the architecture sequence:
 
