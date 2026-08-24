@@ -524,14 +524,15 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
 
     /// Provider-side paginated listing contract.
     ///
-    /// `location` is the typed `Location` (NOT a flattened `&str` path) so future
-    /// S3 listing can distinguish target-root, bucket, and prefix without encoding
-    /// them into a pseudo-filesystem path. Default impl wraps the existing
-    /// `list_async` path: for `continuation == None` it lists and converts each
-    /// `Entry` into `ListedEntry { entry, identity: EntryIdentity::Other }` with
-    /// `continuation: None`. For `continuation == Some(..)` on an unpaged provider
-    /// it fails closed with `Unsupported` rather than silently re-running page 1.
-    // ponytail: transitional adapter; S3 overrides this later without path flattening
+    /// `location` is the typed `Location` (NOT a flattened `&str` path), so
+    /// typed/native-identity providers distinguish target-root, bucket, and
+    /// prefix without encoding them into a pseudo-filesystem path. The default
+    /// implementation serves unpaged/string-path-compatible providers: for
+    /// `continuation == None` it wraps `list_async` and converts each `Entry`
+    /// into `ListedEntry { entry, identity: EntryIdentity::Other }` with
+    /// `continuation: None`; for `continuation == Some(..)` on an unpaged
+    /// provider it fails closed with `Unsupported` rather than silently
+    /// re-running page 1. Typed providers (S3, WebDAV) override this contract.
     async fn list_page(
         &self,
         location: &Location,
@@ -1246,11 +1247,12 @@ impl ProviderRegistry {
 
     /// Provider-side paginated listing entry point.
     ///
-    /// Selects the concrete provider via existing provider-instance routing and
-    /// invokes the provider `list_page` contract. S3 remains fail-closed at
-    /// routing (no client/provider construction). `list_location` /
-    /// `list_location_async` are unchanged for existing PaneLoader consumers.
-    // Page contract rides the typed resolver; no path flattening anywhere.
+    /// Selects the concrete provider via the typed page/native-identity
+    /// resolver and invokes the provider `list_page` contract: configured S3
+    /// and WebDAV locations resolve their exact configured target provider;
+    /// unknown target IDs fail closed. No typed identity/path flattening
+    /// occurs. (The separate string-path seam `provider_for_location` is where
+    /// S3 fails closed before any provider construction.)
     pub async fn list_page(
         &self,
         loc: &Location,
@@ -1508,8 +1510,9 @@ impl Location {
                 let last = inner_path.rsplit('/').next().unwrap_or(inner_path);
                 last.to_string()
             }
-            // ponytail: label is the exact target id; no config/display-name lookup
-            // ponytail: S3-10 owns final label identity; temporary control-safe rep
+            // Intentionally generic pane label; exact S3 target identity lives
+            // in the Location / ProviderInstanceKey / typed refs, never derived
+            // from presentation text.
             Self::S3 { .. } => "S3".to_string(),
             Self::WebDav { target, path } => {
                 let last = path.rsplit('/').next().unwrap_or(path);
@@ -1549,8 +1552,8 @@ impl Location {
                     inner_path: child,
                 }
             }
-            // ponytail: S3 exact navigation uses S3BucketRef/S3PrefixRef later
-            // (S3-23/24); generic child(name) must not retarget from display text
+            // Deliberately fail-closed identity: generic child(name) must not
+            // invent S3 object identity; dedicated S3 paths own navigation.
             Self::S3 { .. } => self.clone(),
             Self::WebDav { target, path } => {
                 let base = path.trim_end_matches('/');
@@ -1644,7 +1647,8 @@ impl Location {
                     inner_path: parent.to_string(),
                 })
             }
-            // ponytail: S3-25 owns virtual-parent semantics; fail-closed until then
+            // Deliberately fail-closed: generic parent must not invent S3
+            // virtual-parent semantics; dedicated S3 paths own that.
             Self::S3 { .. } => None,
             Self::WebDav { target, path } => {
                 let current = path.trim_end_matches('/');
@@ -1972,7 +1976,8 @@ mod tests {
             bucket: None,
             prefix: "".into(),
         };
-        // temporary control-safe label; exact target preserved in instance key
+        // Generic control-safe label by design; exact target preserved in
+        // instance key / typed identity, not in the label.
         assert_eq!(loc.label(), "S3");
         assert_eq!(
             ProviderRegistry::instance_key_for_location(&loc),
@@ -2124,7 +2129,7 @@ mod tests {
     }
 
     #[test]
-    fn s3_provider_routing_unavailable() {
+    fn s3_string_path_routing_stays_unsupported() {
         let loc = Location::S3 {
             target: "aws".into(),
             bucket: Some("b".into()),
@@ -2132,7 +2137,10 @@ mod tests {
         };
         let reg = ProviderRegistry::new();
         let res = reg.provider_for_location(&loc);
-        assert!(res.is_err(), "S3 routing must not be wired yet");
+        assert!(
+            res.is_err(),
+            "string-path resolver must keep S3 Unsupported/fail-closed"
+        );
     }
     #[test]
     fn formats_sftp_location() {
