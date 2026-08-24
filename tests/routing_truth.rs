@@ -5,7 +5,7 @@ use arx::app::{
 use arx::input::Keymap;
 
 #[test]
-fn action_catalog_contains_routing_truth_panels() {
+fn action_registration_contains_routing_truth_panels() {
     let cases = [
         (
             ActionId::OpenSmartTree,
@@ -25,7 +25,6 @@ fn action_catalog_contains_routing_truth_panels() {
         assert_eq!(meta.description, description);
         assert_eq!(meta.category, ActionCategory::Panels);
         assert!(!meta.destructive);
-        assert!(arx::app::registration_lookup(id));
     }
 }
 
@@ -121,4 +120,31 @@ fn action_infrastructure_escape_closes_through_overlay_state() {
     assert_eq!(state.active_overlay(), Some(OverlayKind::Infrastructure));
     state.close_overlay(OverlayKind::Infrastructure);
     assert_eq!(state.active_overlay(), None);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn storage_input_ownership_is_separate_from_launch_route() {
+    let dispatch = include_str!("../src/tui/input_dispatch.rs");
+    let browser_input = include_str!("../src/tui/browser_input.rs");
+
+    // Active-overlay key owner must exist and consume via the real handler.
+    assert!(
+        dispatch.contains("if state.show_storage_inspector"),
+        "input_dispatch must keep the active-overlay storage input owner"
+    );
+    assert!(
+        dispatch.contains("arx::storage_inspector_ui::handle_storage_inspector_key"),
+        "overlay input must route through handle_storage_inspector_key"
+    );
+
+    // The launch route belongs to the registered action path only.
+    assert!(
+        !browser_input.contains("OpenStorageInspector"),
+        "browser_input must not own the Storage launch route"
+    );
+    assert!(
+        !dispatch.contains("BrowserRoute::OpenStorageInspector"),
+        "input_dispatch must not keep the legacy direct-launch branch"
+    );
 }

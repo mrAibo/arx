@@ -4,7 +4,6 @@ use super::*;
 pub(super) enum BrowserRoute {
     Unhandled,
     #[cfg(target_os = "linux")]
-    #[cfg(target_os = "linux")]
     OpenFilesystems,
     TreeFilterBackspace,
     SwitchPane,
@@ -52,7 +51,6 @@ pub(super) enum BrowserRoute {
 pub(super) fn classify(state: &AppState, key: KeyEvent) -> BrowserRoute {
     use BrowserRoute::*;
 
-    #[cfg(target_os = "linux")]
     #[cfg(target_os = "linux")]
     if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::ALT) {
         return OpenFilesystems;

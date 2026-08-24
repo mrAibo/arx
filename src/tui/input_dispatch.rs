@@ -439,6 +439,17 @@ pub(super) async fn handle_event(
                 });
             }
 
+            // Active-overlay input owner (PACK R review fix): distinct from the
+            // Alt+U launch route. Once the overlay is up, this consumes keys.
+            #[cfg(target_os = "linux")]
+            if state.show_storage_inspector {
+                arx::storage_inspector_ui::handle_storage_inspector_key(&mut *state, key);
+                return Ok(InputDispatchOutcome {
+                    flow: InputFlow::ContinueLoop,
+                    entry_mutation: EntryMutation::None,
+                });
+            }
+
             #[cfg(target_os = "linux")]
             if state.show_filesystems {
                 arx::filesystem_usage_ui::handle_filesystems_key(&mut *state, key);

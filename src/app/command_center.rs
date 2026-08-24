@@ -100,8 +100,8 @@ fn kind_bias(kind: CommandKind) -> i64 {
 
 /// Empty Command Center is a discovery surface, not an alphabetic dump.
 ///
-/// This is ranking only: labels and execution still come from the shared
-/// Action Catalog and typed `Action` targets. Once the user types a query,
+/// This is ranking only: labels and execution still come from the canonical
+/// action registration and typed `Action` targets. Once the user types a query,
 /// normal text relevance owns ranking again.
 fn empty_query_action_bias(id: ActionId, state: &AppState) -> i64 {
     if state.remote_workspace.plan.is_some() {

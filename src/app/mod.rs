@@ -27,7 +27,6 @@ pub use actions::{
 mod availability;
 mod registration;
 pub use availability::{ActionAvailability, ActionContext, action_availability};
-pub use registration::registration_lookup;
 mod command_center;
 pub use command_center::{
     CommandItem, CommandKind, CommandTarget, build_command_items,

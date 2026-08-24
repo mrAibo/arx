@@ -583,12 +583,6 @@ pub fn registration_for(id: ActionId) -> Option<&'static Registration> {
     REGISTRATIONS.iter().find(|r| r.meta.id == id)
 }
 
-/// Test-facing lookup proving an id is registered (no second authority).
-#[doc(hidden)]
-pub fn registration_lookup(id: ActionId) -> bool {
-    registration_for(id).is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
