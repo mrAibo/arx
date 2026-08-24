@@ -449,3 +449,15 @@ fn workspace_sync_execution_stays_gated_behind_application_controller() {
         );
     }
 }
+
+#[test]
+fn vfs_module_has_no_legacy_execution_bridge() {
+    let vfs = include_str!("../src/vfs/mod.rs");
+    assert!(!vfs.contains("trait VfsOps"));
+    assert!(!vfs.contains("PROVIDER_REGISTRY"));
+    assert!(!vfs.contains("set_global_registry"));
+    assert!(!vfs.contains("with_registry_mut"));
+    assert!(vfs.contains("pub enum Location"));
+    assert!(vfs.contains("pub struct ProviderRegistry"));
+    assert!(vfs.contains("pub trait VfsProvider"));
+}

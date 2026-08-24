@@ -886,25 +886,6 @@ pub fn default_registry() -> ProviderRegistry {
     r
 }
 
-// ponytail: thread-local bridge during migration. Delete after all call sites
-// use ProviderRegistry directly (Phase 3).
-std::thread_local! {
-    static PROVIDER_REGISTRY: std::cell::RefCell<ProviderRegistry> =
-        std::cell::RefCell::new(ProviderRegistry::new());
-}
-
-// ponytail: one-shot init from AppState::default
-pub fn set_global_registry(r: ProviderRegistry) {
-    PROVIDER_REGISTRY.with(|cell| *cell.borrow_mut() = r);
-}
-
-pub(crate) fn with_registry_mut<F, R>(f: F) -> R
-where
-    F: FnOnce(&mut ProviderRegistry) -> R,
-{
-    PROVIDER_REGISTRY.with(|cell| f(&mut cell.borrow_mut()))
-}
-
 #[allow(clippy::derivable_impls)]
 impl Default for ProviderRegistry {
     fn default() -> Self {
@@ -1814,68 +1795,6 @@ pub(crate) fn canonical_unix_mtime_ms(seconds: u64) -> u64 {
 pub(crate) fn canonical_system_mtime_ms(time: std::time::SystemTime) -> Option<u64> {
     let duration = time.duration_since(std::time::UNIX_EPOCH).ok()?;
     Some(canonical_unix_mtime_ms(duration.as_secs()))
-}
-
-/// Abstract VFS operations — backend-agnostic interface.
-/// ponytail: trait object dispatch; full provider registry deferred to Wave 2.
-pub trait VfsOps {
-    fn list(&self) -> anyhow::Result<Vec<Entry>>;
-    fn read_head(&self, path: &str, lines: usize) -> anyhow::Result<Vec<String>>;
-    fn copy_files(&self, src_dir: &str, dst_dir: &str, names: &[String]) -> std::io::Result<usize>;
-    fn move_files(&self, src_dir: &str, dst_dir: &str, names: &[String]) -> std::io::Result<usize>;
-    fn delete_files(&self, dir: &str, names: &[String]) -> std::io::Result<usize>;
-}
-
-impl VfsOps for Location {
-    fn list(&self) -> anyhow::Result<Vec<Entry>> {
-        with_registry_mut(|r| r.list_location(self)).map_err(|e| anyhow::anyhow!("{e}"))
-    }
-
-    fn read_head(&self, path: &str, lines: usize) -> anyhow::Result<Vec<String>> {
-        match self {
-            Location::Local(_) => local::LocalFs::read_head(std::path::Path::new(path), lines)
-                .map_err(|e| anyhow::anyhow!("{e}")),
-            _ => Err(anyhow::anyhow!("read_head only supported for Local paths")),
-        }
-    }
-
-    fn copy_files(&self, src_dir: &str, dst_dir: &str, names: &[String]) -> std::io::Result<usize> {
-        match self {
-            Location::Local(_) => local::LocalFs::copy_files(
-                std::path::Path::new(src_dir),
-                std::path::Path::new(dst_dir),
-                names,
-            ),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "copy only supported for Local",
-            )),
-        }
-    }
-
-    fn move_files(&self, src_dir: &str, dst_dir: &str, names: &[String]) -> std::io::Result<usize> {
-        match self {
-            Location::Local(_) => local::LocalFs::move_files(
-                std::path::Path::new(src_dir),
-                std::path::Path::new(dst_dir),
-                names,
-            ),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "move only supported for Local",
-            )),
-        }
-    }
-
-    fn delete_files(&self, dir: &str, names: &[String]) -> std::io::Result<usize> {
-        match self {
-            Location::Local(_) => local::LocalFs::delete_files(std::path::Path::new(dir), names),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "delete only supported for Local",
-            )),
-        }
-    }
 }
 
 #[cfg(test)]
