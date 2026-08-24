@@ -16,10 +16,24 @@ pub use capabilities::{Capability, CapabilitySet};
 pub use s3::{S3BucketRef, S3ObjectRef, S3PrefixRef};
 pub use webdav::{WebDavCollectionRef, WebDavObjectRef, encode_segment};
 
-// ── Provider Registry (new architecture — phased migration) ──
-// ponytail: add ProviderId + VfsProvider + Registry alongside old Location enum.
-// Old Location dispatch stays working during migration; call sites switch one by one.
-// Once all call sites use registry, delete old Location enum.
+// ── VFS authority model (final; PACK Q closeout) ──
+//
+// Location          = typed identity / address / navigation information
+// ProviderRegistry  = explicit provider execution authority
+// CapabilitySet     = exact-location / concrete-instance capability truth
+// VfsProvider       = backend provider interface
+//
+// Copy/Move execution lives in TransferPlanner / TransferQueue / the transfer
+// executor; mutations live in MutationService and the typed Registry/provider
+// mutation seams. There is no hidden global registry and no second execution
+// path. Two deliberate resolver seams exist:
+//   * provider_for_location      — string-path backend operations
+//     (evaluates Location::legacy_listing_path first, so S3 fails closed
+//     before any provider construction)
+//   * provider_for_page_location — typed page/native-identity operations
+//     (S3 resolves its exact configured S3Target, WebDAV its WebDavTarget;
+//     Local/SFTP/Archive delegate to the string-path resolver)
+// Both seams are kept intentionally distinct; neither flattens typed identity.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -174,7 +188,7 @@ pub enum ProviderId {
     WebDAV,
 }
 
-/// Unified location target — replaces Location enum after migration.
+/// String-path location target used by string-path backend operations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Target {
     pub provider: ProviderId,
@@ -377,8 +391,8 @@ pub const MAX_REMOTE_EDIT_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 /// races, deterministic Verifying -> Completed ordering.
 pub type RemoteEditProgressFn = std::sync::Arc<dyn Fn(crate::jobs::RemoteEditPhase) + Send + Sync>;
 
-/// Backend trait — each provider implements this. async deferred to F2.
-/// ponytail: sync list() kept for backward compat; list_async() is the new path.
+/// Backend provider interface — each concrete provider implements this.
+/// Sync `list()` remains for simple providers; `list_async()` is preferred.
 #[async_trait::async_trait]
 pub trait VfsProvider: Send + Sync + std::fmt::Debug {
     fn list(&self, path: &str) -> std::io::Result<Vec<Entry>>;
@@ -510,14 +524,15 @@ pub trait VfsProvider: Send + Sync + std::fmt::Debug {
 
     /// Provider-side paginated listing contract.
     ///
-    /// `location` is the typed `Location` (NOT a flattened `&str` path) so future
-    /// S3 listing can distinguish target-root, bucket, and prefix without encoding
-    /// them into a pseudo-filesystem path. Default impl wraps the existing
-    /// `list_async` path: for `continuation == None` it lists and converts each
-    /// `Entry` into `ListedEntry { entry, identity: EntryIdentity::Other }` with
-    /// `continuation: None`. For `continuation == Some(..)` on an unpaged provider
-    /// it fails closed with `Unsupported` rather than silently re-running page 1.
-    // ponytail: transitional adapter; S3 overrides this later without path flattening
+    /// `location` is the typed `Location` (NOT a flattened `&str` path), so
+    /// typed/native-identity providers distinguish target-root, bucket, and
+    /// prefix without encoding them into a pseudo-filesystem path. The default
+    /// implementation serves unpaged/string-path-compatible providers: for
+    /// `continuation == None` it wraps `list_async` and converts each `Entry`
+    /// into `ListedEntry { entry, identity: EntryIdentity::Other }` with
+    /// `continuation: None`; for `continuation == Some(..)` on an unpaged
+    /// provider it fails closed with `Unsupported` rather than silently
+    /// re-running page 1. Typed providers (S3, WebDAV) override this contract.
     async fn list_page(
         &self,
         location: &Location,
@@ -943,8 +958,8 @@ impl ProviderRegistry {
                 let provider = self.resolve_webdav_provider(target)?;
                 (provider, capabilities::WEBDAV_CAPABILITIES)
             }
-            // ponytail: S3 provider routing not wired yet (later client/registry card);
-            // fail-closed Unsupported, no client/provider construction, no bucket+prefix flatten
+            // Deliberate fail-closed boundary: S3 has no string-path form.
+            // Typed S3 goes through provider_for_page_location only.
             Location::S3 { .. } => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
@@ -971,8 +986,9 @@ impl ProviderRegistry {
     /// Local/SFTP/Archive keep existing behavior. `Location::S3` resolves to a
     /// concrete `S3Target(id)` provider instance via the configured inventory —
     /// never to `Singleton(ProviderId::S3)`, never flattening bucket/prefix.
-    // ponytail: parallel to provider_for_location (legacy path); legacy path
-    // stays fail-closed for S3 via Location::legacy_listing_path.
+    // Deliberate second seam (PACK Q3): typed page/native-identity operations
+    // resolve S3/WebDAV per configured target without a string path; the
+    // string-path seam stays fail-closed for S3 via Location::legacy_listing_path.
     pub fn provider_for_page_location(
         &self,
         loc: &Location,
@@ -1231,11 +1247,12 @@ impl ProviderRegistry {
 
     /// Provider-side paginated listing entry point.
     ///
-    /// Selects the concrete provider via existing provider-instance routing and
-    /// invokes the provider `list_page` contract. S3 remains fail-closed at
-    /// routing (no client/provider construction). `list_location` /
-    /// `list_location_async` are unchanged for existing PaneLoader consumers.
-    // ponytail: parallel page contract; S3 overrides later without path flattening
+    /// Selects the concrete provider via the typed page/native-identity
+    /// resolver and invokes the provider `list_page` contract: configured S3
+    /// and WebDAV locations resolve their exact configured target provider;
+    /// unknown target IDs fail closed. No typed identity/path flattening
+    /// occurs. (The separate string-path seam `provider_for_location` is where
+    /// S3 fails closed before any provider construction.)
     pub async fn list_page(
         &self,
         loc: &Location,
@@ -1393,7 +1410,7 @@ pub enum Location {
     /// Typed S3 location: exact target id, optional bucket, navigation prefix.
     /// bucket=None => target root; Some+"" => bucket root; Some+prefix => listing
     /// prefix. Fields stored verbatim (no fs normalization).
-    // ponytail: typed identity only — real S3 routing/navigation is later cards
+    // Typed identity: S3 routing happens through the typed page resolver.
     S3 {
         target: String,
         bucket: Option<String>,
@@ -1493,8 +1510,9 @@ impl Location {
                 let last = inner_path.rsplit('/').next().unwrap_or(inner_path);
                 last.to_string()
             }
-            // ponytail: label is the exact target id; no config/display-name lookup
-            // ponytail: S3-10 owns final label identity; temporary control-safe rep
+            // Intentionally generic pane label; exact S3 target identity lives
+            // in the Location / ProviderInstanceKey / typed refs, never derived
+            // from presentation text.
             Self::S3 { .. } => "S3".to_string(),
             Self::WebDav { target, path } => {
                 let last = path.rsplit('/').next().unwrap_or(path);
@@ -1534,8 +1552,8 @@ impl Location {
                     inner_path: child,
                 }
             }
-            // ponytail: S3 exact navigation uses S3BucketRef/S3PrefixRef later
-            // (S3-23/24); generic child(name) must not retarget from display text
+            // Deliberately fail-closed identity: generic child(name) must not
+            // invent S3 object identity; dedicated S3 paths own navigation.
             Self::S3 { .. } => self.clone(),
             Self::WebDav { target, path } => {
                 let base = path.trim_end_matches('/');
@@ -1564,20 +1582,22 @@ impl Location {
         }
     }
 
-    /// Single legacy unpaged-provider listing-path conversion.
+    /// String-path adapter conversion for unpaged-provider listing.
+    ///
+    /// Maps Local -> filesystem path, SFTP -> remote path, Archive -> inner
+    /// path, WebDAV -> logical path; S3 is Unsupported (never flattened).
     ///
     /// Used by both `provider_for_location` and the default `list_page` adapter so
     /// the two listing paths cannot drift. For `Location::Local` an unrepresentable
     /// (non-UTF8) path is lossily converted — it is NOT silently retargeted to
     /// filesystem root "/". S3 stays typed/fail-closed and is never flattened.
-    // ponytail: one conversion rule; S3 overrides list_page later without using this
+    // ponytail: one conversion rule; the page resolver never uses this for S3.
     pub(crate) fn legacy_listing_path(location: &Location) -> std::io::Result<String> {
         match location {
             Location::Local(path) => Ok(path.to_string_lossy().into_owned()),
             Location::Sftp { path, .. } => Ok(path.clone()),
             Location::Archive { inner_path, .. } => Ok(inner_path.clone()),
-            // ponytail: S3 provider routing not wired yet; fail-closed Unsupported,
-            // no client/provider construction, no bucket+prefix flatten
+            // Deliberate fail-closed boundary: no bucket+prefix flatten, ever.
             Location::S3 { .. } => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "S3 provider routing not implemented yet",
@@ -1627,7 +1647,8 @@ impl Location {
                     inner_path: parent.to_string(),
                 })
             }
-            // ponytail: S3-25 owns virtual-parent semantics; fail-closed until then
+            // Deliberately fail-closed: generic parent must not invent S3
+            // virtual-parent semantics; dedicated S3 paths own that.
             Self::S3 { .. } => None,
             Self::WebDav { target, path } => {
                 let current = path.trim_end_matches('/');
@@ -1674,7 +1695,7 @@ pub struct Entry {
 /// like `foo//bar` or `foo/../bar` is opaque), `identity` carries that exact
 /// ref. For everything still using the existing identity model, `Other` is the
 /// safe compatibility identity.
-// ponytail: data-model boundary only; no consumer migration, no listing change
+// ponytail: presentation metadata never becomes operational identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedEntry {
     pub entry: Entry,
@@ -1955,7 +1976,8 @@ mod tests {
             bucket: None,
             prefix: "".into(),
         };
-        // temporary control-safe label; exact target preserved in instance key
+        // Generic control-safe label by design; exact target preserved in
+        // instance key / typed identity, not in the label.
         assert_eq!(loc.label(), "S3");
         assert_eq!(
             ProviderRegistry::instance_key_for_location(&loc),
@@ -2107,7 +2129,7 @@ mod tests {
     }
 
     #[test]
-    fn s3_provider_routing_unavailable() {
+    fn s3_string_path_routing_stays_unsupported() {
         let loc = Location::S3 {
             target: "aws".into(),
             bucket: Some("b".into()),
@@ -2115,7 +2137,10 @@ mod tests {
         };
         let reg = ProviderRegistry::new();
         let res = reg.provider_for_location(&loc);
-        assert!(res.is_err(), "S3 routing must not be wired yet");
+        assert!(
+            res.is_err(),
+            "string-path resolver must keep S3 Unsupported/fail-closed"
+        );
     }
     #[test]
     fn formats_sftp_location() {
