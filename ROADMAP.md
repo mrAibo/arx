@@ -27,8 +27,8 @@ Current product truth:
   evidence, and JobManager cancellation.
 - **Filesystems (`Alt+D`):** Linux-local, read-only `df++`-style mount/capacity/inode
   view with explicit unavailable/autofs truth and manual refresh.
-- **Typed local Quick Actions:** SHA-256, Touch file, and Compress to tar.gz are built-in
-  Action/Catalog entries discovered through Command Center. They are local-only, use a
+- **Typed local Quick Actions:** SHA-256, Touch file, and Compress to tar.gz are
+  built-in registered Action/ActionId entries discovered through Command Center. They are local-only, use a
   dedicated correlated Effect lane, and never interpolate filenames into `sh -c`.
 - **SSH/X11 environment:** ARX inherits the process/session environment and never
   synthesizes `DISPLAY`; X11 forwarding must be established by the SSH client/session.
@@ -48,13 +48,13 @@ Backlog truth after PACK O:
 - **WebDAV:** the supported Apache mod_dav MVP is shipped; #13 tracks only post-MVP
   auth/interoperability/recursive-operation work.
 
-## ACTIVE DEVELOPMENT SEQUENCE — ARCHITECTURE PACKS
+## COMPLETED ARCHITECTURE SEQUENCE — PACKS P–R
 
 The canonical continuation document is [`docs/DEVELOPMENT_HANDOFF.md`](docs/DEVELOPMENT_HANDOFF.md).
-The original sequence was tracked by umbrella issue **#180**; PACK Q is tracked by
-umbrella issue **#224**.
+Provenance: the original sequence was tracked by umbrella issue **#180**
+(CLOSED completed); PACK Q by umbrella issue **#224** (CLOSED completed).
 
-Status truth (PACK R closeout):
+Status truth (post-PACK-R merge):
 
 1. **PACK P — TUI decomposition.** COMPLETE. Behavior-preserving decomposition of the
    >10k-line `src/tui.rs` composition bottleneck: characterization tests, rendering
@@ -67,21 +67,21 @@ Status truth (PACK R closeout):
    authority and documentation truth. `Location` remains typed identity/address,
    `ProviderRegistry` is the execution authority, `CapabilitySet` is exact-location
    capability truth, and both provider resolver seams are a deliberate design.
-3. **PACK R — internal feature/command registration (#231).** THIS closeout. The
-   implementation introduces one canonical app-level action-registration table
-   (action + metadata + availability policy), Command Center iterating it directly,
-   and a private binary-side controller registry keyed by `ActionId` for the proof
-   consumers Quick Actions, Storage Inspector, and SSH Host Manager. Storage
-   Inspector becomes a real registered action on the fixed default Alt+U binding;
-   no public feature trait, no feature-id type, no plugin framework. PACK R becomes
-   COMPLETE only after the accepted pinned merge.
+3. **PACK R — internal feature/command registration (#231). COMPLETE** — PR #232,
+   accepted merge `1def3adf382978491ce11590470f56d844bcce07`. Delivered: one
+   canonical app-level action-registration table (action + metadata + availability
+   policy), Command Center iterating it directly, and a private binary-side
+   controller registry keyed by `ActionId` for the proof consumers Quick Actions,
+   Storage Inspector, and SSH Host Manager. Storage Inspector is a real registered
+   action on the fixed default Alt+U binding; no public feature trait, no feature-id
+   type, no plugin framework.
 4. **External plugin decision gate.** No Lua/WASM/`.so` runtime is scheduled. Evaluate
    external plugins only after PACK R and only if real demand exists. Manifest
    permissions without real OS/runtime enforcement are not a security boundary.
 
 GitHub state and exact SHAs are authoritative over stale chat summaries or cached
-reviews. A new development session should read the handoff document, this roadmap,
-issue #180, and the current state of umbrella issue #224 before changing code.
+reviews. A new development session should read the handoff document and this roadmap;
+closed issues #180 and #224 are provenance, not active work.
 
 ## RELEASED — v0.17.0 (2026-08-16)
 
@@ -271,10 +271,9 @@ invent X11 forwarding state.
 
 ## FUTURE PRODUCT BACKLOG
 
-The architecture packs O → P → Q removed the largest composition, dispatch, and
-registration bottlenecks; the P → Q → R sequence will be complete after the accepted
-PACK R merge. External plugin evaluation remains a DECISION GATE, not a next
-implementation step — there is no external plugin GO. The product backlog remains active and should not be
+The O → P → Q → R architecture sequence is COMPLETE at accepted PACK R merge
+`1def3adf382978491ce11590470f56d844bcce07`. External plugin evaluation remains a
+DECISION GATE, not a next implementation step — there is no external plugin GO. The product backlog remains active and should not be
 lost during later work.
 
 Near-term product follow-ups after the architecture sequence:
@@ -288,7 +287,7 @@ Near-term product follow-ups after the architecture sequence:
 After the P/Q/R architecture seams are stable, add a conflict-safe user-configurable
 keymap without returning shortcut ownership to individual features.
 
-- Stable `ActionId` / Action Catalog entries remain the only user-addressable actions.
+- Stable `ActionId` / canonical action-registration entries remain the only user-addressable actions.
 - Built-in defaults are layered with user overrides into one **effective runtime
   Keymap**; `KeyRouter` remains the execution source of truth.
 - Prefer an extensible list-based TOML schema (`context`, `action`, `keys`) rather than
