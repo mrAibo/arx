@@ -144,21 +144,25 @@ pub(super) async fn handle_event(
                 }
                 // #10 §14: pane wheel must not operate through another active
                 // overlay (viewer has its own explicit arms in classify).
-                mouse::MouseRoute::PaneScrollDown { pane } if state.active_overlay().is_none() => {
+                mouse::MouseRoute::PaneScrollDown { pane, section }
+                    if state.active_overlay().is_none() =>
+                {
                     let visible_len = if pane == Pane::Left {
                         left_visible.len()
                     } else {
                         right_visible.len()
                     };
-                    pane_wheel(&mut *state, pane, 3, visible_len);
+                    pane_wheel(&mut *state, pane, section, 3, visible_len);
                 }
-                mouse::MouseRoute::PaneScrollUp { pane } if state.active_overlay().is_none() => {
+                mouse::MouseRoute::PaneScrollUp { pane, section }
+                    if state.active_overlay().is_none() =>
+                {
                     let visible_len = if pane == Pane::Left {
                         left_visible.len()
                     } else {
                         right_visible.len()
                     };
-                    pane_wheel(&mut *state, pane, -3, visible_len);
+                    pane_wheel(&mut *state, pane, section, -3, visible_len);
                 }
                 // Wheel over an active overlay: consumed, no pane scroll (#10 §14).
                 mouse::MouseRoute::PaneScrollDown { .. } => {}
@@ -166,32 +170,55 @@ pub(super) async fn handle_event(
                 // #10 review fix: new pane routes must not operate through
                 // another active overlay — consume instead.
                 mouse::MouseRoute::RangeSelect { .. } if state.active_overlay().is_some() => {}
-                mouse::MouseRoute::RangeSelect { pane, row } => {
+                mouse::MouseRoute::RangeSelect { pane, section, row } => {
+                    // #16 11B/11C: explicit click focuses the clicked section
+                    // BEFORE range logic runs.
+                    activate_section(&mut *state, pane, section);
                     let rows = if pane == Pane::Left {
                         &left_visible
                     } else {
                         &right_visible
                     };
-                    range_select(&mut *state, pane, rows, row);
+                    range_select(&mut *state, pane, section, rows, row);
                 }
                 mouse::MouseRoute::ContextMenu { .. } if state.active_overlay().is_some() => {}
-                mouse::MouseRoute::ContextMenu { column, row, pane } => {
+                mouse::MouseRoute::ContextMenu {
+                    anchor_column,
+                    anchor_row,
+                    pane,
+                    section,
+                    target_row,
+                } => {
                     let rows: &[VisiblePaneRow<'_>] = if pane == Pane::Left {
                         left_visible
                     } else {
                         right_visible
                     };
+                    // #16 11E: activate clicked pane+section first; the frozen
+                    // operational target stays (Pane, Location, ListedEntry).
+                    // #16 review fix: activate clicked pane+section first;
+                    // the popup anchors at the RAW pointer while the frozen
+                    // operational target resolves from target_row.
+                    // #16 review fix: NO cursor write before validation —
+                    // open_context_menu sets the section cursor only after a
+                    // real Listed target is confirmed. Synthetic rows leave
+                    // both cursors untouched.
+                    activate_section(&mut *state, pane, section);
                     open_context_menu(
                         &mut *state,
                         mouse_ui,
                         pane,
-                        column,
-                        row,
+                        (anchor_column, anchor_row),
+                        target_row,
                         rows,
                         configured_editor,
                     );
                 }
-                mouse::MouseRoute::DragSelect { pane, row } => {
+                mouse::MouseRoute::DragSelect { pane, section, row } => {
+                    // #16 11D: drag stays Listed-only and operates on the
+                    // clicked section's cursor/focus.
+                    activate_section(&mut *state, pane, section);
+                    set_section_cursor(&mut *state, pane, section, row);
                     let rows = if pane == Pane::Left {
                         &left_visible
                     } else {
@@ -217,24 +244,16 @@ pub(super) async fn handle_event(
                 // #10 fix: rendered rows are VisiblePaneRow (Parent/Listed/
                 // LoadMore); bounds/cursor use visible rows — the old filtered
                 // mapping shifted indices when Parent or LoadMore existed.
-                mouse::MouseRoute::ActivatePaneRow { pane, row } => {
+                mouse::MouseRoute::ActivatePaneRow { pane, section, row } => {
                     let visible = if pane == Pane::Left {
                         &left_visible
                     } else {
                         &right_visible
                     };
                     if row < visible.len() {
-                        let pane_state = if pane == Pane::Left {
-                            &mut state.left
-                        } else {
-                            &mut state.right
-                        };
-                        if pane_state.split && pane_state.split_active {
-                            pane_state.split_cursor = row;
-                        } else {
-                            pane_state.cursor = row;
-                        }
-                        state.active = pane;
+                        // #16 11B: explicit click focuses the clicked section.
+                        activate_section(&mut *state, pane, section);
+                        set_section_cursor(&mut *state, pane, section, row);
                     }
                 }
             }
@@ -1326,29 +1345,76 @@ async fn handle_context_menu_mouse(
     Ok(())
 }
 
-fn pane_wheel(state: &mut AppState, pane: Pane, delta: i32, visible_len: usize) {
-    // #10 v1 frozen rule: wheel over the passive pane does nothing — no cursor
-    // change, no focus change, no selection change. Active pane scrolls.
+/// #16 11B: explicit pointer interaction — activate the clicked outer pane,
+/// set section focus, return the pane state fields for that section.
+/// Current presentation focus of the pane (#16): Secondary when a split is
+/// open and the secondary subview holds focus.
+fn split_section_of(state: &AppState, _pane: Pane) -> SplitSection {
+    let pane_state = match _pane {
+        Pane::Left => &state.left,
+        Pane::Right => &state.right,
+    };
+    if pane_state.split && pane_state.split_active {
+        SplitSection::Secondary
+    } else {
+        SplitSection::Primary
+    }
+}
+
+fn activate_section(state: &mut AppState, pane: Pane, section: SplitSection) {
+    state.active = pane;
+    let pane_state = match pane {
+        Pane::Left => &mut state.left,
+        Pane::Right => &mut state.right,
+    };
+    if pane_state.split {
+        pane_state.split_active = section == SplitSection::Secondary;
+    } else {
+        pane_state.split_active = false;
+    }
+}
+
+/// Cursor of the given section (anchor/cursor authority for wheel/range).
+fn section_cursor(state: &AppState, pane: Pane, section: SplitSection) -> usize {
+    let pane_state = match pane {
+        Pane::Left => &state.left,
+        Pane::Right => &state.right,
+    };
+    match (pane_state.split && pane_state.split_active, section) {
+        (_, SplitSection::Primary) => pane_state.cursor,
+        _ => pane_state.split_cursor,
+    }
+}
+
+/// Set the cursor of the given section.
+fn set_section_cursor(state: &mut AppState, pane: Pane, section: SplitSection, value: usize) {
+    let pane_state = match pane {
+        Pane::Left => &mut state.left,
+        Pane::Right => &mut state.right,
+    };
+    match section {
+        SplitSection::Primary => pane_state.cursor = value,
+        SplitSection::Secondary => pane_state.split_cursor = value,
+    }
+}
+
+fn pane_wheel(
+    state: &mut AppState,
+    pane: Pane,
+    section: SplitSection,
+    delta: i32,
+    visible_len: usize,
+) {
+    // #10 v1 frozen rule: wheel over the passive OUTER pane does nothing. The
+    // active-pane SECONDARY subview may scroll without stealing focus (#16).
     if pane != state.active {
         return;
     }
-    let pane_state = if pane == Pane::Left {
-        &mut state.left
-    } else {
-        &mut state.right
-    };
     let max = visible_len.saturating_sub(1);
-    let current = if pane_state.split && pane_state.split_active {
-        pane_state.split_cursor
-    } else {
-        pane_state.cursor
-    } as i64;
+    let current = section_cursor(state, pane, section) as i64;
     let next = (current + delta as i64).clamp(0, max as i64);
-    if pane_state.split && pane_state.split_active {
-        pane_state.split_cursor = next as usize;
-    } else {
-        pane_state.cursor = next as usize;
-    }
+    // Wheel NEVER changes state.active or split_active.
+    set_section_cursor(state, pane, section, next as usize);
 }
 
 /// Shift+Click inclusive range selection over VisiblePaneRow::Listed rows only.
@@ -1357,6 +1423,7 @@ fn pane_wheel(state: &mut AppState, pane: Pane, delta: i32, visible_len: usize) 
 fn range_select(
     state: &mut AppState,
     pane: Pane,
+    section: SplitSection,
     visible: &[VisiblePaneRow<'_>],
     clicked_row: usize,
 ) {
@@ -1379,18 +1446,8 @@ fn range_select(
         return;
     }
 
-    let anchor = {
-        let pane_state = if pane == Pane::Left {
-            &state.left
-        } else {
-            &state.right
-        };
-        if pane_state.split && pane_state.split_active {
-            pane_state.split_cursor
-        } else {
-            pane_state.cursor
-        }
-    };
+    // #16: anchor comes from the CLICKED section before the target commits.
+    let anchor = section_cursor(state, pane, section);
     let (start, end) = if anchor <= clicked_row {
         (anchor, clicked_row)
     } else {
@@ -1413,18 +1470,9 @@ fn range_select(
         }
     }
 
-    // Explicit click: cursor on target, pane becomes active.
-    let pane_state = if pane == Pane::Left {
-        &mut state.left
-    } else {
-        &mut state.right
-    };
-    if pane_state.split && pane_state.split_active {
-        pane_state.split_cursor = clicked_row;
-    } else {
-        pane_state.cursor = clicked_row;
-    }
-    state.active = pane;
+    // Explicit click: clicked section becomes active, its cursor takes target.
+    activate_section(state, pane, section);
+    set_section_cursor(state, pane, section, clicked_row);
 }
 
 /// Right-click: resolve the exact VisiblePaneRow, refuse synthetic rows, freeze
@@ -1434,14 +1482,17 @@ fn open_context_menu(
     state: &mut AppState,
     mouse_ui: &mut MouseUiState,
     pane: Pane,
-    column: u16,
-    row: u16,
+    anchor: (u16, u16),
+    target_row: usize,
     visible: &[VisiblePaneRow<'_>],
     configured_editor: Option<&str>,
 ) {
-    let _ = column; // anchor uses the raw pointer position from the route
+    let _ = anchor; // popup placement uses the RAW pointer coordinates only
+    let _ = configured_editor;
     mouse_ui.frame_area = None;
-    let Some(listed_entry) = visible.get(row as usize).and_then(|row| row.listed()) else {
+    // #16 review fix: the listing target resolves from the SECTION-RELATIVE
+    // row — NEVER from the absolute terminal pointer row.
+    let Some(listed_entry) = visible.get(target_row).and_then(|row| row.listed()) else {
         // Parent / LoadMore / out of range: never a file-action target.
         state.close_overlay(arx::app::OverlayKind::ContextMenu);
         mouse_ui.close_context_menu();
@@ -1462,22 +1513,15 @@ fn open_context_menu(
         state.clear_selection();
     }
 
-    let pane_state = if pane == Pane::Left {
-        &mut state.left
-    } else {
-        &mut state.right
-    };
-    if pane_state.split && pane_state.split_active {
-        pane_state.split_cursor = row as usize;
-    } else {
-        pane_state.cursor = row as usize;
-    }
+    // Cursor of the clicked section follows the target row.
+    let focus_section = split_section_of(state, pane);
+    set_section_cursor(state, pane, focus_section, target_row);
     state.active = pane;
 
     let items = mouse::build_context_menu_items(state, listed_entry.entry.kind, configured_editor);
     state.open_overlay(arx::app::OverlayKind::ContextMenu);
     mouse_ui.context_menu = Some(ContextMenuState {
-        anchor: (column, row),
+        anchor,
         items,
         target: ContextMenuTarget {
             pane,
@@ -1606,22 +1650,35 @@ async fn execute_context_action(
 pub(crate) mod input_dispatch_helpers_for_test {
     use super::*;
 
+    pub(crate) fn handle_activate_for_test(
+        state: &mut AppState,
+        pane: Pane,
+        section: super::super::split_layout::SplitSection,
+        row: usize,
+    ) {
+        // Mirrors the ActivatePaneRow arm exactly (focus + section cursor).
+        super::input_dispatch::activate_section(state, pane, section);
+        super::input_dispatch::set_section_cursor(state, pane, section, row);
+    }
+
     pub(crate) fn pane_wheel_for_test(
         state: &mut AppState,
         pane: Pane,
+        section: SplitSection,
         delta: i32,
         visible_len: usize,
     ) {
-        pane_wheel(state, pane, delta, visible_len)
+        pane_wheel(state, pane, section, delta, visible_len)
     }
 
     pub(crate) fn range_select_for_test(
         state: &mut AppState,
         pane: Pane,
+        section: SplitSection,
         visible: &[VisiblePaneRow<'_>],
         clicked_row: usize,
     ) {
-        range_select(state, pane, visible, clicked_row)
+        range_select(state, pane, section, visible, clicked_row)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1629,8 +1686,9 @@ pub(crate) mod input_dispatch_helpers_for_test {
         state: &mut AppState,
         mouse_ui: &mut MouseUiState,
         pane: Pane,
-        column: u16,
-        row: u16,
+        anchor_column: u16,
+        anchor_row: u16,
+        target_row: usize,
         visible: &[VisiblePaneRow<'_>],
         configured_editor: Option<&str>,
     ) {
@@ -1638,8 +1696,8 @@ pub(crate) mod input_dispatch_helpers_for_test {
             state,
             mouse_ui,
             pane,
-            column,
-            row,
+            (anchor_column, anchor_row),
+            target_row,
             visible,
             configured_editor,
         )

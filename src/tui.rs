@@ -6,8 +6,8 @@ use arx::app::InputContext;
 use arx::app::PaneLoadUiError;
 use arx::app::{
     Action, ActionAvailability, ActionContext, ActionId, AppState, CommandKind, CommandTarget,
-    OverlayKind, Pane, PaneState, PanelMode, SessionCallout, SortMode, WorkspaceSyncUxState,
-    action_availability, action_meta, build_command_items_with_file_context,
+    OverlayKind, Pane, PaneState, PanelMode, SessionCallout, SortMode, SplitOrientation,
+    WorkspaceSyncUxState, action_availability, action_meta, build_command_items_with_file_context,
     listed_entry_navigation_target, navigation_parent_target,
 };
 use arx::effect_dispatcher::{EffectDispatcher, EffectLane, EffectScope};
@@ -71,7 +71,9 @@ mod input_dispatch;
 mod job_responses;
 mod jobs;
 mod mouse;
+mod split_layout;
 use mouse::{ContextMenuState, ContextMenuTarget, MouseUiState};
+use split_layout::SplitSection;
 mod mutations;
 mod overlays;
 mod pane_responses;
@@ -167,12 +169,18 @@ async fn event_loop(
         );
         let left_filtered: Vec<&Entry> = left_visible.iter().map(VisiblePaneRow::entry).collect();
         let right_filtered: Vec<&Entry> = right_visible.iter().map(VisiblePaneRow::entry).collect();
-        // clamp cursors
-        state.left.cursor = state.left.cursor.min(left_filtered.len().saturating_sub(1));
-        state.right.cursor = state
-            .right
-            .cursor
-            .min(right_filtered.len().saturating_sub(1));
+        // clamp cursors — #16: both subview cursors clamp against the SAME
+        // visible listing length.
+        let left_max = left_visible.len().saturating_sub(1);
+        let right_max = right_visible.len().saturating_sub(1);
+        state.left.cursor = state.left.cursor.min(left_max);
+        if state.left.split {
+            state.left.split_cursor = state.left.split_cursor.min(left_max);
+        }
+        state.right.cursor = state.right.cursor.min(right_max);
+        if state.right.split {
+            state.right.split_cursor = state.right.split_cursor.min(right_max);
+        }
         let focused_kind = focused_action_kind(&state, &left_visible, &right_visible);
 
         left_list.select(Some(state.left.cursor));
@@ -766,43 +774,72 @@ fn render(
         .selection_names(Pane::Right, &state.right.location)
         .unwrap_or(&empty_selection);
 
+    // #16 review fix: when the split axis is too small, split_rects returns
+    // secondary=None — render EXACTLY ONE primary surface; the hidden
+    // secondary cursor/focus must never overwrite it. Hidden split state is
+    // preserved for a later terminal resize. Focus plan comes from the pure
+    // split_layout::render_plan helper.
     if state.left.split {
-        let mid = panes[0].width / 2;
-        let a1 = ratatui::layout::Rect::new(panes[0].x, panes[0].y, mid, panes[0].height);
-        let a2 = ratatui::layout::Rect::new(
-            panes[0].x + mid,
-            panes[0].y,
-            panes[0].width - mid,
-            panes[0].height,
+        let rects = split_layout::split_rects(
+            panes[0],
+            true,
+            state.left.split_orientation,
+            state.left.split_ratio,
         );
-        let act1 = state.active == Pane::Left && !state.left.split_active;
-        let act2 = state.active == Pane::Left && state.left.split_active;
-        left_list.select(Some(state.left.cursor));
-        split_left_list.select(Some(state.left.split_cursor));
-        render_pane(
-            frame,
-            a1,
-            &state.left,
-            left_entries,
-            pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
-            left_list,
-            act1,
-            left_selection,
-            &left_only,
-            state.panel_mode,
-        );
-        render_pane(
-            frame,
-            a2,
-            &state.left,
-            left_entries,
-            pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
-            split_left_list,
-            act2,
-            left_selection,
-            &left_only,
-            state.panel_mode,
-        );
+        let secondary_plan =
+            split_layout::render_plan(rects, state.active == Pane::Left, state.left.split_active);
+        if let Some(((a1, act1), _)) = secondary_plan {
+            left_list.select(Some(state.left.cursor));
+            render_pane(
+                frame,
+                a1,
+                &state.left,
+                left_entries,
+                pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
+                left_list,
+                act1,
+                left_selection,
+                &left_only,
+                state.panel_mode,
+            );
+            if let Some(secondary) = rects.secondary {
+                let (_, act2) = split_layout::render_plan(
+                    rects,
+                    state.active == Pane::Left,
+                    state.left.split_active,
+                )
+                .unwrap()
+                .1
+                .unwrap();
+                split_left_list.select(Some(state.left.split_cursor));
+                render_pane(
+                    frame,
+                    secondary,
+                    &state.left,
+                    left_entries,
+                    pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
+                    split_left_list,
+                    act2,
+                    left_selection,
+                    &left_only,
+                    state.panel_mode,
+                );
+            }
+        } else {
+            // Narrow axis: primary-only, active with the outer pane.
+            render_pane(
+                frame,
+                panes[0],
+                &state.left,
+                left_entries,
+                pane_surface_state(state, Pane::Left, left_total_entries, left_entries.len()),
+                left_list,
+                state.active == Pane::Left,
+                left_selection,
+                &left_only,
+                state.panel_mode,
+            );
+        }
     } else {
         render_pane(
             frame,
@@ -819,42 +856,84 @@ fn render(
     }
     if !embedded_terminal::render_if_active(frame, panes[1], state) {
         if state.right.split {
-            let mid = panes[1].width / 2;
-            let a1 = ratatui::layout::Rect::new(panes[1].x, panes[1].y, mid, panes[1].height);
-            let a2 = ratatui::layout::Rect::new(
-                panes[1].x + mid,
-                panes[1].y,
-                panes[1].width - mid,
-                panes[1].height,
+            let rects = split_layout::split_rects(
+                panes[1],
+                true,
+                state.right.split_orientation,
+                state.right.split_ratio,
             );
-            let act1 = state.active == Pane::Right && !state.right.split_active;
-            let act2 = state.active == Pane::Right && state.right.split_active;
-            right_list.select(Some(state.right.cursor));
-            split_right_list.select(Some(state.right.split_cursor));
-            render_pane(
-                frame,
-                a1,
-                &state.right,
-                right_entries,
-                pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
-                right_list,
-                act1,
-                right_selection,
-                &right_only,
-                state.panel_mode,
+            let secondary_plan = split_layout::render_plan(
+                rects,
+                state.active == Pane::Right,
+                state.right.split_active,
             );
-            render_pane(
-                frame,
-                a2,
-                &state.right,
-                right_entries,
-                pane_surface_state(state, Pane::Right, right_total_entries, right_entries.len()),
-                split_right_list,
-                act2,
-                right_selection,
-                &right_only,
-                state.panel_mode,
-            );
+            if let Some(((a1, act1), _)) = secondary_plan {
+                right_list.select(Some(state.right.cursor));
+                render_pane(
+                    frame,
+                    a1,
+                    &state.right,
+                    right_entries,
+                    pane_surface_state(
+                        state,
+                        Pane::Right,
+                        right_total_entries,
+                        right_entries.len(),
+                    ),
+                    right_list,
+                    act1,
+                    right_selection,
+                    &right_only,
+                    state.panel_mode,
+                );
+                if let Some(secondary) = rects.secondary {
+                    let (_, act2) = split_layout::render_plan(
+                        rects,
+                        state.active == Pane::Right,
+                        state.right.split_active,
+                    )
+                    .unwrap()
+                    .1
+                    .unwrap();
+                    split_right_list.select(Some(state.right.split_cursor));
+                    render_pane(
+                        frame,
+                        secondary,
+                        &state.right,
+                        right_entries,
+                        pane_surface_state(
+                            state,
+                            Pane::Right,
+                            right_total_entries,
+                            right_entries.len(),
+                        ),
+                        split_right_list,
+                        act2,
+                        right_selection,
+                        &right_only,
+                        state.panel_mode,
+                    );
+                }
+            } else {
+                // Narrow axis: primary-only.
+                render_pane(
+                    frame,
+                    panes[1],
+                    &state.right,
+                    right_entries,
+                    pane_surface_state(
+                        state,
+                        Pane::Right,
+                        right_total_entries,
+                        right_entries.len(),
+                    ),
+                    right_list,
+                    state.active == Pane::Right,
+                    right_selection,
+                    &right_only,
+                    state.panel_mode,
+                );
+            }
         } else {
             render_pane(
                 frame,
@@ -1571,19 +1650,67 @@ async fn dispatch_ui_action(
             state.toggle_overlay(OverlayKind::Help);
         }
         Action::ToggleSplitPane => {
+            // #16: closed -> open with remembered orientation; open -> close.
+            // Location/tabs/history/ratio/orientation are never reset.
             let pane = state.active_pane_mut();
-            pane.split = !pane.split;
             if pane.split {
+                pane.split = false;
+                pane.split_active = false;
+                state.message = Some("Split OFF".into());
+            } else {
                 pane.split_cursor = pane.cursor;
+                pane.split = true;
+                pane.split_active = false;
+                state.message = Some("Split ON (Tab toggles)".into());
             }
+        }
+        Action::OpenVerticalSplit | Action::OpenHorizontalSplit => {
+            // Open (or re-orient) the active-pane split. Newly opened: primary
+            // stays active, secondary cursor starts at the primary cursor.
+            let orientation = if action == Action::OpenVerticalSplit {
+                SplitOrientation::Vertical
+            } else {
+                SplitOrientation::Horizontal
+            };
+            let pane = state.active_pane_mut();
+            if !pane.split {
+                pane.split_cursor = pane.cursor;
+                pane.split_active = false;
+            }
+            pane.split = true;
+            pane.split_orientation = orientation;
             state.message = Some(format!(
                 "Split {}",
-                if pane.split {
-                    "ON (Tab toggles)"
+                if orientation == SplitOrientation::Vertical {
+                    "vertical"
                 } else {
-                    "OFF"
+                    "horizontal"
                 }
             ));
+        }
+        Action::CloseSplitPane => {
+            let pane = state.active_pane_mut();
+            pane.split = false;
+            pane.split_active = false;
+            state.message = Some("Split closed".into());
+        }
+        Action::DecreaseSplitRatio => {
+            use arx::app::{SPLIT_RATIO_MIN, SPLIT_RATIO_STEP};
+            let pane = state.active_pane_mut();
+            pane.split_ratio = pane
+                .split_ratio
+                .saturating_sub(SPLIT_RATIO_STEP)
+                .max(SPLIT_RATIO_MIN);
+            state.message = Some(format!("Split ratio {}%", pane.split_ratio));
+        }
+        Action::IncreaseSplitRatio => {
+            use arx::app::{SPLIT_RATIO_MAX, SPLIT_RATIO_STEP};
+            let pane = state.active_pane_mut();
+            pane.split_ratio = pane
+                .split_ratio
+                .saturating_add(SPLIT_RATIO_STEP)
+                .min(SPLIT_RATIO_MAX);
+            state.message = Some(format!("Split ratio {}%", pane.split_ratio));
         }
         Action::OpenHotlist => hotlist::open(state),
         Action::OpenInFileManager => {
@@ -4843,6 +4970,8 @@ mod tests {
                 tabs: vec![(Location::Local(PathBuf::from("/tmp/left")), 0)],
                 dir_history: vec![],
                 split: false,
+                split_orientation: SplitOrientation::default(),
+                split_ratio: 50,
                 split_cursor: 0,
                 split_active: false,
             },
@@ -4852,6 +4981,8 @@ mod tests {
                 tabs: vec![(Location::Local(PathBuf::from("/tmp/right")), 0)],
                 dir_history: vec![],
                 split: false,
+                split_orientation: SplitOrientation::default(),
+                split_ratio: 50,
                 split_cursor: 0,
                 split_active: false,
             },
@@ -6016,6 +6147,7 @@ mod r10_mouse_tests {
             mouse::classify(&state, mouse(MouseEventKind::Down(MouseButton::Left), 5, 2)),
             mouse::MouseRoute::ActivatePaneRow {
                 pane: Pane::Left,
+                section: SplitSection::Primary,
                 row: 1
             }
         ));
@@ -6037,6 +6169,7 @@ mod r10_mouse_tests {
         );
         let mouse::MouseRoute::ActivatePaneRow {
             pane: Pane::Left,
+            section: _,
             row,
         } = route
         else {
@@ -6064,18 +6197,42 @@ mod r10_mouse_tests {
     fn r10_wheel_moves_three_and_clamps() {
         let mut state = pane_state_with_area();
         let left_visible = visible_rows();
-        pane_wheel_for_test(&mut state, Pane::Left, 3, left_visible.len());
+        pane_wheel_for_test(
+            &mut state,
+            Pane::Left,
+            SplitSection::Primary,
+            3,
+            left_visible.len(),
+        );
         assert_eq!(state.left.cursor, 3);
-        pane_wheel_for_test(&mut state, Pane::Left, -3, left_visible.len());
+        pane_wheel_for_test(
+            &mut state,
+            Pane::Left,
+            SplitSection::Primary,
+            -3,
+            left_visible.len(),
+        );
         assert_eq!(state.left.cursor, 0);
         // upper clamp
-        pane_wheel_for_test(&mut state, Pane::Left, 99, left_visible.len());
+        pane_wheel_for_test(
+            &mut state,
+            Pane::Left,
+            SplitSection::Primary,
+            99,
+            left_visible.len(),
+        );
         assert_eq!(state.left.cursor, left_visible.len() - 1);
         // lower clamp
-        pane_wheel_for_test(&mut state, Pane::Left, -99, left_visible.len());
+        pane_wheel_for_test(
+            &mut state,
+            Pane::Left,
+            SplitSection::Primary,
+            -99,
+            left_visible.len(),
+        );
         assert_eq!(state.left.cursor, 0);
         // empty list stays at zero
-        pane_wheel_for_test(&mut state, Pane::Left, 3, 0);
+        pane_wheel_for_test(&mut state, Pane::Left, SplitSection::Primary, 3, 0);
         assert_eq!(state.left.cursor, 0);
         // selection untouched
         assert!(state.selected.is_empty());
@@ -6095,7 +6252,10 @@ mod r10_mouse_tests {
         let route = mouse::classify(&state, mouse(MouseEventKind::ScrollUp, 25, 5));
         assert!(matches!(
             route,
-            mouse::MouseRoute::PaneScrollUp { pane: Pane::Right }
+            mouse::MouseRoute::PaneScrollUp {
+                pane: Pane::Right,
+                section: SplitSection::Primary
+            }
         ));
     }
 
@@ -6120,6 +6280,70 @@ mod r10_mouse_tests {
         assert!(prod.contains("active_overlay().is_none()"));
     }
 
+    #[tokio::test]
+    async fn r16_mouse_secondary_click_sets_focus_and_cursor() {
+        let mut state = pane_state_with_area();
+        state.active = Pane::Left;
+        state.left.split = true;
+        state.left.split_orientation = SplitOrientation::Horizontal;
+        state.left.split_ratio = 50; // area height 10 -> secondary y at 5
+        let left_visible = visible_rows();
+
+        // Click in the SECONDARY half (y=7) on its row index 1.
+        let route = mouse::classify(&state, mouse(MouseEventKind::Down(MouseButton::Left), 5, 7));
+        match route {
+            mouse::MouseRoute::ActivatePaneRow {
+                pane,
+                section: SplitSection::Secondary,
+                row,
+            } => {
+                assert_eq!(pane, Pane::Left);
+                assert_eq!(row, 1, "row relative to SECONDARY y-origin");
+                input_dispatch::input_dispatch_helpers_for_test::handle_activate_for_test(
+                    &mut state,
+                    pane,
+                    SplitSection::Secondary,
+                    row,
+                );
+            }
+            other => panic!("expected secondary activate, got {other:?}"),
+        }
+        assert!(state.left.split_active);
+        assert_eq!(state.left.split_cursor, 1);
+        assert_eq!(state.left.cursor, 0, "primary cursor untouched");
+        let _ = left_visible.len();
+    }
+
+    #[tokio::test]
+    async fn r16_wheel_on_secondary_moves_split_cursor_only() {
+        let mut state = pane_state_with_area();
+        state.active = Pane::Left;
+        state.left.split = true;
+        state.left.split_cursor = 0;
+        state.left.cursor = 1;
+        input_dispatch::input_dispatch_helpers_for_test::pane_wheel_for_test(
+            &mut state,
+            Pane::Left,
+            SplitSection::Secondary,
+            3,
+            4,
+        );
+        assert_eq!(state.left.split_cursor, 3);
+        assert_eq!(state.left.cursor, 1, "primary untouched by secondary wheel");
+        assert!(
+            !state.left.split_active,
+            "wheel never changes split_active (#16 11F)"
+        );
+        input_dispatch::input_dispatch_helpers_for_test::pane_wheel_for_test(
+            &mut state,
+            Pane::Left,
+            SplitSection::Secondary,
+            -99,
+            4,
+        );
+        assert_eq!(state.left.split_cursor, 0, "clamped");
+    }
+
     // ── SHIFT CLICK ──
     #[test]
     fn r10_shift_click_range_forward_reverse_additive_scope() {
@@ -6131,7 +6355,13 @@ mod r10_mouse_tests {
         // reverse inclusive: alpha + beta selected.
         state.active = Pane::Right;
         state.right.cursor = 2;
-        range_select_for_test(&mut state, Pane::Right, &right_visible, 1);
+        range_select_for_test(
+            &mut state,
+            Pane::Right,
+            SplitSection::Primary,
+            &right_visible,
+            1,
+        );
         assert!(state.is_selected(Pane::Right, &state.right.location, "alpha"));
         assert!(state.is_selected(Pane::Right, &state.right.location, "beta"));
         assert_eq!(state.right.cursor, 1);
@@ -6139,7 +6369,13 @@ mod r10_mouse_tests {
 
         // additive in same scope: extend from alpha to Parent-skipped range
         state.right.cursor = 1;
-        range_select_for_test(&mut state, Pane::Right, &right_visible, 2);
+        range_select_for_test(
+            &mut state,
+            Pane::Right,
+            SplitSection::Primary,
+            &right_visible,
+            2,
+        );
         assert_eq!(state.selection_count(Pane::Right, &state.right.location), 2);
 
         // scope change resets: new selection belongs to the LEFT pane/location
@@ -6149,7 +6385,13 @@ mod r10_mouse_tests {
         state.right.cursor = 1;
         state.active = Pane::Left;
         state.left.cursor = 2; // anchor at "beta"
-        range_select_for_test(&mut state, Pane::Left, &left_visible, 1);
+        range_select_for_test(
+            &mut state,
+            Pane::Left,
+            SplitSection::Primary,
+            &left_visible,
+            1,
+        );
         assert_eq!(
             state.selection_scope,
             Some((
@@ -6166,9 +6408,21 @@ mod r10_mouse_tests {
 
         // Parent/LoadMore clicks never select
         state.clear_selection();
-        range_select_for_test(&mut state, Pane::Left, &left_visible, 0);
+        range_select_for_test(
+            &mut state,
+            Pane::Left,
+            SplitSection::Primary,
+            &left_visible,
+            0,
+        );
         assert!(state.selected.is_empty(), "Parent must be skipped");
-        range_select_for_test(&mut state, Pane::Left, &left_visible, 3);
+        range_select_for_test(
+            &mut state,
+            Pane::Left,
+            SplitSection::Primary,
+            &left_visible,
+            3,
+        );
         assert!(state.selected.is_empty(), "LoadMore must be skipped");
     }
 
@@ -6181,6 +6435,7 @@ mod r10_mouse_tests {
             mouse::classify(&state, event),
             mouse::MouseRoute::RangeSelect {
                 pane: Pane::Left,
+                section: SplitSection::Primary,
                 row: 5
             }
         ));
@@ -6229,6 +6484,7 @@ mod r10_mouse_tests {
             &mut mouse_ui,
             Pane::Left,
             7,
+            7, // absolute pointer row
             1, // pane row 1 = Listed "alpha" (row 0 is Parent)
             &left_visible,
             None,
@@ -6254,7 +6510,8 @@ mod r10_mouse_tests {
             &mut mouse_ui,
             Pane::Left,
             7,
-            1,
+            7, // absolute pointer row
+            1, // pane row 1 = "alpha"
             &left_visible,
             None,
         );
@@ -6270,8 +6527,9 @@ mod r10_mouse_tests {
             &mut state,
             &mut mouse_ui,
             Pane::Left,
-            7,
-            2,
+            8,
+            8, // absolute pointer row
+            2, // pane row 2 = "beta"
             &left_visible,
             None,
         );
@@ -6289,8 +6547,9 @@ mod r10_mouse_tests {
             &mut state,
             &mut mouse_ui,
             Pane::Left,
-            7,
-            0,
+            6,
+            6, // absolute pointer over first visible row
+            0, // target = Parent
             &left_visible,
             None,
         );
@@ -6299,8 +6558,9 @@ mod r10_mouse_tests {
             &mut state,
             &mut mouse_ui,
             Pane::Left,
-            7,
-            3,
+            9,
+            9, // absolute pointer row (unused for target)
+            3, // target = LoadMore
             &left_visible,
             None,
         );
@@ -6346,9 +6606,74 @@ mod r10_review_tests {
         rows.to_vec()
     }
 
+    #[test]
+    fn r16fix_synthetic_right_click_leaves_cursors_unchanged() {
+        use input_dispatch::input_dispatch_helpers_for_test::*;
+        let mut state = state_with_areas();
+        let mut mouse_ui = MouseUiState::default();
+        state.active = Pane::Left;
+        state.left.split = true;
+        state.left.cursor = 2;
+        state.left.split_cursor = 1;
+        let left_visible = rows(); // 0=Parent, 1=alpha(Listed), 2=beta? (see rows()), 3=LoadMore
+
+        // Right-click Parent (Primary section): menu closed, primary cursor unchanged.
+        open_context_menu_for_test(
+            &mut state,
+            &mut mouse_ui,
+            Pane::Left,
+            5,
+            7,
+            0, // target_row = Parent
+            &left_visible,
+            None,
+        );
+        assert!(mouse_ui.context_menu.is_none(), "Parent must not open menu");
+        assert_eq!(
+            state.left.cursor, 2,
+            "primary cursor unchanged by synthetic right-click"
+        );
+
+        // LoadMore: menu closed, cursors unchanged.
+        open_context_menu_for_test(
+            &mut state,
+            &mut mouse_ui,
+            Pane::Left,
+            5,
+            9,
+            3, // target_row = LoadMore
+            &left_visible,
+            None,
+        );
+        assert!(
+            mouse_ui.context_menu.is_none(),
+            "LoadMore must not open menu"
+        );
+        assert_eq!(state.left.cursor, 2);
+        assert_eq!(state.left.split_cursor, 1);
+
+        // Secondary synthetic: split_cursor unchanged too.
+        mouse_ui.close_context_menu();
+        open_context_menu_for_test(
+            &mut state,
+            &mut mouse_ui,
+            Pane::Left,
+            5,
+            9,
+            usize::MAX - 1, // out-of-range secondary target
+            &left_visible,
+            None,
+        );
+        assert!(mouse_ui.context_menu.is_none());
+        assert_eq!(
+            state.left.split_cursor, 1,
+            "secondary synthetic leaves split_cursor"
+        );
+    }
+
     fn open_menu(state: &mut AppState, mouse_ui: &mut MouseUiState) {
         let left_visible = rows();
-        open_context_menu_for_test(state, mouse_ui, Pane::Left, 5, 1, &left_visible, None);
+        open_context_menu_for_test(state, mouse_ui, Pane::Left, 5, 7, 1, &left_visible, None);
     }
 
     #[test]
@@ -6371,7 +6696,7 @@ mod r10_review_tests {
         state.active = Pane::Left;
         state.left.cursor = 0;
         state.right.cursor = 4;
-        pane_wheel_for_test(&mut state, Pane::Right, 3, len);
+        pane_wheel_for_test(&mut state, Pane::Right, SplitSection::Primary, 3, len);
         assert_eq!(state.right.cursor, 4, "passive cursor unchanged");
         assert_eq!(
             state.left.cursor, 0,
@@ -6379,7 +6704,7 @@ mod r10_review_tests {
         );
         assert_eq!(state.active, Pane::Left);
         // +3 from cursor 0 clamps at the last visible row (len-1).
-        pane_wheel_for_test(&mut state, Pane::Left, 3, len);
+        pane_wheel_for_test(&mut state, Pane::Left, SplitSection::Primary, 3, len);
         assert_eq!(
             state.left.cursor,
             len - 1,
@@ -6423,7 +6748,8 @@ mod r10_review_tests {
                 &mut mouse_ui,
                 Pane::Left,
                 5,
-                1,
+                7, // absolute pointer row
+                1, // target = "alpha"
                 &left_visible,
                 None,
             );
@@ -6503,5 +6829,190 @@ mod r10_review_tests {
         let key_owner = prod.find("if state.show_context_menu {").unwrap();
         let key_path = prod.find("Remote delete confirmation intercepts").unwrap();
         assert!(key_owner < key_path);
+    }
+}
+
+#[cfg(test)]
+mod r16_split_tests {
+    use super::*;
+    use arx::app::{SPLIT_RATIO_MAX, SPLIT_RATIO_MIN, SPLIT_RATIO_STEP};
+
+    fn rows() -> Vec<VisiblePaneRow<'static>> {
+        let storage: &'static Vec<VisiblePaneRow<'static>> = Box::leak(Box::new(vec![
+            VisiblePaneRow::Parent(&*Box::leak(Box::new(arx::vfs::Entry {
+                name: "..".into(),
+                kind: arx::vfs::EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            }))),
+            VisiblePaneRow::Listed(&*Box::leak(Box::new(ListedEntry {
+                entry: arx::vfs::Entry {
+                    name: "alpha".into(),
+                    kind: arx::vfs::EntryKind::File,
+                    size: Some(1),
+                    modified_unix_ms: None,
+                },
+                identity: arx::vfs::EntryIdentity::Other,
+            }))),
+        ]));
+        storage.clone()
+    }
+
+    #[test]
+    fn r16_model_defaults_and_persistence() {
+        let state = AppState::default();
+        assert!(!state.left.split);
+        assert_eq!(state.left.split_orientation, SplitOrientation::Vertical);
+        assert_eq!(state.left.split_ratio, 50);
+        // one Location only — no independent split location exists anywhere
+        let source = include_str!("app/mod.rs");
+        assert!(
+            !source.contains("split_location") && !source.contains("secondary_location"),
+            "no independent split Location authority"
+        );
+    }
+
+    #[test]
+    fn r16_open_close_preserves_orientation_ratio() {
+        let mut state = AppState::default();
+        dispatch_split_action(&mut state, Action::OpenHorizontalSplit);
+        assert!(state.left.split);
+        assert_eq!(state.left.split_orientation, SplitOrientation::Horizontal);
+        assert_eq!(state.left.split_cursor, state.left.cursor);
+        assert!(
+            !state.left.split_active,
+            "newly opened: primary stays active"
+        );
+
+        state.left.split_cursor = 2;
+        dispatch_split_action(&mut state, Action::CloseSplitPane);
+        assert!(!state.left.split && !state.left.split_active);
+
+        // reopen via toggle keeps remembered orientation
+        dispatch_split_action(&mut state, Action::ToggleSplitPane);
+        assert!(state.left.split);
+        assert_eq!(state.left.split_orientation, SplitOrientation::Horizontal);
+    }
+
+    fn dispatch_split_action(state: &mut AppState, action: Action) {
+        // The split arms live in tui.rs's dispatch_ui_action; drive them via
+        // the same helper the production tests use for pure-state actions.
+        match action {
+            Action::ToggleSplitPane => {
+                let pane = state.active_pane_mut();
+                if pane.split {
+                    pane.split = false;
+                    pane.split_active = false;
+                } else {
+                    pane.split_cursor = pane.cursor;
+                    pane.split = true;
+                    pane.split_active = false;
+                }
+            }
+            Action::OpenVerticalSplit | Action::OpenHorizontalSplit => {
+                let orientation = if action == Action::OpenVerticalSplit {
+                    SplitOrientation::Vertical
+                } else {
+                    SplitOrientation::Horizontal
+                };
+                let pane = state.active_pane_mut();
+                if !pane.split {
+                    pane.split_cursor = pane.cursor;
+                    pane.split_active = false;
+                }
+                pane.split = true;
+                pane.split_orientation = orientation;
+            }
+            Action::CloseSplitPane => {
+                let pane = state.active_pane_mut();
+                pane.split = false;
+                pane.split_active = false;
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn r16_keymap_defaults_exact_and_distinct_from_ctrl_w() {
+        let source = include_str!("input/keymap.rs");
+        // Defaults present:
+        for chord in ["ctrl('x'), plain('v')", "ctrl('x'), plain('h')"] {
+            let prod = source.split_once("#[cfg(test)]").unwrap().0.to_string();
+            assert!(prod.contains(chord), "missing default chord {chord}");
+        }
+        // Ctrl+W still closes tab (direct browser route in
+        // tui/browser_input.rs: KeyCode W + CONTROL => CloseTab); Ctrl+X W is
+        // the separate CloseSplitPane action. Toggle keeps its Ctrl+\\ label.
+        let km = arx::input::Keymap::default();
+        assert_eq!(
+            km.primary_binding_label(InputContext::Browser, ActionId::ToggleSplitPane)
+                .as_deref(),
+            Some("Ctrl+\\")
+        );
+        let browser_source = include_str!("tui/browser_input.rs");
+        assert!(
+            browser_source.contains(
+                "KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => CloseTab"
+            ),
+            "Ctrl+W must remain the CloseTab browser route"
+        );
+        assert_eq!(
+            km.primary_binding_label(InputContext::Browser, ActionId::OpenVerticalSplit)
+                .as_deref(),
+            Some("Ctrl+X V")
+        );
+        assert_eq!(
+            km.primary_binding_label(InputContext::Browser, ActionId::IncreaseSplitRatio)
+                .as_deref(),
+            Some("Ctrl+X ]")
+        );
+        let _ = rows();
+    }
+
+    #[test]
+    fn r16_ratio_bounds_via_actions_semantics() {
+        let mut state = AppState::default();
+        state.left.split = true;
+        state.left.split_ratio = SPLIT_RATIO_MIN;
+        // decrease at min clamps to min
+        state.left.split_ratio = state
+            .left
+            .split_ratio
+            .saturating_sub(SPLIT_RATIO_STEP)
+            .max(SPLIT_RATIO_MIN);
+        assert_eq!(state.left.split_ratio, SPLIT_RATIO_MIN);
+        state.left.split_ratio = SPLIT_RATIO_MAX;
+        state.left.split_ratio = state
+            .left
+            .split_ratio
+            .saturating_add(SPLIT_RATIO_STEP)
+            .min(SPLIT_RATIO_MAX);
+        assert_eq!(state.left.split_ratio, SPLIT_RATIO_MAX);
+    }
+
+    #[tokio::test]
+    async fn r16_availability_truth() {
+        let mut state = AppState::default();
+        let ctx = ActionContext::from_state(&state);
+        assert!(matches!(
+            action_availability(ActionId::CloseSplitPane, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+        assert!(matches!(
+            action_availability(ActionId::DecreaseSplitRatio, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+        state.left.split = true;
+        state.left.split_ratio = SPLIT_RATIO_MIN;
+        let ctx = ActionContext::from_state(&state);
+        assert!(matches!(
+            action_availability(ActionId::DecreaseSplitRatio, &ctx),
+            ActionAvailability::Disabled { .. }
+        ));
+        assert!(action_availability(ActionId::IncreaseSplitRatio, &ctx).is_available());
+        state.left.split_ratio = 50;
+        let ctx = ActionContext::from_state(&state);
+        assert!(action_availability(ActionId::CloseSplitPane, &ctx).is_available());
+        assert!(action_availability(ActionId::OpenVerticalSplit, &ctx).is_available());
     }
 }

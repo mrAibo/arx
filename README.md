@@ -266,10 +266,10 @@ extension mechanism. ARX does not ship an embedded Lua or WASM plugin runtime.
 | Preview engine — chafa, pdftotext, ffprobe, 7z, bat | ✅ |
 | Background jobs with progress | ✅ |
 | Embedded Terminal (Ctrl+X T) | ✅ |
-| tmux/screen integration — tmux discovery/attach shipped; #7 candidate adds typed GNU Screen discovery (`list_screen_sessions`) and terminal-safe attach lifecycle (ARX releases raw/alternate/mouse for `tmux attach-session -t <id>` / `screen -r <id>`, reacquires on detach); pending accepted merge. Detach/prefix belongs to each multiplexer (tmux default `C-b d`; user config authoritative; Screen owns its own) — no ARX second Ctrl+B protocol | ⚠️ Candidate |
+| tmux/screen integration — COMPLETE (#7, PR #238, merge `616b48b…`): tmux + typed GNU Screen discovery (`list_screen_sessions`) and terminal-safe interactive attach shipped; ARX releases raw/alternate/mouse before `tmux attach-session -t <id>` / `screen -r <id>` and reacquires after detach/failure; multiplexers own their own detach/prefix config (tmux default `C-b d`), no ARX second Ctrl+B protocol | ✅ |
 | Mouse — visible-row-correct clicks, drag selection, active-pane wheel, Shift+Click ranges, and provider-aware typed context menu | ✅ (#10 / PR #236) |
 | Directory diff + content diff (Ctrl+D) | ✅ |
-| Split panes — vertical split/focus shipped; horizontal/resize/explicit close remain #16 | ⚠️ Partial |
+| Split panes — vertical split/focus shipped; #16 candidate adds horizontal mode, explicit close, keyboard ratio resize (Ctrl+X [/], 20–80 step 5), and section-aware same-location mouse; pending accepted merge | ⚠️ Candidate |
 | MC-style Ctrl+X prefix (symlink, hardlink, chmod, chown) | ✅ |
 | User extensions — `arx.menu`; no embedded Lua/WASM runtime | ✅ Lean |
 | Host Center (F9) | ✅ |

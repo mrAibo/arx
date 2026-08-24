@@ -190,6 +190,34 @@ impl Default for Keymap {
             ),
             KeyBinding::new(Browser, vec![ctrl('p')], Action::OpenCommandCenter),
             KeyBinding::new(Browser, vec![ctrl('\\')], Action::ToggleSplitPane),
+            // #16 split-pane controls (Ctrl+X prefix family)
+            KeyBinding::new(
+                Browser,
+                vec![ctrl('x'), plain('v')],
+                Action::OpenVerticalSplit,
+            ),
+            KeyBinding::new(
+                Browser,
+                vec![ctrl('x'), plain('h')],
+                Action::OpenHorizontalSplit,
+            ),
+            KeyBinding::new(Browser, vec![ctrl('x'), plain('w')], Action::CloseSplitPane),
+            KeyBinding::new(
+                Browser,
+                vec![
+                    ctrl('x'),
+                    KeyStroke::new(KeyCode::Char('['), KeyModifiers::NONE),
+                ],
+                Action::DecreaseSplitRatio,
+            ),
+            KeyBinding::new(
+                Browser,
+                vec![
+                    ctrl('x'),
+                    KeyStroke::new(KeyCode::Char(']'), KeyModifiers::NONE),
+                ],
+                Action::IncreaseSplitRatio,
+            ),
             // Ctrl+X T: embedded terminal (safe across emulators, unlike Ctrl+Shift+T)
             KeyBinding::new(
                 Browser,
@@ -648,6 +676,11 @@ fn is_bindable(context: ConfigContext, id: ActionId) -> bool {
                 | Delete
                 | OpenCommandCenter
                 | ToggleSplitPane
+                | OpenVerticalSplit
+                | OpenHorizontalSplit
+                | CloseSplitPane
+                | DecreaseSplitRatio
+                | IncreaseSplitRatio
                 | ToggleEmbeddedTerminal
                 | OpenBookmarks
                 | OpenJobs

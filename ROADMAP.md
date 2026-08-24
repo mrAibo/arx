@@ -39,17 +39,20 @@ Current product truth:
 
 Current follow-up truth:
 
-- **tmux/screen (#7) — CURRENT PRODUCT WORK:** typed GNU Screen discovery
-  (`list_screen_sessions`), missing-binary truth, and terminal-suspending
-  interactive attach. Implementation on `feat/7-multiplexer-lifecycle`; baseline
-  entering #7: `80093fc5cdd1f4bb6e1bd16c55e117d257d327dc`. Not COMPLETE until an
-  accepted pinned merge (no future merge SHA invented here).
+- **tmux/screen (#7) — COMPLETE via PR #238**, accepted merge
+  `616b48b6eafbc9dea55b76428b70beab1941b877`: typed GNU Screen discovery,
+  missing-binary truth, terminal-suspending interactive attach.
 - **Mouse:** #10 is COMPLETE via PR #236, accepted merge
   `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`. Shipped: visible-row-correct pane
   clicks, active-pane wheel scrolling, Shift+Click range selection, drag-selection
   safety, and a provider-aware typed context menu with exact frozen-target revalidation.
-- **Split panes:** the vertical split/focus model is shipped; horizontal mode, resize,
-  and explicit close semantics remain in #16.
+- **Split panes (#16) — CURRENT PRODUCT WORK:** same-location split views with
+  vertical + horizontal orientation, ratio 20..=80 (step 5), explicit close, and
+  keyboard resizing; section-aware mouse hit-testing through ONE geometry
+  authority. No independent split Location, no nested pane tree; mouse boundary
+  drag resize deferred. Implementation on `feat/16-split-pane-layout`; baseline
+  entering #16: `616b48b6eafbc9dea55b76428b70beab1941b877`. Not COMPLETE until an
+  accepted pinned merge (no future merge SHA invented here).
 - **WebDAV:** the supported Apache mod_dav MVP is shipped; #13 tracks only post-MVP
   auth/interoperability/recursive-operation work.
 
@@ -283,11 +286,11 @@ lost during later work.
 
 Near-term product follow-ups after the architecture sequence:
 
-- #7 multiplexer lifecycle — CURRENT implementation on `feat/7-multiplexer-lifecycle`
-  (baseline entering #7: `80093fc5cdd1f4bb6e1bd16c55e117d257d327dc`).
+- #7 multiplexer lifecycle — COMPLETE via PR #238 (merge `616b48b…`).
+- #16 split-pane layout follow-up — CURRENT implementation on
+  `feat/16-split-pane-layout` (baseline entering #16: `616b48b…`).
 - #10 mouse follow-up — COMPLETE via PR #236, accepted merge
   `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`.
-- #16 split-pane follow-up: horizontal mode, resize, explicit close semantics (separate).
 
 ### Configurable effective keymap (#214) — COMPLETE
 
