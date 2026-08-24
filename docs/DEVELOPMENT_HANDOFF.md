@@ -9,7 +9,7 @@ working rules, and next sequence from GitHub without reconstructing chat history
 > re-fetch current `main` before making changes; this snapshot is evidence, not
 > eternal truth.
 
-## 1. Current baseline — 2026-08-24 (post-PACK-R)
+## 1. Current baseline — 2026-08-24 (post-#10)
 
 Repository: `mrAibo/arx`
 
@@ -18,15 +18,18 @@ Repository: `mrAibo/arx`
   release has shipped since this snapshot).
 - Rust MSRV: **1.88**
 - Product platform: **Linux only**; published artifact target is Linux x86_64.
-- Current product work: **#10 mouse follow-up** (pane wheel, Shift+Click ranges,
-  provider-aware context availability) on branch `feat/10-mouse-followup`;
-  baseline entering #10: `dad59ac7ae8b80c680767de7c7f95f506078bf44`. Do NOT invent
-  its future merge SHA.
+- Current accepted `main`: `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f` — #10 mouse
+  follow-up accepted via PR #236.
+- #10 mouse follow-up: COMPLETE via PR #236, accepted merge
+  `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`; baseline entering #10 was
+  `dad59ac7ae8b80c680767de7c7f95f506078bf44`.
 - #214 configurable effective keymap: COMPLETE via PR #235, accepted merge
   `dad59ac7ae8b80c680767de7c7f95f506078bf44` (baseline entering #214 was
   `8444820bcb6b392e77a2cffad326b80b39d880b3`).
-- Current accepted main entering #10: `dad59ac7ae8b80c680767de7c7f95f506078bf44`
-  (includes the #214 merge). Earlier provenance — accepted PACK R merge
+- No active product implementation branch is recorded by this snapshot after #10
+  closeout. #7 and #16 remain separate product candidates; choose only after a fresh
+  current-main review.
+- Earlier provenance — accepted PACK R merge
   `1def3adf382978491ce11590470f56d844bcce07` (PR #232 / #231).
 - Provenance entering R: `578d52d685dec7454025521e6d06491273503239`. Its tree was
   exactly the accepted Q3 tree (`bf53c33807be918996d35b45fb4ebbfa7f37abf6`); the two
@@ -42,6 +45,8 @@ Important merge evidence (historical record):
 - PACK Q2 / #227 → merge `b8e5f9a5761875d6b25dfa047d9b93af5619b1f6`
 - PACK Q3 / #229 → accepted merge `c2f30feaf76a405c111f2996387113d6a93d2064`
 - PACK R / PR #232 / #231 → accepted merge `1def3adf382978491ce11590470f56d844bcce07`
+- #214 / PR #235 → accepted merge `dad59ac7ae8b80c680767de7c7f95f506078bf44`
+- #10 / PR #236 → accepted merge `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`
 
 PACK N deliberately removed unsupported runtime surface (no `DISPLAY` guessing, no
 `src/plugins` Lua prototype, no `pub mod plugins`, no `mlua`). Any review claiming
@@ -65,7 +70,8 @@ Deferred by explicit decision, not forgotten (status updated):
 
 - #214 configurable effective keymap — COMPLETE via PR #235 (merge
   `dad59ac7ae8b80c680767de7c7f95f506078bf44`).
-- #10 mouse follow-ups — CURRENT product work on `feat/10-mouse-followup`.
+- #10 mouse follow-up — COMPLETE via PR #236 (merge
+  `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`).
 - external plugin runtime — **no GO** (see §5).
 
 ## 3. VFS authority model (final after PACK Q)
@@ -104,11 +110,13 @@ and explicit, separately reviewed future decisions:
 
 - #214 configurable effective keymap — COMPLETE (PR #235); the KeyRouter/effective
   Keymap architecture is frozen and must not regress.
-- #10 mouse follow-ups — current product work (this branch).
+- #10 mouse follow-up — COMPLETE (PR #236); mouse remains a second input path into the
+  same typed action/availability/selection truth and must not grow a parallel mutation model.
+- #7 tmux/screen and #16 split-pane follow-ups remain separate product work.
 - External plugins remain **no GO** (see §5). Any evaluation after R is a fresh
   decision gate, not a scheduled implementation.
-- #233 remains a separate reliability observation (transfer-queue timing test);
-  do NOT fold it into #214.
+- #233 remains a separate transfer-queue reliability observation; do not change
+  transfer semantics merely to satisfy a timing-sensitive assertion.
 
 ## 5. External plugins — explicitly deferred
 
@@ -174,17 +182,21 @@ contract:
 Future releases keep this one-build/no-rebuild validation/publication contract unless a
 separately reviewed release design changes it.
 
-## 9. Product backlog after the architecture sequence
+## 9. Product backlog after #214 and #10
 
-The remaining product backlog after PACK R is:
+Completed product follow-ups retained as provenance:
+
+- #214 configurable effective keymap — COMPLETE via PR #235, merge
+  `dad59ac7ae8b80c680767de7c7f95f506078bf44`
+- #10 mouse — COMPLETE via PR #236, merge
+  `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`
+
+Remaining product backlog:
 
 - #7 tmux/screen — screen discovery + real-terminal attach/detach hardening
-- #10 mouse — pane wheel, Shift+Click range selection, provider-aware context
-  availability
 - #16 split panes — horizontal mode, resize, explicit close semantics
 - #13 WebDAV post-MVP — auth/interoperability/recursive-operation work under explicit
   safe contracts
-- #214 configurable effective keymap — after the architecture seams are stable
 - cross-backend Move
 - SFTP → SFTP workspace sync
 - recursive remote delete

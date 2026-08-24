@@ -37,18 +37,20 @@ Current product truth:
 - **Distribution:** GitHub Release is the single publication path; Linux x86_64 ships
   tar.gz, `.deb`, `.rpm`, and one `SHA256SUMS`, all produced from one validated ELF.
 
-Backlog truth after PACK O:
+Current follow-up truth:
 
 - **tmux/screen:** tmux discovery + attach are shipped; screen discovery and attach
   lifecycle hardening remain in #7.
-- **Mouse:** right-click and drag-selection are shipped; pane-wheel scrolling,
-  Shift+Click range selection, and provider-aware context availability remain in #10.
+- **Mouse:** #10 is COMPLETE via PR #236, accepted merge
+  `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`. Shipped: visible-row-correct pane
+  clicks, active-pane wheel scrolling, Shift+Click range selection, drag-selection
+  safety, and a provider-aware typed context menu with exact frozen-target revalidation.
 - **Split panes:** the vertical split/focus model is shipped; horizontal mode, resize,
   and explicit close semantics remain in #16.
 - **WebDAV:** the supported Apache mod_dav MVP is shipped; #13 tracks only post-MVP
   auth/interoperability/recursive-operation work.
 
-## ARCHITECTURE PACKS — P–R COMPLETE; CURRENT PRODUCT WORK
+## ARCHITECTURE PACKS — P–R COMPLETE; PRODUCT BACKLOG ACTIVE
 
 The canonical continuation document is [`docs/DEVELOPMENT_HANDOFF.md`](docs/DEVELOPMENT_HANDOFF.md).
 Provenance: the original sequence was tracked by umbrella issue **#180**
@@ -279,10 +281,8 @@ lost during later work.
 Near-term product follow-ups after the architecture sequence:
 
 - #7 tmux/screen follow-up: screen discovery and real-terminal attach/detach lifecycle.
-- #10 mouse follow-up — CURRENT PRODUCT WORK: pane wheel scrolling, Shift+Click
-  range selection, and provider-aware context availability. Implementation on
-  `feat/10-mouse-followup`; not COMPLETE until an accepted pinned merge (no merge
-  SHA invented here). #7 and #16 remain separate.
+- #10 mouse follow-up — COMPLETE via PR #236, accepted merge
+  `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`.
 - #16 split-pane follow-up: horizontal mode, resize, explicit close semantics.
 
 ### Configurable effective keymap (#214) — COMPLETE
@@ -315,9 +315,8 @@ truthful explicit `--config <path>`. No second KeyRouter; no plugin surface.
   strings, no user-defined action names, no second KeyRouter, and no per-feature
   shortcut ownership.
 
-This follow-up is tracked by **#214**. It is intentionally outside behavior-preserving
-PACK P and does not change the approved P → Q → R sequence unless a later architecture
-review explicitly reschedules it.
+This completed follow-up was tracked by **#214**. It is intentionally outside
+behavior-preserving PACK P and does not change the approved P → Q → R sequence.
 
 Provider/transfer follow-ups:
 
