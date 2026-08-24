@@ -1,3 +1,4 @@
+use super::mouse::{ContextMenuState, context_menu_rect};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -48,20 +49,23 @@ pub(super) fn render_smart_tree(frame: &mut Frame, area: Rect, state: &mut AppSt
     frame.render_stateful_widget(list, popup, &mut state.overlay_list_state);
 }
 
-pub(super) fn render_context_menu(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect_lines(18, 8, area);
+pub(super) fn render_context_menu(frame: &mut Frame, area: Rect, menu: &ContextMenuState) {
+    // #10: anchored at the right-click pointer, clamped to the terminal area.
+    let popup = context_menu_rect(menu.anchor, menu.items.len(), area);
     frame.render_widget(Clear, popup);
-    let items: Vec<ListItem> = [
-        "Copy   F5",
-        "Move   F6",
-        "Mkdir  F7",
-        "Delete F8",
-        "View   F3",
-        "Edit   F4",
-    ]
-    .iter()
-    .map(|s| ListItem::new(*s))
-    .collect();
+    let items: Vec<ListItem> = menu
+        .items
+        .iter()
+        .map(|item| {
+            let style = if item.availability.is_available() {
+                Style::default()
+            } else {
+                // Disabled stays visible but dimmed (existing convention).
+                Style::default().fg(Color::DarkGray)
+            };
+            ListItem::new(item.label).style(style)
+        })
+        .collect();
     let list = ratatui::widgets::List::new(items)
         .block(Block::default().borders(Borders::ALL).title(" Menu "))
         .highlight_style(Style::default().fg(Color::Yellow));

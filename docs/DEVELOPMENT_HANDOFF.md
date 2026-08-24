@@ -18,11 +18,16 @@ Repository: `mrAibo/arx`
   release has shipped since this snapshot).
 - Rust MSRV: **1.88**
 - Product platform: **Linux only**; published artifact target is Linux x86_64.
-- Current product work: **#214 configurable effective keymap** on branch
-  `feat/214-effective-keymap`; baseline entering #214:
-  `8444820bcb6b392e77a2cffad326b80b39d880b3`. Do NOT invent its future merge SHA.
-- Current `main` / accepted PACK R merge: `1def3adf382978491ce11590470f56d844bcce07`
-  (PR #232 / #231).
+- Current product work: **#10 mouse follow-up** (pane wheel, Shift+Click ranges,
+  provider-aware context availability) on branch `feat/10-mouse-followup`;
+  baseline entering #10: `dad59ac7ae8b80c680767de7c7f95f506078bf44`. Do NOT invent
+  its future merge SHA.
+- #214 configurable effective keymap: COMPLETE via PR #235, accepted merge
+  `dad59ac7ae8b80c680767de7c7f95f506078bf44` (baseline entering #214 was
+  `8444820bcb6b392e77a2cffad326b80b39d880b3`).
+- Current accepted main entering #10: `dad59ac7ae8b80c680767de7c7f95f506078bf44`
+  (includes the #214 merge). Earlier provenance — accepted PACK R merge
+  `1def3adf382978491ce11590470f56d844bcce07` (PR #232 / #231).
 - Provenance entering R: `578d52d685dec7454025521e6d06491273503239`. Its tree was
   exactly the accepted Q3 tree (`bf53c33807be918996d35b45fb4ebbfa7f37abf6`); the two
   housekeeping commits between accepted Q3 merge
@@ -56,10 +61,11 @@ Provenance: the O → P → Q → R sequence was tracked by umbrella issue **#18
 | PACK Q3 | finalize resolver authority + docs truth (#229) | COMPLETE (accepted merge `c2f30feaf76a405c111f2996387113d6a93d2064`) |
 | PACK R | internal feature/command registration (#231) | COMPLETE (accepted merge `1def3adf382978491ce11590470f56d844bcce07`) |
 
-Deferred by explicit decision, not forgotten:
+Deferred by explicit decision, not forgotten (status updated):
 
-- #214 configurable effective keymap — later, outside PACK Q.
-- #10 mouse follow-ups — outside PACK Q.
+- #214 configurable effective keymap — COMPLETE via PR #235 (merge
+  `dad59ac7ae8b80c680767de7c7f95f506078bf44`).
+- #10 mouse follow-ups — CURRENT product work on `feat/10-mouse-followup`.
 - external plugin runtime — **no GO** (see §5).
 
 ## 3. VFS authority model (final after PACK Q)
@@ -96,9 +102,9 @@ The O → P → Q → R architecture sequence is complete at accepted PACK R mer
 `1def3adf382978491ce11590470f56d844bcce07`. Return to the product backlog (§8)
 and explicit, separately reviewed future decisions:
 
-- #214 configurable effective keymap remains separate/later — PACK R only migrated
-  one hard-coded Alt+U route onto the existing fixed Keymap; no remapping work.
-- #10 mouse follow-ups remain separate.
+- #214 configurable effective keymap — COMPLETE (PR #235); the KeyRouter/effective
+  Keymap architecture is frozen and must not regress.
+- #10 mouse follow-ups — current product work (this branch).
 - External plugins remain **no GO** (see §5). Any evaluation after R is a fresh
   decision gate, not a scheduled implementation.
 - #233 remains a separate reliability observation (transfer-queue timing test);

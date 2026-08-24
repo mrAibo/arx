@@ -48,7 +48,7 @@ Backlog truth after PACK O:
 - **WebDAV:** the supported Apache mod_dav MVP is shipped; #13 tracks only post-MVP
   auth/interoperability/recursive-operation work.
 
-## COMPLETED ARCHITECTURE SEQUENCE — PACKS P–R
+## ARCHITECTURE PACKS — P–R COMPLETE; CURRENT PRODUCT WORK
 
 The canonical continuation document is [`docs/DEVELOPMENT_HANDOFF.md`](docs/DEVELOPMENT_HANDOFF.md).
 Provenance: the original sequence was tracked by umbrella issue **#180**
@@ -279,15 +279,21 @@ lost during later work.
 Near-term product follow-ups after the architecture sequence:
 
 - #7 tmux/screen follow-up: screen discovery and real-terminal attach/detach lifecycle.
-- #10 mouse follow-up: pane wheel, Shift+Click range selection, context availability.
+- #10 mouse follow-up — CURRENT PRODUCT WORK: pane wheel scrolling, Shift+Click
+  range selection, and provider-aware context availability. Implementation on
+  `feat/10-mouse-followup`; not COMPLETE until an accepted pinned merge (no merge
+  SHA invented here). #7 and #16 remain separate.
 - #16 split-pane follow-up: horizontal mode, resize, explicit close semantics.
 
-### Configurable effective keymap (#214) — CURRENT PRODUCT WORK
+### Configurable effective keymap (#214) — COMPLETE
 
-The P/Q/R architecture seams are stable; #214 implements the conflict-safe
-user-configurable keymap without returning shortcut ownership to individual features.
-Status: implementation on `feat/214-effective-keymap` — not COMPLETE until an accepted
-pinned merge (no merge SHA invented here).
+PR #235; accepted merge `dad59ac7ae8b80c680767de7c7f95f506078bf44`. Delivered the
+conflict-safe user-configurable keymap: canonical `ActionId` config identity, raw
+`[[keybindings]]` model with keys-XOR-disabled, one `Keymap::effective()` builder
+(replacement/disable/duplicate/exact/prefix conflict rules), v1 bindability policy,
+real-classifier browser legacy collision validation, sync-context fail-closed, ONE
+effective map feeding routing and all presentation surfaces, `--print-keymap`, and a
+truthful explicit `--config <path>`. No second KeyRouter; no plugin surface.
 
 - Stable `ActionId` / canonical action-registration entries remain the only user-addressable actions.
 - Built-in defaults are layered with user overrides into one **effective runtime

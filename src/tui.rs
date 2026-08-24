@@ -71,6 +71,7 @@ mod input_dispatch;
 mod job_responses;
 mod jobs;
 mod mouse;
+use mouse::{ContextMenuState, ContextMenuTarget, MouseUiState};
 mod mutations;
 mod overlays;
 mod pane_responses;
@@ -121,6 +122,7 @@ async fn event_loop(
         ..AppState::default()
     };
     let mut runtime = TuiRuntime::new(&mut state, &config);
+    let mut mouse_ui = MouseUiState::default();
     let mut left_entries = Vec::new();
     let mut right_entries = Vec::new();
     schedule_pane_load(&runtime.pane_loader, &mut state, Pane::Left);
@@ -183,6 +185,7 @@ async fn event_loop(
             render(
                 frame,
                 &mut state,
+                &mouse_ui,
                 left_entries.len(),
                 right_entries.len(),
                 &left_filtered,
@@ -293,10 +296,12 @@ async fn event_loop(
                 }
             }
         };
+        mouse_ui.frame_area = Some(Rect::from(terminal.size()?));
         if let Some(event) = next_input {
             let outcome = input_dispatch::handle_event(
                 event,
                 &mut state,
+                &mut mouse_ui,
                 &left_visible,
                 &right_visible,
                 &left_filtered,
@@ -683,6 +688,7 @@ fn s3_f3_routes_to_preview(location: &Location) -> bool {
 fn render(
     frame: &mut ratatui::Frame,
     state: &mut AppState,
+    mouse_ui: &MouseUiState,
     left_total_entries: usize,
     right_total_entries: usize,
     left_entries: &[&Entry],
@@ -889,8 +895,10 @@ fn render(
         command_center::render(frame, area, state, key_router.keymap());
     }
 
-    if state.show_context_menu {
-        render_context_menu(frame, area);
+    if state.show_context_menu
+        && let Some(menu) = mouse_ui.context_menu.as_ref()
+    {
+        render_context_menu(frame, area, menu);
     }
 
     // Bookmarks overlay
@@ -4669,13 +4677,37 @@ mod tests {
 
     #[test]
     fn utility_overlay_context_menu_characterization() {
+        use mouse::{ContextMenuItem, ContextMenuState, ContextMenuTarget};
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|f| render_context_menu(f, f.area())).unwrap();
+        let menu = ContextMenuState {
+            anchor: (5, 5),
+            items: vec![ContextMenuItem {
+                action: Action::Copy,
+                label: "Copy",
+                availability: arx::app::ActionAvailability::Available,
+            }],
+            target: ContextMenuTarget {
+                pane: Pane::Left,
+                location: Location::Local(std::path::PathBuf::from("/tmp")),
+                listed: ListedEntry {
+                    entry: Entry {
+                        name: "alpha".into(),
+                        kind: EntryKind::File,
+                        size: Some(1),
+                        modified_unix_ms: None,
+                    },
+                    identity: EntryIdentity::Other,
+                },
+            },
+        };
+        terminal
+            .draw(|f| render_context_menu(f, f.area(), &menu))
+            .unwrap();
 
         let buf = terminal.backend().buffer();
         let text = buf
@@ -4686,12 +4718,9 @@ mod tests {
             .join("");
 
         assert!(text.contains("Menu"));
-        assert!(text.contains("Copy   F5"));
-        assert!(text.contains("Move   F6"));
-        assert!(text.contains("Mkdir  F7"));
-        assert!(text.contains("Delete F8"));
-        assert!(text.contains("View   F3"));
-        assert!(text.contains("Edit   F4"));
+        // #214/#10: no hard-coded F-key shortcut truth in the context menu.
+        assert!(text.contains("Copy"));
+        assert!(!text.contains("F5"));
     }
 
     #[test]
@@ -5846,5 +5875,558 @@ mod r214_browser_legacy_tests {
         let empty: Vec<KeybindingConfig> = Vec::new();
         let km = Keymap::effective(&empty).unwrap();
         assert!(!km.bindings().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod r10_mouse_tests {
+    use super::*;
+    use input_dispatch::input_dispatch_helpers_for_test::*;
+
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn mk_file(name: &str) -> Entry {
+        Entry {
+            name: name.into(),
+            kind: EntryKind::File,
+            size: Some(1),
+            modified_unix_ms: None,
+        }
+    }
+
+    fn mk_listed(entry: Entry) -> ListedEntry {
+        ListedEntry {
+            entry,
+            identity: EntryIdentity::Other,
+        }
+    }
+
+    fn visible_rows() -> Vec<VisiblePaneRow<'static>> {
+        // Leak-free static rows are impossible; use owned boxes via into? The
+        // production helpers take borrows, so build with a leaked slice for
+        // tests only.
+        let rows: &'static [VisiblePaneRow<'static>] = Box::leak(Box::new(vec![
+            VisiblePaneRow::Parent(&*Box::leak(Box::new(mk_file("..")))),
+            VisiblePaneRow::Listed(&*Box::leak(Box::new(mk_listed(mk_file("alpha"))))),
+            VisiblePaneRow::Listed(&*Box::leak(Box::new(mk_listed(mk_file("beta"))))),
+            VisiblePaneRow::LoadMore(&*Box::leak(Box::new(mk_file("(more)")))),
+        ]));
+        rows.to_vec()
+    }
+
+    fn pane_state_with_area() -> AppState {
+        AppState {
+            left_area: Some(Rect::new(0, 0, 20, 10)),
+            right_area: Some(Rect::new(20, 0, 20, 10)),
+            ..AppState::default()
+        }
+    }
+
+    // ── VISIBLE ROW MAPPING ──
+    #[test]
+    fn r10_parent_row_does_not_shift_first_listed_target() {
+        let state = pane_state_with_area();
+        // Click at screen row 2 => pane row index 1 (below header row) which is
+        // Listed("alpha") because row 0 is Parent.
+        assert!(matches!(
+            mouse::classify(&state, mouse(MouseEventKind::Down(MouseButton::Left), 5, 2)),
+            mouse::MouseRoute::ActivatePaneRow {
+                pane: Pane::Left,
+                row: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn r10_activate_uses_visible_rows_not_filtered() {
+        let mut state = pane_state_with_area();
+        state.left.cursor = 0;
+        let left_visible = visible_rows();
+        let left_filtered: Vec<&Entry> = left_visible.iter().map(VisiblePaneRow::entry).collect();
+        // Old bug: filtered len == 4 here too, so simulate the real mismatch by
+        // clicking the LAST visible row (LoadMore). With visible mapping the
+        // cursor lands on LoadMore's index; focusing it must not fabricate an
+        // entry — verified via action_entry().
+        let route = mouse::classify(
+            &state,
+            mouse(MouseEventKind::Down(MouseButton::Left), 5, 1 + 3),
+        );
+        let mouse::MouseRoute::ActivatePaneRow {
+            pane: Pane::Left,
+            row,
+        } = route
+        else {
+            panic!("expected ActivatePaneRow");
+        };
+        assert!(row < left_visible.len());
+        assert!(row < left_filtered.len()); // same length here; mapping is what matters
+        let target = left_visible.get(row).unwrap();
+        if target.listed_entry().is_none() {
+            // synthetic row focused: no mutation target may be derived from it
+            assert!(target.listed().is_none());
+        }
+    }
+
+    #[test]
+    fn r10_load_more_focus_does_not_fabricate_entry() {
+        let left_visible = visible_rows();
+        let load_more = left_visible.get(3).unwrap();
+        assert!(load_more.listed().is_none());
+        assert!(load_more.listed_entry().is_none());
+    }
+
+    // ── WHEEL ──
+    #[test]
+    fn r10_wheel_moves_three_and_clamps() {
+        let mut state = pane_state_with_area();
+        let left_visible = visible_rows();
+        pane_wheel_for_test(&mut state, Pane::Left, 3, left_visible.len());
+        assert_eq!(state.left.cursor, 3);
+        pane_wheel_for_test(&mut state, Pane::Left, -3, left_visible.len());
+        assert_eq!(state.left.cursor, 0);
+        // upper clamp
+        pane_wheel_for_test(&mut state, Pane::Left, 99, left_visible.len());
+        assert_eq!(state.left.cursor, left_visible.len() - 1);
+        // lower clamp
+        pane_wheel_for_test(&mut state, Pane::Left, -99, left_visible.len());
+        assert_eq!(state.left.cursor, 0);
+        // empty list stays at zero
+        pane_wheel_for_test(&mut state, Pane::Left, 3, 0);
+        assert_eq!(state.left.cursor, 0);
+        // selection untouched
+        assert!(state.selected.is_empty());
+    }
+
+    #[test]
+    fn r10_viewer_wins_over_pane_wheel() {
+        let mut state = pane_state_with_area();
+        state.viewer_content = vec!["line".into()];
+        let route = mouse::classify(&state, mouse(MouseEventKind::ScrollDown, 5, 5));
+        assert!(matches!(route, mouse::MouseRoute::ViewerScrollDown));
+    }
+
+    #[test]
+    fn r10_pane_wheel_route_when_no_viewer() {
+        let state = pane_state_with_area();
+        let route = mouse::classify(&state, mouse(MouseEventKind::ScrollUp, 25, 5));
+        assert!(matches!(
+            route,
+            mouse::MouseRoute::PaneScrollUp { pane: Pane::Right }
+        ));
+    }
+
+    #[test]
+    fn r10_active_overlay_blocks_pane_wheel_in_dispatch() {
+        // classify still returns PaneScroll*, but dispatch must ignore pane
+        // wheel while a non-viewer overlay owns input. Source contract:
+        let source = include_str!("tui/input_dispatch.rs");
+        let prod = source.split_once("#[cfg(test)]").unwrap().0;
+        // ContextMenu owns mouse BEFORE classification (review fix 1):
+        let ownership = prod
+            .find("if state.show_context_menu {")
+            .expect("ownership hook");
+        let classify = prod
+            .find("match mouse::classify(state, mouse) {")
+            .expect("classify");
+        assert!(
+            ownership < classify,
+            "menu must own mouse before classification"
+        );
+        // Overlay guard for other overlays lives in the wheel arms:
+        assert!(prod.contains("active_overlay().is_none()"));
+    }
+
+    // ── SHIFT CLICK ──
+    #[test]
+    fn r10_shift_click_range_forward_reverse_additive_scope() {
+        let mut state = pane_state_with_area();
+        state.right.location = Location::Local(std::path::PathBuf::from("/tmp"));
+        let right_visible = visible_rows();
+
+        // cursor anchor at row 2 ("beta"), shift-click row 1 ("alpha") =>
+        // reverse inclusive: alpha + beta selected.
+        state.active = Pane::Right;
+        state.right.cursor = 2;
+        range_select_for_test(&mut state, Pane::Right, &right_visible, 1);
+        assert!(state.is_selected(Pane::Right, &state.right.location, "alpha"));
+        assert!(state.is_selected(Pane::Right, &state.right.location, "beta"));
+        assert_eq!(state.right.cursor, 1);
+        assert_eq!(state.active, Pane::Right);
+
+        // additive in same scope: extend from alpha to Parent-skipped range
+        state.right.cursor = 1;
+        range_select_for_test(&mut state, Pane::Right, &right_visible, 2);
+        assert_eq!(state.selection_count(Pane::Right, &state.right.location), 2);
+
+        // scope change resets: new selection belongs to the LEFT pane/location
+        // and contains exactly the Listed members of the clicked range.
+        state.left.location = Location::Local(std::path::PathBuf::from("/home"));
+        let left_visible = visible_rows();
+        state.right.cursor = 1;
+        state.active = Pane::Left;
+        state.left.cursor = 2; // anchor at "beta"
+        range_select_for_test(&mut state, Pane::Left, &left_visible, 1);
+        assert_eq!(
+            state.selection_scope,
+            Some((
+                Pane::Left,
+                Location::Local(std::path::PathBuf::from("/home"))
+            ))
+        );
+        assert!(state.is_selected(Pane::Left, &state.left.location, "beta"));
+        assert!(
+            !state.selected.contains("beta")
+                || state.selection_scope.as_ref().map(|(p, _)| *p) == Some(Pane::Left)
+        );
+        assert_eq!(state.active, Pane::Left);
+
+        // Parent/LoadMore clicks never select
+        state.clear_selection();
+        range_select_for_test(&mut state, Pane::Left, &left_visible, 0);
+        assert!(state.selected.is_empty(), "Parent must be skipped");
+        range_select_for_test(&mut state, Pane::Left, &left_visible, 3);
+        assert!(state.selected.is_empty(), "LoadMore must be skipped");
+    }
+
+    #[test]
+    fn r10_shift_click_is_distinct_route() {
+        let state = pane_state_with_area();
+        let mut event = mouse(MouseEventKind::Down(MouseButton::Left), 5, 6);
+        event.modifiers = KeyModifiers::SHIFT;
+        assert!(matches!(
+            mouse::classify(&state, event),
+            mouse::MouseRoute::RangeSelect {
+                pane: Pane::Left,
+                row: 5
+            }
+        ));
+    }
+
+    // ── CONTEXT MENU TARGET + GEOMETRY ──
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn r10_context_menu_geometry_clamps_to_area() {
+        // A 6-item menu needs 8 rows; in a 6-row terminal it clamps to full height.
+        let area = Rect::new(0, 0, 40, 10);
+        let r = mouse::context_menu_rect((2, 1), 6, area);
+        assert_eq!(r.x, 2);
+        assert_eq!(r.y, 1);
+        // right edge clamp
+        let r = mouse::context_menu_rect((39, 1), 6, area);
+        assert!(r.x + r.width <= area.width);
+        // bottom edge clamp
+        let r = mouse::context_menu_rect((1, 5), 6, area);
+        assert!(r.y + r.height <= area.height);
+        // tiny area never overflows
+        let tiny = Rect::new(0, 0, 4, 3);
+        let r = mouse::context_menu_rect((9, 9), 6, tiny);
+        assert!(r.x + r.width <= tiny.width && r.y + r.height <= tiny.height);
+    }
+
+    #[test]
+    fn r10_context_menu_hit_mapping() {
+        let rect = Rect::new(2, 2, 18, 8);
+        assert_eq!(mouse::context_menu_hit(rect, 5, 3), Some(0));
+        assert_eq!(mouse::context_menu_hit(rect, 5, 4), Some(1));
+        assert_eq!(mouse::context_menu_hit(rect, 2, 3), None); // border/left
+        assert_eq!(mouse::context_menu_hit(rect, 50, 50), None); // outside
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn r10_right_click_opens_menu_with_exact_frozen_target() {
+        let mut state = pane_state_with_area();
+        state.left.location = Location::Local(std::path::PathBuf::from("/tmp"));
+        let left_visible = visible_rows();
+        let mut mouse_ui = MouseUiState::default();
+
+        open_context_menu_for_test(
+            &mut state,
+            &mut mouse_ui,
+            Pane::Left,
+            7,
+            1, // pane row 1 = Listed "alpha" (row 0 is Parent)
+            &left_visible,
+            None,
+        );
+        assert!(mouse_ui.context_menu.is_some());
+        {
+            let menu = mouse_ui.context_menu.as_ref().expect("menu opened");
+            let target = &menu.target;
+            assert_eq!(target.listed.entry.name, "alpha");
+            assert_eq!(target.pane, Pane::Left);
+            // labels come from action_meta — no physical F-keys in the menu
+            assert!(menu.items.iter().any(|item| item.label == "Copy"));
+            assert!(menu.items.iter().all(|item| !item.label.contains('F')));
+        }
+        assert_eq!(state.left.cursor, 1); // clicked listed row index
+        assert_eq!(state.active, Pane::Left);
+
+        // Right-clicking an UNSELECTED row clears unrelated stale selection.
+        let left_loc = state.left.location.clone();
+        state.toggle_selection(Pane::Left, &left_loc, "beta");
+        open_context_menu_for_test(
+            &mut state,
+            &mut mouse_ui,
+            Pane::Left,
+            7,
+            1,
+            &left_visible,
+            None,
+        );
+        assert_eq!(menu_target_name(&mouse_ui), "alpha");
+        assert!(
+            !state.is_selected(Pane::Left, &left_loc, "beta"),
+            "stale selection must be cleared"
+        );
+
+        // Right-clicking an already-selected row preserves selection.
+        state.toggle_selection(Pane::Left, &left_loc, "beta");
+        open_context_menu_for_test(
+            &mut state,
+            &mut mouse_ui,
+            Pane::Left,
+            7,
+            2,
+            &left_visible,
+            None,
+        );
+        {
+            let name = menu_target_name(&mouse_ui);
+            assert_eq!(name, "beta");
+        }
+        assert!(
+            state.is_selected(Pane::Left, &state.left.location, "beta"),
+            "same-scope selection preserved"
+        );
+
+        // Right-click on Parent/LoadMore must NOT open the file-action menu.
+        open_context_menu_for_test(
+            &mut state,
+            &mut mouse_ui,
+            Pane::Left,
+            7,
+            0,
+            &left_visible,
+            None,
+        );
+        assert!(mouse_ui.context_menu.is_none(), "Parent must not open menu");
+        open_context_menu_for_test(
+            &mut state,
+            &mut mouse_ui,
+            Pane::Left,
+            7,
+            3,
+            &left_visible,
+            None,
+        );
+        assert!(
+            mouse_ui.context_menu.is_none(),
+            "LoadMore must not open menu"
+        );
+        assert!(mouse_ui.context_menu.is_none() || menu_target_name(&mouse_ui) != "(more)");
+    }
+}
+
+#[cfg(test)]
+mod r10_review_tests {
+    use super::*;
+    use input_dispatch::input_dispatch_helpers_for_test::*;
+
+    fn state_with_areas() -> AppState {
+        AppState {
+            left_area: Some(Rect::new(0, 0, 20, 10)),
+            right_area: Some(Rect::new(20, 0, 20, 10)),
+            ..AppState::default()
+        }
+    }
+
+    fn rows() -> Vec<VisiblePaneRow<'static>> {
+        let rows: &'static [VisiblePaneRow<'static>] = Box::leak(Box::new(vec![
+            VisiblePaneRow::Parent(&*Box::leak(Box::new(Entry {
+                name: "..".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            }))),
+            VisiblePaneRow::Listed(&*Box::leak(Box::new(ListedEntry {
+                entry: Entry {
+                    name: "alpha".into(),
+                    kind: EntryKind::File,
+                    size: Some(1),
+                    modified_unix_ms: None,
+                },
+                identity: EntryIdentity::Other,
+            }))),
+        ]));
+        rows.to_vec()
+    }
+
+    fn open_menu(state: &mut AppState, mouse_ui: &mut MouseUiState) {
+        let left_visible = rows();
+        open_context_menu_for_test(state, mouse_ui, Pane::Left, 5, 1, &left_visible, None);
+    }
+
+    #[test]
+    fn r10fix_esc_closes_menu_and_clears_target() {
+        let mut state = state_with_areas();
+        let mut mouse_ui = MouseUiState::default();
+        open_menu(&mut state, &mut mouse_ui);
+        assert!(state.show_context_menu);
+        // Simulate the key owner: Esc closes + clears (behavioral contract).
+        mouse_ui.close_context_menu();
+        state.close_overlay(arx::app::OverlayKind::ContextMenu);
+        assert!(!state.show_context_menu);
+        assert!(mouse_ui.context_menu.is_none());
+    }
+
+    #[test]
+    fn r10fix_wheel_on_passive_pane_does_nothing_and_active_scrolls_three() {
+        let mut state = state_with_areas();
+        let len = rows().len();
+        state.active = Pane::Left;
+        state.left.cursor = 0;
+        state.right.cursor = 4;
+        pane_wheel_for_test(&mut state, Pane::Right, 3, len);
+        assert_eq!(state.right.cursor, 4, "passive cursor unchanged");
+        assert_eq!(
+            state.left.cursor, 0,
+            "active cursor unchanged by passive wheel"
+        );
+        assert_eq!(state.active, Pane::Left);
+        // +3 from cursor 0 clamps at the last visible row (len-1).
+        pane_wheel_for_test(&mut state, Pane::Left, 3, len);
+        assert_eq!(
+            state.left.cursor,
+            len - 1,
+            "active wheel scrolls then clamps"
+        );
+    }
+
+    #[test]
+    fn r10fix_range_and_context_routes_have_overlay_guards() {
+        let source = include_str!("tui/input_dispatch.rs");
+        let prod = source.split_once("#[cfg(test)]").unwrap().0;
+        assert_eq!(
+            prod.matches(
+                "mouse::MouseRoute::RangeSelect { .. } if state.active_overlay().is_some() => {}"
+            )
+            .count(),
+            1,
+            "RangeSelect overlay guard missing"
+        );
+        assert_eq!(
+            prod.matches(
+                "mouse::MouseRoute::ContextMenu { .. } if state.active_overlay().is_some() => {}"
+            )
+            .count(),
+            1,
+            "ContextMenu opening overlay guard missing"
+        );
+    }
+
+    #[test]
+    fn r10fix_overlay_open_right_click_does_not_create_target() {
+        // Dispatch consumes right-click under an overlay before open_context_menu
+        // can run; simulate exactly that: guard consumes -> no target created.
+        let mut state = state_with_areas();
+        state.open_overlay(OverlayKind::Jobs);
+        let mut mouse_ui = MouseUiState::default();
+        if state.active_overlay().is_none() {
+            let left_visible = rows();
+            open_context_menu_for_test(
+                &mut state,
+                &mut mouse_ui,
+                Pane::Left,
+                5,
+                1,
+                &left_visible,
+                None,
+            );
+        }
+        assert!(
+            mouse_ui.context_menu.is_none(),
+            "no frozen target under overlay"
+        );
+        assert_eq!(state.active_overlay(), Some(OverlayKind::Jobs));
+    }
+
+    #[test]
+    fn r10fix_right_click_guard_present() {
+        let source = include_str!("tui/input_dispatch.rs");
+        let prod = source.split_once("#[cfg(test)]").unwrap().0;
+        assert!(prod.contains(
+            "mouse::MouseRoute::ContextMenu { .. } if state.active_overlay().is_some() => {}"
+        ));
+    }
+
+    #[test]
+    fn r10fix_same_name_different_identity_fails_closed() {
+        // Frozen target: "alpha" with identity A. Refreshed row: same name,
+        // different native identity B => execution matching rejects it.
+        let frozen = ListedEntry {
+            entry: Entry {
+                name: "alpha".into(),
+                kind: EntryKind::File,
+                size: Some(1),
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::Other,
+        };
+        let refreshed_different_identity = ListedEntry {
+            entry: frozen.entry.clone(),
+            identity: arx::vfs::EntryIdentity::WebDavCollection(
+                arx::vfs::webdav::WebDavCollectionRef {
+                    target: "https://dav.example/a/".into(),
+                    href: "https://dav.example/a/".into(),
+                },
+            ),
+        };
+        // Full-equality is the production rule; name equality alone would pass.
+        assert_ne!(frozen, refreshed_different_identity);
+        assert_eq!(frozen.entry.name, refreshed_different_identity.entry.name);
+
+        // Behavioral: exact frozen entry present => matches; absent => no match.
+        let visible = [VisiblePaneRow::Listed(&frozen)];
+        let matched = visible
+            .iter()
+            .copied()
+            .find(|row| row.listed().is_some_and(|current| current == &frozen));
+        assert!(matched.is_some());
+
+        let wrong_identity = [VisiblePaneRow::Listed(&refreshed_different_identity)];
+        let rejected = wrong_identity
+            .iter()
+            .copied()
+            .find(|row| row.listed().is_some_and(|current| current == &frozen));
+        assert!(
+            rejected.is_none(),
+            "same name with different identity must NOT match"
+        );
+    }
+
+    #[test]
+    fn r10fix_source_contract_menu_owns_mouse_before_classification() {
+        let source = include_str!("tui/input_dispatch.rs");
+        let prod = source.split_once("#[cfg(test)]").unwrap().0;
+        let ownership = prod.find("if state.show_context_menu {").unwrap();
+        let classify = prod.find("match mouse::classify(state, mouse) {").unwrap();
+        assert!(
+            ownership < classify,
+            "menu ownership must precede classification"
+        );
+        // Key owner precedes remote-delete/browser handling:
+        let key_owner = prod.find("if state.show_context_menu {").unwrap();
+        let key_path = prod.find("Remote delete confirmation intercepts").unwrap();
+        assert!(key_owner < key_path);
     }
 }

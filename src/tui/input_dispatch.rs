@@ -23,6 +23,7 @@ pub(super) struct InputDispatchOutcome {
 pub(super) async fn handle_event(
     event: Event,
     state: &mut AppState,
+    mouse_ui: &mut MouseUiState,
     left_visible: &[VisiblePaneRow<'_>],
     right_visible: &[VisiblePaneRow<'_>],
     left_filtered: &[&Entry],
@@ -44,6 +45,30 @@ pub(super) async fn handle_event(
             embedded_terminal::handle_key(&mut *state, key);
         }
         Event::Mouse(mouse) => {
+            // #10 review fix: while the context menu is open it is the FIRST
+            // mouse owner — before CommandBar hitboxes and pane classification.
+            // Nothing underneath executes in the same event.
+            if state.show_context_menu {
+                handle_context_menu_mouse(
+                    &mut *state,
+                    mouse_ui,
+                    mouse,
+                    left_visible,
+                    right_visible,
+                    workspace_scanner,
+                    sync,
+                    effect_dispatcher,
+                    pane_loader,
+                    terminal_session,
+                    configured_editor,
+                    key_router,
+                )
+                .await?;
+                return Ok(InputDispatchOutcome {
+                    flow: InputFlow::ContinueLoop,
+                    entry_mutation: EntryMutation::None,
+                });
+            }
             match mouse::classify(state, mouse) {
                 mouse::MouseRoute::Ignore => {}
                 mouse::MouseRoute::CommandBar { action, available } => {
@@ -117,9 +142,54 @@ pub(super) async fn handle_event(
                 mouse::MouseRoute::ViewerScrollUp => {
                     state.viewer_scroll = state.viewer_scroll.saturating_sub(1);
                 }
-                mouse::MouseRoute::ContextMenu { column, row } => {
-                    state.show_context_menu = !state.show_context_menu;
-                    state.context_menu_pos = (column, row);
+                // #10 §14: pane wheel must not operate through another active
+                // overlay (viewer has its own explicit arms in classify).
+                mouse::MouseRoute::PaneScrollDown { pane } if state.active_overlay().is_none() => {
+                    let visible_len = if pane == Pane::Left {
+                        left_visible.len()
+                    } else {
+                        right_visible.len()
+                    };
+                    pane_wheel(&mut *state, pane, 3, visible_len);
+                }
+                mouse::MouseRoute::PaneScrollUp { pane } if state.active_overlay().is_none() => {
+                    let visible_len = if pane == Pane::Left {
+                        left_visible.len()
+                    } else {
+                        right_visible.len()
+                    };
+                    pane_wheel(&mut *state, pane, -3, visible_len);
+                }
+                // Wheel over an active overlay: consumed, no pane scroll (#10 §14).
+                mouse::MouseRoute::PaneScrollDown { .. } => {}
+                mouse::MouseRoute::PaneScrollUp { .. } => {}
+                // #10 review fix: new pane routes must not operate through
+                // another active overlay — consume instead.
+                mouse::MouseRoute::RangeSelect { .. } if state.active_overlay().is_some() => {}
+                mouse::MouseRoute::RangeSelect { pane, row } => {
+                    let rows = if pane == Pane::Left {
+                        &left_visible
+                    } else {
+                        &right_visible
+                    };
+                    range_select(&mut *state, pane, rows, row);
+                }
+                mouse::MouseRoute::ContextMenu { .. } if state.active_overlay().is_some() => {}
+                mouse::MouseRoute::ContextMenu { column, row, pane } => {
+                    let rows: &[VisiblePaneRow<'_>] = if pane == Pane::Left {
+                        left_visible
+                    } else {
+                        right_visible
+                    };
+                    open_context_menu(
+                        &mut *state,
+                        mouse_ui,
+                        pane,
+                        column,
+                        row,
+                        rows,
+                        configured_editor,
+                    );
                 }
                 mouse::MouseRoute::DragSelect { pane, row } => {
                     let rows = if pane == Pane::Left {
@@ -132,6 +202,8 @@ pub(super) async fn handle_event(
                         .and_then(VisiblePaneRow::listed)
                         .map(|listed| &listed.entry)
                     {
+                        // #10 §6: drag consumes only Listed; Parent/LoadMore
+                        // are impossible targets by construction here.
                         let location = if pane == Pane::Left {
                             state.left.location.clone()
                         } else {
@@ -142,17 +214,25 @@ pub(super) async fn handle_event(
                         }
                     }
                 }
+                // #10 fix: rendered rows are VisiblePaneRow (Parent/Listed/
+                // LoadMore); bounds/cursor use visible rows — the old filtered
+                // mapping shifted indices when Parent or LoadMore existed.
                 mouse::MouseRoute::ActivatePaneRow { pane, row } => {
-                    let filt = if pane == Pane::Left {
-                        &left_filtered
+                    let visible = if pane == Pane::Left {
+                        &left_visible
                     } else {
-                        &right_filtered
+                        &right_visible
                     };
-                    if row < filt.len() {
-                        if pane == Pane::Left {
-                            state.left.cursor = row;
+                    if row < visible.len() {
+                        let pane_state = if pane == Pane::Left {
+                            &mut state.left
                         } else {
-                            state.right.cursor = row;
+                            &mut state.right
+                        };
+                        if pane_state.split && pane_state.split_active {
+                            pane_state.split_cursor = row;
+                        } else {
+                            pane_state.cursor = row;
                         }
                         state.active = pane;
                     }
@@ -160,6 +240,19 @@ pub(super) async fn handle_event(
             }
         }
         Event::Key(key) => {
+            // #10 review fix: while the context menu is open it owns keys —
+            // Esc closes; every other key is consumed. No keymap/browser
+            // mutation leaks through a mouse-only menu.
+            if state.show_context_menu {
+                if key.code == KeyCode::Esc {
+                    mouse_ui.close_context_menu();
+                    state.close_overlay(arx::app::OverlayKind::ContextMenu);
+                }
+                return Ok(InputDispatchOutcome {
+                    flow: InputFlow::ContinueLoop,
+                    entry_mutation: EntryMutation::None,
+                });
+            }
             // Remote delete confirmation intercepts Enter/Escape
             if state.pending_delete.is_some() {
                 match key.code {
@@ -1143,6 +1236,422 @@ pub(super) async fn handle_event(
         flow: InputFlow::Proceed,
         entry_mutation,
     })
+}
+
+// ── #10 helpers: pane wheel, range select, context menu lifecycle ──
+
+/// Move the pane cursor by `delta` VISIBLE rows (Parent/Listed/LoadMore all
+/// count — they are rendered rows). Clamps to 0..visible.len()-1. Wheel never
+/// activates Parent, executes LoadMore, navigates, or touches selection.
+/// Context-menu mouse ownership (runs BEFORE normal classification while the
+/// menu is open): item click routes/dispatches, disabled shows reason, outside
+/// click or right-click-outside closes, wheel/drag consumed. No pane action,
+/// no CommandBar execution, no viewer scroll underneath.
+#[allow(clippy::too_many_arguments)]
+async fn handle_context_menu_mouse(
+    state: &mut AppState,
+    mouse_ui: &mut MouseUiState,
+    mouse: MouseEvent,
+    left_visible: &[VisiblePaneRow<'_>],
+    right_visible: &[VisiblePaneRow<'_>],
+    workspace_scanner: &WorkspaceScanner,
+    sync: &SyncUiRuntime,
+    effect_dispatcher: &EffectDispatcher,
+    pane_loader: &PaneLoader,
+    terminal_session: &mut TuiTerminalSession,
+    configured_editor: Option<&str>,
+    key_router: &mut KeyRouter,
+) -> io::Result<()> {
+    let close = |state: &mut AppState, mouse_ui: &mut MouseUiState| {
+        mouse_ui.close_context_menu();
+        state.close_overlay(arx::app::OverlayKind::ContextMenu);
+    };
+    let Some(rect) = mouse_ui.context_menu_rect() else {
+        close(state, mouse_ui);
+        return Ok(());
+    };
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            match mouse::context_menu_hit(rect, mouse.column, mouse.row) {
+                Some(item_index) => {
+                    let available = mouse_ui
+                        .context_menu
+                        .as_ref()
+                        .and_then(|menu| menu.items.get(item_index))
+                        .map(|item| (item.action, item.availability.is_available()));
+                    let Some((action, true)) = available else {
+                        // Disabled item: canonical reason, menu stays open.
+                        if let Some(reason) = mouse_ui
+                            .context_menu
+                            .as_ref()
+                            .and_then(|menu| menu.items.get(item_index))
+                            .and_then(|item| item.availability.reason())
+                        {
+                            state.message = Some(reason.to_string());
+                        }
+                        return Ok(());
+                    };
+                    execute_context_action(
+                        state,
+                        mouse_ui,
+                        left_visible,
+                        right_visible,
+                        workspace_scanner,
+                        sync,
+                        effect_dispatcher,
+                        pane_loader,
+                        terminal_session,
+                        configured_editor,
+                        key_router,
+                        action,
+                    )
+                    .await?;
+                }
+                None => {
+                    // Outside popup: close only — never click through to panes
+                    // or command bar in the same event.
+                    close(state, mouse_ui);
+                }
+            }
+        }
+        MouseEventKind::Down(MouseButton::Right)
+            if mouse::context_menu_hit(rect, mouse.column, mouse.row).is_none() =>
+        {
+            // Right-click outside closes; inside keeps the menu.
+            close(state, mouse_ui);
+        }
+        // Wheel/drag/other: fully consumed while the menu is open.
+        _ => {}
+    }
+    Ok(())
+}
+
+fn pane_wheel(state: &mut AppState, pane: Pane, delta: i32, visible_len: usize) {
+    // #10 v1 frozen rule: wheel over the passive pane does nothing — no cursor
+    // change, no focus change, no selection change. Active pane scrolls.
+    if pane != state.active {
+        return;
+    }
+    let pane_state = if pane == Pane::Left {
+        &mut state.left
+    } else {
+        &mut state.right
+    };
+    let max = visible_len.saturating_sub(1);
+    let current = if pane_state.split && pane_state.split_active {
+        pane_state.split_cursor
+    } else {
+        pane_state.cursor
+    } as i64;
+    let next = (current + delta as i64).clamp(0, max as i64);
+    if pane_state.split && pane_state.split_active {
+        pane_state.split_cursor = next as usize;
+    } else {
+        pane_state.cursor = next as usize;
+    }
+}
+
+/// Shift+Click inclusive range selection over VisiblePaneRow::Listed rows only.
+/// Anchor = the pane's current cursor BEFORE this click; target = clicked row.
+/// Same scope adds members; different scope resets first. Never toggles off.
+fn range_select(
+    state: &mut AppState,
+    pane: Pane,
+    visible: &[VisiblePaneRow<'_>],
+    clicked_row: usize,
+) {
+    // Existence check only: Parent/LoadMore/out-of-range are not selection
+    // targets; members are collected from the visible slice below.
+    if visible
+        .get(clicked_row)
+        .and_then(VisiblePaneRow::listed)
+        .is_none()
+    {
+        return;
+    }
+    let location = if pane == Pane::Left {
+        state.left.location.clone()
+    } else {
+        state.right.location.clone()
+    };
+    // Provider selection policy unchanged (#10 does not broaden S3 rules).
+    if matches!(location, Location::S3 { .. }) {
+        return;
+    }
+
+    let anchor = {
+        let pane_state = if pane == Pane::Left {
+            &state.left
+        } else {
+            &state.right
+        };
+        if pane_state.split && pane_state.split_active {
+            pane_state.split_cursor
+        } else {
+            pane_state.cursor
+        }
+    };
+    let (start, end) = if anchor <= clicked_row {
+        (anchor, clicked_row)
+    } else {
+        (clicked_row, anchor)
+    };
+
+    // Scope change => reset to this pane/location, then ADD range members.
+    let same_scope = matches!(
+        &state.selection_scope,
+        Some((selected_pane, selected_location))
+            if *selected_pane == pane && *selected_location == location
+    );
+    if !same_scope {
+        state.selected.clear();
+        state.selection_scope = Some((pane, location.clone()));
+    }
+    for row in visible[start..=end].iter() {
+        if let Some(listed) = row.listed() {
+            state.selected.insert(listed.entry.name.clone());
+        }
+    }
+
+    // Explicit click: cursor on target, pane becomes active.
+    let pane_state = if pane == Pane::Left {
+        &mut state.left
+    } else {
+        &mut state.right
+    };
+    if pane_state.split && pane_state.split_active {
+        pane_state.split_cursor = clicked_row;
+    } else {
+        pane_state.cursor = clicked_row;
+    }
+    state.active = pane;
+}
+
+/// Right-click: resolve the exact VisiblePaneRow, refuse synthetic rows, freeze
+/// the exact target, apply selection precedence, open OverlayKind::ContextMenu.
+#[allow(clippy::too_many_arguments)]
+fn open_context_menu(
+    state: &mut AppState,
+    mouse_ui: &mut MouseUiState,
+    pane: Pane,
+    column: u16,
+    row: u16,
+    visible: &[VisiblePaneRow<'_>],
+    configured_editor: Option<&str>,
+) {
+    let _ = column; // anchor uses the raw pointer position from the route
+    mouse_ui.frame_area = None;
+    let Some(listed_entry) = visible.get(row as usize).and_then(|row| row.listed()) else {
+        // Parent / LoadMore / out of range: never a file-action target.
+        state.close_overlay(arx::app::OverlayKind::ContextMenu);
+        mouse_ui.close_context_menu();
+        return;
+    };
+
+    let location = if pane == Pane::Left {
+        state.left.location.clone()
+    } else {
+        state.right.location.clone()
+    };
+
+    // Selection precedence (issue #10 frozen comment): already-selected in the
+    // SAME scope keeps the selection; otherwise clear stale selection so it can
+    // never override the right-clicked target. Focused frozen entry is fallback.
+    let same_scope_selected = state.is_selected(pane, &location, &listed_entry.entry.name);
+    if !same_scope_selected {
+        state.clear_selection();
+    }
+
+    let pane_state = if pane == Pane::Left {
+        &mut state.left
+    } else {
+        &mut state.right
+    };
+    if pane_state.split && pane_state.split_active {
+        pane_state.split_cursor = row as usize;
+    } else {
+        pane_state.cursor = row as usize;
+    }
+    state.active = pane;
+
+    let items = mouse::build_context_menu_items(state, listed_entry.entry.kind, configured_editor);
+    state.open_overlay(arx::app::OverlayKind::ContextMenu);
+    mouse_ui.context_menu = Some(ContextMenuState {
+        anchor: (column, row),
+        items,
+        target: ContextMenuTarget {
+            pane,
+            location,
+            listed: listed_entry.clone(),
+        },
+    });
+}
+
+/// Execute a context-menu action through the ONE central seam.
+///
+/// #10 §12/§13: verify the frozen target still exists and the pane Location is
+/// unchanged; re-check availability from CURRENT state with the frozen target
+/// kind; then dispatch_ui_action with the frozen ListedEntry as focused row and
+/// the CURRENT real Listed rows of the frozen pane/location as active entries.
+#[allow(clippy::too_many_arguments)]
+async fn execute_context_action(
+    state: &mut AppState,
+    mouse_ui: &mut MouseUiState,
+    left_visible: &[VisiblePaneRow<'_>],
+    right_visible: &[VisiblePaneRow<'_>],
+    workspace_scanner: &WorkspaceScanner,
+    sync: &SyncUiRuntime,
+    effect_dispatcher: &EffectDispatcher,
+    pane_loader: &PaneLoader,
+    terminal_session: &mut TuiTerminalSession,
+    configured_editor: Option<&str>,
+    key_router: &mut KeyRouter,
+    action: Action,
+) -> io::Result<()> {
+    let close = |state: &mut AppState, mouse_ui: &mut MouseUiState| {
+        mouse_ui.close_context_menu();
+        state.close_overlay(arx::app::OverlayKind::ContextMenu);
+    };
+
+    let Some(menu) = mouse_ui.context_menu.as_ref() else {
+        return Ok(());
+    };
+    let target_pane = menu.target.pane;
+    let frozen_location = menu.target.location.clone();
+    let frozen_kind = menu.target.listed.entry.kind;
+
+    // Stale guard: pane must still sit on the exact frozen location.
+    let current_location = if target_pane == Pane::Left {
+        state.left.location.clone()
+    } else {
+        state.right.location.clone()
+    };
+    if current_location != frozen_location {
+        close(state, mouse_ui);
+        state.message = Some("Context changed; menu closed".to_string());
+        return Ok(());
+    }
+
+    // Fresh availability from CURRENT state + frozen target kind (#10 §13).
+    let context = arx::app::ActionContext::from_state(state)
+        .with_file_context(Some(frozen_kind), configured_editor.is_some());
+    if !matches!(
+        arx::app::action_availability(action.id(), &context),
+        arx::app::ActionAvailability::Available
+    ) {
+        state.message = Some("Action no longer available".to_string());
+        return Ok(());
+    }
+
+    // Current real rows of the frozen pane: focused row = frozen identity if it
+    // still exists there; otherwise fail closed for identity-sensitive actions.
+    let visible: &[VisiblePaneRow<'_>] = if target_pane == Pane::Left {
+        left_visible
+    } else {
+        right_visible
+    };
+    // Exact frozen ListedEntry equality (#10 review fix): entry.name is
+    // presentation only — EntryIdentity is operational truth, so revalidation
+    // must compare the full frozen ListedEntry, never the name alone.
+    let frozen_listed = {
+        let menu = mouse_ui.context_menu.as_ref().expect("checked above");
+        menu.target.listed.clone()
+    };
+    let focused_row = visible.iter().copied().find(|row| {
+        row.listed()
+            .is_some_and(|current| current == &frozen_listed)
+    });
+    let Some(focused_row) = focused_row else {
+        // The exact target vanished after an async refresh. Never resolve by
+        // name to a different identity — fail closed.
+        close(state, mouse_ui);
+        state.message = Some("Target no longer listed; action cancelled".to_string());
+        return Ok(());
+    };
+
+    // Active entries = current real Listed rows of the frozen pane (existing
+    // central dispatch contract), cursor on the frozen target's row.
+    let active_entries: Vec<&arx::vfs::Entry> = visible
+        .iter()
+        .filter_map(|row| row.listed_entry())
+        .collect();
+    let other_focused_row = if target_pane == Pane::Left {
+        right_visible.get(state.right.cursor).copied()
+    } else {
+        left_visible.get(state.left.cursor).copied()
+    };
+
+    dispatch_ui_action(
+        state,
+        action,
+        Some(focused_row),
+        other_focused_row,
+        &active_entries,
+        visible.len(),
+        workspace_scanner,
+        sync,
+        effect_dispatcher,
+        pane_loader,
+        terminal_session,
+        configured_editor,
+        key_router,
+    )
+    .await?;
+
+    close(state, mouse_ui);
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod input_dispatch_helpers_for_test {
+    use super::*;
+
+    pub(crate) fn pane_wheel_for_test(
+        state: &mut AppState,
+        pane: Pane,
+        delta: i32,
+        visible_len: usize,
+    ) {
+        pane_wheel(state, pane, delta, visible_len)
+    }
+
+    pub(crate) fn range_select_for_test(
+        state: &mut AppState,
+        pane: Pane,
+        visible: &[VisiblePaneRow<'_>],
+        clicked_row: usize,
+    ) {
+        range_select(state, pane, visible, clicked_row)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_context_menu_for_test(
+        state: &mut AppState,
+        mouse_ui: &mut MouseUiState,
+        pane: Pane,
+        column: u16,
+        row: u16,
+        visible: &[VisiblePaneRow<'_>],
+        configured_editor: Option<&str>,
+    ) {
+        open_context_menu(
+            state,
+            mouse_ui,
+            pane,
+            column,
+            row,
+            visible,
+            configured_editor,
+        )
+    }
+
+    pub(crate) fn menu_target_name(mouse_ui: &MouseUiState) -> String {
+        mouse_ui
+            .context_menu
+            .as_ref()
+            .map(|m| m.target.listed.entry.name.clone())
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]

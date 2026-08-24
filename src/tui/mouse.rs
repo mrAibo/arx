@@ -1,12 +1,104 @@
 use super::*;
 
+// ── #10: private TUI mouse UI state (not a runtime/service/channel) ──
+
+/// One context-menu entry: canonical action + metadata + availability snapshot.
+pub(crate) struct ContextMenuItem {
+    pub action: Action,
+    pub label: &'static str,
+    pub availability: arx::app::ActionAvailability,
+}
+
+/// Frozen right-click target: exact pane, cloned location, cloned ListedEntry
+/// (native identity preserved — never reconstructed from presentation data).
+pub(crate) struct ContextMenuTarget {
+    pub pane: Pane,
+    pub location: Location,
+    pub listed: ListedEntry,
+}
+
+pub(crate) struct ContextMenuState {
+    pub anchor: (u16, u16),
+    pub items: Vec<ContextMenuItem>,
+    pub target: ContextMenuTarget,
+}
+
+#[derive(Default)]
+pub(crate) struct MouseUiState {
+    /// Last seen frame area, used for popup clamping/hit-testing.
+    pub frame_area: Option<Rect>,
+    pub context_menu: Option<ContextMenuState>,
+}
+
+impl MouseUiState {
+    pub fn close_context_menu(&mut self) {
+        self.context_menu = None;
+    }
+
+    /// Deterministic popup rect anchored at the pointer, clamped inside `area`.
+    pub fn context_menu_rect(&self) -> Option<Rect> {
+        let menu = self.context_menu.as_ref()?;
+        let area = self.frame_area?;
+        Some(context_menu_rect(menu.anchor, menu.items.len(), area))
+    }
+}
+
+/// Anchor-based menu rectangle: wide enough for the longest label, tall enough
+/// for every item, clamped so it never crosses the right/bottom edge.
+pub(super) fn context_menu_rect(anchor: (u16, u16), item_count: usize, area: Rect) -> Rect {
+    let width = 18u16.min(area.width);
+    let height = (item_count as u16 + 2).min(area.height); // +2 border rows
+    let max_x = area.x + area.width.saturating_sub(width);
+    let max_y = area.y + area.height.saturating_sub(height);
+    let x = anchor.0.min(max_x).max(area.x);
+    let y = anchor.1.min(max_y).max(area.y);
+    Rect::new(x, y, width, height)
+}
+
+/// Canonical #10 menu actions. Labels/availability always come from the
+/// canonical registration + availability seam — never duplicated here.
+const CONTEXT_MENU_ACTIONS: [Action; 6] = [
+    Action::ViewFile,
+    Action::EditFile,
+    Action::Copy,
+    Action::Move,
+    Action::Mkdir,
+    Action::Delete,
+];
+
+pub(super) fn build_context_menu_items(
+    state: &AppState,
+    target_kind: arx::vfs::EntryKind,
+    configured_editor: Option<&str>,
+) -> Vec<ContextMenuItem> {
+    let context = arx::app::ActionContext::from_state(state)
+        .with_file_context(Some(target_kind), configured_editor.is_some());
+    CONTEXT_MENU_ACTIONS
+        .iter()
+        .filter_map(|action| {
+            let id = action.id();
+            let meta = arx::app::action_meta(id)?;
+            let availability = arx::app::action_availability(id, &context);
+            let visible_item = !matches!(availability, arx::app::ActionAvailability::Hidden);
+            visible_item.then_some(ContextMenuItem {
+                action: *action,
+                label: meta.label,
+                availability,
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MouseRoute {
     Ignore,
     CommandBar { action: Action, available: bool },
     ViewerScrollDown,
     ViewerScrollUp,
-    ContextMenu { column: u16, row: u16 },
+    PaneScrollDown { pane: Pane },
+    PaneScrollUp { pane: Pane },
+    ContextMenu { column: u16, row: u16, pane: Pane },
+    RangeSelect { pane: Pane, row: usize },
     DragSelect { pane: Pane, row: usize },
     ActivatePaneRow { pane: Pane, row: usize },
 }
@@ -52,19 +144,43 @@ pub(super) fn classify(state: &AppState, mouse: MouseEvent) -> MouseRoute {
     };
     let row = mouse.row.saturating_sub(area.y + 1) as usize;
 
+    // #10: wheel over the viewer stays viewer-owned regardless of position;
+    // otherwise it becomes a pane scroll for the pane under the pointer.
     match mouse.kind {
         MouseEventKind::ScrollDown if !state.viewer_content.is_empty() => {
             MouseRoute::ViewerScrollDown
         }
         MouseEventKind::ScrollUp if !state.viewer_content.is_empty() => MouseRoute::ViewerScrollUp,
+        MouseEventKind::ScrollDown => MouseRoute::PaneScrollDown { pane },
+        MouseEventKind::ScrollUp => MouseRoute::PaneScrollUp { pane },
         MouseEventKind::Down(MouseButton::Right) => MouseRoute::ContextMenu {
             column: mouse.column,
             row: mouse.row,
+            pane,
         },
+        // Shift+Click is an explicit inclusive range selection.
+        MouseEventKind::Down(MouseButton::Left)
+            if mouse.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            MouseRoute::RangeSelect { pane, row }
+        }
         MouseEventKind::Drag(MouseButton::Left) => MouseRoute::DragSelect { pane, row },
         MouseEventKind::Down(_) => MouseRoute::ActivatePaneRow { pane, row },
         _ => MouseRoute::Ignore,
     }
+}
+
+/// Hit-test a rendered context menu. Returns Some(item_index) for a click on a
+/// visible item row (border offset 1), None when the click is outside the menu.
+pub(super) fn context_menu_hit(menu_rect: Rect, column: u16, row: u16) -> Option<usize> {
+    if column <= menu_rect.x
+        || column >= menu_rect.x + menu_rect.width
+        || row <= menu_rect.y
+        || row >= menu_rect.y + menu_rect.height
+    {
+        return None;
+    }
+    Some((row - menu_rect.y - 1) as usize)
 }
 
 #[cfg(test)]
@@ -213,7 +329,11 @@ mod tests {
                 &state(),
                 mouse(MouseEventKind::Down(MouseButton::Right), 11, 7)
             ),
-            MouseRoute::ContextMenu { column: 11, row: 7 }
+            MouseRoute::ContextMenu {
+                column: 11,
+                row: 7,
+                pane: Pane::Left
+            }
         );
     }
 
