@@ -165,7 +165,68 @@ fn copy_pair_supported(active: ProviderId, passive: ProviderId) -> bool {
     )
 }
 
+/// Top-level availability entry (PACK R).
+///
+/// Resolves the canonical registration for `id` and evaluates THAT entry's
+/// [`super::registration::AvailabilityPolicy`]. The centralized legacy
+/// evaluator runs only for `AvailabilityPolicy::Default`. Unknown ids fail
+/// closed — no invented metadata.
 pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailability {
+    let Some(registration) = super::registration::registration_for(id) else {
+        return ActionAvailability::Hidden;
+    };
+    match registration.policy {
+        super::registration::AvailabilityPolicy::Default => default_action_availability(id, ctx),
+        super::registration::AvailabilityPolicy::Always => ActionAvailability::Available,
+        super::registration::AvailabilityPolicy::LocalOnly(reason) => {
+            if ctx.active_provider == ProviderId::Local {
+                ActionAvailability::Available
+            } else {
+                ActionAvailability::Disabled {
+                    reason: reason.to_string(),
+                }
+            }
+        }
+        super::registration::AvailabilityPolicy::QuickSha256 => quick_local_only(ctx)
+            .unwrap_or_else(|| {
+                if ctx.selection_count == 0 && ctx.focused_kind != Some(EntryKind::File) {
+                    ActionAvailability::Disabled {
+                        reason: "Select a regular file to hash".into(),
+                    }
+                } else {
+                    ActionAvailability::Available
+                }
+            }),
+        super::registration::AvailabilityPolicy::QuickTouch => {
+            quick_local_only(ctx).unwrap_or(ActionAvailability::Available)
+        }
+        super::registration::AvailabilityPolicy::QuickCompress => quick_local_only(ctx)
+            .unwrap_or_else(|| {
+                if ctx.selection_count == 0 && ctx.focused_kind.is_none() {
+                    ActionAvailability::Disabled {
+                        reason: "Select a file or directory to compress".into(),
+                    }
+                } else {
+                    ActionAvailability::Available
+                }
+            }),
+    }
+}
+
+/// Shared Quick Action gate: local pane only. `None` means "local, continue".
+fn quick_local_only(ctx: &ActionContext) -> Option<ActionAvailability> {
+    if ctx.active_provider != ProviderId::Local {
+        Some(ActionAvailability::Disabled {
+            reason: "Quick Actions are currently local-only".into(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Centralized legacy evaluator for `AvailabilityPolicy::Default` actions.
+/// PACK R moved the proof-feature branches out; they must NOT return here.
+pub(crate) fn default_action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailability {
     match id {
         ActionId::OpenInFileManager if ctx.active_provider != ProviderId::Local => {
             ActionAvailability::Disabled {
@@ -177,28 +238,6 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
         | ActionId::OpenInFileManager
         | ActionId::OpenSmartTree
         | ActionId::OpenInfrastructureCenter => ActionAvailability::Available,
-        ActionId::ComputeSha256 | ActionId::TouchFile | ActionId::CompressTarGz
-            if ctx.active_provider != ProviderId::Local =>
-        {
-            ActionAvailability::Disabled {
-                reason: "Quick Actions are currently local-only".into(),
-            }
-        }
-        ActionId::ComputeSha256
-            if ctx.selection_count == 0 && ctx.focused_kind != Some(EntryKind::File) =>
-        {
-            ActionAvailability::Disabled {
-                reason: "Select a regular file to hash".into(),
-            }
-        }
-        ActionId::ComputeSha256 => ActionAvailability::Available,
-        ActionId::TouchFile => ActionAvailability::Available,
-        ActionId::CompressTarGz if ctx.selection_count == 0 && ctx.focused_kind.is_none() => {
-            ActionAvailability::Disabled {
-                reason: "Select a file or directory to compress".into(),
-            }
-        }
-        ActionId::CompressTarGz => ActionAvailability::Available,
         ActionId::BeginSymlink => {
             require_active_capability(ctx, Capability::Symlink, "Symbolic links")
         }

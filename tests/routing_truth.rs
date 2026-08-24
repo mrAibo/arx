@@ -1,6 +1,6 @@
 use arx::app::{
-    ACTION_CATALOG, Action, ActionCategory, ActionId, AppState, CommandTarget, OverlayKind,
-    action_meta, build_command_items,
+    Action, ActionCategory, ActionId, AppState, CommandTarget, OverlayKind, action_meta,
+    build_command_items,
 };
 use arx::input::Keymap;
 
@@ -25,7 +25,7 @@ fn action_catalog_contains_routing_truth_panels() {
         assert_eq!(meta.description, description);
         assert_eq!(meta.category, ActionCategory::Panels);
         assert!(!meta.destructive);
-        assert!(ACTION_CATALOG.iter().any(|candidate| candidate.id == id));
+        assert!(arx::app::registration_lookup(id));
     }
 }
 

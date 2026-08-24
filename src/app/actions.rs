@@ -33,6 +33,7 @@ pub enum ActionId {
     OpenInfrastructureCenter,
     OpenHosts,
     OpenSshHosts,
+    OpenStorageInspector,
     OpenHelp,
     OpenHotlist,
     OpenInFileManager,
@@ -88,6 +89,7 @@ pub enum Action {
     OpenInfrastructureCenter,
     OpenHosts,
     OpenSshHosts,
+    OpenStorageInspector,
     OpenHelp,
     OpenHotlist,
     OpenInFileManager,
@@ -140,6 +142,7 @@ impl Action {
             Self::OpenInfrastructureCenter => ActionId::OpenInfrastructureCenter,
             Self::OpenHosts => ActionId::OpenHosts,
             Self::OpenSshHosts => ActionId::OpenSshHosts,
+            Self::OpenStorageInspector => ActionId::OpenStorageInspector,
             Self::OpenHelp => ActionId::OpenHelp,
             Self::OpenHotlist => ActionId::OpenHotlist,
             Self::OpenInFileManager => ActionId::OpenInFileManager,
@@ -164,56 +167,6 @@ impl Action {
     }
 }
 
-pub const ALL_ACTIONS: &[Action] = &[
-    Action::Quit,
-    Action::Up,
-    Action::Down,
-    Action::Enter,
-    Action::Back,
-    Action::SwitchPane,
-    Action::ToggleSplitPane,
-    Action::ToggleSelect,
-    Action::ToggleEmbeddedTerminal,
-    Action::ViewFile,
-    Action::EditFile,
-    Action::Copy,
-    Action::Move,
-    Action::Mkdir,
-    Action::Delete,
-    Action::ComputeSha256,
-    Action::TouchFile,
-    Action::CompressTarGz,
-    Action::ListTmuxSessions,
-    Action::Refresh,
-    Action::OpenCommandCenter,
-    Action::OpenBookmarks,
-    Action::OpenJobs,
-    Action::OpenSmartTree,
-    Action::OpenInfrastructureCenter,
-    Action::OpenHosts,
-    Action::OpenSshHosts,
-    Action::OpenHelp,
-    Action::OpenHotlist,
-    Action::OpenInFileManager,
-    Action::BeginSymlink,
-    Action::BeginChmod,
-    Action::BeginHardLink,
-    Action::BeginChown,
-    Action::ToggleWorkspaceComparison,
-    Action::PreviewWorkspaceSync,
-    Action::ReverseWorkspaceDirection,
-    Action::ToggleWorkspaceSyncMode,
-    Action::CloseWorkspaceSyncOverlay,
-    Action::ExecuteWorkspaceSync,
-    Action::ConfirmWorkspaceSync,
-    Action::CancelWorkspaceSync,
-    Action::ShowWorkspaceSyncDetails,
-    Action::ShowWorkspaceVerificationDiff,
-    Action::ReturnToWorkspaceSyncPreview,
-    Action::ConfirmRemoteDelete,
-    Action::CancelRemoteDelete,
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActionCategory {
     Application,
@@ -235,340 +188,8 @@ pub struct ActionMeta {
     pub destructive: bool,
 }
 
-pub const ACTION_CATALOG: &[ActionMeta] = &[
-    ActionMeta {
-        id: ActionId::Quit,
-        label: "Quit",
-        description: "Exit ARX",
-        category: ActionCategory::Application,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::Up,
-        label: "Move up",
-        description: "Move the cursor up",
-        category: ActionCategory::Navigation,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::Down,
-        label: "Move down",
-        description: "Move the cursor down",
-        category: ActionCategory::Navigation,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::Enter,
-        label: "Open",
-        description: "Open the focused item",
-        category: ActionCategory::Navigation,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::Back,
-        label: "Back",
-        description: "Navigate to the parent or previous location",
-        category: ActionCategory::Navigation,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::SwitchPane,
-        label: "Switch pane",
-        description: "Move focus to the opposite pane",
-        category: ActionCategory::Panels,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::ToggleSplitPane,
-        label: "Toggle split pane",
-        description: "toggle vertical split for active pane",
-        category: ActionCategory::Panels,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::ToggleSelect,
-        label: "Toggle selection",
-        description: "Select or deselect the focused item",
-        category: ActionCategory::Selection,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::ViewFile,
-        label: "View file",
-        description: "Open a read-only preview of the focused file",
-        category: ActionCategory::Files,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::EditFile,
-        label: "Edit file",
-        description: "Edit the focused supported text file",
-        category: ActionCategory::Files,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::Copy,
-        label: "Copy",
-        description: "Copy file selection to other pane",
-        category: ActionCategory::Files,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::Move,
-        label: "Move",
-        description: "Move file selection to other pane",
-        category: ActionCategory::Files,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::Mkdir,
-        label: "New directory",
-        description: "Create a new directory",
-        category: ActionCategory::Files,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::Delete,
-        label: "Delete",
-        description: "Delete the selected items using the provider's safe delete flow",
-        category: ActionCategory::Files,
-        destructive: true,
-    },
-    ActionMeta {
-        id: ActionId::ComputeSha256,
-        label: "Compute SHA-256",
-        description: "Hash focused or selected local regular files",
-        category: ActionCategory::Files,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::TouchFile,
-        label: "Touch file",
-        description: "Create or update a local regular file timestamp",
-        category: ActionCategory::Files,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::CompressTarGz,
-        label: "Compress to tar.gz",
-        description: "Create a noclobber tar.gz from focused or selected local entries",
-        category: ActionCategory::Files,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::ListTmuxSessions,
-        label: "List tmux sessions",
-        description: "Discover and attach to a tmux session",
-        category: ActionCategory::Application,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::ToggleEmbeddedTerminal,
-        label: "Embedded Terminal",
-        description: "Open an embedded terminal in the right pane",
-        category: ActionCategory::Panels,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::Refresh,
-        label: "Refresh",
-        description: "Refresh visible entries",
-        category: ActionCategory::Navigation,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::OpenCommandCenter,
-        label: "Command Center",
-        description: "Search actions, hosts, bookmarks, and history",
-        category: ActionCategory::Panels,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::OpenBookmarks,
-        label: "Bookmarks",
-        description: "Open the bookmarks panel",
-        category: ActionCategory::Panels,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::OpenJobs,
-        label: "Jobs",
-        description: "Open the background jobs panel",
-        category: ActionCategory::Panels,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::OpenSmartTree,
-        label: "Smart Tree",
-        description: "Open the filtered directory tree",
-        category: ActionCategory::Panels,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::OpenInfrastructureCenter,
-        label: "Infrastructure Center",
-        description: "Open infrastructure and SSH host status",
-        category: ActionCategory::Panels,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::OpenHosts,
-        label: "Hosts",
-        description: "Open the SSH hosts panel",
-        category: ActionCategory::Panels,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::OpenSshHosts,
-        label: "SSH Hosts",
-        description: "Open the managed SSH host configuration manager",
-        category: ActionCategory::Panels,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::OpenHelp,
-        label: "Help",
-        description: "Open or close contextual help",
-        category: ActionCategory::Panels,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::OpenHotlist,
-        label: "Directory Hotlist",
-        description: "open configured favorite directories",
-        category: ActionCategory::Navigation,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::OpenInFileManager,
-        label: "Open in file manager",
-        description: "open active local directory in desktop file manager",
-        category: ActionCategory::Files,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::BeginSymlink,
-        label: "Create symbolic link",
-        description: "Prepare a symbolic link command for the focused item",
-        category: ActionCategory::Files,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::BeginChmod,
-        label: "Change permissions",
-        description: "Prepare a chmod command",
-        category: ActionCategory::Files,
-        destructive: true,
-    },
-    ActionMeta {
-        id: ActionId::BeginHardLink,
-        label: "Create hard link",
-        description: "Prepare a hard link command for the focused item",
-        category: ActionCategory::Files,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::BeginChown,
-        label: "Change owner",
-        description: "Prepare a chown command",
-        category: ActionCategory::Files,
-        destructive: true,
-    },
-    ActionMeta {
-        id: ActionId::ToggleWorkspaceComparison,
-        label: "Compare panes",
-        description: "Compare the left and right locations as one workspace",
-        category: ActionCategory::Workspace,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::PreviewWorkspaceSync,
-        label: "Preview workspace sync",
-        description: "Build a safe sync plan without changing files",
-        category: ActionCategory::Workspace,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::ReverseWorkspaceDirection,
-        label: "Reverse sync direction",
-        description: "Switch between left → right and right → left",
-        category: ActionCategory::Workspace,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::ToggleWorkspaceSyncMode,
-        label: "Toggle update/mirror",
-        description: "Switch safe update mode or destructive mirror mode",
-        category: ActionCategory::Workspace,
-        destructive: true,
-    },
-    ActionMeta {
-        id: ActionId::CloseWorkspaceSyncOverlay,
-        label: "Hide workspace sync",
-        description: "Hide the sync overlay without cancelling the job",
-        category: ActionCategory::Workspace,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::ExecuteWorkspaceSync,
-        label: "Execute workspace sync",
-        description: "Freeze the current preview and execute it when safe",
-        category: ActionCategory::Workspace,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::ConfirmWorkspaceSync,
-        label: "Confirm workspace sync",
-        description: "Explicitly confirm this exact destructive frozen plan",
-        category: ActionCategory::Workspace,
-        destructive: true,
-    },
-    ActionMeta {
-        id: ActionId::CancelWorkspaceSync,
-        label: "Cancel workspace sync",
-        description: "Request cancellation of the active sync job",
-        category: ActionCategory::Workspace,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::ShowWorkspaceSyncDetails,
-        label: "Show workspace sync details",
-        description: "Reopen the current sync progress or verification overlay",
-        category: ActionCategory::Workspace,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::ShowWorkspaceVerificationDiff,
-        label: "Show verification diff",
-        description: "Show workspace differences found by post-sync verification",
-        category: ActionCategory::Workspace,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::ReturnToWorkspaceSyncPreview,
-        label: "Back in workspace sync",
-        description: "Return from verification details or to the current preview when it still exists",
-        category: ActionCategory::Workspace,
-        destructive: false,
-    },
-    ActionMeta {
-        id: ActionId::ConfirmRemoteDelete,
-        label: "Confirm remote delete",
-        description: "Confirm permanent deletion of the selected remote files",
-        category: ActionCategory::Files,
-        destructive: true,
-    },
-    ActionMeta {
-        id: ActionId::CancelRemoteDelete,
-        label: "Cancel remote delete",
-        description: "Cancel the pending remote delete operation",
-        category: ActionCategory::Files,
-        destructive: false,
-    },
-];
-
 pub fn action_meta(id: ActionId) -> Option<&'static ActionMeta> {
-    ACTION_CATALOG.iter().find(|meta| meta.id == id)
+    crate::app::registration::registration_for(id).map(|r| &r.meta)
 }
 
 pub fn listed_entry_navigation_target(
@@ -776,11 +397,10 @@ mod tests {
 
     #[test]
     fn every_action_has_catalog_metadata() {
-        assert_eq!(ALL_ACTIONS.len(), ACTION_CATALOG.len());
-        for action in ALL_ACTIONS {
-            let meta = action_meta(action.id())
-                .unwrap_or_else(|| panic!("missing metadata for {:?}", action.id()));
-            assert_eq!(meta.id, action.id());
+        for registration in crate::app::registration::registrations() {
+            let meta = action_meta(registration.action.id())
+                .unwrap_or_else(|| panic!("missing metadata for {:?}", registration.action.id()));
+            assert_eq!(meta, &registration.meta);
             assert!(!meta.label.is_empty());
             assert!(!meta.description.is_empty());
         }
@@ -788,13 +408,14 @@ mod tests {
 
     #[test]
     fn action_ids_are_unique_in_catalog() {
-        for (index, meta) in ACTION_CATALOG.iter().enumerate() {
+        let registrations = crate::app::registration::registrations();
+        for (index, meta) in registrations.iter().enumerate() {
             assert!(
-                ACTION_CATALOG[index + 1..]
+                registrations[index + 1..]
                     .iter()
-                    .all(|other| other.id != meta.id),
+                    .all(|other| other.meta.id != meta.meta.id),
                 "duplicate action metadata for {:?}",
-                meta.id
+                meta.meta.id
             );
         }
     }

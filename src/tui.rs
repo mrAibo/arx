@@ -62,6 +62,7 @@ mod command_bar;
 mod command_center;
 mod effect_responses;
 mod embedded_terminal;
+mod feature_registry;
 mod help;
 mod hosts;
 mod hotlist;
@@ -1485,8 +1486,18 @@ async fn dispatch_ui_action(
     let focused = focused_row
         .and_then(|row| row.listed())
         .map(|listed| &listed.entry);
-    if quick_actions::handle_action(state, &action, focused, active_entries, effect_dispatcher) {
-        return Ok(());
+    // PACK R: proof-feature activation through the registered controller seam.
+    {
+        let focused_ref = focused;
+        let mut ctx = feature_registry::FeatureActionContext {
+            state,
+            focused: focused_ref,
+            active_entries,
+            effect_dispatcher,
+        };
+        if feature_registry::handle_registered_action(&mut ctx, &action) {
+            return Ok(());
+        }
     }
     // ponytail: keep the ListedEntry (exact identity) for preview, not &Entry
     let focused_listed = focused_row.and_then(|row| row.listed());
@@ -1543,7 +1554,6 @@ async fn dispatch_ui_action(
             }
         }
         Action::OpenHosts => toggle_hosts_overlay(state),
-        Action::OpenSshHosts => state.toggle_overlay(OverlayKind::SshHosts),
         Action::OpenHelp => {
             key_router.clear_pending();
             state.help_scroll = 0;
