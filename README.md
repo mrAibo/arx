@@ -133,6 +133,7 @@ of truth.
 | Ctrl+G | Go to path |
 | Ctrl+H | Toggle hidden files |
 | Alt+Down / Alt+Up | Directory history |
+| Mouse wheel | Scroll the active file pane by 3 visible rows; passive panes do not steal focus |
 
 ### Selection
 
@@ -142,7 +143,8 @@ of truth.
 | * | Invert selection |
 | / | Filter by name |
 | + | Select by glob |
-| Right-click | Context menu |
+| Shift+Left-click | Add the inclusive real-row range in the clicked pane/location; synthetic Parent/LoadMore rows are skipped |
+| Right-click | Provider-aware typed context menu using canonical action availability; stale exact targets fail closed |
 
 ### File operations
 
@@ -265,7 +267,7 @@ extension mechanism. ARX does not ship an embedded Lua or WASM plugin runtime.
 | Background jobs with progress | ✅ |
 | Embedded Terminal (Ctrl+X T) | ✅ |
 | tmux/screen integration — tmux discovery/attach shipped; screen discovery/lifecycle remain #7 | ⚠️ Partial |
-| Mouse — right-click + drag-select shipped; pane wheel/Shift+Click/context availability remain #10 | ⚠️ Partial |
+| Mouse — visible-row-correct clicks, drag selection, active-pane wheel, Shift+Click ranges, and provider-aware typed context menu | ✅ (#10 / PR #236) |
 | Directory diff + content diff (Ctrl+D) | ✅ |
 | Split panes — vertical split/focus shipped; horizontal/resize/explicit close remain #16 | ⚠️ Partial |
 | MC-style Ctrl+X prefix (symlink, hardlink, chmod, chown) | ✅ |
