@@ -54,7 +54,7 @@ The canonical continuation document is [`docs/DEVELOPMENT_HANDOFF.md`](docs/DEVE
 The original sequence was tracked by umbrella issue **#180**; PACK Q is tracked by
 umbrella issue **#224**.
 
-Status truth (PACK Q3 closeout):
+Status truth (PACK R closeout):
 
 1. **PACK P — TUI decomposition.** COMPLETE. Behavior-preserving decomposition of the
    >10k-line `src/tui.rs` composition bottleneck: characterization tests, rendering
@@ -67,11 +67,13 @@ Status truth (PACK Q3 closeout):
    authority and documentation truth. `Location` remains typed identity/address,
    `ProviderRegistry` is the execution authority, `CapabilitySet` is exact-location
    capability truth, and both provider resolver seams are a deliberate design.
-3. **PACK R — internal feature/command registration.** NEXT after the Q3 merge.
-   Introduce only the smallest
-   internal registration layer proven necessary after P/Q. Migrate Quick Actions,
-   Storage Inspector, and SSH Host Manager as proof consumers. Do not freeze a broad
-   public `FeatureModule` plugin trait prematurely.
+3. **PACK R — internal feature/command registration (#231).** COMPLETE with this
+   closeout: one canonical app-level action-registration table (action + metadata +
+   availability policy), Command Center iterating it directly, and a private
+   binary-side controller registry keyed by `ActionId` for the proof consumers
+   Quick Actions, Storage Inspector, and SSH Host Manager. Storage Inspector became
+   a real registered action on the fixed default Alt+U binding; no public feature
+   trait, no feature-id type, no plugin framework.
 4. **External plugin decision gate.** No Lua/WASM/`.so` runtime is scheduled. Evaluate
    external plugins only after PACK R and only if real demand exists. Manifest
    permissions without real OS/runtime enforcement are not a security boundary.
@@ -268,9 +270,11 @@ invent X11 forwarding state.
 
 ## FUTURE PRODUCT BACKLOG
 
-The architecture packs O → P → Q removed the largest composition and dispatch
-bottlenecks; PACK R completes that sequence after the Q3 closeout merge. The product
-backlog remains active and should not be lost during those refactors.
+The architecture packs O → P → Q → R removed the largest composition, dispatch, and
+registration bottlenecks; the P → Q → R sequence is COMPLETE after the PACK R merge.
+External plugin evaluation remains a DECISION GATE, not a next implementation step —
+there is no external plugin GO. The product backlog remains active and should not be
+lost during later work.
 
 Near-term product follow-ups after the architecture sequence:
 
