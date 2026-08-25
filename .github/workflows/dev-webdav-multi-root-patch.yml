@@ -1,0 +1,383 @@
+name: DEV WebDAV multi-root patch
+
+on:
+  push:
+    branches: [feature/webdav-multi-root-copy]
+    paths:
+      - '.github/workflows/dev-webdav-multi-root-patch.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+      - name: Verify branch ancestry and apply deterministic patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor 4355f24e8a74c3393c34bc3dbe05a8e5753457c0 HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one replacement, found {count}: {old[:80]!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "src/transfer/mod.rs",
+              "pub mod s3_upload;\npub mod webdav_transfer;\n",
+              "pub mod s3_upload;\npub mod webdav_batch;\npub mod webdav_transfer;\n",
+          )
+          replace_once(
+              "src/transfer/mod.rs",
+              '''    DownloadTree {
+                  source: crate::vfs::WebDavCollectionRef,
+                  local_destination: PathBuf,
+              },
+          }
+          ''',
+              '''    DownloadTree {
+                  source: crate::vfs::WebDavCollectionRef,
+                  local_destination: PathBuf,
+              },
+              /// Two or more frozen sibling roots executed sequentially through the
+              /// existing WebDAV executor and one concrete provider authority.
+              Batch {
+                  target: String,
+                  items: Vec<WebDavTransferSpec>,
+              },
+          }
+          ''',
+          )
+          replace_once(
+              "src/transfer/mod.rs",
+              '''            Self::DownloadOne { source, .. } => &source.target,
+                      Self::DownloadTree { source, .. } => &source.target,
+                  }
+          ''',
+              '''            Self::DownloadOne { source, .. } => &source.target,
+                      Self::DownloadTree { source, .. } => &source.target,
+                      Self::Batch { target, .. } => target,
+                  }
+          ''',
+          )
+
+          replace_once(
+              "src/tui/transfers.rs",
+              '''            // WebDAV basic transfer: resolve exactly ONE source from the ACTIVE
+                      // pane. Selection wins over cursor and is matched against current
+                      // real ListedEntry rows; passive pane contributes Location only.
+                      let webdav_spec: Option<arx::transfer::WebDavTransferSpec> =
+                          if src_provider == ProviderId::WebDAV || dst_provider == ProviderId::WebDAV {
+                              match arx::transfer::prepare_webdav_copy(
+                                  &src_loc,
+                                  &dst_loc,
+                                  &selected_names,
+                                  focused_listed,
+                                  active_listed,
+                              ) {
+                                  Ok((spec, queue_name)) => {
+                                      names = vec![queue_name];
+                                      Some(spec)
+                                  }
+                                  Err(msg) => {
+                                      state.message = Some(msg);
+                                      return true;
+                                  }
+                              }
+                          } else {
+                              None
+                          };
+          ''',
+              '''            // WebDAV transfer: resolve one or many roots only from CURRENT
+                      // real rows of the ACTIVE source pane. Multi-selection is frozen as
+                      // one sequential Batch; the passive pane contributes Location only.
+                      let webdav_spec: Option<arx::transfer::WebDavTransferSpec> =
+                          if src_provider == ProviderId::WebDAV || dst_provider == ProviderId::WebDAV {
+                              match arx::transfer::webdav_batch::prepare_webdav_copy_batch(
+                                  &src_loc,
+                                  &dst_loc,
+                                  &selected_names,
+                                  focused_listed,
+                                  active_listed,
+                              ) {
+                                  Ok((spec, queue_names)) => {
+                                      names = queue_names;
+                                      Some(spec)
+                                  }
+                                  Err(msg) => {
+                                      state.message = Some(msg);
+                                      return true;
+                                  }
+                              }
+                          } else {
+                              None
+                          };
+          ''',
+          )
+
+          replace_once(
+              "src/transfer/executor.rs",
+              "use crate::vfs::{Location, ProviderRegistry, local::LocalFs};\n",
+              "use crate::vfs::{Location, ProviderRegistry, local::LocalFs, webdav::WebDavProvider};\n",
+          )
+          marker = '''/// Execute a previously validated transfer plan without blocking the async TUI.
+          '''
+          helper = r'''#[derive(Debug, thiserror::Error)]
+          #[error(
+              "WebDAV batch root '{item}' failed after {completed} of {total} completed: {source}"
+          )]
+          struct WebDavBatchFailure {
+              item: String,
+              completed: usize,
+              total: usize,
+              #[source]
+              source: Box<TransferExecutionError>,
+          }
+
+          fn webdav_batch_failure_disposition(
+              error: &TransferExecutionError,
+          ) -> crate::transfer_queue::RetryDisposition {
+              match error.retry_disposition() {
+                  crate::transfer_queue::RetryDisposition::RecoveryRequired => {
+                      crate::transfer_queue::RetryDisposition::RecoveryRequired
+                  }
+                  crate::transfer_queue::RetryDisposition::AmbiguousMutation => {
+                      crate::transfer_queue::RetryDisposition::AmbiguousMutation
+                  }
+                  _ => crate::transfer_queue::RetryDisposition::NeverRetry,
+              }
+          }
+
+          async fn execute_webdav_batch_item(
+              provider: &WebDavProvider,
+              spec: &WebDavTransferSpec,
+              cancel: Arc<AtomicBool>,
+              pause: crate::transfer_queue::PauseGate,
+          ) -> Result<(), TransferExecutionError> {
+              let mut discard_progress = |_| {};
+              match spec {
+                  WebDavTransferSpec::UploadOne { .. } => {
+                      webdav_upload_one(
+                          provider,
+                          spec,
+                          WebDavOverwritePolicy::Forbid,
+                          cancel,
+                          &mut discard_progress,
+                      )
+                      .await
+                      .map_err(|error| {
+                          match error
+                              .get_ref()
+                              .and_then(|inner| inner.downcast_ref::<TransferExecutionError>())
+                          {
+                              Some(typed) => TransferExecutionError::Io {
+                                  disposition: typed.retry_disposition(),
+                                  source: error,
+                              },
+                              None => TransferExecutionError::ambiguous(error),
+                          }
+                      })?;
+                  }
+                  WebDavTransferSpec::UploadTree { .. } => {
+                      webdav_upload_tree(
+                          provider,
+                          spec,
+                          cancel,
+                          pause,
+                          &mut discard_progress,
+                      )
+                      .await
+                      .map_err(classify_webdav_upload_tree_error)?;
+                  }
+                  WebDavTransferSpec::DownloadOne { .. } => {
+                      webdav_download_one(
+                          provider,
+                          spec,
+                          WebDavOverwritePolicy::Forbid,
+                          cancel,
+                          pause,
+                          &mut discard_progress,
+                      )
+                      .await
+                      .map_err(TransferExecutionError::from)?;
+                  }
+                  WebDavTransferSpec::DownloadTree { .. } => {
+                      webdav_download_tree(
+                          provider,
+                          spec,
+                          cancel,
+                          pause,
+                          &mut discard_progress,
+                      )
+                      .await
+                      .map_err(classify_webdav_tree_error)?;
+                  }
+                  WebDavTransferSpec::Batch { .. } => {
+                      return Err(TransferExecutionError::InvalidPlan {
+                          method: TransferMethod::WebDav,
+                          reason: "nested WebDAV transfer batch".into(),
+                      });
+                  }
+              }
+              Ok(())
+          }
+
+          async fn execute_webdav_batch(
+              provider: &WebDavProvider,
+              target: &str,
+              items: &[WebDavTransferSpec],
+              names: &[String],
+              cancel: Arc<AtomicBool>,
+              pause: crate::transfer_queue::PauseGate,
+              on_progress: &mut impl FnMut(TypedTransferProgress),
+          ) -> Result<TransferOutcome, TransferExecutionError> {
+              if items.len() < 2 || names.len() != items.len() {
+                  return Err(TransferExecutionError::InvalidPlan {
+                      method: TransferMethod::WebDav,
+                      reason: "WebDAV batch requires matching root specs and names".into(),
+                  });
+              }
+              if items.iter().any(|item| {
+                  matches!(item, WebDavTransferSpec::Batch { .. }) || item.target() != target
+              }) {
+                  return Err(TransferExecutionError::InvalidPlan {
+                      method: TransferMethod::WebDav,
+                      reason: "WebDAV batch contains a nested or mixed-target root".into(),
+                  });
+              }
+
+              let total = items.len();
+              let mut completed = 0usize;
+              for (index, item) in items.iter().enumerate() {
+                  pause.checkpoint().await;
+                  ensure_not_cancelled(&cancel, completed)?;
+                  match execute_webdav_batch_item(
+                      provider,
+                      item,
+                      cancel.clone(),
+                      pause.clone(),
+                  )
+                  .await
+                  {
+                      Ok(()) => {
+                          completed += 1;
+                          on_progress(TypedTransferProgress::Items {
+                              completed: completed as u64,
+                              total: Some(total as u64),
+                          });
+                      }
+                      Err(TransferExecutionError::Cancelled { .. }) => {
+                          return Err(TransferExecutionError::Cancelled { completed });
+                      }
+                      Err(error) => {
+                          let disposition = webdav_batch_failure_disposition(&error);
+                          return Err(TransferExecutionError::Io {
+                              source: io::Error::other(WebDavBatchFailure {
+                                  item: names[index].clone(),
+                                  completed,
+                                  total,
+                                  source: Box::new(error),
+                              }),
+                              disposition,
+                          });
+                      }
+                  }
+              }
+
+              Ok(TransferOutcome { completed, total })
+          }
+
+          '''
+          p = Path("src/transfer/executor.rs")
+          text = p.read_text()
+          if text.count(marker) != 1:
+              raise SystemExit("executor marker mismatch")
+          p.write_text(text.replace(marker, helper + marker, 1))
+
+          replace_once(
+              "src/transfer/executor.rs",
+              '''                WebDavTransferSpec::DownloadTree { .. } => {
+                              let items = webdav_download_tree(
+                                  &provider,
+                                  spec,
+                                  cancel.clone(),
+                                  pause,
+                                  &mut on_progress,
+                              )
+                              .await
+                              .map_err(classify_webdav_tree_error)?;
+                              // Stable item semantics: selected root + every manifest
+                              // descendant. Full completion is reported only here.
+                              return Ok(TransferOutcome {
+                                  completed: items,
+                                  total: items,
+                              });
+                          }
+                      }
+          ''',
+              '''                WebDavTransferSpec::DownloadTree { .. } => {
+                              let items = webdav_download_tree(
+                                  &provider,
+                                  spec,
+                                  cancel.clone(),
+                                  pause,
+                                  &mut on_progress,
+                              )
+                              .await
+                              .map_err(classify_webdav_tree_error)?;
+                              // Stable item semantics: selected root + every manifest
+                              // descendant. Full completion is reported only here.
+                              return Ok(TransferOutcome {
+                                  completed: items,
+                                  total: items,
+                              });
+                          }
+                          WebDavTransferSpec::Batch { target, items } => {
+                              return execute_webdav_batch(
+                                  &provider,
+                                  target,
+                                  items,
+                                  names,
+                                  cancel.clone(),
+                                  pause,
+                                  &mut on_progress,
+                              )
+                              .await;
+                          }
+                      }
+          ''',
+          )
+          PY
+      - name: Format and standard gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo check --locked --all-features
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-features
+          git diff --check
+      - name: Commit implementation and remove helper workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/dev-webdav-multi-root-patch.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/transfer/mod.rs src/transfer/webdav_batch.rs src/transfer/executor.rs src/tui/transfers.rs
+          git commit -m 'feat: wire WebDAV multi-root F5 copy'
+          git push origin HEAD:feature/webdav-multi-root-copy
