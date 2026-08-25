@@ -14,7 +14,7 @@ pub use self::webdav_transfer::WebDavOverwritePolicy;
 
 use crate::vfs::{
     Capability, CapabilitySet, EntryIdentity, EntryKind, ListedEntry, Location, ProviderId,
-    S3ObjectRef, WebDavObjectRef, encode_segment, validate_child_name,
+    S3ObjectRef, WebDavObjectRef, validate_child_name,
 };
 use std::path::PathBuf;
 
@@ -125,15 +125,25 @@ pub enum S3TransferSpec {
     },
 }
 
-/// Frozen, transferred WebDAV identity/payload. The `WebDavObjectRef` (exact
-/// target id + raw `href` from the listing) is the sole authority for the
-/// remote object — never reconstructed from a `Location` + name.
-// ponytail: identity boundary only; WebDavProvider executes both directions
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebDavWriteTarget {
+    pub target: String,
+    /// Decoded logical path inside the configured target. The provider owns
+    /// wire percent-encoding at the HTTP boundary.
+    pub logical_path: String,
+}
+
+/// Frozen WebDAV transfer payload. Existing remote resources use exact native
+/// href identity; not-yet-existing upload destinations use `WebDavWriteTarget`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebDavTransferSpec {
     UploadOne {
         local_source: PathBuf,
-        destination: WebDavObjectRef,
+        destination: WebDavWriteTarget,
+    },
+    UploadTree {
+        local_source: PathBuf,
+        destination_root: WebDavWriteTarget,
     },
     DownloadOne {
         source: WebDavObjectRef,
@@ -152,6 +162,9 @@ impl WebDavTransferSpec {
     pub fn target(&self) -> &str {
         match self {
             Self::UploadOne { destination, .. } => &destination.target,
+            Self::UploadTree {
+                destination_root, ..
+            } => &destination_root.target,
             Self::DownloadOne { source, .. } => &source.target,
             Self::DownloadTree { source, .. } => &source.target,
         }
@@ -406,25 +419,27 @@ pub fn webdav_download_local_name(
     Ok(presentation_name.to_string())
 }
 
-/// Build a frozen WebDAV destination `WebDavObjectRef` for an upload.
-///
-/// The `href` comes from the listing identity (exact raw href from server).
-/// `filename` must be a safe single local child (fail closed otherwise).
-/// The ref is constructed from the authoritative `target` + server href,
-// ponytail: no path reconstruction; exact server href is the identity
-pub fn webdav_upload_destination_ref(
+/// Freeze a not-yet-existing WebDAV child write address from a configured
+/// target, decoded logical parent path, and one validated decoded component.
+pub fn webdav_write_child_target(
     target: &str,
-    href: &str,
-    filename: &str,
-) -> Result<WebDavObjectRef, TransferPlanError> {
-    validate_child_name(filename).map_err(|_| {
+    parent_logical_path: &str,
+    name: &str,
+) -> Result<WebDavWriteTarget, TransferPlanError> {
+    validate_webdav_local_component(name).map_err(|_| {
         TransferPlanError::InvalidLocalName(
-            "object cannot be represented as a single local filename".to_string(),
+            "object cannot be represented as a single WebDAV path component".to_string(),
         )
     })?;
-    Ok(WebDavObjectRef {
+    let parent = parent_logical_path.trim_end_matches('/');
+    let logical_path = if parent.is_empty() {
+        format!("/{name}")
+    } else {
+        format!("{parent}/{name}")
+    };
+    Ok(WebDavWriteTarget {
         target: target.to_string(),
-        href: href.to_string(),
+        logical_path,
     })
 }
 
@@ -487,19 +502,20 @@ pub fn build_webdav_copy_spec(
                 path: destination_path,
             },
         ) => {
-            if source.entry.kind != EntryKind::File {
-                return Err(
-                    "WebDAV upload currently supports a single local file, not a directory".into(),
-                );
-            }
             let filename = source.entry.name.as_str();
-            let dest_href = format!("{}{}", destination_path, encode_segment(filename));
-            let destination = webdav_upload_destination_ref(target, &dest_href, filename)
+            let destination = webdav_write_child_target(target, destination_path, filename)
                 .map_err(|e| e.to_string())?;
-            Ok(WebDavTransferSpec::UploadOne {
-                local_source: local_root.join(filename),
-                destination,
-            })
+            match source.entry.kind {
+                EntryKind::File => Ok(WebDavTransferSpec::UploadOne {
+                    local_source: local_root.join(filename),
+                    destination,
+                }),
+                EntryKind::Directory => Ok(WebDavTransferSpec::UploadTree {
+                    local_source: local_root.join(filename),
+                    destination_root: destination,
+                }),
+                _ => Err("WebDAV upload requires a regular file or directory".into()),
+            }
         }
         (Location::WebDav { target, .. }, Location::Local(local_root)) => {
             match (&source.entry.kind, &source.identity) {
@@ -1111,7 +1127,7 @@ mod tests {
             } => {
                 assert_eq!(local_source, PathBuf::from("/active/A.txt"));
                 assert_eq!(destination.target, "target-A");
-                assert_eq!(destination.href, "/files/A.txt");
+                assert_eq!(destination.logical_path, "/files/A.txt");
             }
             _ => panic!("T1 expected upload"),
         }
@@ -1276,17 +1292,21 @@ mod tests {
             target: "dav-a".into(),
             path: "/dst/".into(),
         };
-        assert!(
-            prepare_webdav_copy(
-                &Location::Local(PathBuf::from("/src")),
-                &dav_dst,
-                &[],
-                Some(&local_dir),
-                &[&local_dir]
-            )
-            .unwrap_err()
-            .contains("not a directory")
-        ); // R3
+        let (tree, queue) = prepare_webdav_copy(
+            &Location::Local(PathBuf::from("/src")),
+            &dav_dst,
+            &[],
+            Some(&local_dir),
+            &[&local_dir],
+        )
+        .expect("local directory prepares UploadTree");
+        assert_eq!(queue, "dir");
+        assert!(matches!(
+            tree,
+            WebDavTransferSpec::UploadTree { local_source, destination_root }
+                if local_source == std::path::Path::new("/src/dir")
+                    && destination_root.logical_path == "/dst/dir"
+        ));
 
         // R4: accepted #246 multi-selection remains fail-closed.
         assert_eq!(

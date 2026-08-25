@@ -583,3 +583,112 @@ async fn physical_webdav_interop_recursive_download_tree() {
     );
     assert_eq!(std::fs::read(existing.join("sentinel")).unwrap(), b"keep");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn physical_webdav_interop_recursive_upload_tree() {
+    let host_ok = std::env::var("ARX_WEBDAV_SMOKE_HOST").is_ok();
+    let required = std::env::var("ARX_WEBDAV_INTEROP_REQUIRED").ok().as_deref() == Some("1");
+    if !host_ok && !required {
+        eprintln!("skipping recursive upload interop: no fixture env");
+        return;
+    }
+    let provider = Arc::new(target_direct());
+    let target_id = provider.target().id.clone();
+    let local_parent = tempfile::tempdir().unwrap();
+    let root_name = format!("{}-upload-tree", physical_run_id());
+    let local_root = local_parent.path().join(&root_name);
+    std::fs::create_dir(&local_root).unwrap();
+    for dir in ["empty", "nested", "unicodé spáces"] {
+        std::fs::create_dir(local_root.join(dir)).unwrap();
+    }
+    std::fs::write(local_root.join("normal.txt"), b"normal").unwrap();
+    std::fs::write(local_root.join("zero.bin"), b"").unwrap();
+    std::fs::write(local_root.join("nested/child.txt"), b"nested").unwrap();
+    std::fs::write(local_root.join("unicodé spáces/file name.txt"), b"unicode").unwrap();
+    let source = ListedEntry {
+        entry: crate::vfs::Entry {
+            name: root_name.clone(),
+            kind: EntryKind::Directory,
+            size: None,
+            modified_unix_ms: None,
+        },
+        identity: EntryIdentity::Other,
+    };
+    run_f5(
+        &registry_with(&provider),
+        Location::Local(local_parent.path().to_path_buf()),
+        Location::WebDav {
+            target: target_id.clone(),
+            path: "/".into(),
+        },
+        source,
+    )
+    .await
+    .expect("recursive upload product path");
+    for (path, bytes) in [
+        ("normal.txt", b"normal".as_slice()),
+        ("zero.bin", b"".as_slice()),
+        ("nested/child.txt", b"nested".as_slice()),
+        ("unicodé spáces/file name.txt", b"unicode".as_slice()),
+    ] {
+        assert_eq!(
+            provider
+                .read_all_capped(&format!("/{root_name}/{path}"), 64)
+                .await
+                .unwrap()
+                .bytes,
+            bytes
+        );
+    }
+    assert!(
+        list_at(&provider, &target_id, &format!("/{root_name}/empty"))
+            .await
+            .iter()
+            .all(|entry| entry.entry.name == "empty")
+    );
+    let collision_name = format!("{}-collision", physical_run_id());
+    provider.mkdir(&format!("/{collision_name}")).await.unwrap();
+    provider
+        .write_file_bytes_if_unchanged(
+            &format!("/{collision_name}/marker"),
+            b"keep",
+            &RemoteEditRevision::new(vec![], 0, 0, 0),
+            &CancellationFlag::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    let collision_root = local_parent.path().join(&collision_name);
+    std::fs::create_dir(&collision_root).unwrap();
+    std::fs::write(collision_root.join("new"), b"new").unwrap();
+    let collision = ListedEntry {
+        entry: crate::vfs::Entry {
+            name: collision_name.clone(),
+            kind: EntryKind::Directory,
+            size: None,
+            modified_unix_ms: None,
+        },
+        identity: EntryIdentity::Other,
+    };
+    assert!(
+        run_f5(
+            &registry_with(&provider),
+            Location::Local(local_parent.path().to_path_buf()),
+            Location::WebDav {
+                target: target_id,
+                path: "/".into()
+            },
+            collision
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        provider
+            .read_all_capped(&format!("/{collision_name}/marker"), 64)
+            .await
+            .unwrap()
+            .bytes,
+        b"keep"
+    );
+}
