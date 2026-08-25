@@ -1,241 +1,235 @@
 # ARX Development Handoff
 
-This document is the canonical continuation point for active ARX development. It is
-intentionally written so a new development session can recover the current state,
-working rules, and next sequence from GitHub without reconstructing chat history.
+This document is the canonical continuation point for active ARX development. It is intentionally compact: a new development session should be able to recover current product truth, frozen architecture rules, and the next work sequence without reconstructing chat history.
 
-> **Authority rule:** current GitHub state and exact SHAs win over any stale chat,
-> cached review, or old local checkout — and over this snapshot itself. Always
-> re-fetch current `main` before making changes; this snapshot is evidence, not
-> eternal truth.
+> **Authority rule:** live GitHub state wins over this file. Re-fetch current `main`, open issues/PRs, and release state before changing code. The v0.21.0 release tag target recorded below is immutable release evidence; current `main` may advance through later docs/bugfix work.
 
-## 1. Current baseline — 2026-08-24 (post-#10)
+## 1. Current release baseline
 
 Repository: `mrAibo/arx`
 
-- Current published release: **v0.20.0**
-  (tag target `3db9cee78d056e4e568e9d9a7f08fb0f579ea707`; verify on GitHub if a newer
-  release has shipped since this snapshot).
+- Current public release: **v0.21.0**
+- v0.21.0 tag target: `3427cd085740d2c3f8a4bffbbf55b34ba3d9bb85`
+- Published: 2026-08-25
 - Rust MSRV: **1.88**
-- Product platform: **Linux only**; published artifact target is Linux x86_64.
-- Accepted #10 runtime merge baseline: `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`
-  (#10 / PR #236). After it, docs-only PR #237 landed and the branch state entering
-  #7 is `80093fc5cdd1f4bb6e1bd16c55e117d257d327dc`. No self-referential "future
-  current main" claim is made here.
-- #10 mouse follow-up: COMPLETE via PR #236, accepted merge
-  `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`; baseline entering #10 was
-  `dad59ac7ae8b80c680767de7c7f95f506078bf44`.
-- #214 configurable effective keymap: COMPLETE via PR #235, accepted merge
-  `dad59ac7ae8b80c680767de7c7f95f506078bf44` (baseline entering #214 was
-  `8444820bcb6b392e77a2cffad326b80b39d880b3`).
-- Current product work: **#16 split-pane layout follow-up** on
-  `feat/16-split-pane-layout`; baseline entering #16:
-  `616b48b6eafbc9dea55b76428b70beab1941b877` (= accepted main after #7). No
-  future merge SHA invented. v1 frozen model: same outer `PaneState` Location /
-  listing / provider / pagination authority, TWO split cursors/views only,
-  `SplitOrientation::{Vertical,Horizontal}`, ratio 20..=80 step 5, explicit
-  close + keyboard resize, section-aware mouse (presentation identity only);
-  NO split_location, no extra Pane enum, no second loader/runtime/selection
-  store; mouse boundary drag resize deferred.
-- Plugins remain no-GO; #233 remains separate; #16 is the active product work above.
-- Earlier provenance — accepted PACK R merge
-  `1def3adf382978491ce11590470f56d844bcce07` (PR #232 / #231).
-- Provenance entering R: `578d52d685dec7454025521e6d06491273503239`. Its tree was
-  exactly the accepted Q3 tree (`bf53c33807be918996d35b45fb4ebbfa7f37abf6`); the two
-  housekeeping commits between accepted Q3 merge
-  `c2f30feaf76a405c111f2996387113d6a93d2064` and that entering-R baseline had
-  a NET zero file diff.
+- Product platform: **Linux only**
+- Published target: **Linux x86_64**
+- Release assets: tar.gz, `.deb`, `.rpm`, and `SHA256SUMS`
+- Release publication uses one validated ELF and reuses the validated artifact bundle; do not rebuild between validation and publication.
 
-Important merge evidence (historical record):
+v0.20.0 remains an immutable historical release baseline. Never move/reinterpret old tags to absorb later work.
 
-- PACK M / PR #175 → `d8abad76623b9fb22190de15249acbfb6fa12673`
-- PACK N / PR #177 → `eec15d91d264a40760b6772135de516d40f1b95c`
-- PACK Q1 / #225 → merge `872298913640a7add5ed4a19748a66f9a8de3113`
-- PACK Q2 / #227 → merge `b8e5f9a5761875d6b25dfa047d9b93af5619b1f6`
-- PACK Q3 / #229 → accepted merge `c2f30feaf76a405c111f2996387113d6a93d2064`
-- PACK R / PR #232 / #231 → accepted merge `1def3adf382978491ce11590470f56d844bcce07`
-- #214 / PR #235 → accepted merge `dad59ac7ae8b80c680767de7c7f95f506078bf44`
-- #10 / PR #236 → accepted merge `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`
+## 2. Current phase — stabilization
 
-PACK N deliberately removed unsupported runtime surface (no `DISPLAY` guessing, no
-`src/plugins` Lua prototype, no `pub mod plugins`, no `mlua`). Any review claiming
-current `main` still contains those is stale.
+The immediate phase after v0.21.0 is **stabilization**, not another architecture pack.
 
-## 2. Architecture pack status
+Priorities:
 
-Provenance: the O → P → Q → R sequence was tracked by umbrella issue **#180**
-(CLOSED completed); PACK Q by umbrella issue **#224** (CLOSED completed).
+1. keep public docs and live GitHub status synchronized with shipped truth
+2. prioritize real user regressions/bug reports over speculative features
+3. keep runtime architecture frozen unless a demonstrated correctness/safety blocker requires change
+4. preserve exact-head CI and affected physical provider acceptance
+5. clean obsolete GitHub PR/branch/status clutter only after verifying it is superseded
+
+The next major feature should be chosen only after stabilization is clean.
+
+## 3. Current product truth
+
+Completed post-v0.20.0 work now included in v0.21.0:
+
+- configurable conflict-safe effective keymap + `arx --print-keymap`
+- mouse follow-up and provider-aware typed context menu
+- tmux / GNU Screen lifecycle hardening
+- split panes: vertical + horizontal, explicit close, keyboard ratio resize, section-aware same-location mouse
+- deterministic transfer-pause acceptance
+- WebDAV F5 target/source truth hardening
+- RFC-compatible WebDAV MOVE Depth behavior
+- Nextcloud 34.0.2 and ownCloud 11.0.0 physical WebDAV certification
+- exact one-root WebDAV recursive download to one new Local tree
+- typed local SHA-256 / Touch / Compress Quick Actions
+
+At this baseline, **#13 WebDAV post-MVP is the only active product issue**. Always re-query GitHub before relying on that count.
+
+## 4. Architecture status
+
+The O → P → Q → R architecture sequence is complete.
 
 | Pack | Scope | Status |
 |---|---|---|
-| PACK O | typed local Quick Actions (#178 / PR #179) | COMPLETE |
-| PACK P | TUI decomposition into controllers/runtime | COMPLETE |
-| PACK Q1 | concrete-location capability authority (#225) | COMPLETE |
-| PACK Q2 | remove legacy Location execution bridge (#227) | COMPLETE |
-| PACK Q3 | finalize resolver authority + docs truth (#229) | COMPLETE (accepted merge `c2f30feaf76a405c111f2996387113d6a93d2064`) |
-| PACK R | internal feature/command registration (#231) | COMPLETE (accepted merge `1def3adf382978491ce11590470f56d844bcce07`) |
+| O | typed local Quick Actions | COMPLETE |
+| P | TUI decomposition | COMPLETE |
+| Q | VFS convergence / resolver authority | COMPLETE |
+| R | internal feature/command registration | COMPLETE |
 
-Deferred by explicit decision, not forgotten (status updated):
+External plugins remain **no GO**. `arx.menu` is the supported lightweight extension path.
 
-- #214 configurable effective keymap — COMPLETE via PR #235 (merge
-  `dad59ac7ae8b80c680767de7c7f95f506078bf44`).
-- #10 mouse follow-up — COMPLETE via PR #236 (merge
-  `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`).
-- external plugin runtime — **no GO** (see §5).
-
-## 3. VFS authority model (final after PACK Q)
-
-`src/vfs/mod.rs` documents this at its top; the summary:
+### Frozen VFS authority model
 
 ```text
-Location          = typed identity / address / navigation information
+Location          = typed identity / address / navigation
 ProviderRegistry  = explicit provider execution authority
 CapabilitySet     = exact-location / concrete-instance capability truth
 VfsProvider       = backend provider interface
 ```
 
-Copy/Move execution lives in `TransferPlanner` / transfer queue / executor; mutations
-live in `MutationService` plus the typed Registry/provider mutation seams.
+Two deliberate resolver seams remain distinct:
 
-Two deliberate resolver seams exist and are kept distinct by design decision:
+- `ProviderRegistry::provider_for_location` — string-path backend operations / legacy listing path authority.
+- `ProviderRegistry::provider_for_page_location` — typed page/native-identity operations for exact targets.
 
-- `ProviderRegistry::provider_for_location` — string-path backend operations.
-  Evaluates `Location::legacy_listing_path` first, so S3 fails closed before any
-  provider construction.
-- `ProviderRegistry::provider_for_page_location` — typed page/native-identity
-  operations. S3 resolves its exact configured `S3Target`, WebDAV its exact
-  `WebDavTarget`; Local/SFTP/Archive delegate to the string-path resolver.
+Do not merge these casually, add a third resolver authority, or reconstruct provider-native identity from display strings.
 
-Do NOT merge them, add a third resolver, or flatten typed identity. The legacy
-`VfsOps` trait, the hidden thread-local `PROVIDER_REGISTRY`, `set_global_registry`,
-and `with_registry_mut` were removed in PACK Q2 and a source-contract test keeps them
-out (`tests/async_vfs_contracts.rs::vfs_module_has_no_legacy_execution_bridge`).
+### Runtime authority rules
 
-## 4. After PACK R
+Do not introduce a second:
 
-The O → P → Q → R architecture sequence is complete at accepted PACK R merge
-`1def3adf382978491ce11590470f56d844bcce07`. Return to the product backlog (§8)
-and explicit, separately reviewed future decisions:
+- ProviderRegistry
+- TransferQueueRuntime
+- JobManager
+- EffectDispatcher
+- scheduler
+- retry authority
+- secret store
 
-- #214 configurable effective keymap — COMPLETE (PR #235); the KeyRouter/effective
-  Keymap architecture is frozen and must not regress.
-- #10 mouse follow-up — COMPLETE (PR #236); mouse remains a second input path into the
-  same typed action/availability/selection truth and must not grow a parallel mutation model.
-- #7 tmux/screen and #16 split-pane follow-ups remain separate product work.
-- External plugins remain **no GO** (see §5). Any evaluation after R is a fresh
-  decision gate, not a scheduled implementation.
-- #233 remains a separate transfer-queue reliability observation; do not change
-  transfer semantics merely to satisfy a timing-sensitive assertion.
+Transfer execution remains owned by TransferPlanner / Transfer Queue / executor seams. Mutations remain routed through the existing typed mutation/provider authorities.
 
-## 5. External plugins — explicitly deferred
+## 5. WebDAV truth after v0.21.0
 
-There is **no GO** for an external plugin runtime.
+Physically accepted targets:
 
-Do not reintroduce Lua, WASM, or Rust `.so` plugins without a fresh reviewed decision.
-External plugins may be evaluated only if real user/ecosystem demand exists; the preferred direction would be read-only first and
-either a genuinely sandboxed out-of-process protocol or capability-constrained
-WASI-style execution.
+- Apache mod_dav — W1–W18
+- Nextcloud 34.0.2-apache — I1–I12
+- ownCloud 11.0.0 — I1–I12
 
-Important security rule:
+Basic auth through keyring/environment-backed secrets is the shipped path. Digest/Bearer are not scheduled without concrete interoperability evidence.
 
-> A manifest permission such as `network = false` or `filesystem_write = false` is
-> documentation, not enforcement, when an arbitrary native plugin runs as the same OS
-> user. JSON over stdin/stdout gives crash/ABI isolation, but not a security sandbox.
+v0.21.0 ships recursive **WebDAV → Local** for one exact selected collection:
 
-Core-owned authority must remain intact for mutations. Provider plugins and
-mutation-capable third-party plugins are late-stage concerns.
+- exact provider-native `WebDavCollectionRef` / `WebDavObjectRef` href identities
+- authenticated bounded `PROPFIND Depth: 1`
+- complete manifest before Local mutation
+- bounded descendants/depth and direct-child/root containment
+- cycle/duplicate/presentation-name/path-component fail-closed behavior
+- staged noclobber file downloads
+- attempt-owned root cleanup on failure/cancel
+- recovery-required outcome if cleanup itself fails
+- cumulative checked byte progress
 
-## 6. Engineering and safety invariants
+Not implied by that implementation:
 
-These rules apply across all packs unless a separately reviewed design explicitly
-changes them:
+- Local directory → WebDAV recursive upload
+- recursive WebDAV delete
+- WebDAV→WebDAV recursive/cross-target copy/move
+- multiple recursive roots
+- metadata/property mutation
+- Digest/Bearer auth
 
-- exact SHA pinning for acceptance evidence; exact-head CI is authoritative
-- Rust MSRV 1.88
-- `cargo fmt --check` (CI formats with the pinned toolchain)
-- Clippy all targets/features with warnings denied
-- full test suite
-- physical Apache WebDAV W1–W18 acceptance where WebDAV behavior changes
-- physical MinIO transfer-queue retry acceptance where S3 transfers change
+Those remain under #13 and require fresh contracts before implementation.
+
+## 6. Recommended next feature sequence
+
+After stabilization, the preferred next design review is:
+
+### A. Local directory → WebDAV recursive upload
+
+Do not mirror the download implementation mechanically. Remote mutation requires a fresh contract covering at least:
+
+- exact destination collection identity
+- source pre-scan / manifest before remote mutation where feasible
+- MKCOL semantics and empty directories
+- staged/noclobber file upload reuse
+- symlink policy
+- partial remote-tree rollback/recovery
+- cancellation boundaries
+- retry ambiguity after remote mutations
+- cleanup failures and recovery evidence
+- progress semantics
+- Apache / Nextcloud / ownCloud physical acceptance through the same real product path
+
+### B. Later candidates
+
+- recursive WebDAV delete
+- multiple-root recursive planning
+- WebDAV↔WebDAV transfer under truthful target semantics
+- SFTP→SFTP workspace sync
+- safe cross-backend Move (`copy → verify → delete-source`, never optimistic provider-crossing rename semantics)
+- S3 Object/Bucket Inspector and evidence-based usage analytics
+- additional Linux architectures / signed repositories if justified
+
+Create/freshen dedicated issues before implementing backlog items that are currently roadmap-only.
+
+## 7. External plugins — explicit decision gate
+
+There is no GO for Lua, WASM, or native `.so` plugins.
+
+Do not reintroduce a general plugin runtime unless real user/ecosystem demand exists and a reviewed enforcement model is available. A manifest permission is not a security boundary if arbitrary native code runs as the same OS user.
+
+Core mutation/provider authority must remain inside the existing trusted runtime.
+
+## 8. Engineering and acceptance invariants
+
+Standard code gates:
+
+```bash
+cargo fmt --check
+cargo check --locked --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+cargo +1.88 check --locked --all-features
+git diff --check
+```
+
+Additional rules:
+
+- exact SHA pinning for acceptance evidence
+- exact-head CI is authoritative
+- provider/transfer semantic changes require their affected physical lanes
+- WebDAV semantic changes require Apache acceptance and, where portable behavior is affected, Nextcloud/ownCloud interoperability
+- S3 transfer/retry changes require MinIO physical evidence
+- multiplexer terminal lifecycle changes require real PTY evidence
 - fail closed when identity/capability/safety is ambiguous
-- no fake progress, total, rate, ETA, capacity, or provider semantics
-- one JobManager/runtime source of truth; no duplicate schedulers
-- provider-native identity must not be reconstructed from presentation strings
-- destructive or remote mutation paths require truthful transaction/cancellation
-  semantics
-- capability truth flows only through `ProviderRegistry` exact-location queries;
-  no caller-side independent fallback authority
-- docs (`README.md`, `ROADMAP.md`, `ARCHITECTURE.md`, release notes when applicable)
-  must match implemented reality
-- releases build once and reuse validated artifacts; do not rebuild between validation
-  and publication
+- never fabricate progress, rate, ETA, capacity, or provider semantics
+- do not change runtime semantics merely to satisfy timing-sensitive tests
+- destructive/remote mutation paths require truthful transaction, cancellation, retry, and recovery behavior
+- `Cargo.lock` remains authoritative
 
-## 7. Collaboration model
+## 9. Collaboration model
 
-- **ChatGPT is the primary programmer/reviewer.** It owns architecture, code review,
-  GitHub changes, CI interpretation, and decisions.
-- **Hermes Agent is a secondary Linux executor** used for deterministic, shell-oriented
-  work with exact branch/SHA guards, stop-on-failure behavior, and explicit expected
-  output. Do not delegate architecture, ambiguous fixes, or safety decisions to it.
+- **ChatGPT** owns architecture, connected-source recon, code/diff review, GitHub PR/merge/release operations, CI interpretation, and final acceptance decisions.
+- **Hermes Agent** is a secondary Linux executor for deterministic shell-oriented work that connected tooling cannot perform.
+- Prefer one coherent Hermes `/goal` or macro-task over repeated microtasks.
+- Hermes must not independently redefine architecture/scope, open/merge PRs, close issues, move published tags, or publish releases unless authority is explicitly changed by the user.
 
-## 8. Release baseline and policy
+## 10. Release policy
 
-v0.20.0 remains the current published release as of this snapshot. Its publication
-contract:
+For feature releases:
 
-- tag target `3db9cee78d056e4e568e9d9a7f08fb0f579ea707`
-- Linux x86_64 tar.gz, Debian `.deb`, RPM `.rpm`, `SHA256SUMS`
-- all package binaries from the same validated ELF, exact payload checks
-- generated third-party license report
+1. freeze scope
+2. reconcile fresh `main`
+3. prepare one release-candidate branch
+4. version/package/release-note truth only unless a genuine blocker requires a separately reviewed product fix
+5. run exact-head standard + affected physical gates
+6. validate release packages from one release ELF
+7. merge with pinned expected head
+8. create a new immutable tag on the accepted main commit
+9. allow the existing tag-triggered Release workflow to publish validated artifacts
+10. independently verify tag target, release state, assets, checksums, packaged binary version, and prior-tag immutability
 
-Future releases keep this one-build/no-rebuild validation/publication contract unless a
-separately reviewed release design changes it.
+Never repurpose an already-published version identity.
 
-## 9. Product backlog after #214 and #10
+## 11. New-session startup checklist
 
-Completed product follow-ups retained as provenance:
+Before changing code:
 
-- #214 configurable effective keymap — COMPLETE via PR #235, merge
-  `dad59ac7ae8b80c680767de7c7f95f506078bf44`
-- #10 mouse — COMPLETE via PR #236, merge
-  `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`
+1. Read this file, `ROADMAP.md`, and `ARCHITECTURE.md`.
+2. Fetch current `main`; do not assume the v0.21.0 release target is still current main.
+3. Query open issues and PRs from GitHub.
+4. Treat current public release/tag state as immutable evidence.
+5. Confirm whether the request is stabilization, bugfix, or a newly approved feature slice.
+6. Check affected source and tests before freezing semantics.
+7. Use connected GitHub tooling for review/PR/merge/CI whenever available.
+8. Use Hermes only where Linux-local execution materially helps.
 
-Remaining product backlog:
+Minimal continuation prompt:
 
-- #7 tmux/screen — screen discovery + real-terminal attach/detach hardening
-- #16 split panes — horizontal mode, resize, explicit close semantics
-- #13 WebDAV post-MVP — auth/interoperability/recursive-operation work under explicit
-  safe contracts
-- cross-backend Move
-- SFTP → SFTP workspace sync
-- recursive remote delete
-- binary remote editing
-- additional Linux architectures / package-repository distribution if justified
-- S3 read-only inspector/analytics with explicit evidence source and freshness
-
-Architecture work should make these later features easier to integrate, not silently
-expand their scope.
-
-## 10. New-session startup checklist
-
-A fresh development session should do this before changing code:
-
-1. Read this file and `ROADMAP.md`.
-2. Treat closed issues #180 (architecture sequence) and #224 (PACK Q) as provenance,
-   not active work.
-3. Fetch current `main` SHA; never assume any SHA in this snapshot is still current.
-4. Continue from the product backlog or an explicitly approved future decision; the
-   O → P → Q → R architecture sequence is complete.
-5. Check exact-head CI/workflow evidence for any currently active PR.
-6. Compare current docs/source against any review supplied by the user; reviews may be
-   stale.
-7. Act as primary programmer. Use Hermes only for deterministic mechanical work that
-   connected tooling cannot execute.
-
-A useful minimal handoff prompt is:
-
-> Continue development of `github.com/mrAibo/arx`. Read
-> `docs/DEVELOPMENT_HANDOFF.md` and `ROADMAP.md`; treat closed issues #180 and #224
-> as architecture provenance. Treat current GitHub state as authoritative and continue
-> from the approved product backlog or an explicit future decision. You are the primary
-> programmer; Hermes is mechanical Linux-only assistance.
+> Continue development of `github.com/mrAibo/arx`. Read `docs/DEVELOPMENT_HANDOFF.md`, `ROADMAP.md`, and `ARCHITECTURE.md`; treat live GitHub state as authoritative. Current public baseline is v0.21.0, with stabilization first and #13 WebDAV post-MVP as the active product umbrella unless GitHub now says otherwise. Preserve the frozen architecture authorities and use Hermes only for deterministic Linux-local execution.
