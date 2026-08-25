@@ -150,6 +150,8 @@ fn date_parser_covers_formats() {
 // ── HTTP-behavior: std TcpListener mock DAV server ──────────────────────────
 
 type MockLog = Arc<Mutex<Vec<(String, String, bool, Option<String>, usize)>>>;
+/// Full raw request text per exchange (headers included), for wire assertions.
+type RawLog = Arc<Mutex<Vec<String>>>;
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_mock(
@@ -215,6 +217,75 @@ fn spawn_mock(
         }
     });
     (format!("http://{addr}"), log)
+}
+
+/// Like `spawn_mock`, but additionally records the FULL raw request text
+/// (request line + headers + body prefix) of every exchange so tests can
+/// assert exact wire headers such as Depth presence/absence (#242).
+fn spawn_mock_raw(
+    handler: impl Fn(&str, &str, &str, Option<&str>, &[u8]) -> (u16, Vec<u8>) + Send + 'static,
+) -> (String, MockLog, RawLog) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let log: MockLog = Arc::new(Mutex::new(Vec::new()));
+    let log2 = log.clone();
+    let raw: RawLog = Arc::new(Mutex::new(Vec::new()));
+    let raw2 = raw.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut buf = [0u8; 8192];
+            let mut req = Vec::new();
+            loop {
+                let n = match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                req.extend_from_slice(&buf[..n]);
+                if req.windows(4).any(|w| w == b"\r\n\r\n") || req.len() > 8000 {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&req).to_string();
+            let lines: Vec<&str> = text.split("\r\n").collect();
+            let first = lines.first().unwrap_or(&"").to_string();
+            let parts: Vec<&str> = first.split_whitespace().collect();
+            let method = parts.first().unwrap_or(&"").to_string();
+            let path = parts.get(1).unwrap_or(&"/").to_string();
+            let has_auth = text
+                .lines()
+                .any(|l| l.to_lowercase().starts_with("authorization: basic "));
+            let dest = text
+                .lines()
+                .find(|l| l.to_lowercase().starts_with("destination:"))
+                .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()));
+            let body = match text.find("\r\n\r\n") {
+                Some(i) => req[i + 4..].to_vec(),
+                None => Vec::new(),
+            };
+            let (status, resp_body) = handler(&method, &path, &first, dest.as_deref(), &body);
+            log2.lock().unwrap().push((
+                method.clone(),
+                path.clone(),
+                has_auth,
+                dest.clone(),
+                body.len(),
+            ));
+            raw2.lock().unwrap().push(text);
+            let headers = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                resp_body.len()
+            );
+            let _ = stream.write_all(headers.as_bytes());
+            let _ = stream.write_all(&resp_body);
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://{addr}"), log, raw)
 }
 
 /// Stream `total` bytes in `chunk`-sized pieces so the client can disconnect
@@ -749,4 +820,103 @@ async fn c_propfind_over_cap_is_invalid_data() {
     // list_async -> propfind -> read_body_bounded(MAX_PROPFIND_BYTES) -> truncated error
     let r = provider.list_async("/dav").await;
     assert!(r.is_err(), "oversized PROPFIND body must be rejected");
+}
+
+// ── #242: COPY sends Depth: 0; MOVE omits Depth entirely ────────────────────
+
+#[tokio::test]
+async fn copy_sends_depth_zero() {
+    let (url, _, raw) = spawn_mock_raw(|method, _, _, _, _| match method {
+        "COPY" => (201, Vec::new()),
+        _ => (404, Vec::new()),
+    });
+    let p = provider_for(&url, "x");
+    p.copy_or_move(
+        reqwest::Method::from_bytes(b"COPY").unwrap(),
+        "/dav/src.txt",
+        "/dav2/src.txt",
+        false,
+    )
+    .await
+    .expect("copy");
+    let texts = raw.lock().unwrap();
+    let copy_req = texts
+        .iter()
+        .find(|t| t.starts_with("COPY "))
+        .expect("COPY request captured");
+    // Request line + exact wire headers.
+    assert!(
+        copy_req.starts_with("COPY /dav/src.txt HTTP/1.1"),
+        "request line"
+    );
+    assert!(
+        copy_req
+            .lines()
+            .any(|l| l.eq_ignore_ascii_case("destination: http://") && l.contains("/dav2/src.txt"))
+            || copy_req.lines().any(
+                |l| l.to_lowercase().starts_with("destination:") && l.contains("/dav2/src.txt")
+            ),
+        "Destination present"
+    );
+    assert!(
+        copy_req
+            .lines()
+            .any(|l| l.to_lowercase().starts_with("overwrite:") && l.ends_with("F")),
+        "Overwrite: F present"
+    );
+    assert!(
+        copy_req.lines().any(|l| l.to_lowercase() == "depth: 0"),
+        "COPY must carry exactly Depth: 0, got:\n{copy_req}"
+    );
+    // Auth must be present on the wire (basic).
+    assert!(
+        copy_req
+            .lines()
+            .any(|l| l.to_lowercase().starts_with("authorization: basic ")),
+        "basic auth present"
+    );
+}
+
+#[tokio::test]
+async fn move_omits_depth_header_completely() {
+    let (url, _, raw) = spawn_mock_raw(|method, _, _, _, _| match method {
+        "MOVE" => (201, Vec::new()),
+        _ => (404, Vec::new()),
+    });
+    let p = provider_for(&url, "x");
+    p.copy_or_move(
+        reqwest::Method::from_bytes(b"MOVE").unwrap(),
+        "/dav/src.txt",
+        "/dav2/src.txt",
+        true,
+    )
+    .await
+    .expect("move");
+    let texts = raw.lock().unwrap();
+    let move_req = texts
+        .iter()
+        .find(|t| t.starts_with("MOVE "))
+        .expect("MOVE request captured");
+    assert!(
+        move_req.starts_with("MOVE /dav/src.txt HTTP/1.1"),
+        "request line"
+    );
+    assert!(
+        move_req
+            .lines()
+            .any(|l| l.to_lowercase().starts_with("destination:") && l.contains("/dav2/src.txt")),
+        "Destination present"
+    );
+    assert!(
+        move_req
+            .lines()
+            .any(|l| l.to_lowercase().starts_with("overwrite:") && l.ends_with("T")),
+        "Overwrite: T present"
+    );
+    assert!(
+        !move_req
+            .lines()
+            .any(|l| l.to_lowercase().starts_with("depth:")),
+        "MOVE must NOT send any Depth header (neither 0 nor infinity), got:\n{move_req}"
+    );
 }
