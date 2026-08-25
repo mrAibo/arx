@@ -244,15 +244,7 @@ impl WebDavProvider {
             // Same-origin absolute href: containment is proven on the PATH with
             // the exact same authority as the path-absolute form below; the raw
             // href (path + query) is returned verbatim, never re-encoded.
-            let after_scheme = href
-                .find("://")
-                .map(|idx| idx + 3)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad absolute href"))?;
-            let path_start = href[after_scheme..].find('/').map(|idx| after_scheme + idx);
-            let raw_path_and_query = path_start.map(|idx| &href[idx..]).unwrap_or("/");
-            let raw_path = raw_path_and_query
-                .split_once('?')
-                .map_or(raw_path_and_query, |(path, _)| path);
+            let raw_path = raw_path_from_absolute_href(href)?;
             self.check_contained(root_path, raw_path, href)?;
             return Ok(href.to_string());
         }
@@ -965,6 +957,29 @@ impl std::fmt::Debug for WebDavProvider {
 
 /// Extract the path portion of an href, stripping any `scheme://host[:port]`
 /// prefix so logical-path comparisons are host-agnostic.
+fn raw_path_from_absolute_href(href: &str) -> io::Result<&str> {
+    let authority_start = href
+        .find("://")
+        .map(|idx| idx + 3)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad absolute href"))?;
+    let tail = &href[authority_start..];
+    let terminator = tail
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '/' | '?' | '#'));
+    let Some((offset, delimiter)) = terminator else {
+        return Ok("/");
+    };
+    if delimiter != '/' {
+        return Ok("/");
+    }
+    let path_and_tail = &tail[offset..];
+    let end = path_and_tail
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '?' | '#'))
+        .map_or(path_and_tail.len(), |(idx, _)| idx);
+    Ok(&path_and_tail[..end])
+}
+
 fn canonical_url_identity(url: &url::Url) -> String {
     let mut canonical = url.clone();
     canonical.set_fragment(None);
@@ -1563,6 +1578,40 @@ mod tests {
     // root and never allow traversal out of it.
     #[test]
     fn exact_href_containment_and_canonical_identity_corrections() {
+        let https = dav_provider("https://example.test/dav");
+        for bad in [
+            "https://example.test?next=/dav/file.txt",
+            "https://example.test?next=/dav/",
+            "https://example.test?x=foo/bar",
+            "https://example.test/dav/%2e%2e/secret?next=/dav/file",
+            "https://example.test/dav/.%2e/secret?next=/dav/file",
+            "https://example.test/dav/%2e./secret?next=/dav/file",
+            "https://example.test/dav/a%2Fb?next=/dav/file",
+            "https://example.test/dav/a%2fb?next=/dav/file",
+            "https://example.test/dav/a%5Cb?next=/dav/file",
+            "https://example.test/dav/a%5cb?next=/dav/file",
+        ] {
+            assert!(
+                https.wire_url_for_href(bad).is_err(),
+                "query slash is not a path: {bad}"
+            );
+        }
+        for good in [
+            "https://example.test/dav/file.txt?next=/outside",
+            "https://example.test/dav/?next=/outside",
+        ] {
+            assert_eq!(https.wire_url_for_href(good).unwrap(), good);
+        }
+        let exact = "https://example.test/dav/a%20b.txt?version=7&next=/x";
+        assert_eq!(https.wire_url_for_href(exact).unwrap(), exact);
+        let origin = dav_provider("https://example.test");
+        for good in [
+            "https://example.test?next=/whatever",
+            "https://example.test/dav/file?x=/foo",
+        ] {
+            assert_eq!(origin.wire_url_for_href(good).unwrap(), good);
+        }
+
         let p = dav_provider("http://example/dav/");
         for good in ["/dav/a%20b?version=7", "http://example/dav/a%20b?version=7"] {
             assert_eq!(
