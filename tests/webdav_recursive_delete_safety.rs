@@ -430,12 +430,9 @@ async fn physical_webdav_recursive_delete_safety() {
     drop(record);
     assert!(root_exists(&provider, &ambiguous_root).await);
     let ambiguous_names = list_root_names(&provider, &ambiguous_root).await;
-    let remaining_ambiguous_children = ambiguous_names
-        .iter()
-        .any(|name| name == "a-first.txt") as usize
-        + ambiguous_names
-            .iter()
-            .any(|name| name == "z-later.txt") as usize;
+    let remaining_ambiguous_children = ambiguous_names.iter().any(|name| name == "a-first.txt")
+        as usize
+        + ambiguous_names.iter().any(|name| name == "z-later.txt") as usize;
     assert_eq!(
         remaining_ambiguous_children, 1,
         "no later manifest node may be deleted after ambiguity"
