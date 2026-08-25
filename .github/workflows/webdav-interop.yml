@@ -1,0 +1,77 @@
+name: WebDAV Interoperability
+
+# #241: physical interoperability certification against REAL pinned
+# Nextcloud 34 and ownCloud 11 servers. Matrix jobs are isolated per runner;
+# each provisions its own disposable fixture with ephemeral credentials.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/webdav-interop.yml"
+      - "scripts/setup_webdav_interop.sh"
+      - "scripts/cleanup_webdav_interop.sh"
+      - "src/vfs/webdav.rs"
+      - "src/vfs/webdav_interop_acceptance.rs"
+      - "src/vfs/mod.rs"
+      - "src/config.rs"
+      - "src/transfer/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+jobs:
+  interop:
+    name: Interop ${{ matrix.kind }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [nextcloud, owncloud]
+    env:
+      EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # PR head exactly (never the merge ref); dispatch checks out github.sha.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Record tested SHA (exact-SHA evidence)
+        run: |
+          set -euo pipefail
+          TESTED_SHA="$(git rev-parse HEAD)"
+          echo "TESTED_SHA=${TESTED_SHA}"
+          if [ "${TESTED_SHA}" != "${EXPECTED_SHA}" ]; then
+            echo "::error::tested SHA ${TESTED_SHA} != expected ${EXPECTED_SHA}"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Ensure Docker is running
+        run: |
+          set -euo pipefail
+          sudo systemctl start docker || true
+          docker info > /dev/null
+
+      - name: Provision ${{ matrix.kind }} fixture
+        run: |
+          set -euo pipefail
+          bash scripts/setup_webdav_interop.sh "${{ matrix.kind }}"
+
+      - name: Run portable interop matrix I1-I12
+        run: |
+          set -euo pipefail
+          set +x
+          # shellcheck disable=SC1091
+          source "/tmp/arx-webdav-interop-${{ matrix.kind }}.env"
+          # Keep xtrace disabled after loading the secret-bearing env file.
+          cargo test --locked --lib --features physical-webdav \
+            physical_webdav_interop_core_matrix -- --nocapture
+
+      - name: Cleanup fixture
+        if: always()
+        run: |
+          bash scripts/cleanup_webdav_interop.sh
