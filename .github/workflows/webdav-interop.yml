@@ -70,6 +70,8 @@ jobs:
           # Keep xtrace disabled after loading the secret-bearing env file.
           cargo test --locked --lib --features physical-webdav \
             physical_webdav_interop_core_matrix -- --nocapture
+          cargo test --locked --lib --features physical-webdav \
+            physical_webdav_interop_recursive_download_tree -- --nocapture
 
       - name: Cleanup fixture
         if: always()

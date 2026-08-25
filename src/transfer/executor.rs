@@ -10,7 +10,8 @@ use crate::vfs::{Location, ProviderRegistry, local::LocalFs};
 use super::s3_download;
 use super::s3_upload;
 use super::webdav_transfer::{
-    WebDavOverwritePolicy, download_one as webdav_download_one, upload_one as webdav_upload_one,
+    TreeCleanupFailure, WebDavOverwritePolicy, download_one as webdav_download_one,
+    download_tree as webdav_download_tree, upload_one as webdav_upload_one,
 };
 use super::{S3TransferSpec, TransferIntent, TransferMethod, TransferPlan, WebDavTransferSpec};
 use crate::transfer::sftp_copy;
@@ -98,6 +99,25 @@ impl From<io::Error> for TransferExecutionError {
     fn from(source: io::Error) -> Self {
         Self::Io {
             source,
+            disposition: crate::transfer_queue::RetryDisposition::NeverRetry,
+        }
+    }
+}
+
+fn classify_webdav_tree_error(error: io::Error) -> TransferExecutionError {
+    if error.kind() == io::ErrorKind::Interrupted {
+        TransferExecutionError::Cancelled { completed: 0 }
+    } else if error
+        .get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<TreeCleanupFailure>().is_some())
+    {
+        TransferExecutionError::Io {
+            source: error,
+            disposition: crate::transfer_queue::RetryDisposition::RecoveryRequired,
+        }
+    } else {
+        TransferExecutionError::Io {
+            source: error,
             disposition: crate::transfer_queue::RetryDisposition::NeverRetry,
         }
     }
@@ -265,6 +285,23 @@ pub async fn execute_transfer(
                     )
                     .await
                     .map_err(TransferExecutionError::from)?;
+                }
+                WebDavTransferSpec::DownloadTree { .. } => {
+                    let items = webdav_download_tree(
+                        &provider,
+                        spec,
+                        cancel.clone(),
+                        pause,
+                        &mut on_progress,
+                    )
+                    .await
+                    .map_err(classify_webdav_tree_error)?;
+                    // Stable item semantics: selected root + every manifest
+                    // descendant. Full completion is reported only here.
+                    return Ok(TransferOutcome {
+                        completed: items,
+                        total: items,
+                    });
                 }
             }
             Ok(TransferOutcome {
@@ -511,6 +548,26 @@ mod tests {
             host: host.into(),
             path: path.into(),
         }
+    }
+
+    #[test]
+    fn recursive_cleanup_failure_is_recovery_required_r20() {
+        let error = io::Error::other(TreeCleanupFailure {
+            root: std::path::PathBuf::from("/tmp/partial-tree"),
+            original: "GET failed".into(),
+            cleanup: "permission denied".into(),
+        });
+        let classified = classify_webdav_tree_error(error);
+        assert_eq!(
+            classified.retry_disposition(),
+            crate::transfer_queue::RetryDisposition::RecoveryRequired
+        );
+        assert!(classified.to_string().contains("/tmp/partial-tree"));
+        assert_eq!(
+            classify_webdav_tree_error(io::Error::other("ordinary tree failure"))
+                .retry_disposition(),
+            crate::transfer_queue::RetryDisposition::NeverRetry
+        );
     }
 
     #[tokio::test]

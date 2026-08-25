@@ -348,13 +348,13 @@ impl WebDavProvider {
         self.join_url(dst)
     }
 
-    /// PROPFIND Depth:1 and parse the multistatus response.
-    async fn propfind(&self, path: &str, depth: &str) -> io::Result<Vec<PropFindEntry>> {
-        let url = self.join_url(path);
+    /// Shared authenticated PROPFIND request/parser beneath both logical
+    /// listing and exact raw-href collection traversal.
+    async fn propfind_url(&self, url: &str, depth: &str) -> io::Result<Vec<PropFindEntry>> {
         let body = r#"<?xml version="1.0" encoding="utf-8"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/><D:getcontentlength/><D:getlastmodified/><D:displayname/></D:prop></D:propfind>"#;
         let req = self.auth_req(
             self.client
-                .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
+                .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), url)
                 .header("Depth", depth)
                 .header("Content-Type", "application/xml; charset=utf-8")
                 .body(body),
@@ -373,6 +373,99 @@ impl WebDavProvider {
             ));
         }
         parse_multistatus(&bytes.bytes)
+    }
+
+    /// Logical-path PROPFIND wrapper used by normal listing/metadata.
+    async fn propfind(&self, path: &str, depth: &str) -> io::Result<Vec<PropFindEntry>> {
+        let url = self.join_url(path);
+        self.propfind_url(&url, depth).await
+    }
+
+    /// Resolve the canonical wire URL for an exact collection identity.
+    pub(crate) fn collection_wire_url(
+        &self,
+        collection: &WebDavCollectionRef,
+    ) -> io::Result<String> {
+        if collection.target != self.target.id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WebDAV collection target does not match provider target",
+            ));
+        }
+        self.wire_url_for_href(&collection.href)
+    }
+
+    pub(crate) fn canonical_collection_identity(
+        &self,
+        collection: &WebDavCollectionRef,
+    ) -> io::Result<String> {
+        let wire = self.collection_wire_url(collection)?;
+        let parsed = url::Url::parse(&wire).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bad collection url: {e}"),
+            )
+        })?;
+        Ok(canonical_url_identity(&parsed))
+    }
+
+    /// Exact provider-native collection listing: authenticated PROPFIND
+    /// Depth:1 against the raw collection href. Existing child href identities
+    /// are copied verbatim; no child address is reconstructed from display text.
+    pub(crate) async fn list_collection_exact(
+        &self,
+        collection: &WebDavCollectionRef,
+    ) -> io::Result<Vec<ListedEntry>> {
+        let collection_url = self.collection_wire_url(collection)?;
+        let self_url = url::Url::parse(&collection_url).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bad collection url: {e}"),
+            )
+        })?;
+        let entries = self.propfind_url(&collection_url, "1").await?;
+        let mut listed = Vec::new();
+        for entry in entries {
+            let child_url_text = self.wire_url_for_href(&entry.raw_href)?;
+            let child_url = url::Url::parse(&child_url_text).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("bad child href: {e}"))
+            })?;
+            if self_url.origin() == child_url.origin()
+                && self_url.path().trim_end_matches('/') == child_url.path().trim_end_matches('/')
+            {
+                continue; // Depth:1 self response; query may be normalized by server
+            }
+            validate_direct_child_url(&collection_url, &child_url_text)?;
+            let name = entry
+                .display_name
+                .clone()
+                .unwrap_or_else(|| href_leaf(&entry.raw_href));
+            let identity = if entry.is_collection {
+                EntryIdentity::WebDavCollection(WebDavCollectionRef {
+                    target: self.target.id.clone(),
+                    href: entry.raw_href.clone(),
+                })
+            } else {
+                EntryIdentity::WebDavObject(WebDavObjectRef {
+                    target: self.target.id.clone(),
+                    href: entry.raw_href.clone(),
+                })
+            };
+            listed.push(ListedEntry {
+                entry: Entry {
+                    name,
+                    kind: if entry.is_collection {
+                        EntryKind::Directory
+                    } else {
+                        EntryKind::File
+                    },
+                    size: entry.content_length,
+                    modified_unix_ms: entry.modified_unix_ms,
+                },
+                identity,
+            });
+        }
+        Ok(listed)
     }
 
     /// Bounded GET: request a Range, then read at most `max_bytes` and track
@@ -851,6 +944,47 @@ impl std::fmt::Debug for WebDavProvider {
 
 /// Extract the path portion of an href, stripping any `scheme://host[:port]`
 /// prefix so logical-path comparisons are host-agnostic.
+fn canonical_url_identity(url: &url::Url) -> String {
+    let mut canonical = url.clone();
+    canonical.set_fragment(None);
+    // A collection trailing slash is presentation-equivalent for cycle/self
+    // detection, while a legitimate query remains part of remote identity.
+    let path = canonical.path().trim_end_matches('/').to_string();
+    canonical.set_path(&path);
+    canonical.to_string()
+}
+
+/// Prove a Depth:1 result is one direct child by canonical WIRE URL path.
+/// Returns a stable canonical URL identity for duplicate/cycle detection.
+pub(crate) fn validate_direct_child_url(parent: &str, child: &str) -> io::Result<String> {
+    let parent = url::Url::parse(parent)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad parent URL: {e}")))?;
+    let child = url::Url::parse(child)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad child URL: {e}")))?;
+    if parent.origin() != child.origin() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "child origin mismatch",
+        ));
+    }
+    let parent_path = parent.path().trim_end_matches('/');
+    let child_path = child.path().trim_end_matches('/');
+    let prefix = format!("{parent_path}/");
+    let Some(rest) = child_path.strip_prefix(&prefix) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Depth:1 response is not below current collection",
+        ));
+    };
+    if rest.is_empty() || rest.contains('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Depth:1 response is not a direct child",
+        ));
+    }
+    Ok(canonical_url_identity(&child))
+}
+
 fn href_path_only(href: &str) -> &str {
     if let Some(idx) = href.find("://") {
         // find end of authority (next '/' after the host)
@@ -1406,6 +1540,29 @@ mod tests {
 
     // Security boundary: an authoritative href must stay inside the target
     // root and never allow traversal out of it.
+    #[test]
+    fn recursive_direct_child_shape_r7_r8() {
+        assert!(
+            validate_direct_child_url(
+                "http://example/dav/root/",
+                "http://example/dav/root/child%20x?version=7"
+            )
+            .is_ok()
+        );
+        for bad in [
+            "http://example/dav/root/",           // self
+            "http://example/dav/",                // ancestor
+            "http://example/dav/sibling",         // sibling
+            "http://example/dav/root/a/b",        // non-direct descendant
+            "http://evil.example/dav/root/child", // cross-origin
+        ] {
+            assert!(
+                validate_direct_child_url("http://example/dav/root/", bad).is_err(),
+                "must reject {bad}"
+            );
+        }
+    }
+
     #[test]
     fn wire_url_for_href_rejects_escapes() {
         let p = dav_provider("http://example/dav/");

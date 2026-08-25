@@ -491,3 +491,95 @@ with ARX_WEBDAV_INTEROP_REQUIRED=1 absence is a FAILURE)"
 
     println!("#241 interop core matrix PASSED for kind={kind}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn physical_webdav_interop_recursive_download_tree() {
+    let host_ok = std::env::var("ARX_WEBDAV_SMOKE_HOST").is_ok();
+    let required = std::env::var("ARX_WEBDAV_INTEROP_REQUIRED").ok().as_deref() == Some("1");
+    if !host_ok && !required {
+        eprintln!("skipping recursive interop: no fixture env");
+        return;
+    }
+    let provider = Arc::new(target_direct());
+    let target_id = provider.target().id.clone();
+    let root_name = format!("{}-tree", physical_run_id());
+    let remote_root = format!("/{root_name}");
+    provider.mkdir(&remote_root).await.expect("tree root MKCOL");
+    for dir in ["empty", "nested", "unicodé spáces"] {
+        provider
+            .mkdir(&format!("{remote_root}/{dir}"))
+            .await
+            .expect("child MKCOL");
+    }
+    for (path, bytes) in [
+        ("normal.txt", b"normal".as_slice()),
+        ("nested/child.txt", b"nested".as_slice()),
+        ("unicodé spáces/zero.bin", b"".as_slice()),
+    ] {
+        provider
+            .write_file_bytes_if_unchanged(
+                &format!("{remote_root}/{path}"),
+                bytes,
+                &RemoteEditRevision::new(vec![], 0, 0, 0),
+                &CancellationFlag::default(),
+                None,
+            )
+            .await
+            .expect("seed tree file");
+    }
+    let selected = list_at(&provider, &target_id, "/")
+        .await
+        .into_iter()
+        .find(|entry| entry.entry.name == root_name)
+        .expect("real exact collection listing");
+    assert!(matches!(
+        selected.identity,
+        EntryIdentity::WebDavCollection(_)
+    ));
+    let local = tempfile::tempdir().unwrap();
+    run_f5(
+        &registry_with(&provider),
+        Location::WebDav {
+            target: target_id.clone(),
+            path: "/".into(),
+        },
+        Location::Local(local.path().to_path_buf()),
+        selected.clone(),
+    )
+    .await
+    .expect("recursive product path");
+    let downloaded = local.path().join(&root_name);
+    assert_eq!(
+        std::fs::read(downloaded.join("normal.txt")).unwrap(),
+        b"normal"
+    );
+    assert_eq!(
+        std::fs::read(downloaded.join("nested/child.txt")).unwrap(),
+        b"nested"
+    );
+    assert_eq!(
+        std::fs::metadata(downloaded.join("unicodé spáces/zero.bin"))
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(downloaded.join("empty").is_dir());
+    let collision = tempfile::tempdir().unwrap();
+    let existing = collision.path().join(&root_name);
+    std::fs::create_dir(&existing).unwrap();
+    std::fs::write(existing.join("sentinel"), b"keep").unwrap();
+    assert!(
+        run_f5(
+            &registry_with(&provider),
+            Location::WebDav {
+                target: target_id,
+                path: "/".into()
+            },
+            Location::Local(collision.path().to_path_buf()),
+            selected
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(std::fs::read(existing.join("sentinel")).unwrap(), b"keep");
+}
