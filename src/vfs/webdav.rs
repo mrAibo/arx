@@ -146,6 +146,41 @@ impl WebDavProvider {
         Ok(self.password.clone())
     }
 
+    /// Join the configured target root with a TARGET-RELATIVE decoded logical
+    /// path for NEW write destinations (`WebDavWriteTarget`).
+    ///
+    /// Unlike `join_url` (which strips a coincidentally matching configured
+    /// root prefix for legacy raw-href callers), this never rewrites the path:
+    /// logical `/davfoo/file.txt` under target `…/dav/` resolves to
+    /// `…/dav/davfoo/file.txt`, and logical `/dav/…` addresses a child named
+    /// `dav`, never the root itself. Each component is percent-encoded exactly
+    /// once; Unicode/spaces are preserved; `%`, `?`, `#` are data. Dot segments
+    /// fail closed.
+    fn write_logical_url(&self, logical_path: &str) -> io::Result<String> {
+        let mut url = self.target.url.clone();
+        if !url.ends_with('/') {
+            url.push('/');
+        }
+        let trimmed = logical_path.trim_matches('/');
+        if trimmed.is_empty() {
+            return Ok(url);
+        }
+        let mut encoded = String::new();
+        for component in trimmed.split('/') {
+            if component == "." || component == ".." {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("logical write path dot segment rejected: {logical_path}"),
+                ));
+            }
+            encoded.push_str(&encode_segment(component));
+            encoded.push('/');
+        }
+        encoded.pop();
+        url.push_str(&encoded);
+        Ok(url)
+    }
+
     /// Join the target root with a logical (decoded) path. Preserves the exact
     /// target root verbatim and applies per-segment percent-encoding. Does NOT
     /// normalize away duplicate slashes, trailing slashes, or Unicode.
@@ -633,7 +668,7 @@ impl WebDavProvider {
         data: &[u8],
         policy: WebDavOverwritePolicy,
     ) -> io::Result<()> {
-        let url = self.join_url(logical_path);
+        let url = self.write_logical_url(logical_path)?;
         let mut builder = self.client.put(&url).body(data.to_vec());
         if matches!(policy, WebDavOverwritePolicy::Forbid) {
             builder = builder.header("If-None-Match", "*");
@@ -658,7 +693,9 @@ impl WebDavProvider {
         &self,
         logical_path: &str,
     ) -> Result<(), NewCollectionError> {
-        let mut url = self.join_url(logical_path);
+        let mut url = self
+            .write_logical_url(logical_path)
+            .map_err(|e| NewCollectionError::Definitive(io::Error::new(e.kind(), e.to_string())))?;
         if !url.ends_with('/') {
             url.push('/');
         }
@@ -685,7 +722,7 @@ impl WebDavProvider {
     }
 
     pub(crate) async fn delete_logical_collection(&self, logical_path: &str) -> io::Result<()> {
-        let mut url = self.join_url(logical_path);
+        let mut url = self.write_logical_url(logical_path)?;
         if !url.ends_with('/') {
             url.push('/');
         }
@@ -1723,6 +1760,37 @@ mod tests {
                 .unwrap(),
             p.canonical_exact_href_identity("t", "/dav/root/a?version=2")
                 .unwrap()
+        );
+    }
+
+    // Blocker A: write-logical URL authority — target-relative, never
+    // prefix-stripped, encoded exactly once.
+    #[test]
+    fn write_logical_url_is_target_relative_and_single_encoded() {
+        let p = dav_provider("http://host/dav/");
+        let cases = [
+            ("/file.txt", "http://host/dav/file.txt"),
+            ("/dav/file.txt", "http://host/dav/dav/file.txt"),
+            ("/davfoo/file.txt", "http://host/dav/davfoo/file.txt"),
+            ("/dav", "http://host/dav/dav"),
+            (
+                "/unicodé spáces/name.txt",
+                "http://host/dav/unicod%C3%A9%20sp%C3%A1ces/name.txt",
+            ),
+            ("/100%.txt", "http://host/dav/100%25.txt"),
+            ("/q?uery.txt", "http://host/dav/q%3Fuery.txt"),
+            ("/ha#sh.txt", "http://host/dav/ha%23sh.txt"),
+        ];
+        for (logical, expected) in cases {
+            assert_eq!(p.write_logical_url(logical).unwrap(), expected);
+        }
+        for bad in ["/a/../b", "/.", "/.."] {
+            assert!(p.write_logical_url(bad).is_err(), "must reject {bad}");
+        }
+        let bare = dav_provider("http://host");
+        assert_eq!(
+            bare.write_logical_url("/f.txt").unwrap(),
+            "http://host/f.txt"
         );
     }
 

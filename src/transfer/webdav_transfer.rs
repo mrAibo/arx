@@ -242,6 +242,147 @@ pub(crate) fn build_upload_tree_manifest(root: &Path) -> io::Result<UploadTreeMa
     })
 }
 
+// ponytail: root-relative no-follow open via libc openat/O_NOFOLLOW. No new
+// dependency; libc is already a direct Linux dep. Used only by UploadTree file
+// reads to avoid following a replaced intermediate symlink.
+#[cfg(target_os = "linux")]
+fn read_upload_file_nofollow(
+    root: &Path,
+    relative: &Path,
+    _local_source: &Path,
+    expected_size: u64,
+) -> io::Result<Vec<u8>> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let root_c = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "root path contains NUL"))?;
+    // SAFETY: root_c is NUL-terminated and outlives the call.
+    let root_fd = unsafe {
+        libc::open(
+            root_c.as_ptr(),
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: root_fd is a fresh successful open descriptor.
+    let mut dir_fd = unsafe { OwnedFd::from_raw_fd(root_fd) };
+
+    let components: Vec<&std::ffi::OsStr> = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid upload tree component: {relative:?}"),
+            )
+        })?;
+    for (index, name) in components.iter().enumerate() {
+        let bytes = name.as_bytes();
+        let c = CString::new(bytes).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "path component contains NUL")
+        })?;
+        let is_final = index + 1 == components.len();
+        if is_final {
+            // Final file component: reject a symlink via O_NOFOLLOW.
+            // SAFETY: dir_fd is an open directory descriptor; c is NUL-terminated.
+            let fd = unsafe {
+                libc::openat(
+                    dir_fd.as_raw_fd(),
+                    c.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fd is a fresh open descriptor we now own.
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let stat = file.metadata()?;
+            if !stat.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("upload tree file is not regular: {relative:?}"),
+                ));
+            }
+            if stat.len() != expected_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "upload tree file size mismatch before PUT: {relative:?} expected {expected_size} got {}",
+                        stat.len()
+                    ),
+                ));
+            }
+            let mut data = Vec::with_capacity(expected_size as usize);
+            let read = std::io::Read::read_to_end(&mut file, &mut data)?;
+            if read as u64 != expected_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "upload tree file read length mismatch: {relative:?} expected {expected_size} got {read}"
+                    ),
+                ));
+            }
+            return Ok(data);
+        }
+        // Intermediate directory component.
+        // SAFETY: dir_fd is an open directory descriptor; c is NUL-terminated.
+        let next = unsafe {
+            libc::openat(
+                dir_fd.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if next < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: next is a fresh successful open descriptor. Assignment
+        // drops the prior OwnedFd exactly once.
+        dir_fd = unsafe { OwnedFd::from_raw_fd(next) };
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "upload tree empty relative path",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_upload_file_nofollow(
+    _root: &Path,
+    _relative: &Path,
+    local_source: &Path,
+    _expected_size: u64,
+) -> io::Result<Vec<u8>> {
+    tokio::fs::read(local_source)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("read local: {e}")))
+}
+
+/// True when a non-UTF-8 sibling name's lossy representation collides with the
+/// selected root's (valid UTF-8) presentation name. The selected entry itself
+/// is excluded; a non-UTF-8 selected name is rejected by the caller.
+fn selected_root_name_has_lossy_alias(parent: &Path, selected_name: &str) -> io::Result<bool> {
+    for entry in std::fs::read_dir(parent)? {
+        let file_name = entry?.file_name();
+        if file_name.to_str() == Some(selected_name) {
+            continue;
+        }
+        if file_name.to_str().is_none() && file_name.to_string_lossy() == selected_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn revalidate_upload_tree(root: &Path, frozen: &UploadTreeManifest) -> io::Result<()> {
     let current = build_upload_tree_manifest(root)?;
     if &current != frozen {
@@ -272,6 +413,46 @@ fn revalidate_upload_file(file: &UploadTreeFile) -> io::Result<()> {
 pub enum WebDavOverwritePolicy {
     Forbid,
     Allow,
+}
+
+/// Upload a single local file to a WebDAV write target, reading bytes from the
+/// caller-supplied buffer (used by UploadTree, which already read the file via
+/// root-relative no-follow open). The single-file UploadOne path reads itself.
+pub(crate) async fn upload_one_with_data(
+    provider: &WebDavProvider,
+    spec: &WebDavTransferSpec,
+    data: &[u8],
+    overwrite: WebDavOverwritePolicy,
+    cancel: Arc<AtomicBool>,
+    on_progress: &mut impl FnMut(TypedTransferProgress),
+) -> io::Result<u64> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "upload cancelled",
+        ));
+    }
+    let (_, destination) = match spec {
+        WebDavTransferSpec::UploadOne {
+            local_source: _,
+            destination,
+        } => (Path::new(""), destination),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "upload_one_with_data requires WebDavTransferSpec::UploadOne",
+            ));
+        }
+    };
+    let total = data.len();
+    provider
+        .put_logical_with_policy(&destination.logical_path, data, overwrite)
+        .await?;
+    on_progress(TypedTransferProgress::Bytes {
+        completed: total as u64,
+        total: Some(total as u64),
+    });
+    Ok(total as u64)
 }
 
 /// Upload a single local file to the exact WebDAV href.
@@ -409,6 +590,35 @@ pub(crate) async fn upload_tree(
             "tree upload cancelled",
         ));
     }
+    // Check for non-UTF-8 lossy alias collision on the selected root directory
+    // before any remote mutation. A selected root whose own name is non-UTF-8
+    // cannot be trusted either, so reject it outright.
+    let Some(parent) = local_source.parent() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "recursive upload root has no parent directory",
+        ));
+    };
+    let selected_name = local_source
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "recursive upload root name is not valid UTF-8: {}",
+                    local_source.display()
+                ),
+            )
+        })?;
+    if selected_root_name_has_lossy_alias(parent, selected_name)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "recursive upload root name is a lossy alias for a non-UTF-8 directory: {selected_name}"
+            ),
+        ));
+    }
     match provider
         .create_new_collection(&destination_root.logical_path)
         .await
@@ -456,16 +666,30 @@ pub(crate) async fn upload_tree(
                 ));
             }
             revalidate_upload_file(file)?;
+            pause.checkpoint().await;
+            if cancel.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "tree upload cancelled",
+                ));
+            }
             let target = upload_target_for_relative(destination_root, &file.relative)?;
+            let data = read_upload_file_nofollow(
+                local_source,
+                &file.relative,
+                &file.local_source,
+                file.expected_size,
+            )?;
             let one = WebDavTransferSpec::UploadOne {
                 local_source: file.local_source.clone(),
                 destination: target,
             };
             let base = completed_before;
             let mut overflow = false;
-            let actual = upload_one(
+            let actual = upload_one_with_data(
                 provider,
                 &one,
+                &data,
                 WebDavOverwritePolicy::Forbid,
                 cancel.clone(),
                 &mut |progress| {
@@ -506,6 +730,13 @@ pub(crate) async fn upload_tree(
                 completed: 0,
                 total: Some(0),
             });
+        }
+        // final cumulative check
+        if completed_before != manifest.total_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "upload tree completed bytes mismatch manifest total",
+            ));
         }
         Ok(())
     }
@@ -1138,6 +1369,127 @@ mod tests {
                 "{bad:?} must be rejected"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_relative_no_follow_rejects_symlink_and_size_mismatch() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("sub")).unwrap();
+        std::fs::write(root.path().join("real.txt"), b"real-content").unwrap();
+        // Intermediate symlink replacement must fail: sub -> real.txt.
+        std::fs::remove_dir(root.path().join("sub")).unwrap();
+        symlink(root.path().join("real.txt"), root.path().join("sub")).unwrap();
+        std::fs::write(root.path().join("file.txt"), b"payload").unwrap();
+        let err = read_upload_file_nofollow(
+            root.path(),
+            Path::new("sub/file.txt"),
+            &root.path().join("sub/file.txt"),
+            8,
+        )
+        .unwrap_err();
+        // Intermediate symlink replacement must fail (ENOTDIR from O_DIRECTORY,
+        // or ELOOP from O_NOFOLLOW) before any read.
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::InvalidInput
+                    | io::ErrorKind::Other
+                    | io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::NotADirectory
+            ),
+            "intermediate symlink rejected: {err}"
+        );
+        std::fs::remove_file(root.path().join("sub")).unwrap();
+
+        // Final symlink rejected via O_NOFOLLOW.
+        symlink(root.path().join("real.txt"), root.path().join("link.txt")).unwrap();
+        let err = read_upload_file_nofollow(
+            root.path(),
+            Path::new("link.txt"),
+            &root.path().join("link.txt"),
+            11,
+        )
+        .unwrap_err();
+        // O_NOFOLLOW open of a symlink must fail before any read (ELOOP/
+        // EACCES/ENOTDIR depending on platform); any error proves rejection.
+        let _ = err;
+
+        // Size/length mismatch fail closed before PUT.
+        std::fs::write(root.path().join("file.txt"), b"payload").unwrap();
+        let ok = read_upload_file_nofollow(
+            root.path(),
+            Path::new("file.txt"),
+            &root.path().join("file.txt"),
+            7,
+        )
+        .unwrap();
+        assert_eq!(ok, b"payload");
+        assert!(
+            read_upload_file_nofollow(
+                root.path(),
+                Path::new("file.txt"),
+                &root.path().join("file.txt"),
+                999,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lossy_root_alias_rejected_before_mutation() {
+        use std::os::unix::ffi::OsStringExt;
+        let parent = tempfile::tempdir().unwrap();
+        // Selected root is a valid UTF-8 name that equals the lossy form of a
+        // non-UTF-8 sibling (invalid bytes lossily render as replacement chars).
+        let selected = "\u{FFFD}\u{FFFD}";
+        let good = parent.path().join(selected);
+        std::fs::create_dir(&good).unwrap();
+        let bad = std::ffi::OsString::from_vec(vec![0xff, 0xff]);
+        std::fs::create_dir(parent.path().join(bad)).unwrap();
+        assert!(selected_root_name_has_lossy_alias(parent.path(), selected).unwrap());
+        // No collision: a normal sibling name is fine.
+        let other = parent.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert!(!selected_root_name_has_lossy_alias(parent.path(), "other").unwrap());
+    }
+
+    #[test]
+    fn upload_tree_zero_byte_and_total_progress() {
+        let manifest = UploadTreeManifest {
+            directories: vec![UploadTreeDirectory {
+                relative: PathBuf::from("empty"),
+            }],
+            files: vec![],
+            descendant_count: 1,
+            total_bytes: 0,
+        };
+        let mut progress = None;
+        let mut completed = 0u64;
+        for _ in &manifest.files {
+            completed = completed.checked_add(0).unwrap();
+            progress = Some(TypedTransferProgress::Bytes {
+                completed,
+                total: Some(manifest.total_bytes),
+            });
+        }
+        if manifest.files.is_empty() {
+            progress = Some(TypedTransferProgress::Bytes {
+                completed: 0,
+                total: Some(0),
+            });
+        }
+        assert_eq!(
+            progress,
+            Some(TypedTransferProgress::Bytes {
+                completed: 0,
+                total: Some(0)
+            })
+        );
+        assert_eq!(completed, manifest.total_bytes);
     }
 
     #[test]
