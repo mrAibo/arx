@@ -43,7 +43,22 @@ Priorities:
 4. Preserve exact-head CI and physical provider acceptance when affected code changes.
 5. Clean obsolete GitHub PR/branch/status clutter after verifying that no unique unfinished work remains.
 
-Patch releases in the v0.21.x line should normally contain bug fixes, compatibility corrections, documentation truth, or release/distribution fixes — not large new feature surfaces.
+The first stabilization pass is complete: the public truth documents were refreshed for v0.21.0 and obsolete historical draft PRs were closed without deleting their history.
+
+### Development cadence after stabilization
+
+ARX should now progress in **large, coherent user-visible vertical slices**, not long chains of micro-tasks or stacked micro-PRs.
+
+- Freeze the complete behavioral/safety contract before implementation.
+- Implement the selected feature as one coherent branch / macro-batch.
+- Include its unit/contract tests, physical acceptance changes, and necessary documentation in the same slice.
+- Collect related review findings and correct them coherently on the same branch instead of bouncing between tiny implementation prompts.
+- Accept only one exact final head SHA after independent full-diff review and required CI/physical evidence.
+- Prefer completing one useful capability and moving toward the next release over speculative architecture work.
+
+The selected next major slice is **#253 — Local directory → WebDAV recursive upload**.
+
+Patch releases in the v0.21.x line should normally contain bug fixes, compatibility corrections, documentation truth, or release/distribution fixes — not large new feature surfaces. #253 is therefore the leading candidate for the next feature release rather than a v0.21.x patch.
 
 ## COMPLETED FOUNDATION
 
@@ -73,7 +88,8 @@ There is **no GO** for an external Lua/WASM/`.so` plugin runtime. Re-evaluate on
 
 ## ACTIVE GITHUB BACKLOG
 
-At the v0.21.0 release baseline, the only active product issue is **#13 — WebDAV post-MVP**.
+**#13 — WebDAV post-MVP** remains the product umbrella.  
+**#253 — WebDAV recursive upload** is the selected active implementation slice under that umbrella.
 
 Already shipped under #13:
 
@@ -84,9 +100,12 @@ Already shipped under #13:
 - RFC-compatible MOVE Depth behavior
 - exact recursive WebDAV collection download to Local
 
-Remaining #13 roadmap:
+Selected now:
 
-- [ ] **Local directory → WebDAV recursive upload** — only after a fresh contract review of MKCOL, staged/noclobber upload reuse, source pre-scan, empty directories, symlink policy, partial remote-tree rollback/recovery, cancellation, and retry ambiguity.
+- [ ] **#253 Local directory → WebDAV recursive upload** — one selected Local directory to one new remote tree through the existing F5/planner/queue/executor authority, with full Local pre-scan, bounded tree limits, symlink/special-file rejection, destination-root noclobber, owned-root cleanup/recovery truth, whole-attempt byte progress, and Apache/Nextcloud/ownCloud physical acceptance.
+
+Remaining #13 roadmap after #253:
+
 - [ ] **Recursive WebDAV delete** — only with explicit bounded traversal/identity and recovery semantics.
 - [ ] **WebDAV → WebDAV recursive/cross-target copy or move** — only with a truthful execution model; never pretend server-side MOVE spans unrelated targets.
 - [ ] **Multiple-root recursive selection** — only after one stable planning/progress contract exists.
@@ -101,11 +120,14 @@ This is prioritization guidance, not a promise that each item must ship in the n
 
 ### Candidate v0.22.0 — WebDAV write-side recursion
 
-Primary candidate:
+**Chosen implementation slice: #253.**
 
-- Local directory → WebDAV recursive upload.
+- One selected Local directory → one new WebDAV directory tree.
+- Existing one-file upload remains supported.
+- No merging into an existing remote root.
+- No multiple roots, recursive delete, WebDAV↔WebDAV recursion, cross-backend Move, or speculative auth expansion in this slice.
 
-Acceptance should include Apache mod_dav, Nextcloud, and ownCloud through the same real product path, with explicit partial-remote-tree recovery semantics and no blind retry of ambiguous mutations.
+Acceptance must include Apache mod_dav, Nextcloud, and ownCloud through the same real F5 → preparation → planner → Transfer Queue → executor product path, with explicit partial-remote-tree cleanup/recovery semantics and no blind retry of ambiguous mutations.
 
 ### Candidate v0.23.0 — Remote tree operations
 
@@ -226,7 +248,10 @@ Before tagging:
 ## DEVELOPMENT POLICY
 
 - Prefer user-visible vertical slices over new architecture packs.
-- Collect related findings and fix them coherently instead of micro-iterating one edge case at a time.
+- Implement one selected feature as a coherent macro-batch instead of a chain of micro-tasks.
+- Collect related findings and fix them coherently on the same implementation branch.
+- Keep product/runtime/documentation/physical acceptance changes for one capability in the same slice when they are logically required.
 - Use exact-head CI and physical evidence as acceptance gates.
 - Do not weaken production semantics to satisfy timing-sensitive tests.
+- Move toward a usable release once the frozen slice is complete; do not extend scope merely because adjacent ideas are available.
 - Use Hermes only for deterministic Linux-local execution that connected tooling cannot perform; architecture, review, PR/merge, and release authority remain outside Hermes.
