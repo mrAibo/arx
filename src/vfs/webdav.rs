@@ -100,6 +100,14 @@ pub struct WebDavCollectionRef {
     pub href: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum NewCollectionError {
+    #[error("definitive MKCOL failure: {0}")]
+    Definitive(#[source] io::Error),
+    #[error("ambiguous MKCOL outcome: {0}")]
+    Ambiguous(#[source] io::Error),
+}
+
 /// A WebDAV provider bound to one configured target.
 pub struct WebDavProvider {
     target: WebDavTarget,
@@ -617,6 +625,71 @@ impl WebDavProvider {
         }
         let text = read_fixed_text(resp).await;
         Err(self.status_error("PUT", status, &text))
+    }
+
+    pub(crate) async fn put_logical_with_policy(
+        &self,
+        logical_path: &str,
+        data: &[u8],
+        policy: WebDavOverwritePolicy,
+    ) -> io::Result<()> {
+        let url = self.join_url(logical_path);
+        let mut builder = self.client.put(&url).body(data.to_vec());
+        if matches!(policy, WebDavOverwritePolicy::Forbid) {
+            builder = builder.header("If-None-Match", "*");
+        }
+        let req = self.auth_req(builder)?;
+        let resp = req.send().await.map_err(map_reqwest)?;
+        let status = resp.status();
+        if matches!(status.as_u16(), 200 | 201 | 204) {
+            return Ok(());
+        }
+        if status == reqwest::StatusCode::PRECONDITION_FAILED {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "refusing to overwrite existing resource (policy Forbid)",
+            ));
+        }
+        let text = read_fixed_text(resp).await;
+        Err(self.status_error("PUT", status, &text))
+    }
+
+    pub(crate) async fn create_new_collection(
+        &self,
+        logical_path: &str,
+    ) -> Result<(), NewCollectionError> {
+        let mut url = self.join_url(logical_path);
+        if !url.ends_with('/') {
+            url.push('/');
+        }
+        let req = self
+            .auth_req(
+                self.client
+                    .request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), &url),
+            )
+            .map_err(NewCollectionError::Definitive)?;
+        let resp = req.send().await.map_err(|error| {
+            NewCollectionError::Ambiguous(io::Error::other(format!("MKCOL transport: {error}")))
+        })?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::CREATED {
+            return Ok(());
+        }
+        let text = read_fixed_text(resp).await;
+        let error = self.status_error("MKCOL", status, &text);
+        if status.is_client_error() {
+            Err(NewCollectionError::Definitive(error))
+        } else {
+            Err(NewCollectionError::Ambiguous(error))
+        }
+    }
+
+    pub(crate) async fn delete_logical_collection(&self, logical_path: &str) -> io::Result<()> {
+        let mut url = self.join_url(logical_path);
+        if !url.ends_with('/') {
+            url.push('/');
+        }
+        self.delete_url(url).await
     }
 
     /// Plain PUT that allows overwriting (used by internal callers that have

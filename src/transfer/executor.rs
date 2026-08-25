@@ -10,8 +10,9 @@ use crate::vfs::{Location, ProviderRegistry, local::LocalFs};
 use super::s3_download;
 use super::s3_upload;
 use super::webdav_transfer::{
-    TreeCleanupFailure, WebDavOverwritePolicy, download_one as webdav_download_one,
-    download_tree as webdav_download_tree, upload_one as webdav_upload_one,
+    TreeCleanupFailure, UploadTreeCleanupFailure, UploadTreeRootAmbiguous, WebDavOverwritePolicy,
+    download_one as webdav_download_one, download_tree as webdav_download_tree,
+    upload_one as webdav_upload_one, upload_tree as webdav_upload_tree,
 };
 use super::{S3TransferSpec, TransferIntent, TransferMethod, TransferPlan, WebDavTransferSpec};
 use crate::transfer::sftp_copy;
@@ -99,6 +100,25 @@ impl From<io::Error> for TransferExecutionError {
     fn from(source: io::Error) -> Self {
         Self::Io {
             source,
+            disposition: crate::transfer_queue::RetryDisposition::NeverRetry,
+        }
+    }
+}
+
+fn classify_webdav_upload_tree_error(error: io::Error) -> TransferExecutionError {
+    if error.kind() == io::ErrorKind::Interrupted {
+        TransferExecutionError::Cancelled { completed: 0 }
+    } else if error.get_ref().is_some_and(|inner| {
+        inner.downcast_ref::<UploadTreeCleanupFailure>().is_some()
+            || inner.downcast_ref::<UploadTreeRootAmbiguous>().is_some()
+    }) {
+        TransferExecutionError::Io {
+            source: error,
+            disposition: crate::transfer_queue::RetryDisposition::RecoveryRequired,
+        }
+    } else {
+        TransferExecutionError::Io {
+            source: error,
             disposition: crate::transfer_queue::RetryDisposition::NeverRetry,
         }
     }
@@ -269,6 +289,21 @@ pub async fn execute_transfer(
                             None => TransferExecutionError::ambiguous(e),
                         }
                     })?;
+                }
+                WebDavTransferSpec::UploadTree { .. } => {
+                    let items = webdav_upload_tree(
+                        &provider,
+                        spec,
+                        cancel.clone(),
+                        pause,
+                        &mut on_progress,
+                    )
+                    .await
+                    .map_err(classify_webdav_upload_tree_error)?;
+                    return Ok(TransferOutcome {
+                        completed: items,
+                        total: items,
+                    });
                 }
                 WebDavTransferSpec::DownloadOne { .. } => {
                     // As with S3 download, plain io::Error currently crosses
@@ -548,6 +583,36 @@ mod tests {
             host: host.into(),
             path: path.into(),
         }
+    }
+
+    #[test]
+    fn recursive_upload_recovery_classification() {
+        let ambiguous = io::Error::other(UploadTreeRootAmbiguous {
+            target: "dav".into(),
+            logical_path: "/root".into(),
+            reason: "timeout".into(),
+        });
+        assert_eq!(
+            classify_webdav_upload_tree_error(ambiguous).retry_disposition(),
+            crate::transfer_queue::RetryDisposition::RecoveryRequired
+        );
+        let cleanup = io::Error::other(UploadTreeCleanupFailure {
+            target: "dav".into(),
+            logical_path: "/root".into(),
+            original: "PUT failed".into(),
+            cleanup: "DELETE timeout".into(),
+        });
+        assert_eq!(
+            classify_webdav_upload_tree_error(cleanup).retry_disposition(),
+            crate::transfer_queue::RetryDisposition::RecoveryRequired
+        );
+        assert!(matches!(
+            classify_webdav_upload_tree_error(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "cancelled"
+            )),
+            TransferExecutionError::Cancelled { completed: 0 }
+        ));
     }
 
     #[test]
