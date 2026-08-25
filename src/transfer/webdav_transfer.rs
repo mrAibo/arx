@@ -619,6 +619,14 @@ pub(crate) async fn upload_tree(
             ),
         ));
     }
+    // Final gate immediately before the first remote mutation.
+    pause.checkpoint().await;
+    if cancel.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "tree upload cancelled",
+        ));
+    }
     match provider
         .create_new_collection(&destination_root.logical_path)
         .await
@@ -680,6 +688,15 @@ pub(crate) async fn upload_tree(
                 &file.local_source,
                 file.expected_size,
             )?;
+            // Required gate AFTER the local read, immediately before PUT: a
+            // pause/cancel arriving during the read must still prevent it.
+            pause.checkpoint().await;
+            if cancel.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "tree upload cancelled",
+                ));
+            }
             let one = WebDavTransferSpec::UploadOne {
                 local_source: file.local_source.clone(),
                 destination: target,
