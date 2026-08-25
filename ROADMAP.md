@@ -1,346 +1,232 @@
 # ARX Roadmap
 
-## CURRENT — Product Truth
+GitHub state is authoritative over this document. Re-fetch current `main`, issues, PRs, and release state before acting on any SHA or backlog item recorded here.
 
-ARX **v0.20.0** is the current release line. It promotes the already-merged storage,
-transfer-control, and Linux packaging work built on the v0.19.0 Transfer Queue
-baseline. PACK L was release-readiness/publication only; it did not introduce new
-runtime behavior.
+## CURRENT — v0.21.0 product truth
+
+**Current public release:** `v0.21.0`  
+**Release tag target:** `3427cd085740d2c3f8a4bffbbf55b34ba3d9bb85`  
+**Published:** 2026-08-25  
+**Platform:** Linux only; published target Linux x86_64  
+**MSRV:** Rust 1.88
+
+v0.21.0 is the current stable 0.x release line. It keeps the established one-build/no-rebuild release pipeline and adds the first recursive WebDAV capability on top of the v0.20.0 storage, transfer-control, and native-packaging baseline.
 
 Current product truth:
 
-- **Platform:** Linux only; published target is Linux x86_64. Native Windows support is
-  not planned.
-- **MSRV:** Rust 1.88.
-- **SFTP:** Remote Edit, SSH Host Manager, transactional copy, and existing physical
-  safety acceptance retained.
-- **S3:** AWS S3 + MinIO PHYSICAL PASS / SUPPORTED MVP; Moto EMULATED PASS;
-  Cloudflare R2 / Wasabi remain UNVERIFIED best-effort targets.
-- **WebDAV:** Apache mod_dav PHYSICAL PASS, W1–W18; Basic auth only; Nextcloud /
-  ownCloud remain UNVERIFIED.
-- **Transfer Queue:** bounded FIFO runtime, truthful progress/rate/ETA where known,
-  safe retry, cooperative pause/resume/cancel, and owned shutdown.
-- **Transfer Center v2:** keyboard-first Active / History / All views with selected-job
-  detail and controls routed to the existing TransferQueueRuntime.
-- **Storage Inspector (`Alt+U`):** Linux-local, read-only `du++`-style scan with
-  logical/allocated byte truth, hard-link handling, drill-down/top files, partial/error
-  evidence, and JobManager cancellation.
-- **Filesystems (`Alt+D`):** Linux-local, read-only `df++`-style mount/capacity/inode
-  view with explicit unavailable/autofs truth and manual refresh.
-- **Typed local Quick Actions:** SHA-256, Touch file, and Compress to tar.gz are
-  built-in registered Action/ActionId entries discovered through Command Center. They are local-only, use a
-  dedicated correlated Effect lane, and never interpolate filenames into `sh -c`.
-- **SSH/X11 environment:** ARX inherits the process/session environment and never
-  synthesizes `DISPLAY`; X11 forwarding must be established by the SSH client/session.
-- **User extension surface:** `arx.menu` is the supported lightweight mechanism; the
-  unwired embedded Lua prototype/runtime has been removed and WASM is not product scope.
-- **Distribution:** GitHub Release is the single publication path; Linux x86_64 ships
-  tar.gz, `.deb`, `.rpm`, and one `SHA256SUMS`, all produced from one validated ELF.
+- **Local / SFTP:** browsing, transactional copy, bounded preview, SFTP conflict-safe text Remote Edit, OpenSSH-backed host/session behavior.
+- **Remote Workspace:** compare → Preview → Execute → Verify for Local→Local, Local→SFTP, and SFTP→Local. SFTP→SFTP workspace sync remains unsupported.
+- **Transfer Queue:** one persistent bounded FIFO runtime, configurable concurrency `1..=8`, truthful progress/rate/ETA where known, cooperative Pause/Resume/Cancel, and bounded safe retry.
+- **Transfer Center v2:** Active / History / All views and controls routed to the existing TransferQueueRuntime.
+- **Storage Inspector (`Alt+U`):** Linux-local, read-only `du++`-style logical/allocated usage, drill-down/top-files, hard-link handling, partial/error/cancel truth.
+- **Filesystems (`Alt+D`):** Linux-local, read-only `df++`-style capacity/inode view with explicit unavailable/autofs truth.
+- **Effective keymap:** one conflict-safe effective runtime map with user overrides and `arx --print-keymap` discovery.
+- **Mouse:** visible-row-correct clicks, active-pane wheel, Shift+Click ranges, drag-selection safety, provider-aware typed context menu.
+- **Split panes:** vertical + horizontal orientation, explicit close, keyboard ratio resize `20..=80` step 5, section-aware same-location mouse behavior. No independent split Location and no nested pane tree.
+- **tmux / GNU Screen:** typed discovery and terminal mode release/reacquire around interactive attach.
+- **Typed local Quick Actions:** SHA-256, Touch, Compress-to-tar.gz, with the pre-existing mkdir/chmod/symlink surface retained. No shell-string interpolation for the new actions.
+- **S3:** AWS S3 + MinIO physically accepted supported MVPs; Moto emulated; Cloudflare R2 / Wasabi remain unverified best-effort targets.
+- **WebDAV:** Apache mod_dav, Nextcloud 34.0.2-apache, and ownCloud 11.0.0 physically accepted through the supported Basic-auth path.
+- **WebDAV recursive download:** one exact selected WebDAV collection → one new Local tree, using provider-native href identities, bounded authenticated `PROPFIND Depth: 1`, manifest-before-Local-mutation, noclobber staging, cleanup/recovery truth, and checked cumulative byte progress.
+- **Distribution:** GitHub Release is the publication path; Linux x86_64 ships tar.gz, `.deb`, `.rpm`, and one `SHA256SUMS`, all produced from one validated ELF.
+- **Extension surface:** `arx.menu` is the supported lightweight admin extension mechanism. There is no embedded Lua/WASM/native plugin runtime.
 
-Current follow-up truth:
+## STABILIZATION — v0.21.x
 
-- **tmux/screen (#7) — COMPLETE via PR #238**, accepted merge
-  `616b48b6eafbc9dea55b76428b70beab1941b877`: typed GNU Screen discovery,
-  missing-binary truth, terminal-suspending interactive attach.
-- **Mouse:** #10 is COMPLETE via PR #236, accepted merge
-  `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`. Shipped: visible-row-correct pane
-  clicks, active-pane wheel scrolling, Shift+Click range selection, drag-selection
-  safety, and a provider-aware typed context menu with exact frozen-target revalidation.
-- **Split panes (#16) — CURRENT PRODUCT WORK:** same-location split views with
-  vertical + horizontal orientation, ratio 20..=80 (step 5), explicit close, and
-  keyboard resizing; section-aware mouse hit-testing through ONE geometry
-  authority. No independent split Location, no nested pane tree; mouse boundary
-  drag resize deferred. Implementation on `feat/16-split-pane-layout`; baseline
-  entering #16: `616b48b6eafbc9dea55b76428b70beab1941b877`. Not COMPLETE until an
-  accepted pinned merge (no future merge SHA invented here).
-- **WebDAV:** the supported Apache mod_dav MVP is shipped; #13 tracks only post-MVP
-  auth/interoperability/recursive-operation work.
+The immediate phase after v0.21.0 is stabilization, not another architecture sequence.
 
-## ARCHITECTURE PACKS — P–R COMPLETE; PRODUCT BACKLOG ACTIVE
+Priorities:
 
-The canonical continuation document is [`docs/DEVELOPMENT_HANDOFF.md`](docs/DEVELOPMENT_HANDOFF.md).
-Provenance: the original sequence was tracked by umbrella issue **#180**
-(CLOSED completed); PACK Q by umbrella issue **#224** (CLOSED completed).
+1. Keep README / ROADMAP / development handoff / current status synchronized with released product truth.
+2. Treat real user bug reports and regressions as higher priority than speculative feature work.
+3. Keep runtime architecture frozen unless a demonstrated correctness/safety blocker requires a reviewed change.
+4. Preserve exact-head CI and physical provider acceptance when affected code changes.
+5. Clean obsolete GitHub PR/branch/status clutter after verifying that no unique unfinished work remains.
 
-Status truth (post-PACK-R merge):
+Patch releases in the v0.21.x line should normally contain bug fixes, compatibility corrections, documentation truth, or release/distribution fixes — not large new feature surfaces.
 
-1. **PACK P — TUI decomposition.** COMPLETE. Behavior-preserving decomposition of the
-   >10k-line `src/tui.rs` composition bottleneck: characterization tests, rendering
-   extraction, feature controllers, keyboard/mouse routing, Effect/Job response
-   handling, then a thin runtime/event loop. No product features and no public plugin API.
-2. **PACK Q — VFS convergence.** COMPLETE with Q3 (#229). Q1 made capability truth
-   concrete-location aware (merge `872298913640a7add5ed4a19748a66f9a8de3113`);
-   Q2 removed the legacy `Location` execution bridge and the thread-local registry
-   (merge `b8e5f9a5761875d6b25dfa047d9b93af5619b1f6`); Q3 finalizes resolver
-   authority and documentation truth. `Location` remains typed identity/address,
-   `ProviderRegistry` is the execution authority, `CapabilitySet` is exact-location
-   capability truth, and both provider resolver seams are a deliberate design.
-3. **PACK R — internal feature/command registration (#231). COMPLETE** — PR #232,
-   accepted merge `1def3adf382978491ce11590470f56d844bcce07`. Delivered: one
-   canonical app-level action-registration table (action + metadata + availability
-   policy), Command Center iterating it directly, and a private binary-side
-   controller registry keyed by `ActionId` for the proof consumers Quick Actions,
-   Storage Inspector, and SSH Host Manager. Storage Inspector is a real registered
-   action on the fixed default Alt+U binding; no public feature trait, no feature-id
-   type, no plugin framework.
-4. **External plugin decision gate.** No Lua/WASM/`.so` runtime is scheduled. Evaluate
-   external plugins only after PACK R and only if real demand exists. Manifest
-   permissions without real OS/runtime enforcement are not a security boundary.
+## COMPLETED FOUNDATION
 
-GitHub state and exact SHAs are authoritative over stale chat summaries or cached
-reviews. A new development session should read the handoff document and this roadmap;
-closed issues #180 and #224 are provenance, not active work.
+The architecture sequence **O → P → Q → R is complete**.
 
-## RELEASED — v0.17.0 (2026-08-16)
+- **PACK O:** typed local Quick Actions — complete.
+- **PACK P:** TUI decomposition — complete.
+- **PACK Q:** VFS convergence — complete.
+- **PACK R:** internal feature/command registration — complete.
 
-Release-readiness established the Linux x86_64 publication baseline:
+Frozen architecture truths:
 
-- Rust 1.88 MSRV gate.
-- checksums, quality gates, and packaged-binary smoke.
-- release notes and installation truth.
+```text
+Location          = typed identity / address / navigation
+ProviderRegistry  = execution authority
+CapabilitySet     = exact-location / concrete-instance capability truth
+VfsProvider       = backend provider interface
+```
 
-## RELEASED — v0.17.1
+Do not add a second ProviderRegistry, TransferQueueRuntime, JobManager, EffectDispatcher, scheduler, retry authority, or secret store.
 
-Historical SFTP Remote Edit reliability/hardening release over v0.17.0. PACK C merged
-via PR #155 and delivered transport-only invalidation, bounded pooled-session health
-checks, deterministic fault/race coverage, safer writable-parent policy, and
-JobManager-integrated Remote Edit lifecycle.
+Provider-native identity remains authoritative. Presentation/display names never reconstruct remote addresses.
 
-Physical acceptance included E1–E12, pool-health, fault/race, TUI lifecycle, and zero
-leaked `.arx-part-*` partial-upload artifacts on accepted paths.
+### External plugins
 
-## RELEASED — v0.18.0
+There is **no GO** for an external Lua/WASM/`.so` plugin runtime. Re-evaluate only if real user/ecosystem demand appears and a truthful enforcement/security model can be defined. `arx.menu` remains the supported lightweight extension path.
 
-The WebDAV release over the v0.17.1 reliability baseline. PACK E merged via PR #157.
+## ACTIVE GITHUB BACKLOG
 
-Delivered:
+At the v0.21.0 release baseline, the only active product issue is **#13 — WebDAV post-MVP**.
 
-- PROPFIND / GET / PUT / DELETE / MKCOL / COPY / MOVE provider semantics.
-- HTTP Basic auth with OS-keyring / environment secret resolution.
-- bounded F3 preview and one-file Local ↔ WebDAV F5 copy.
-- authoritative raw-href identity and strict DAV namespace/propstat parsing.
-- atomic remote no-clobber via `If-None-Match: *`.
-- local staged download with real noclobber finalization.
-- no blind retry of ambiguous mutations.
-- Apache mod_dav W1–W18 PHYSICAL PASS.
+Already shipped under #13:
 
-Not claimed: Digest/Bearer auth, WebDAV F4 remote edit, recursive WebDAV
-transfer/delete, cross-target WebDAV move, or Nextcloud/ownCloud physical
-certification.
+- core WebDAV provider semantics
+- Apache mod_dav W1–W18 physical acceptance
+- Nextcloud 34.0.2 and ownCloud 11.0.0 I1–I12 physical certification
+- WebDAV F5 source/selection truth hardening
+- RFC-compatible MOVE Depth behavior
+- exact recursive WebDAV collection download to Local
 
-## RELEASED — v0.19.0 (2026-08-21)
+Remaining #13 roadmap:
 
-v0.19.0 is the Transfer Queue release, tag target
-`092c3013e29ba70e083634ff50df36a794056f1d`.
+- [ ] **Local directory → WebDAV recursive upload** — only after a fresh contract review of MKCOL, staged/noclobber upload reuse, source pre-scan, empty directories, symlink policy, partial remote-tree rollback/recovery, cancellation, and retry ambiguity.
+- [ ] **Recursive WebDAV delete** — only with explicit bounded traversal/identity and recovery semantics.
+- [ ] **WebDAV → WebDAV recursive/cross-target copy or move** — only with a truthful execution model; never pretend server-side MOVE spans unrelated targets.
+- [ ] **Multiple-root recursive selection** — only after one stable planning/progress contract exists.
+- [ ] **Metadata/property mutation** — optional, only if a real admin use case justifies it.
+- [ ] **Digest/Bearer auth** — only if future interoperability evidence demonstrates that the shipped Basic-auth/app-password path is insufficient.
 
-Delivered:
+The remaining #13 items are enhancements, not regressions or release blockers.
 
-- one persistent bounded FIFO `TransferQueueRuntime`.
-- default concurrency N=2, configurable in the range 1..=8.
-- background Copy/Move orchestration for already-supported TransferPlanner paths.
-- one JobManager lifecycle truth for queue/run/pause/cancel/retry/completion.
-- truthful status-bar percentage, byte rate, and ETA only where known.
-- cooperative same-task Pause/Resume with `PausePending`, same JobId, same attempt.
-- bounded automatic retry, maximum 3 total attempts, only for `SafeToRetry`.
-- `AmbiguousMutation` / `RecoveryRequired` outcomes never blindly replayed.
-- workers/retry timers owned and joined at shutdown.
+## RECOMMENDED NEXT FEATURE SEQUENCE
 
-Physical acceptance covered Local queue/runtime behavior, real MinIO safe-read retry,
-WebDAV ambiguous mutation evidence, and SFTP commit/rename ambiguity policy.
+This is prioritization guidance, not a promise that each item must ship in the named version.
 
-## RELEASED — v0.20.0
+### Candidate v0.22.0 — WebDAV write-side recursion
 
-v0.20.0 consolidates four already-merged product packs into one release.
+Primary candidate:
 
-### PACK I — Storage Inspector / Filesystems
+- Local directory → WebDAV recursive upload.
 
-- **I1** merged via PR #162: Linux Local Storage Inspector core using `dua-core` for
-  parallel traversal; logical vs allocated bytes, symlink no-follow, hard-link
-  de-duplication, top-N, depth/same-filesystem policy, truthful errors/cancellation.
-- **I2** merged via PR #164: one `StorageScan` JobManager lifecycle plus read-only
-  drill-down TUI; no second job runtime and no destructive cleanup actions.
-- **I3** merged via PR #166: Linux `/proc/self/mountinfo` + `statvfs` filesystem view;
-  block/inode modes, deterministic sort/filter, explicit unavailable/autofs states,
-  manual refresh only.
+Acceptance should include Apache mod_dav, Nextcloud, and ownCloud through the same real product path, with explicit partial-remote-tree recovery semantics and no blind retry of ambiguous mutations.
 
-### PACK J — Transfer Center UX v2
+### Candidate v0.23.0 — Remote tree operations
 
-Merged via PR #168 at `f95b601745a093a29cff1f05b463616ecca37f6e`.
+Potential scope after upload is stable:
 
-- Ctrl+Y overlay owns input while open.
-- Active / History / All filters with deterministic cursor clamping.
-- compact list plus selected-job lifecycle/progress/scheduler/attempt detail.
-- Pause/Resume/Cancel call the existing TransferQueueRuntime; UI does not fabricate
-  JobManager transitions.
-- terminal history presentation is bounded without changing JobManager retention.
+- recursive WebDAV delete
+- multiple-root recursive planning if one coherent contract is proven
 
-### PACK K — Native Linux packages
+Do not combine these merely to fill a release; each mutation surface must have its own safety proof.
 
-Merged via PR #171 at `b4e14ee25a4b7be88f5c0330eaf14509c55023e7`.
+### Candidate v0.24.0 — Cross-provider transfer evolution
 
-- tar.gz, Debian `.deb`, and RPM `.rpm` from the **same validated release ELF**.
-- no rebuild between package formats or between validate and publish.
-- exact package payload manifests; unexpected files/symlinks fail closed.
-- RPM build-id payload injection disabled so the package stays inside the declared
-  executable/docs contract.
-- Debian runtime dependencies derived from the exact ELF with `dpkg-shlibdeps`.
-- `cargo-about` generated `THIRD_PARTY_LICENSES.html` included in every package.
-- one `SHA256SUMS` covers all three published package artifacts.
+Potential work:
 
-## PACK M — BACKLOG RECONCILIATION
+- WebDAV↔WebDAV transfer under explicit target truth
+- SFTP→SFTP workspace sync
+- safe cross-backend Move based on copy → verify → delete-source, never optimistic rename semantics across providers
+- broader recursive remote operations only where transaction/recovery truth exists
 
-PACK M was tracked by #174 and changed repository truth only; it added no runtime
-behavior.
+### Candidate v0.25.0 — Storage intelligence
 
-Reconciled against the v0.20.0 tree:
+S3 post-MVP direction:
 
-- #8 Cloud Storage backends — **closed completed**; S3 and WebDAV supported MVPs ship.
-- #41 Embedded Terminal through Action/Command Center — **closed completed**; PR #43
-  delivered the requested shared Action Catalog / Command Center path.
-- #14 Lua plugin issue — **closed duplicate** of canonical plugin decision #11.
-- #5, #7, #9, #10, #11, #13, and #16 were rewritten so they described only work that
-  remained rather than features already present in v0.20.0.
+- read-only Object Inspector
+- read-only Bucket Inspector
+- usage analytics with explicit evidence source and freshness (`LiveScan`, `StorageLens`, `Inventory`, `OtherProvider`, `Unavailable`)
 
-The reconciliation also found a README overclaim: at that point compress/touch/SHA-256
-were not present as typed built-in Quick Actions in the Action Catalog. PACK M therefore
-kept documentation partial until the implementation could ship; PACK O now closes that
-gap.
+S3 must remain an object-storage model. Never fabricate POSIX `df`/filesystem-capacity semantics when the provider cannot prove them.
 
-## PACK N — LEAN RUNTIME HARDENING
+## OTHER PRODUCT BACKLOG
 
-PACK N was tracked by #176 and merged through PR #177 at
-`eec15d91d264a40760b6772135de516d40f1b95c`. It intentionally removed unsupported
-runtime surface rather than adding a new subsystem.
+Items not currently represented by active GitHub issues should be promoted to dedicated issues before implementation:
 
-Delivered:
+- binary remote editing
+- additional Linux architectures, especially ARM64 if user demand justifies it
+- signed package-repository distribution if operationally worthwhile
+- broader cross-backend Move
+- SFTP→SFTP workspace sync
+- provider-specific read-only inspection/analytics where evidence is truthful
 
-- #5 X11 hardening: removed the startup heuristic that guessed
-  `DISPLAY=localhost:0.0` whenever `SSH_CLIENT` existed. ARX now leaves DISPLAY and
-  forwarding ownership entirely with the established session environment.
-- #11 plugin decision, path A: removed the unwired `src/plugins` prototype, removed
-  `pub mod plugins`, removed `mlua`, and pruned the orphaned Lua runtime subtree from
-  `Cargo.lock` without dependency-version/checksum churn.
-- `arx.menu` remains the supported lightweight admin-defined command extension path.
-- no WASM runtime, general plugin API, terminal-brand detection, or new feature surface
-  was introduced.
+Native Windows support remains out of scope. Windows SSH clients may interoperate with an ARX process running on Linux; that does not change the Linux-only product policy.
 
-#5, #11, and #176 are complete under this lean-policy decision.
+## RELEASED — v0.21.0 (2026-08-25)
 
-## PACK O — TYPED LOCAL QUICK ACTIONS
+Release target: `3427cd085740d2c3f8a4bffbbf55b34ba3d9bb85`.
 
-PACK O is tracked by #178 and PR #179 and completes the remaining scope of #9.
+Highlights:
 
-Delivered:
+- exact one-root WebDAV recursive download to a new Local tree
+- Nextcloud 34.0.2 and ownCloud 11.0.0 physical WebDAV certification
+- WebDAV F5 target/source truth and MOVE interoperability fixes
+- horizontal/resizable split panes and section-aware mouse behavior
+- conflict-safe configurable effective keymap + `arx --print-keymap`
+- tmux/GNU Screen lifecycle hardening
+- mouse follow-up and typed context menu
+- deterministic transfer-pause acceptance
+- typed local SHA-256 / Touch / Compress Quick Actions
 
-- **Compute SHA-256:** local focused/selected regular files are hashed in Rust with
-  `sha2`; results preserve exact filename/digest association and hashing runs off the
-  TUI thread.
-- **Touch file:** local child-name prompt with traversal/absolute-name rejection,
-  `O_NOFOLLOW`, exact opened regular-file verification, `futimens`, and a truthful
-  pre-mutation cancellation boundary.
-- **Compress to tar.gz:** focused/selected local entries, typed system-`tar` argv with
-  `--` before filenames, `kill_on_drop(true)` cancellation, same-directory staging,
-  and `persist_noclobber` finalization.
-- all three actions live in the shared Action / ActionId / Action Catalog / Availability
-  model and are discoverable through Command Center without new global shortcuts.
-- remote/cloud providers fail closed; no local shell semantics are guessed for SFTP,
-  S3, WebDAV, or Archive locations.
-- `EffectLane::QuickAction` owns correlated async lifecycle, safe Quit cancellation,
-  navigation-independent terminal result acceptance, and mutation-origin refresh.
-- control characters in filenames/path/tool errors are escaped before presentation while
-  printable Unicode remains intact.
-- Cargo.lock gained only the already-resolved direct `sha2 0.10.9` root dependency;
-  no package/version/checksum churn was introduced.
+Published artifacts:
 
-The implementation passed local fmt/check/clippy/full-test/Rust-1.88 gates and a
-physical system-`tar` test before final exact-head CI/Release acceptance.
+- `arx-v0.21.0-x86_64-unknown-linux-gnu.tar.gz`
+- `arx_0.21.0_amd64.deb`
+- `arx-0.21.0-1.x86_64.rpm`
+- `SHA256SUMS`
+
+The tag-triggered Release workflow validated version/tag truth, format, Clippy, full tests, Rust 1.88, one release build, third-party licenses, TAR/DEB/RPM payload and metadata, packaged-binary identity, checksums, and publication from the validated artifact bundle.
+
+## RELEASE HISTORY
+
+### v0.20.0
+
+Storage/operations release:
+
+- Local Storage Inspector / Filesystems
+- Transfer Center v2
+- native Linux tar.gz / DEB / RPM publication contract
+- typed local Quick Actions and lean extension/runtime cleanup landed in the post-v0.20 development range and are represented accurately in v0.21.0 notes
+
+### v0.19.0
+
+Transfer Queue release:
+
+- one persistent bounded FIFO `TransferQueueRuntime`
+- configurable concurrency
+- truthful progress/rate/ETA
+- cooperative Pause/Resume/Cancel
+- bounded safe retry and recovery/ambiguity classification
+
+### v0.18.0
+
+WebDAV MVP:
+
+- PROPFIND / GET / PUT / DELETE / MKCOL / COPY / MOVE
+- Basic auth through keyring/environment secret resolution
+- bounded F3 preview and one-file Local↔WebDAV F5 copy
+- raw-href authority and noclobber safety
+- Apache mod_dav W1–W18 physical acceptance
+
+### v0.17.x
+
+Linux publication and SFTP Remote Edit reliability baseline.
+
+Historical implementation detail remains available through Git history, closed issues/PRs, and per-release notes; the roadmap intentionally emphasizes current truth over chronology.
 
 ## RELEASE PROCESS POLICY
 
-A release candidate must keep runtime code frozen and change only release truth unless
-a newly discovered blocker requires a separately reviewed fix. Before tagging:
+A release candidate should keep runtime code frozen and change only release truth unless a newly discovered correctness/safety blocker requires a separately reviewed fix.
+
+Before tagging:
 
 - Cargo version and root Cargo.lock version match the intended tag.
-- README, ROADMAP, and `docs/releases/vX.Y.Z.md` describe the same product truth.
-- exact-head quality / Rust 1.88 MSRV / physical provider gates are green.
-- Release validation builds once and validates third-party notices, tar/deb/rpm exact
-  payloads, metadata, ELF identity, checksums, and artifact upload.
-- tag targets the accepted merge SHA; publication reuses validated artifacts without a
-  rebuild.
+- README, ROADMAP, handoff, and `docs/releases/vX.Y.Z.md` describe the same product truth.
+- exact-head quality / Rust 1.88 MSRV / affected physical provider gates are green.
+- Release validation builds once and validates notices, tar/deb/rpm exact payloads, package metadata, ELF identity, checksums, and artifact upload.
+- the tag targets the accepted merge SHA.
+- publication reuses validated artifacts without rebuilding them.
 
-## PLATFORM POLICY
+## DEVELOPMENT POLICY
 
-ARX remains intentionally **Linux-only**. Future platform effort, if useful, should
-stay within Linux (for example additional architectures) rather than creating a
-separate Windows product surface. Windows SSH clients may still be interoperability
-subjects when they connect to an ARX process running on Linux; that does not change the
-platform policy. ARX consumes the environment established by that session and does not
-invent X11 forwarding state.
-
-## FUTURE PRODUCT BACKLOG
-
-The O → P → Q → R architecture sequence is COMPLETE at accepted PACK R merge
-`1def3adf382978491ce11590470f56d844bcce07`. External plugin evaluation remains a
-DECISION GATE, not a next implementation step — there is no external plugin GO. The product backlog remains active and should not be
-lost during later work.
-
-Near-term product follow-ups after the architecture sequence:
-
-- #7 multiplexer lifecycle — COMPLETE via PR #238 (merge `616b48b…`).
-- #16 split-pane layout follow-up — CURRENT implementation on
-  `feat/16-split-pane-layout` (baseline entering #16: `616b48b…`).
-- #10 mouse follow-up — COMPLETE via PR #236, accepted merge
-  `4eadaa1c5bc3e230374ed80a1bd66540c40ca01f`.
-
-### Configurable effective keymap (#214) — COMPLETE
-
-PR #235; accepted merge `dad59ac7ae8b80c680767de7c7f95f506078bf44`. Delivered the
-conflict-safe user-configurable keymap: canonical `ActionId` config identity, raw
-`[[keybindings]]` model with keys-XOR-disabled, one `Keymap::effective()` builder
-(replacement/disable/duplicate/exact/prefix conflict rules), v1 bindability policy,
-real-classifier browser legacy collision validation, sync-context fail-closed, ONE
-effective map feeding routing and all presentation surfaces, `--print-keymap`, and a
-truthful explicit `--config <path>`. No second KeyRouter; no plugin surface.
-
-- Stable `ActionId` / canonical action-registration entries remain the only user-addressable actions.
-- Built-in defaults are layered with user overrides into one **effective runtime
-  Keymap**; `KeyRouter` remains the execution source of truth.
-- Prefer an extensible list-based TOML schema (`context`, `action`, `keys`) rather than
-  one configuration field per action. Unknown ActionIds are rejected.
-- A binding may be explicitly disabled so the action stays available through Command
-  Center without consuming a global shortcut.
-- Duplicate physical sequences in the same `InputContext` are a configuration error;
-  ARX must never silently pick the first action. Reusing the same key in different
-  contexts remains valid.
-- Help, Which-Key, the command bar/footer, and Command Center shortcut labels derive
-  from the effective runtime keymap instead of maintaining independent hard-coded
-  shortcut tables.
-- Add read-only effective-keymap discovery for admins, preferably through Command
-  Center and/or `arx --print-keymap`, including context, action, binding, and whether
-  the binding is built-in or user-provided.
-- This is configuration/discovery work, not a plugin surface: no arbitrary executable
-  strings, no user-defined action names, no second KeyRouter, and no per-feature
-  shortcut ownership.
-
-This completed follow-up was tracked by **#214**. It is intentionally outside
-behavior-preserving PACK P and does not change the approved P → Q → R sequence.
-
-Provider/transfer follow-ups:
-
-- #13 WebDAV post-MVP — Digest/Bearer evaluation, physical Nextcloud/ownCloud
-  certification, recursive transfers/delete under an explicit safe contract, and
-  cross-target operations only with a truthful execution model.
-- Cross-backend Move.
-- SFTP → SFTP workspace sync.
-- Recursive remote delete.
-- Binary remote editing.
-- Additional Linux architectures and, if justified, signed package-repository
-  distribution.
-
-### S3 Inspector and Analytics (POST-MVP)
-
-- Read-only Object Inspector and Bucket Inspector for S3.
-- Usage analytics with explicit evidence source (LiveScan / StorageLens / Inventory /
-  OtherProvider / Unavailable) and as-of freshness.
-- S3 remains an object-storage usage model, not POSIX `df`; never fabricate filesystem
-  capacity semantics for providers that cannot prove them.
+- Prefer user-visible vertical slices over new architecture packs.
+- Collect related findings and fix them coherently instead of micro-iterating one edge case at a time.
+- Use exact-head CI and physical evidence as acceptance gates.
+- Do not weaken production semantics to satisfy timing-sensitive tests.
+- Use Hermes only for deterministic Linux-local execution that connected tooling cannot perform; architecture, review, PR/merge, and release authority remain outside Hermes.
