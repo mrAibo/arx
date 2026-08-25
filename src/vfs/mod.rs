@@ -9,6 +9,8 @@ pub mod sftp;
 pub mod webdav;
 #[cfg(all(test, feature = "physical-webdav"))]
 mod webdav_acceptance;
+#[cfg(all(test, feature = "physical-webdav"))]
+mod webdav_interop_acceptance;
 #[cfg(test)]
 mod webdav_tests;
 

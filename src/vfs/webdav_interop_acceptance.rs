@@ -1,0 +1,503 @@
+//! #241 — WebDAV interoperability certification against REAL pinned
+//! Nextcloud and ownCloud servers.
+//!
+//! One physical test (`physical_webdav_interop_core_matrix`) executes the
+//! portable I1–I12 matrix against whatever fixture `setup_webdav_interop.sh`
+//! provisioned (kind recorded in `ARX_WEBDAV_INTEROP_KIND`). The SAME logic
+//! runs for both servers — no per-server fake behavior.
+//!
+//! Contract:
+//! - With `ARX_WEBDAV_INTEROP_REQUIRED=1`, missing fixture env is a FAILURE,
+//!   never a silent skip.
+//! - W1-style production resolver evidence is mandatory (WebDavTargetConfig →
+//!   register_webdav_targets → keyring/env secret resolution →
+//!   resolve_webdav_provider → authenticated PROPFIND).
+//! - F5 items go through the real product path
+//!   (`build_webdav_copy_spec` → planner → executor), never direct PUT.
+//! - Apache-specific LOCK/proxy/fault behaviors stay in webdav_acceptance.rs.
+use super::webdav::{WebDavProvider, WebDavTarget};
+use crate::transfer::{ExecutorAvailability, TransferIntent, TransferPlanner, TransferRequest};
+use crate::vfs::{
+    CancellationFlag, EntryIdentity, EntryKind, ListedEntry, Location, ProviderRegistry,
+    RemoteEditRevision, VfsProvider,
+};
+use std::sync::Arc;
+
+fn required_env(name: &str) -> String {
+    match std::env::var(name) {
+        Ok(v) if !v.is_empty() => v,
+        _ => panic!(
+            "#241: required interop fixture env {name} missing — \
+             run scripts/setup_webdav_interop.sh <nextcloud|owncloud>; \
+             with ARX_WEBDAV_INTEROP_REQUIRED=1 a missing fixture is a FAILURE"
+        ),
+    }
+}
+
+fn physical_run_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    format!("interop-{}-{}", std::process::id(), nanos)
+}
+
+fn target_direct() -> WebDavProvider {
+    WebDavProvider::new(
+        WebDavTarget {
+            id: "accept".into(),
+            name: "interop".into(),
+            url: required_env("ARX_WEBDAV_SMOKE_HOST"),
+            username: required_env("ARX_WEBDAV_SMOKE_USER"),
+            auth: "basic".into(),
+        },
+        required_env("ARX_WEBDAV_SMOKE_PASS"),
+    )
+    .expect("direct provider construction")
+}
+
+/// I1 production-chain evidence: config → registration → env secret
+/// resolution → resolve → authenticated PROPFIND. No interop-only adapter.
+/// Target id `accept` maps the resolver to `ARX_WEBDAV_ACCEPT_PASSWORD`.
+fn target_via_production_resolver() -> Arc<dyn VfsProvider> {
+    let host = required_env("ARX_WEBDAV_SMOKE_HOST");
+    let user = required_env("ARX_WEBDAV_SMOKE_USER");
+    let _ = required_env("ARX_WEBDAV_ACCEPT_PASSWORD"); // resolver convention
+    let reg = Arc::new(ProviderRegistry::new());
+    reg.register_webdav_targets(&[crate::config::WebDavTargetConfig {
+        id: "accept".into(),
+        name: "interop".into(),
+        url: host,
+        username: user,
+        auth: "basic".into(),
+    }]);
+    reg.resolve_webdav_provider("accept")
+        .expect("production secret-resolution chain must resolve the interop provider")
+}
+
+fn registry_with(p: &WebDavProvider) -> Arc<ProviderRegistry> {
+    let reg = Arc::new(ProviderRegistry::new());
+    let t = p.target();
+    reg.register_webdav_targets(&[crate::config::WebDavTargetConfig {
+        id: t.id.clone(),
+        name: t.name.clone(),
+        url: t.url.clone(),
+        username: t.username.clone(),
+        auth: t.auth.clone(),
+    }]);
+    reg
+}
+
+/// Real F5 path: build_webdav_copy_spec -> planner -> executor. Identical to
+/// the Apache suite's helper; no direct PUT shortcut.
+#[allow(clippy::too_many_arguments)]
+async fn run_f5(
+    registry: &Arc<ProviderRegistry>,
+    src_loc: Location,
+    dst_loc: Location,
+    focused_listed: Option<&ListedEntry>,
+    other_listed: Option<&ListedEntry>,
+    filename: &str,
+) -> Result<(), String> {
+    let src_provider = src_loc.provider_id();
+    let dst_provider = dst_loc.provider_id();
+    let src_caps = registry
+        .capabilities_for_location(&src_loc)
+        .unwrap_or_default();
+    let dst_caps = registry
+        .capabilities_for_location(&dst_loc)
+        .unwrap_or_default();
+
+    let webdav_spec = crate::transfer::build_webdav_copy_spec(
+        src_provider,
+        dst_provider,
+        &src_loc,
+        &dst_loc,
+        focused_listed,
+        other_listed,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut executors = ExecutorAvailability::local();
+    executors.webdav = true;
+
+    let request = TransferRequest {
+        source: src_loc,
+        destination: dst_loc,
+        source_provider: src_provider,
+        destination_provider: dst_provider,
+        source_capabilities: src_caps,
+        destination_capabilities: dst_caps,
+        intent: TransferIntent::Copy,
+        executors,
+        delete_extraneous: false,
+        s3_spec: None,
+        webdav_spec: Some(webdav_spec),
+    };
+    let plan = TransferPlanner::plan(request).map_err(|e| e.to_string())?;
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    crate::transfer::executor::execute_transfer(
+        &plan,
+        &[filename.to_string()],
+        registry,
+        cancel,
+        crate::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn list_at(p: &WebDavProvider, target_id: &str, path: &str) -> Vec<ListedEntry> {
+    p.list_page(
+        &Location::WebDav {
+            target: target_id.to_string(),
+            path: path.to_string(),
+        },
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("list {path} failed: {e}"))
+    .entries
+}
+
+/// The complete portable I1–I12 matrix against the provisioned REAL server.
+#[tokio::test(flavor = "multi_thread")]
+async fn physical_webdav_interop_core_matrix() {
+    let host_ok = std::env::var("ARX_WEBDAV_SMOKE_HOST").is_ok();
+    let required = std::env::var("ARX_WEBDAV_INTEROP_REQUIRED").ok().as_deref() == Some("1");
+    if !host_ok && !required {
+        eprintln!(
+            "skipping #241 interop matrix: no fixture env (set ARX_WEBDAV_SMOKE_*; \
+with ARX_WEBDAV_INTEROP_REQUIRED=1 absence is a FAILURE)"
+        );
+        return;
+    }
+    let kind = std::env::var("ARX_WEBDAV_INTEROP_KIND").unwrap_or_default();
+    assert!(
+        matches!(kind.as_str(), "nextcloud" | "owncloud"),
+        "#241: ARX_WEBDAV_INTEROP_KIND must be nextcloud|owncloud (got `{kind}`)"
+    );
+
+    // ── I1 AUTH / ROOT LIST via the PRODUCTION resolver chain ──
+    let prod = target_via_production_resolver();
+    let target_id = "accept".to_string();
+    let root = "/".to_string();
+    let seed_entries = prod
+        .list_page(
+            &Location::WebDav {
+                target: target_id.clone(),
+                path: root.clone(),
+            },
+            None,
+        )
+        .await
+        .expect("I1: authenticated root PROPFIND via production resolver");
+    assert!(
+        seed_entries
+            .entries
+            .iter()
+            .any(|e| e.entry.name == "interop-seed" && e.entry.kind == EntryKind::Directory),
+        "I1: seeded fixture collection visible through production resolver"
+    );
+    println!("I1 PASS ({kind}): production resolver + auth + seeded listing");
+
+    let p_arc = Arc::new(target_direct());
+    let run = physical_run_id();
+
+    // ── I2 NESTED MKCOL / NAVIGATION ──
+    let nested = format!("/{}-nested", run);
+    let nested_file = format!("{}/child.txt", nested);
+    p_arc.mkdir(&nested).await.expect("I2: mkdir");
+    p_arc
+        .write_file_bytes_if_unchanged(
+            &nested_file,
+            b"nested-content",
+            &RemoteEditRevision::new(vec![], 0, 0, 0),
+            &CancellationFlag::default(),
+            None,
+        )
+        .await
+        .expect("I2: put child");
+    let child = list_at(&p_arc, &target_id, &nested)
+        .await
+        .into_iter()
+        .find(|e| e.entry.name == "child.txt")
+        .expect("I2: child listed inside collection");
+    assert_eq!(child.entry.kind, EntryKind::File);
+    println!("I2 PASS ({kind})");
+
+    // ── I3 UNICODE / SPACE / RAW HREF IDENTITY ──
+    let unicode = format!("/{}-unicodé spáces.txt", run);
+    p_arc
+        .write_file_bytes_if_unchanged(
+            &unicode,
+            b"unicode-bytes",
+            &RemoteEditRevision::new(vec![], 0, 0, 0),
+            &CancellationFlag::default(),
+            None,
+        )
+        .await
+        .expect("I3: put unicode/space name");
+    let u_entry = list_at(&p_arc, &target_id, &root)
+        .await
+        .into_iter()
+        .find(|e| e.entry.name == unicode.trim_start_matches('/'))
+        .expect("I3: unicode entry listed by display name");
+    match &u_entry.identity {
+        EntryIdentity::WebDavObject(o) => {
+            assert!(!o.href.is_empty(), "I3: raw href non-empty");
+            assert_eq!(o.target, target_id, "I3: href bound to target");
+            assert!(
+                o.href.contains("%20") || o.href.contains(' '),
+                "I3: href preserves the encoded/raw space form: {}",
+                o.href
+            );
+        }
+        other => panic!("I3: expected WebDavObject identity, got {other:?}"),
+    }
+    println!("I3 PASS ({kind})");
+
+    // ── I4 BOUNDED GET / PREVIEW ──
+    let rd = p_arc
+        .read_all_capped(&nested_file, 64)
+        .await
+        .expect("I4: bounded read small");
+    assert_eq!(rd.bytes, b"nested-content", "I4: exact bytes");
+    let big = p_arc
+        .read_all_capped(&nested_file, 10 * 1024 * 1024)
+        .await
+        .expect("I4: bounded read past EOF");
+    assert_eq!(
+        big.bytes.len(),
+        "nested-content".len(),
+        "I4: bounded to real size"
+    );
+    println!("I4 PASS ({kind})");
+
+    // ── I5 LOCAL -> WEBDAV via REAL F5 path ──
+    let local_name = format!("{}-upload.txt", run);
+    let local_path = std::env::temp_dir().join(&local_name);
+    const UPLOAD_BYTES: &[u8] = b"f5-upload-bytes";
+    std::fs::write(&local_path, UPLOAD_BYTES).expect("I5: local source");
+    run_f5(
+        &registry_with(&p_arc),
+        Location::Local(local_path.parent().unwrap().to_path_buf()),
+        Location::WebDav {
+            target: target_id.clone(),
+            path: root.clone(),
+        },
+        None,
+        Some(&ListedEntry {
+            entry: crate::vfs::Entry {
+                name: local_name.clone(),
+                kind: EntryKind::File,
+                size: Some(UPLOAD_BYTES.len() as u64),
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::Other,
+        }),
+        &local_name,
+    )
+    .await
+    .expect("I5: Local -> WebDAV F5");
+    let uploaded = list_at(&p_arc, &target_id, &root)
+        .await
+        .into_iter()
+        .find(|e| e.entry.name == local_name)
+        .expect("I5: upload visible on server");
+    let got = p_arc
+        .read_all_capped(&format!("/{local_name}"), 64)
+        .await
+        .expect("I5: read back upload");
+    assert_eq!(got.bytes, UPLOAD_BYTES, "I5: upload bytes exact");
+    let _ = uploaded;
+    println!("I5 PASS ({kind})");
+
+    // ── I6 WEBDAV -> LOCAL via REAL F5 path using real WebDavObject identity ──
+    let dl_dir = tempfile::tempdir().expect("I6: dest dir");
+    let w_obj = list_at(&p_arc, &target_id, &root)
+        .await
+        .into_iter()
+        .find(|e| e.entry.name == local_name)
+        .and_then(|e| match e.identity {
+            EntryIdentity::WebDavObject(o) => Some(o),
+            _ => None,
+        })
+        .expect("I6: WebDavObject identity from listing");
+    run_f5(
+        &registry_with(&p_arc),
+        Location::WebDav {
+            target: target_id.clone(),
+            path: root.clone(),
+        },
+        Location::Local(dl_dir.path().to_path_buf()),
+        Some(&ListedEntry {
+            entry: crate::vfs::Entry {
+                name: local_name.clone(),
+                kind: EntryKind::File,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::WebDavObject(w_obj),
+        }),
+        None,
+        &local_name,
+    )
+    .await
+    .expect("I6: WebDAV -> Local F5");
+    let dl = std::fs::read(dl_dir.path().join(&local_name)).expect("I6: downloaded file");
+    assert_eq!(dl, UPLOAD_BYTES, "I6: download bytes exact");
+    println!("I6 PASS ({kind})");
+
+    // ── I7 SAME-TARGET SERVER-SIDE COPY ──
+    let copy = format!("/{}-copy.txt", run);
+    p_arc
+        .copy_or_move(
+            reqwest::Method::from_bytes(b"COPY").unwrap(),
+            &format!("/{local_name}"),
+            &copy,
+            true,
+        )
+        .await
+        .expect("I7: server-side COPY");
+    assert!(
+        list_at(&p_arc, &target_id, &root)
+            .await
+            .into_iter()
+            .any(|e| e.entry.name == copy.trim_start_matches('/')),
+        "I7: copy present"
+    );
+    println!("I7 PASS ({kind})");
+
+    // ── I8 SAME-TARGET SERVER-SIDE MOVE (post-#242: no Depth on MOVE) ──
+    let moved = format!("/{}-moved.txt", run);
+    p_arc
+        .copy_or_move(
+            reqwest::Method::from_bytes(b"MOVE").unwrap(),
+            &copy,
+            &moved,
+            true,
+        )
+        .await
+        .expect("I8: server-side MOVE");
+    let after_move = list_at(&p_arc, &target_id, &root).await;
+    assert!(
+        after_move
+            .iter()
+            .any(|e| e.entry.name == moved.trim_start_matches('/')),
+        "I8: destination present"
+    );
+    assert!(
+        !after_move
+            .iter()
+            .any(|e| e.entry.name == copy.trim_start_matches('/')),
+        "I8: source gone after move"
+    );
+    println!("I8 PASS ({kind})");
+
+    // ── I9 DELETE ──
+    p_arc.remove_file(&moved).await.expect("I9: delete moved");
+    p_arc
+        .remove_file(&format!("/{local_name}"))
+        .await
+        .expect("I9: delete upload");
+    p_arc
+        .remove_file(&unicode)
+        .await
+        .expect("I9: delete unicode");
+    p_arc
+        .remove_file(&nested_file)
+        .await
+        .expect("I9: delete child");
+    p_arc.remove_dir(&nested).await.expect("I9: delete dir");
+    let after_delete = list_at(&p_arc, &target_id, &root).await;
+    assert!(
+        !after_delete.iter().any(|e| {
+            let n = e.entry.name.as_str();
+            n == moved.trim_start_matches('/')
+                || n == local_name
+                || n == unicode.trim_start_matches('/')
+                || n == nested.trim_start_matches('/')
+        }),
+        "I9: all deleted resources gone"
+    );
+    println!("I9 PASS ({kind})");
+
+    // ── I10 WRONG CREDENTIALS: factual failure, not an empty listing ──
+    let bad = WebDavProvider::new(
+        WebDavTarget {
+            id: target_id.clone(),
+            name: "interop".into(),
+            url: p_arc.target().url.clone(),
+            username: p_arc.target().username.clone(),
+            auth: "basic".into(),
+        },
+        "definitely-wrong-password".into(),
+    )
+    .unwrap();
+    let bad_res = bad
+        .list_page(
+            &Location::WebDav {
+                target: target_id.clone(),
+                path: root.clone(),
+            },
+            None,
+        )
+        .await;
+    assert!(bad_res.is_err(), "I10: wrong credentials rejected");
+    println!("I10 PASS ({kind})");
+
+    // ── I11 MISSING RESOURCE: truthful 404/NotFound-equivalent ──
+    let missing = p_arc.read_all_capped("/does-not-exist-xyz.txt", 64).await;
+    assert!(missing.is_err(), "I11: 404 -> factual error");
+    println!("I11 PASS ({kind})");
+
+    // ── I12 OVERWRITE / NOCLOBBER SAFETY through the REAL one-file F5 path ──
+    let ov = format!("/{}-noclobber.txt", run);
+    p_arc
+        .write_file_bytes_if_unchanged(
+            &ov,
+            b"OLD",
+            &RemoteEditRevision::new(vec![], 0, 0, 0),
+            &CancellationFlag::default(),
+            None,
+        )
+        .await
+        .expect("I12: seed OLD");
+    let ov_local = std::env::temp_dir().join(ov.trim_start_matches('/'));
+    std::fs::write(&ov_local, b"NEW").expect("I12: local NEW");
+    let conflict = run_f5(
+        &registry_with(&p_arc),
+        Location::Local(ov_local.parent().unwrap().to_path_buf()),
+        Location::WebDav {
+            target: target_id.clone(),
+            path: root.clone(),
+        },
+        None,
+        Some(&ListedEntry {
+            entry: crate::vfs::Entry {
+                name: ov.trim_start_matches('/').to_string(),
+                kind: EntryKind::File,
+                size: Some(std::fs::metadata(&ov_local).unwrap().len()),
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::Other,
+        }),
+        ov.trim_start_matches('/'),
+    )
+    .await;
+    assert!(conflict.is_err(), "I12: forbid/noclobber must fail closed");
+    let preserved = p_arc
+        .read_all_capped(&ov, 64)
+        .await
+        .expect("I12: read existing remote object");
+    assert_eq!(preserved.bytes, b"OLD", "I12: original bytes preserved");
+    let _ = p_arc.remove_file(&ov).await;
+    let _ = std::fs::remove_file(&ov_local);
+    println!("I12 PASS ({kind})");
+
+    println!("#241 interop core matrix PASSED for kind={kind}");
+}
