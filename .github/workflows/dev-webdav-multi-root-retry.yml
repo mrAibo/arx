@@ -1,0 +1,85 @@
+name: DEV WebDAV multi-root retry
+
+on:
+  push:
+    branches: [feature/webdav-multi-root-copy]
+    paths:
+      - '.github/workflows/dev-webdav-multi-root-retry.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+      - name: Fix dependency-free test temp dirs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/transfer/webdav_batch.rs')
+          text = p.read_text()
+          anchor = '''    use std::path::PathBuf;\n\n    fn local_file(name: &str) -> ListedEntry {\n'''
+          replacement = '''    use std::path::PathBuf;\n\n    fn test_temp_dir(label: &str) -> PathBuf {\n        let nanos = std::time::SystemTime::now()\n            .duration_since(std::time::UNIX_EPOCH)\n            .expect("clock")\n            .as_nanos();\n        let path = std::env::temp_dir().join(format!(\n            "arx-webdav-batch-{label}-{}-{nanos}",\n            std::process::id()\n        ));\n        std::fs::create_dir_all(&path).unwrap();\n        path\n    }\n\n    fn local_file(name: &str) -> ListedEntry {\n'''
+          if text.count(anchor) != 1:
+              raise SystemExit('test helper anchor mismatch')
+          text = text.replace(anchor, replacement, 1)
+          old = '''        let destination = tempfile::tempdir().unwrap();\n        let (spec, names) = prepare_webdav_copy_batch(\n            &dav_location("dav", "/presentation/ignored"),\n            &Location::Local(destination.path().to_path_buf()),\n'''
+          new = '''        let destination = test_temp_dir("download");\n        let (spec, names) = prepare_webdav_copy_batch(\n            &dav_location("dav", "/presentation/ignored"),\n            &Location::Local(destination.clone()),\n'''
+          if text.count(old) != 1:
+              raise SystemExit('download temp replacement mismatch')
+          text = text.replace(old, new, 1)
+          old = '''        let destination = tempfile::tempdir().unwrap();\n        std::fs::write(destination.path().join("a"), b"existing").unwrap();\n        let error = prepare_webdav_copy_batch(\n            &dav_location("dav", "/"),\n            &Location::Local(destination.path().to_path_buf()),\n'''
+          new = '''        let destination = test_temp_dir("collision");\n        std::fs::write(destination.join("a"), b"existing").unwrap();\n        let error = prepare_webdav_copy_batch(\n            &dav_location("dav", "/"),\n            &Location::Local(destination.clone()),\n'''
+          if text.count(old) != 1:
+              raise SystemExit('collision temp replacement mismatch')
+          text = text.replace(old, new, 1)
+          p.write_text(text)
+          PY
+      - name: Reuse deterministic production patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor 4355f24e8a74c3393c34bc3dbe05a8e5753457c0 HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+          src = Path('.github/workflows/dev-webdav-multi-root-patch.yml').read_text().splitlines()
+          start = next(i for i, line in enumerate(src) if "python3 - <<'PY'" in line) + 1
+          end = next(i for i in range(start, len(src)) if src[i].strip() == 'PY')
+          lines = src[start:end]
+          indents = [len(line) - len(line.lstrip()) for line in lines if line.strip()]
+          trim = min(indents)
+          script = '\n'.join(line[trim:] if line.strip() else '' for line in lines) + '\n'
+          Path('/tmp/arx-multi-root-patch.py').write_text(script)
+          PY
+          python3 /tmp/arx-multi-root-patch.py
+      - name: Format and standard gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo check --locked --all-features
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-features
+          cargo +1.88 check --locked --all-features
+          git diff --check
+      - name: Commit implementation and remove helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/dev-webdav-multi-root-patch.yml
+          git rm .github/workflows/dev-webdav-multi-root-retry.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/transfer/mod.rs src/transfer/webdav_batch.rs src/transfer/executor.rs src/tui/transfers.rs
+          git commit -m 'feat: wire WebDAV multi-root F5 copy'
+          git push origin HEAD:feature/webdav-multi-root-copy
