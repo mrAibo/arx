@@ -568,6 +568,16 @@ mod tests {
                 .retry_disposition(),
             crate::transfer_queue::RetryDisposition::NeverRetry
         );
+        let cancelled =
+            classify_webdav_tree_error(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        assert!(matches!(
+            &cancelled,
+            TransferExecutionError::Cancelled { completed: 0 }
+        ));
+        assert_eq!(
+            cancelled.retry_disposition(),
+            crate::transfer_queue::RetryDisposition::NeverRetry
+        );
     }
 
     #[tokio::test]

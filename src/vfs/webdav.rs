@@ -241,15 +241,26 @@ impl WebDavProvider {
                     "href must not carry fragment",
                 ));
             }
-            // Same-origin absolute href: the server gave us an authoritative URL.
-            // Return it verbatim (raw path + query), do NOT re-encode or drop the
-            // query. Origin/creds/fragment already validated above.
+            // Same-origin absolute href: containment is proven on the PATH with
+            // the exact same authority as the path-absolute form below; the raw
+            // href (path + query) is returned verbatim, never re-encoded.
+            let after_scheme = href
+                .find("://")
+                .map(|idx| idx + 3)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad absolute href"))?;
+            let path_start = href[after_scheme..].find('/').map(|idx| after_scheme + idx);
+            let raw_path_and_query = path_start.map(|idx| &href[idx..]).unwrap_or("/");
+            let raw_path = raw_path_and_query
+                .split_once('?')
+                .map_or(raw_path_and_query, |(path, _)| path);
+            self.check_contained(root_path, raw_path, href)?;
             return Ok(href.to_string());
         }
 
         // Path-absolute href: preserve raw path/query verbatim, prefix origin.
         if href.starts_with('/') {
-            return self.check_contained(root_path, href, href);
+            let path_only = href.split_once('?').map_or(href, |(path, _)| path);
+            return self.check_contained(root_path, path_only, href);
         }
 
         // Other relative forms (e.g. `a/b`, `./a`) are not supported for PACK E.
@@ -282,7 +293,10 @@ impl WebDavProvider {
                 continue;
             }
             let dec = percent_decode(seg);
-            if dec == ".." || dec == "." {
+            // One percent-decode must not produce path-shape control: encoded
+            // separators or encoded dot segments are rejected fail-closed.
+            // The RAW href stays the addressing identity; this is validation only.
+            if dec == ".." || dec == "." || dec.contains('/') || dec.contains('\\') {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("href traversal rejected: {raw}"),
@@ -294,7 +308,7 @@ impl WebDavProvider {
             .url
             .trim_end_matches('/')
             .trim_end_matches(root_path);
-        Ok(format!("{origin_base}{href_path}"))
+        Ok(format!("{origin_base}{raw}"))
     }
 
     /// Smart URL resolver: raw hrefs (under the target root) go through
@@ -395,15 +409,22 @@ impl WebDavProvider {
         self.wire_url_for_href(&collection.href)
     }
 
-    pub(crate) fn canonical_collection_identity(
+    pub(crate) fn canonical_exact_href_identity(
         &self,
-        collection: &WebDavCollectionRef,
+        target: &str,
+        href: &str,
     ) -> io::Result<String> {
-        let wire = self.collection_wire_url(collection)?;
+        if target != self.target.id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WebDAV exact href target does not match provider target",
+            ));
+        }
+        let wire = self.wire_url_for_href(href)?;
         let parsed = url::Url::parse(&wire).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("bad collection url: {e}"),
+                format!("bad exact href url: {e}"),
             )
         })?;
         Ok(canonical_url_identity(&parsed))
@@ -522,7 +543,7 @@ impl WebDavProvider {
         pause: Option<&crate::transfer_queue::PauseGate>,
         mut on_progress: impl FnMut(u64, Option<u64>),
     ) -> io::Result<u64> {
-        let url = self.resolve_url(href)?;
+        let url = self.wire_url_for_href(href)?;
         let req = self.auth_req(self.client.get(&url))?;
         let mut resp = req.send().await.map_err(map_reqwest)?;
         let status = resp.status();
@@ -1540,6 +1561,49 @@ mod tests {
 
     // Security boundary: an authoritative href must stay inside the target
     // root and never allow traversal out of it.
+    #[test]
+    fn exact_href_containment_and_canonical_identity_corrections() {
+        let p = dav_provider("http://example/dav/");
+        for good in ["/dav/a%20b?version=7", "http://example/dav/a%20b?version=7"] {
+            assert_eq!(
+                p.wire_url_for_href(good).unwrap(),
+                if good.starts_with("http") {
+                    good.to_string()
+                } else {
+                    format!("http://example{good}")
+                }
+            );
+        }
+        for bad in [
+            "http://example/outside/file",
+            "http://example/dav2/file",
+            "http://evil/dav/file",
+            "http://user@example/dav/file",
+            "http://example/dav/file#frag",
+            "/dav/%2e%2e/secret",
+            "http://example/dav/%2e%2e/secret",
+            "/dav/%2E%2E/secret",
+            "http://example/dav/a/%2E%2E?version=7",
+            "/dav/a/%2e%2e?version=7",
+            "/dav/root/a%2Fb",
+            "/dav/root/a%2fb",
+            "/dav/root/a%5Cb",
+        ] {
+            assert!(p.wire_url_for_href(bad).is_err(), "must reject {bad}");
+        }
+        let no_slash = p.canonical_exact_href_identity("t", "/dav/root/a").unwrap();
+        let slash = p
+            .canonical_exact_href_identity("t", "/dav/root/a/")
+            .unwrap();
+        assert_eq!(no_slash, slash, "file/collection slash conflict collides");
+        assert_ne!(
+            p.canonical_exact_href_identity("t", "/dav/root/a?version=1")
+                .unwrap(),
+            p.canonical_exact_href_identity("t", "/dav/root/a?version=2")
+                .unwrap()
+        );
+    }
+
     #[test]
     fn recursive_direct_child_shape_r7_r8() {
         assert!(

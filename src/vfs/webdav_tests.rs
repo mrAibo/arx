@@ -930,14 +930,14 @@ async fn exact_collection_listing_preserves_raw_children_and_excludes_self_r5_r6
 </D:multistatus>"#.to_vec();
     let (url, _) = spawn_mock(move |method, path, _, _, _| {
         assert_eq!(method, "PROPFIND");
-        assert_eq!(path, "/dav/root/");
+        assert_eq!(path, "/dav/root/?token=abc");
         (207, xml.clone())
     });
     let p = provider_for(&url, "x");
     let listed = p
         .list_collection_exact(&super::webdav::WebDavCollectionRef {
             target: "t".into(),
-            href: "/dav/root/".into(),
+            href: "/dav/root/?token=abc".into(),
         })
         .await
         .expect("exact Depth:1 list");
@@ -952,4 +952,41 @@ async fn exact_collection_listing_preserves_raw_children_and_excludes_self_r5_r6
         crate::vfs::EntryIdentity::WebDavCollection(collection)
             if collection.href == "/dav/root/child%20dir/"
     )));
+}
+
+#[tokio::test]
+async fn exact_streamed_get_preserves_raw_href_query_and_encoding() {
+    let (url, log) = spawn_mock(|method, _, _, _, _| {
+        assert_eq!(method, "GET");
+        (200, b"ok".to_vec())
+    });
+    let p = provider_for(&url, "x");
+    for href in [
+        format!("{url}/dav/a%20b?version=7"),
+        "/dav/path%20absolute?version=8".to_string(),
+    ] {
+        let mut sink = tokio::io::sink();
+        assert_eq!(
+            p.get_stream(&href, 64, &mut sink, None, None, |_, _| {})
+                .await
+                .unwrap(),
+            2
+        );
+    }
+    let requests = log.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|(_, path, _, _, _)| path == "/dav/a%20b?version=7")
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|(_, path, _, _, _)| path == "/dav/path%20absolute?version=8")
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|(_, path, _, _, _)| !path.contains("%2520"))
+    );
 }

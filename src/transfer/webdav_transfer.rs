@@ -9,10 +9,10 @@
 //! - cancellation truth: staged file removed, never a partial final path
 //! - no overwrite of an existing final path without a frozen policy
 
-use crate::transfer::WebDavTransferSpec;
+use crate::transfer::{WebDavTransferSpec, validate_webdav_local_component};
 use crate::transfer_queue::TypedTransferProgress;
 use crate::vfs::webdav::WebDavProvider;
-use crate::vfs::{EntryIdentity, WebDavCollectionRef, WebDavObjectRef, validate_child_name};
+use crate::vfs::{EntryIdentity, WebDavCollectionRef, WebDavObjectRef};
 use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -73,11 +73,8 @@ fn accept_unique_identity(
 }
 
 fn accept_local_name(seen: &mut HashSet<String>, name: &str) -> io::Result<()> {
-    validate_child_name(name).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsafe WebDAV presentation name: {name}"),
-        )
+    validate_webdav_local_component(name).map_err(|message| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("{message}: {name}"))
     })?;
     if !seen.insert(name.to_string()) {
         return Err(io::Error::new(
@@ -97,6 +94,14 @@ fn accept_descendant(count: &mut usize) -> io::Result<()> {
     }
     *count += 1;
     Ok(())
+}
+
+fn descendant_depth(parent_depth: usize) -> io::Result<usize> {
+    let depth = parent_depth
+        .checked_add(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WebDAV tree depth overflow"))?;
+    validate_depth(depth)?;
+    Ok(depth)
 }
 
 fn validate_depth(depth: usize) -> io::Result<()> {
@@ -294,8 +299,8 @@ pub(crate) async fn build_tree_manifest(
     let mut directories = Vec::new();
     let mut files = Vec::new();
     let mut descendants = 0usize;
-    let mut seen_collections = HashSet::new();
-    let mut seen_children = HashSet::new();
+    let root_identity = provider.canonical_exact_href_identity(&root.target, &root.href)?;
+    let mut seen_remote_identities = HashSet::from([root_identity]);
     let mut pending = VecDeque::from([(root.clone(), PathBuf::new(), 0usize)]);
 
     while let Some((collection, relative_parent, depth)) = pending.pop_front() {
@@ -313,28 +318,22 @@ pub(crate) async fn build_tree_manifest(
                 "tree download cancelled",
             ));
         }
-        let collection_identity = provider.canonical_collection_identity(&collection)?;
-        accept_unique_identity(
-            &mut seen_collections,
-            collection_identity,
-            "WebDAV collection cycle/repeated canonical collection URL",
-        )?;
         let children = provider.list_collection_exact(&collection).await?;
         let mut local_names = HashSet::new();
         for child in children {
             accept_descendant(&mut descendants)?;
             accept_local_name(&mut local_names, &child.entry.name)?;
             let relative = relative_parent.join(&child.entry.name);
+            let child_depth = descendant_depth(depth)?;
             match child.identity {
                 EntryIdentity::WebDavCollection(source) => {
-                    let identity = provider.canonical_collection_identity(&source)?;
+                    let identity =
+                        provider.canonical_exact_href_identity(&source.target, &source.href)?;
                     accept_unique_identity(
-                        &mut seen_children,
+                        &mut seen_remote_identities,
                         identity,
-                        "duplicate exact WebDAV child identity",
+                        "duplicate exact WebDAV remote identity",
                     )?;
-                    let child_depth = depth + 1;
-                    validate_depth(child_depth)?;
                     directories.push(TreeDirectory {
                         relative: relative.clone(),
                         source: source.clone(),
@@ -342,17 +341,12 @@ pub(crate) async fn build_tree_manifest(
                     pending.push_back((source, relative, child_depth));
                 }
                 EntryIdentity::WebDavObject(source) => {
-                    if source.target != root.target {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "WebDAV child target mismatch",
-                        ));
-                    }
-                    let identity = provider.wire_url_for_href(&source.href)?;
+                    let identity =
+                        provider.canonical_exact_href_identity(&source.target, &source.href)?;
                     accept_unique_identity(
-                        &mut seen_children,
+                        &mut seen_remote_identities,
                         identity,
-                        "duplicate exact WebDAV child identity",
+                        "duplicate exact WebDAV remote identity",
                     )?;
                     files.push(TreeFile {
                         relative,
@@ -459,6 +453,7 @@ pub(crate) async fn download_tree(
             };
             let total = manifest.total_bytes;
             let base = completed_before;
+            let mut progress_overflow = false;
             let actual = download_one(
                 provider,
                 &one,
@@ -467,11 +462,21 @@ pub(crate) async fn download_tree(
                 pause.clone(),
                 &mut |progress| {
                     if let TypedTransferProgress::Bytes { completed, .. } = progress {
-                        on_progress(tree_progress(base, completed, total));
+                        if let Some(progress) = tree_progress(base, completed, total) {
+                            on_progress(progress);
+                        } else {
+                            progress_overflow = true;
+                        }
                     }
                 },
             )
             .await?;
+            if progress_overflow {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "downloaded byte progress overflow",
+                ));
+            }
             completed_before = completed_before.checked_add(actual).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "downloaded byte count overflow")
             })?;
@@ -502,11 +507,9 @@ fn tree_progress(
     base: u64,
     current_file_completed: u64,
     total: Option<u64>,
-) -> TypedTransferProgress {
-    TypedTransferProgress::Bytes {
-        completed: base.saturating_add(current_file_completed),
-        total,
-    }
+) -> Option<TypedTransferProgress> {
+    base.checked_add(current_file_completed)
+        .map(|completed| TypedTransferProgress::Bytes { completed, total })
 }
 
 fn stream_progress(completed: u64, total: Option<u64>) -> TypedTransferProgress {
@@ -542,6 +545,8 @@ mod progress_tests {
         assert!(accept_descendant(&mut count).is_err());
         assert!(validate_depth(128).is_ok());
         assert!(validate_depth(129).is_err());
+        assert_eq!(descendant_depth(127).unwrap(), 128);
+        assert!(descendant_depth(128).is_err());
     }
 
     #[test]
@@ -568,18 +573,19 @@ mod progress_tests {
         );
         assert_eq!(
             tree_progress(3, 2, Some(8)),
-            TypedTransferProgress::Bytes {
+            Some(TypedTransferProgress::Bytes {
                 completed: 5,
                 total: Some(8)
-            }
+            })
         );
         assert_eq!(
             tree_progress(5, 1, Some(8)),
-            TypedTransferProgress::Bytes {
+            Some(TypedTransferProgress::Bytes {
                 completed: 6,
                 total: Some(8)
-            }
+            })
         );
+        assert_eq!(tree_progress(u64::MAX, 1, None), None);
     }
 
     #[tokio::test]
@@ -697,7 +703,23 @@ mod tests {
             href: "/dav/x".into(),
         };
         assert_eq!(webdav_download_local_name(&obj, "a.txt").unwrap(), "a.txt");
-        for bad in ["../", "/", "", ".", ".."] {
+        assert_eq!(
+            webdav_download_local_name(&obj, "unicodé spáces.txt").unwrap(),
+            "unicodé spáces.txt"
+        );
+        for bad in [
+            "../",
+            "/",
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "\\absolute",
+            "C:escape",
+            "C:\\escape",
+            "nul\0name",
+        ] {
             assert!(
                 webdav_download_local_name(&obj, bad).is_err(),
                 "{bad:?} must be rejected"

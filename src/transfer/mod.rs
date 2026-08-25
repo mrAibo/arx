@@ -384,11 +384,21 @@ pub fn s3_spec_for_objects(objects: &[S3ObjectRef]) -> Result<&S3ObjectRef, Tran
 /// it. Fails closed with a factual error for unsafe names; never sanitizes.
 // ponytail: WebDAV download uses the listing identity's exact href; local name
 /// is purely for the destination file on disk — same validation as S3.
+pub fn validate_webdav_local_component(name: &str) -> Result<(), String> {
+    validate_child_name(name).map_err(|_| {
+        "WebDAV name cannot be represented as one safe local path component".to_string()
+    })?;
+    if name.contains('\\') || name.contains(':') {
+        return Err("WebDAV name cannot be represented as one safe local path component".into());
+    }
+    Ok(())
+}
+
 pub fn webdav_download_local_name(
     _object: &WebDavObjectRef,
     presentation_name: &str,
 ) -> Result<String, TransferPlanError> {
-    validate_child_name(presentation_name).map_err(|_| {
+    validate_webdav_local_component(presentation_name).map_err(|_| {
         TransferPlanError::InvalidLocalName(
             "object cannot be represented as a single local filename".to_string(),
         )
@@ -514,7 +524,7 @@ pub fn build_webdav_copy_spec(
                             collection.target, target
                         ));
                     }
-                    validate_child_name(&source.entry.name).map_err(|_| {
+                    validate_webdav_local_component(&source.entry.name).map_err(|_| {
                         "collection cannot be represented as one safe local directory name"
                             .to_string()
                     })?;
