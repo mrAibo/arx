@@ -18,6 +18,10 @@ pub use capabilities::{Capability, CapabilitySet};
 pub use s3::{S3BucketRef, S3ObjectRef, S3PrefixRef};
 pub use webdav::{WebDavCollectionRef, WebDavObjectRef, encode_segment};
 
+/// Shared safety bounds for all recursive WebDAV operations.
+pub const MAX_WEBDAV_TREE_DESCENDANTS: usize = 50_000;
+pub const MAX_WEBDAV_TREE_DEPTH: usize = 128;
+
 // ── VFS authority model (final; PACK Q closeout) ──
 //
 // Location          = typed identity / address / navigation information
@@ -1235,6 +1239,14 @@ impl ProviderRegistry {
             Some(webdav) => Ok(webdav),
             None => Err(RegistryError::NotFound(target_id.to_string())),
         }
+    }
+
+    /// Same concrete provider/client instance as listing and transfer.
+    pub fn webdav_provider_for_mutation(
+        &self,
+        target_id: &str,
+    ) -> Result<Arc<webdav::WebDavProvider>, RegistryError> {
+        self.webdav_provider_for_transfer(target_id)
     }
 
     pub fn list_location(&self, loc: &Location) -> std::io::Result<Vec<Entry>> {
@@ -2632,6 +2644,31 @@ mod tests {
             0,
             "capability query must not construct a WebDAV provider"
         );
+    }
+
+    #[test]
+    fn webdav_mutation_resolver_reuses_transfer_instance() {
+        let registry = ProviderRegistry::new();
+        registry.register_webdav_targets(&[crate::config::WebDavTargetConfig {
+            id: "mut".into(),
+            name: "Mutation Target".into(),
+            url: "http://127.0.0.1:9/dav".into(),
+            username: "user".into(),
+            // ponytail: test only checks Arc identity, not real auth
+            auth: "basic".into(),
+        }]);
+        // A real secret is required to build the provider; stub one via env.
+        // set_var is unsafe (data race); test only, single-threaded.
+        unsafe {
+            std::env::set_var("ARX_WEBDAV_MUT_PASSWORD", "test");
+        }
+        // Transfer seam and mutation seam must hand out the SAME Arc.
+        let transfer = registry.webdav_provider_for_transfer("mut").unwrap();
+        let mutation = registry.webdav_provider_for_mutation("mut").unwrap();
+        assert!(Arc::ptr_eq(&transfer, &mutation));
+        // Repeated mutation resolution reuses the registered instance.
+        let again = registry.webdav_provider_for_mutation("mut").unwrap();
+        assert!(Arc::ptr_eq(&mutation, &again));
     }
 
     #[test]

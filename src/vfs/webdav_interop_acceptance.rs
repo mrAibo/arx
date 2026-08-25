@@ -692,3 +692,67 @@ async fn physical_webdav_interop_recursive_upload_tree() {
         b"keep"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn physical_webdav_interop_recursive_delete_tree() {
+    let host_ok = std::env::var("ARX_WEBDAV_SMOKE_HOST").is_ok();
+    let required = std::env::var("ARX_WEBDAV_INTEROP_REQUIRED").ok().as_deref() == Some("1");
+    if !host_ok && !required {
+        eprintln!("skipping recursive delete interop: no fixture env");
+        return;
+    }
+    let provider = Arc::new(target_direct());
+    let target_id = provider.target().id.clone();
+    let root_name = format!("{}-delete", physical_run_id());
+    let root = format!("/{root_name}");
+    provider.mkdir(&root).await.unwrap();
+    provider.mkdir(&format!("{root}/empty")).await.unwrap();
+    provider.mkdir(&format!("{root}/nested")).await.unwrap();
+    for (path, bytes) in [
+        ("zero.bin", b"".as_slice()),
+        ("unicodé spáces.txt", b"u".as_slice()),
+        ("nested/file.txt", b"n".as_slice()),
+    ] {
+        provider
+            .write_file_bytes_if_unchanged(
+                &format!("{root}/{path}"),
+                bytes,
+                &RemoteEditRevision::new(vec![], 0, 0, 0),
+                &CancellationFlag::default(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let location = Location::WebDav {
+        target: target_id.clone(),
+        path: "/".into(),
+    };
+    let rows = provider.list_page(&location, None).await.unwrap().entries;
+    let selected = rows.iter().find(|row| row.entry.name == root_name).unwrap();
+    let plan = crate::services::prepare_webdav_recursive_delete(
+        &location,
+        &[],
+        Some(selected),
+        &rows.iter().collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let outcome = crate::services::MutationService::delete_webdav_tree(
+        provider.clone(),
+        plan.source,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.completed, outcome.total);
+    assert!(
+        provider
+            .list_page(&location, None)
+            .await
+            .unwrap()
+            .entries
+            .iter()
+            .all(|row| row.entry.name != root_name)
+    );
+}

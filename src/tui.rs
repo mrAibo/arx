@@ -1039,7 +1039,7 @@ fn render(
     }
 
     // Remote delete confirmation overlay
-    if state.pending_delete.is_some() {
+    if state.pending_delete.is_some() || state.pending_webdav_delete.is_some() {
         mutations::render_confirmation(frame, area, state);
     }
 
@@ -1608,7 +1608,16 @@ async fn dispatch_ui_action(
     if workspace::handle_action(state, &action, workspace_scanner, sync) {
         return Ok(());
     }
-    if mutations::handle_action(state, &action, focused, active_entries, sync, pane_loader) {
+    if mutations::handle_action(
+        state,
+        &action,
+        focused,
+        focused_listed,
+        active_entries,
+        active_listed,
+        sync,
+        pane_loader,
+    ) {
         return Ok(());
     }
 

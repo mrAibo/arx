@@ -390,6 +390,8 @@ pub struct AppState {
     pub pending_quick_action_prompt: Option<QuickActionPrompt>,
     /// Pending remote delete plan awaiting user confirmation.
     pub pending_delete: Option<RemoteDeletePlan>,
+    /// Exact provider-native WebDAV recursive delete plan awaiting confirmation.
+    pub pending_webdav_delete: Option<crate::services::WebDavRecursiveDeletePlan>,
     /// Ctrl+X prefix for MC-style key combos
     pub cmd_prefix: bool,
     /// Phase-2 remote edit: Download landed, editor needs launching.
@@ -537,6 +539,7 @@ impl Default for AppState {
             pending_mkdir_location: None,
             pending_quick_action_prompt: None,
             pending_delete: None,
+            pending_webdav_delete: None,
             cmd_prefix: false,
             pending_remote_edit_session: None,
             pending_remote_edit_origin: None,

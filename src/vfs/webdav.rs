@@ -108,6 +108,14 @@ pub(crate) enum NewCollectionError {
     Ambiguous(#[source] io::Error),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ExactDeleteError {
+    #[error("definitive DELETE failure: {0}")]
+    Definitive(#[source] io::Error),
+    #[error("ambiguous DELETE outcome: {0}")]
+    Ambiguous(#[source] io::Error),
+}
+
 /// A WebDAV provider bound to one configured target.
 pub struct WebDavProvider {
     target: WebDavTarget,
@@ -444,6 +452,17 @@ impl WebDavProvider {
         self.wire_url_for_href(&collection.href)
     }
 
+    pub(crate) fn is_target_root_collection(
+        &self,
+        collection: &WebDavCollectionRef,
+    ) -> io::Result<bool> {
+        let collection = url::Url::parse(&self.collection_wire_url(collection)?)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        let root = url::Url::parse(&self.target.url)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        Ok(canonical_url_identity(&collection) == canonical_url_identity(&root))
+    }
+
     pub(crate) fn canonical_exact_href_identity(
         &self,
         target: &str,
@@ -746,6 +765,62 @@ impl WebDavProvider {
         }
         let text = read_fixed_text(resp).await;
         Err(self.status_error("DELETE", status, &text))
+    }
+
+    async fn delete_exact_url(&self, url: String) -> Result<(), ExactDeleteError> {
+        let req = self
+            .auth_req(self.client.delete(&url))
+            .map_err(ExactDeleteError::Definitive)?;
+        let resp = req.send().await.map_err(|error| {
+            ExactDeleteError::Ambiguous(io::Error::other(format!("DELETE transport: {error}")))
+        })?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NO_CONTENT || status == reqwest::StatusCode::OK {
+            return Ok(());
+        }
+        let text = read_fixed_text(resp).await;
+        let error = self.status_error("DELETE", status, &text);
+        if status.is_client_error() {
+            Err(ExactDeleteError::Definitive(error))
+        } else {
+            Err(ExactDeleteError::Ambiguous(error))
+        }
+    }
+
+    pub async fn delete_object_exact(
+        &self,
+        object: &WebDavObjectRef,
+    ) -> Result<(), ExactDeleteError> {
+        if object.target != self.target.id {
+            return Err(ExactDeleteError::Definitive(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WebDAV object target does not match provider target",
+            )));
+        }
+        let url = self
+            .wire_url_for_href(&object.href)
+            .map_err(ExactDeleteError::Definitive)?;
+        self.delete_exact_url(url).await
+    }
+
+    pub async fn delete_collection_exact(
+        &self,
+        collection: &WebDavCollectionRef,
+    ) -> Result<(), ExactDeleteError> {
+        let wire = self
+            .collection_wire_url(collection)
+            .map_err(ExactDeleteError::Definitive)?;
+        let mut url = url::Url::parse(&wire).map_err(|error| {
+            ExactDeleteError::Definitive(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bad exact collection URL: {error}"),
+            ))
+        })?;
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
+        }
+        self.delete_exact_url(url.into()).await
     }
 
     // ponytail: collections must be deleted with a trailing-slash URL; Apache

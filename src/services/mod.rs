@@ -16,7 +16,11 @@ pub use diff::DiffService;
 pub use file_info::FileInfoService;
 pub use git::GitService;
 pub use infrastructure::InfrastructureService;
-pub use mutation::{MutationError, MutationProgress, MutationService, TrashOutcome};
+pub use mutation::{
+    MutationError, MutationProgress, MutationService, TrashOutcome, WebDavDeleteError,
+    WebDavDeleteIdentity, WebDavDeleteManifest, WebDavDeleteNode, WebDavDeleteOutcome,
+    WebDavRecursiveDeletePlan, prepare_webdav_recursive_delete,
+};
 pub use pane_loader::{
     PaneListingContinuation, PaneLoadId, PaneLoadPage, PaneLoadPurpose, PaneLoadResponse,
     PaneLoader, PaneNextPageResponse, PanePageRequestId,
