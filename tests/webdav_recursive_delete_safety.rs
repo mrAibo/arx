@@ -83,7 +83,7 @@ async fn plan_for_root(provider: &WebDavProvider, root_name: &str) -> WebDavRecu
     prepare_webdav_recursive_delete(&location, &[], Some(selected), &active).unwrap()
 }
 
-async fn list_root_children(provider: &WebDavProvider, root_name: &str) -> usize {
+async fn list_root_names(provider: &WebDavProvider, root_name: &str) -> Vec<String> {
     provider
         .list_page(
             &Location::WebDav {
@@ -95,7 +95,9 @@ async fn list_root_children(provider: &WebDavProvider, root_name: &str) -> usize
         .await
         .unwrap()
         .entries
-        .len()
+        .into_iter()
+        .map(|row| row.entry.name)
+        .collect()
 }
 
 async fn root_exists(provider: &WebDavProvider, root_name: &str) -> bool {
@@ -340,7 +342,10 @@ async fn physical_webdav_recursive_delete_safety() {
         })
     ));
     assert!(root_exists(&provider, &cancel_root).await);
-    assert_eq!(list_root_children(&provider, &cancel_root).await, 1);
+    let cancel_names = list_root_names(&provider, &cancel_root).await;
+    let remaining_cancel_children = cancel_names.iter().any(|name| name == "a.txt") as usize
+        + cancel_names.iter().any(|name| name == "b.txt") as usize;
+    assert_eq!(remaining_cancel_children, 1);
     cleanup_tree(&provider, &cancel_root).await;
 
     // A real Apache write lock must yield a definitive 423 on the first exact
@@ -371,7 +376,9 @@ async fn physical_webdav_recursive_delete_safety() {
         Err(WebDavDeleteError::PreMutation { .. })
     ));
     assert!(root_exists(&provider, &locked_root).await);
-    assert_eq!(list_root_children(&provider, &locked_root).await, 2);
+    let locked_names = list_root_names(&provider, &locked_root).await;
+    assert!(locked_names.iter().any(|name| name == "a-locked.txt"));
+    assert!(locked_names.iter().any(|name| name == "z-later.txt"));
     unlock_resource(&upstream, &locked_path, &token, &user, &pass)
         .await
         .unwrap();
@@ -422,9 +429,15 @@ async fn physical_webdav_recursive_delete_safety() {
     );
     drop(record);
     assert!(root_exists(&provider, &ambiguous_root).await);
+    let ambiguous_names = list_root_names(&provider, &ambiguous_root).await;
+    let remaining_ambiguous_children = ambiguous_names
+        .iter()
+        .any(|name| name == "a-first.txt") as usize
+        + ambiguous_names
+            .iter()
+            .any(|name| name == "z-later.txt") as usize;
     assert_eq!(
-        list_root_children(&provider, &ambiguous_root).await,
-        1,
+        remaining_ambiguous_children, 1,
         "no later manifest node may be deleted after ambiguity"
     );
     cleanup_tree(&provider, &ambiguous_root).await;
