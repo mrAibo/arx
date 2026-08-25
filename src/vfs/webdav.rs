@@ -241,15 +241,18 @@ impl WebDavProvider {
                     "href must not carry fragment",
                 ));
             }
-            // Same-origin absolute href: the server gave us an authoritative URL.
-            // Return it verbatim (raw path + query), do NOT re-encode or drop the
-            // query. Origin/creds/fragment already validated above.
+            // Same-origin absolute href: containment is proven on the PATH with
+            // the exact same authority as the path-absolute form below; the raw
+            // href (path + query) is returned verbatim, never re-encoded.
+            let raw_path = raw_path_from_absolute_href(href)?;
+            self.check_contained(root_path, raw_path, href)?;
             return Ok(href.to_string());
         }
 
         // Path-absolute href: preserve raw path/query verbatim, prefix origin.
         if href.starts_with('/') {
-            return self.check_contained(root_path, href, href);
+            let path_only = href.split_once('?').map_or(href, |(path, _)| path);
+            return self.check_contained(root_path, path_only, href);
         }
 
         // Other relative forms (e.g. `a/b`, `./a`) are not supported for PACK E.
@@ -282,7 +285,10 @@ impl WebDavProvider {
                 continue;
             }
             let dec = percent_decode(seg);
-            if dec == ".." || dec == "." {
+            // One percent-decode must not produce path-shape control: encoded
+            // separators or encoded dot segments are rejected fail-closed.
+            // The RAW href stays the addressing identity; this is validation only.
+            if dec == ".." || dec == "." || dec.contains('/') || dec.contains('\\') {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("href traversal rejected: {raw}"),
@@ -294,7 +300,7 @@ impl WebDavProvider {
             .url
             .trim_end_matches('/')
             .trim_end_matches(root_path);
-        Ok(format!("{origin_base}{href_path}"))
+        Ok(format!("{origin_base}{raw}"))
     }
 
     /// Smart URL resolver: raw hrefs (under the target root) go through
@@ -348,13 +354,13 @@ impl WebDavProvider {
         self.join_url(dst)
     }
 
-    /// PROPFIND Depth:1 and parse the multistatus response.
-    async fn propfind(&self, path: &str, depth: &str) -> io::Result<Vec<PropFindEntry>> {
-        let url = self.join_url(path);
+    /// Shared authenticated PROPFIND request/parser beneath both logical
+    /// listing and exact raw-href collection traversal.
+    async fn propfind_url(&self, url: &str, depth: &str) -> io::Result<Vec<PropFindEntry>> {
         let body = r#"<?xml version="1.0" encoding="utf-8"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/><D:getcontentlength/><D:getlastmodified/><D:displayname/></D:prop></D:propfind>"#;
         let req = self.auth_req(
             self.client
-                .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &url)
+                .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), url)
                 .header("Depth", depth)
                 .header("Content-Type", "application/xml; charset=utf-8")
                 .body(body),
@@ -373,6 +379,106 @@ impl WebDavProvider {
             ));
         }
         parse_multistatus(&bytes.bytes)
+    }
+
+    /// Logical-path PROPFIND wrapper used by normal listing/metadata.
+    async fn propfind(&self, path: &str, depth: &str) -> io::Result<Vec<PropFindEntry>> {
+        let url = self.join_url(path);
+        self.propfind_url(&url, depth).await
+    }
+
+    /// Resolve the canonical wire URL for an exact collection identity.
+    pub(crate) fn collection_wire_url(
+        &self,
+        collection: &WebDavCollectionRef,
+    ) -> io::Result<String> {
+        if collection.target != self.target.id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WebDAV collection target does not match provider target",
+            ));
+        }
+        self.wire_url_for_href(&collection.href)
+    }
+
+    pub(crate) fn canonical_exact_href_identity(
+        &self,
+        target: &str,
+        href: &str,
+    ) -> io::Result<String> {
+        if target != self.target.id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WebDAV exact href target does not match provider target",
+            ));
+        }
+        let wire = self.wire_url_for_href(href)?;
+        let parsed = url::Url::parse(&wire).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bad exact href url: {e}"),
+            )
+        })?;
+        Ok(canonical_url_identity(&parsed))
+    }
+
+    /// Exact provider-native collection listing: authenticated PROPFIND
+    /// Depth:1 against the raw collection href. Existing child href identities
+    /// are copied verbatim; no child address is reconstructed from display text.
+    pub(crate) async fn list_collection_exact(
+        &self,
+        collection: &WebDavCollectionRef,
+    ) -> io::Result<Vec<ListedEntry>> {
+        let collection_url = self.collection_wire_url(collection)?;
+        let self_url = url::Url::parse(&collection_url).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bad collection url: {e}"),
+            )
+        })?;
+        let entries = self.propfind_url(&collection_url, "1").await?;
+        let mut listed = Vec::new();
+        for entry in entries {
+            let child_url_text = self.wire_url_for_href(&entry.raw_href)?;
+            let child_url = url::Url::parse(&child_url_text).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("bad child href: {e}"))
+            })?;
+            if self_url.origin() == child_url.origin()
+                && self_url.path().trim_end_matches('/') == child_url.path().trim_end_matches('/')
+            {
+                continue; // Depth:1 self response; query may be normalized by server
+            }
+            validate_direct_child_url(&collection_url, &child_url_text)?;
+            let name = entry
+                .display_name
+                .clone()
+                .unwrap_or_else(|| href_leaf(&entry.raw_href));
+            let identity = if entry.is_collection {
+                EntryIdentity::WebDavCollection(WebDavCollectionRef {
+                    target: self.target.id.clone(),
+                    href: entry.raw_href.clone(),
+                })
+            } else {
+                EntryIdentity::WebDavObject(WebDavObjectRef {
+                    target: self.target.id.clone(),
+                    href: entry.raw_href.clone(),
+                })
+            };
+            listed.push(ListedEntry {
+                entry: Entry {
+                    name,
+                    kind: if entry.is_collection {
+                        EntryKind::Directory
+                    } else {
+                        EntryKind::File
+                    },
+                    size: entry.content_length,
+                    modified_unix_ms: entry.modified_unix_ms,
+                },
+                identity,
+            });
+        }
+        Ok(listed)
     }
 
     /// Bounded GET: request a Range, then read at most `max_bytes` and track
@@ -429,7 +535,7 @@ impl WebDavProvider {
         pause: Option<&crate::transfer_queue::PauseGate>,
         mut on_progress: impl FnMut(u64, Option<u64>),
     ) -> io::Result<u64> {
-        let url = self.resolve_url(href)?;
+        let url = self.wire_url_for_href(href)?;
         let req = self.auth_req(self.client.get(&url))?;
         let mut resp = req.send().await.map_err(map_reqwest)?;
         let status = resp.status();
@@ -851,6 +957,70 @@ impl std::fmt::Debug for WebDavProvider {
 
 /// Extract the path portion of an href, stripping any `scheme://host[:port]`
 /// prefix so logical-path comparisons are host-agnostic.
+fn raw_path_from_absolute_href(href: &str) -> io::Result<&str> {
+    let authority_start = href
+        .find("://")
+        .map(|idx| idx + 3)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad absolute href"))?;
+    let tail = &href[authority_start..];
+    let terminator = tail
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '/' | '?' | '#'));
+    let Some((offset, delimiter)) = terminator else {
+        return Ok("/");
+    };
+    if delimiter != '/' {
+        return Ok("/");
+    }
+    let path_and_tail = &tail[offset..];
+    let end = path_and_tail
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '?' | '#'))
+        .map_or(path_and_tail.len(), |(idx, _)| idx);
+    Ok(&path_and_tail[..end])
+}
+
+fn canonical_url_identity(url: &url::Url) -> String {
+    let mut canonical = url.clone();
+    canonical.set_fragment(None);
+    // A collection trailing slash is presentation-equivalent for cycle/self
+    // detection, while a legitimate query remains part of remote identity.
+    let path = canonical.path().trim_end_matches('/').to_string();
+    canonical.set_path(&path);
+    canonical.to_string()
+}
+
+/// Prove a Depth:1 result is one direct child by canonical WIRE URL path.
+/// Returns a stable canonical URL identity for duplicate/cycle detection.
+pub(crate) fn validate_direct_child_url(parent: &str, child: &str) -> io::Result<String> {
+    let parent = url::Url::parse(parent)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad parent URL: {e}")))?;
+    let child = url::Url::parse(child)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad child URL: {e}")))?;
+    if parent.origin() != child.origin() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "child origin mismatch",
+        ));
+    }
+    let parent_path = parent.path().trim_end_matches('/');
+    let child_path = child.path().trim_end_matches('/');
+    let prefix = format!("{parent_path}/");
+    let Some(rest) = child_path.strip_prefix(&prefix) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Depth:1 response is not below current collection",
+        ));
+    };
+    if rest.is_empty() || rest.contains('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Depth:1 response is not a direct child",
+        ));
+    }
+    Ok(canonical_url_identity(&child))
+}
+
 fn href_path_only(href: &str) -> &str {
     if let Some(idx) = href.find("://") {
         // find end of authority (next '/' after the host)
@@ -1406,6 +1576,106 @@ mod tests {
 
     // Security boundary: an authoritative href must stay inside the target
     // root and never allow traversal out of it.
+    #[test]
+    fn exact_href_containment_and_canonical_identity_corrections() {
+        let https = dav_provider("https://example.test/dav");
+        for bad in [
+            "https://example.test?next=/dav/file.txt",
+            "https://example.test?next=/dav/",
+            "https://example.test?x=foo/bar",
+            "https://example.test/dav/%2e%2e/secret?next=/dav/file",
+            "https://example.test/dav/.%2e/secret?next=/dav/file",
+            "https://example.test/dav/%2e./secret?next=/dav/file",
+            "https://example.test/dav/a%2Fb?next=/dav/file",
+            "https://example.test/dav/a%2fb?next=/dav/file",
+            "https://example.test/dav/a%5Cb?next=/dav/file",
+            "https://example.test/dav/a%5cb?next=/dav/file",
+        ] {
+            assert!(
+                https.wire_url_for_href(bad).is_err(),
+                "query slash is not a path: {bad}"
+            );
+        }
+        for good in [
+            "https://example.test/dav/file.txt?next=/outside",
+            "https://example.test/dav/?next=/outside",
+        ] {
+            assert_eq!(https.wire_url_for_href(good).unwrap(), good);
+        }
+        let exact = "https://example.test/dav/a%20b.txt?version=7&next=/x";
+        assert_eq!(https.wire_url_for_href(exact).unwrap(), exact);
+        let origin = dav_provider("https://example.test");
+        for good in [
+            "https://example.test?next=/whatever",
+            "https://example.test/dav/file?x=/foo",
+        ] {
+            assert_eq!(origin.wire_url_for_href(good).unwrap(), good);
+        }
+
+        let p = dav_provider("http://example/dav/");
+        for good in ["/dav/a%20b?version=7", "http://example/dav/a%20b?version=7"] {
+            assert_eq!(
+                p.wire_url_for_href(good).unwrap(),
+                if good.starts_with("http") {
+                    good.to_string()
+                } else {
+                    format!("http://example{good}")
+                }
+            );
+        }
+        for bad in [
+            "http://example/outside/file",
+            "http://example/dav2/file",
+            "http://evil/dav/file",
+            "http://user@example/dav/file",
+            "http://example/dav/file#frag",
+            "/dav/%2e%2e/secret",
+            "http://example/dav/%2e%2e/secret",
+            "/dav/%2E%2E/secret",
+            "http://example/dav/a/%2E%2E?version=7",
+            "/dav/a/%2e%2e?version=7",
+            "/dav/root/a%2Fb",
+            "/dav/root/a%2fb",
+            "/dav/root/a%5Cb",
+        ] {
+            assert!(p.wire_url_for_href(bad).is_err(), "must reject {bad}");
+        }
+        let no_slash = p.canonical_exact_href_identity("t", "/dav/root/a").unwrap();
+        let slash = p
+            .canonical_exact_href_identity("t", "/dav/root/a/")
+            .unwrap();
+        assert_eq!(no_slash, slash, "file/collection slash conflict collides");
+        assert_ne!(
+            p.canonical_exact_href_identity("t", "/dav/root/a?version=1")
+                .unwrap(),
+            p.canonical_exact_href_identity("t", "/dav/root/a?version=2")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn recursive_direct_child_shape_r7_r8() {
+        assert!(
+            validate_direct_child_url(
+                "http://example/dav/root/",
+                "http://example/dav/root/child%20x?version=7"
+            )
+            .is_ok()
+        );
+        for bad in [
+            "http://example/dav/root/",           // self
+            "http://example/dav/",                // ancestor
+            "http://example/dav/sibling",         // sibling
+            "http://example/dav/root/a/b",        // non-direct descendant
+            "http://evil.example/dav/root/child", // cross-origin
+        ] {
+            assert!(
+                validate_direct_child_url("http://example/dav/root/", bad).is_err(),
+                "must reject {bad}"
+            );
+        }
+    }
+
     #[test]
     fn wire_url_for_href_rejects_escapes() {
         let p = dav_provider("http://example/dav/");

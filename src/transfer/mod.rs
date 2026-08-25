@@ -139,6 +139,12 @@ pub enum WebDavTransferSpec {
         source: WebDavObjectRef,
         local_destination: PathBuf,
     },
+    /// One exact WebDAV collection recursively materialized as one new Local
+    /// root. Traversal stays in the existing WebDAV executor authority.
+    DownloadTree {
+        source: crate::vfs::WebDavCollectionRef,
+        local_destination: PathBuf,
+    },
 }
 
 impl WebDavTransferSpec {
@@ -147,6 +153,7 @@ impl WebDavTransferSpec {
         match self {
             Self::UploadOne { destination, .. } => &destination.target,
             Self::DownloadOne { source, .. } => &source.target,
+            Self::DownloadTree { source, .. } => &source.target,
         }
     }
 }
@@ -377,11 +384,21 @@ pub fn s3_spec_for_objects(objects: &[S3ObjectRef]) -> Result<&S3ObjectRef, Tran
 /// it. Fails closed with a factual error for unsafe names; never sanitizes.
 // ponytail: WebDAV download uses the listing identity's exact href; local name
 /// is purely for the destination file on disk — same validation as S3.
+pub fn validate_webdav_local_component(name: &str) -> Result<(), String> {
+    validate_child_name(name).map_err(|_| {
+        "WebDAV name cannot be represented as one safe local path component".to_string()
+    })?;
+    if name.contains('\\') || name.contains(':') {
+        return Err("WebDAV name cannot be represented as one safe local path component".into());
+    }
+    Ok(())
+}
+
 pub fn webdav_download_local_name(
     _object: &WebDavObjectRef,
     presentation_name: &str,
 ) -> Result<String, TransferPlanError> {
-    validate_child_name(presentation_name).map_err(|_| {
+    validate_webdav_local_component(presentation_name).map_err(|_| {
         TransferPlanError::InvalidLocalName(
             "object cannot be represented as a single local filename".to_string(),
         )
@@ -462,10 +479,6 @@ pub fn build_webdav_copy_spec(
     dst_loc: &Location,
     source: &ListedEntry,
 ) -> Result<WebDavTransferSpec, String> {
-    if source.entry.kind != EntryKind::File {
-        return Err("WebDAV copy requires a single regular file".into());
-    }
-
     match (src_loc, dst_loc) {
         (
             Location::Local(local_root),
@@ -474,6 +487,11 @@ pub fn build_webdav_copy_spec(
                 path: destination_path,
             },
         ) => {
+            if source.entry.kind != EntryKind::File {
+                return Err(
+                    "WebDAV upload currently supports a single local file, not a directory".into(),
+                );
+            }
             let filename = source.entry.name.as_str();
             let dest_href = format!("{}{}", destination_path, encode_segment(filename));
             let destination = webdav_upload_destination_ref(target, &dest_href, filename)
@@ -484,21 +502,42 @@ pub fn build_webdav_copy_spec(
             })
         }
         (Location::WebDav { target, .. }, Location::Local(local_root)) => {
-            let EntryIdentity::WebDavObject(object) = &source.identity else {
-                return Err("Download requires an exact WebDAV object identity".into());
-            };
-            if object.target != *target {
-                return Err(format!(
-                    "WebDAV object target '{}' does not match pane target '{}'",
-                    object.target, target
-                ));
+            match (&source.entry.kind, &source.identity) {
+                (EntryKind::File, EntryIdentity::WebDavObject(object)) => {
+                    if object.target != *target {
+                        return Err(format!(
+                            "WebDAV object target '{}' does not match pane target '{}'",
+                            object.target, target
+                        ));
+                    }
+                    let local_name = webdav_download_local_name(object, &source.entry.name)
+                        .map_err(|e| e.to_string())?;
+                    Ok(WebDavTransferSpec::DownloadOne {
+                        source: object.clone(),
+                        local_destination: local_root.join(local_name),
+                    })
+                }
+                (EntryKind::Directory, EntryIdentity::WebDavCollection(collection)) => {
+                    if collection.target != *target {
+                        return Err(format!(
+                            "WebDAV collection target '{}' does not match pane target '{}'",
+                            collection.target, target
+                        ));
+                    }
+                    validate_webdav_local_component(&source.entry.name).map_err(|_| {
+                        "collection cannot be represented as one safe local directory name"
+                            .to_string()
+                    })?;
+                    Ok(WebDavTransferSpec::DownloadTree {
+                        source: collection.clone(),
+                        local_destination: local_root.join(&source.entry.name),
+                    })
+                }
+                (EntryKind::Directory, _) => {
+                    Err("Recursive download requires an exact WebDAV collection identity".into())
+                }
+                _ => Err("WebDAV download requires an exact file or collection identity".into()),
             }
-            let local_name = webdav_download_local_name(object, &source.entry.name)
-                .map_err(|e| e.to_string())?;
-            Ok(WebDavTransferSpec::DownloadOne {
-                source: object.clone(),
-                local_destination: local_root.join(local_name),
-            })
         }
         _ => Err("WebDAV copy requires exactly one Local pane and one WebDAV pane".into()),
     }
@@ -1174,6 +1213,92 @@ mod tests {
                 &dir,
             )
             .is_err()
+        );
+    }
+    #[test]
+    fn webdav_recursive_prepare_r1_r4() {
+        let collection = ListedEntry {
+            entry: crate::vfs::Entry {
+                name: "unicodé root".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::WebDavCollection(crate::vfs::WebDavCollectionRef {
+                target: "dav-a".into(),
+                href: "/remote/exact%20root/?version=7".into(),
+            }),
+        };
+        let source = Location::WebDav {
+            target: "dav-a".into(),
+            path: "/presentation/ignored/".into(),
+        };
+        let destination = Location::Local(PathBuf::from("/downloads"));
+        let (spec, queue_name) = prepare_webdav_copy(
+            &source,
+            &destination,
+            &[],
+            Some(&collection),
+            &[&collection],
+        )
+        .expect("R1 collection download");
+        assert_eq!(queue_name, "unicodé root");
+        assert!(matches!(
+            spec,
+            WebDavTransferSpec::DownloadTree { source, local_destination }
+                if source.href == "/remote/exact%20root/?version=7"
+                    && local_destination == std::path::Path::new("/downloads/unicodé root")
+        ));
+
+        let wrong = ListedEntry {
+            identity: EntryIdentity::WebDavCollection(crate::vfs::WebDavCollectionRef {
+                target: "dav-b".into(),
+                href: "/remote/root/".into(),
+            }),
+            ..collection.clone()
+        };
+        assert!(
+            prepare_webdav_copy(&source, &destination, &[], Some(&wrong), &[&wrong])
+                .unwrap_err()
+                .contains("does not match")
+        ); // R2
+
+        let local_dir = ListedEntry {
+            entry: crate::vfs::Entry {
+                name: "dir".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::Other,
+        };
+        let dav_dst = Location::WebDav {
+            target: "dav-a".into(),
+            path: "/dst/".into(),
+        };
+        assert!(
+            prepare_webdav_copy(
+                &Location::Local(PathBuf::from("/src")),
+                &dav_dst,
+                &[],
+                Some(&local_dir),
+                &[&local_dir]
+            )
+            .unwrap_err()
+            .contains("not a directory")
+        ); // R3
+
+        // R4: accepted #246 multi-selection remains fail-closed.
+        assert_eq!(
+            prepare_webdav_copy(
+                &source,
+                &destination,
+                &["a".into(), "b".into()],
+                Some(&collection),
+                &[&collection]
+            )
+            .unwrap_err(),
+            "WebDAV copy currently supports one selected item"
         );
     }
 }

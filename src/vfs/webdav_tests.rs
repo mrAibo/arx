@@ -920,3 +920,73 @@ async fn move_omits_depth_header_completely() {
         "MOVE must NOT send any Depth header (neither 0 nor infinity), got:\n{move_req}"
     );
 }
+
+#[tokio::test]
+async fn exact_collection_listing_preserves_raw_children_and_excludes_self_r5_r6() {
+    let xml = br#"<?xml version="1.0"?><D:multistatus xmlns:D="DAV:">
+<D:response><D:href>/dav/root/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:displayname>root</D:displayname></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+<D:response><D:href>/dav/root/file%20x.txt?version=7</D:href><D:propstat><D:prop><D:resourcetype/><D:displayname>file x.txt</D:displayname><D:getcontentlength>4</D:getcontentlength></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+<D:response><D:href>/dav/root/child%20dir/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype><D:displayname>child dir</D:displayname></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>
+</D:multistatus>"#.to_vec();
+    let (url, _) = spawn_mock(move |method, path, _, _, _| {
+        assert_eq!(method, "PROPFIND");
+        assert_eq!(path, "/dav/root/?token=abc");
+        (207, xml.clone())
+    });
+    let p = provider_for(&url, "x");
+    let listed = p
+        .list_collection_exact(&super::webdav::WebDavCollectionRef {
+            target: "t".into(),
+            href: "/dav/root/?token=abc".into(),
+        })
+        .await
+        .expect("exact Depth:1 list");
+    assert_eq!(listed.len(), 2, "self response excluded");
+    assert!(listed.iter().any(|entry| matches!(
+        &entry.identity,
+        crate::vfs::EntryIdentity::WebDavObject(object)
+            if object.href == "/dav/root/file%20x.txt?version=7"
+    )));
+    assert!(listed.iter().any(|entry| matches!(
+        &entry.identity,
+        crate::vfs::EntryIdentity::WebDavCollection(collection)
+            if collection.href == "/dav/root/child%20dir/"
+    )));
+}
+
+#[tokio::test]
+async fn exact_streamed_get_preserves_raw_href_query_and_encoding() {
+    let (url, log) = spawn_mock(|method, _, _, _, _| {
+        assert_eq!(method, "GET");
+        (200, b"ok".to_vec())
+    });
+    let p = provider_for(&url, "x");
+    for href in [
+        format!("{url}/dav/a%20b?version=7"),
+        "/dav/path%20absolute?version=8".to_string(),
+    ] {
+        let mut sink = tokio::io::sink();
+        assert_eq!(
+            p.get_stream(&href, 64, &mut sink, None, None, |_, _| {})
+                .await
+                .unwrap(),
+            2
+        );
+    }
+    let requests = log.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|(_, path, _, _, _)| path == "/dav/a%20b?version=7")
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|(_, path, _, _, _)| path == "/dav/path%20absolute?version=8")
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|(_, path, _, _, _)| !path.contains("%2520"))
+    );
+}

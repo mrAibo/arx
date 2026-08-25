@@ -867,6 +867,105 @@ async fn physical_w1_through_w18() {
     eprintln!("physical W1–W18 PASSED for run {}", run);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn physical_webdav_recursive_download_tree() {
+    let Some(provider) = target() else {
+        eprintln!("skipping recursive WebDAV acceptance: no fixture env");
+        return;
+    };
+    let provider = Arc::new(provider);
+    let target_id = provider.target().id.clone();
+    let root_name = format!("{}-tree", physical_run_id());
+    let remote_root = format!("/{root_name}");
+    provider.mkdir(&remote_root).await.expect("tree root MKCOL");
+    for dir in ["empty", "nested", "unicodé spáces"] {
+        provider
+            .mkdir(&format!("{remote_root}/{dir}"))
+            .await
+            .expect("child MKCOL");
+    }
+    for (path, bytes) in [
+        ("normal.txt", b"normal".as_slice()),
+        ("nested/child.txt", b"nested".as_slice()),
+        ("unicodé spáces/zero.bin", b"".as_slice()),
+    ] {
+        provider
+            .write_file_bytes_if_unchanged(
+                &format!("{remote_root}/{path}"),
+                bytes,
+                &RemoteEditRevision::new(vec![], 0, 0, 0),
+                &CancellationFlag::default(),
+                None,
+            )
+            .await
+            .expect("seed tree file");
+    }
+    let selected = provider
+        .list_page(
+            &Location::WebDav {
+                target: target_id.clone(),
+                path: "/".into(),
+            },
+            None,
+        )
+        .await
+        .expect("real root listing")
+        .entries
+        .into_iter()
+        .find(|entry| entry.entry.name == root_name)
+        .expect("exact selected collection");
+    assert!(matches!(
+        selected.identity,
+        EntryIdentity::WebDavCollection(_)
+    ));
+    let local = tempfile::tempdir().unwrap();
+    run_f5(
+        &registry_with(&provider),
+        Location::WebDav {
+            target: target_id.clone(),
+            path: "/".into(),
+        },
+        Location::Local(local.path().to_path_buf()),
+        selected.clone(),
+    )
+    .await
+    .expect("product recursive F5");
+    let downloaded = local.path().join(&root_name);
+    assert_eq!(
+        std::fs::read(downloaded.join("normal.txt")).unwrap(),
+        b"normal"
+    );
+    assert_eq!(
+        std::fs::read(downloaded.join("nested/child.txt")).unwrap(),
+        b"nested"
+    );
+    assert_eq!(
+        std::fs::metadata(downloaded.join("unicodé spáces/zero.bin"))
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(downloaded.join("empty").is_dir());
+    let collision = tempfile::tempdir().unwrap();
+    let existing = collision.path().join(&root_name);
+    std::fs::create_dir(&existing).unwrap();
+    std::fs::write(existing.join("sentinel"), b"keep").unwrap();
+    assert!(
+        run_f5(
+            &registry_with(&provider),
+            Location::WebDav {
+                target: target_id,
+                path: "/".into()
+            },
+            Location::Local(collision.path().to_path_buf()),
+            selected
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(std::fs::read(existing.join("sentinel")).unwrap(), b"keep");
+}
+
 /// Join the fixture DAV root and a resource path with exactly one slash.
 fn fixture_resource_url(upstream: &str, path: &str) -> String {
     format!(
