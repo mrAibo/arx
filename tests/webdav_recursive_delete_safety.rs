@@ -1,10 +1,11 @@
 #![cfg(feature = "physical-webdav")]
 
-use arx::services::{MutationService, WebDavDeleteError, WebDavRecursiveDeletePlan, prepare_webdav_recursive_delete};
-use arx::vfs::webdav::{WebDavProvider, WebDavTarget};
-use arx::vfs::{
-    CancellationFlag, Location, RemoteEditRevision, VfsProvider,
+use arx::services::{
+    MutationService, WebDavDeleteError, WebDavRecursiveDeletePlan,
+    prepare_webdav_recursive_delete,
 };
+use arx::vfs::webdav::{WebDavProvider, WebDavTarget};
+use arx::vfs::{CancellationFlag, Location, RemoteEditRevision, VfsProvider};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -126,7 +127,12 @@ fn fixture_resource_url(upstream: &str, path: &str) -> String {
     )
 }
 
-async fn lock_resource(upstream: &str, path: &str, user: &str, pass: &str) -> io::Result<String> {
+async fn lock_resource(
+    upstream: &str,
+    path: &str,
+    user: &str,
+    pass: &str,
+) -> io::Result<String> {
     let body = r#"<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
   <D:lockscope><D:exclusive/></D:lockscope>
@@ -148,7 +154,9 @@ async fn lock_resource(upstream: &str, path: &str, user: &str, pass: &str) -> io
         .map_err(|error| io::Error::other(format!("LOCK transport: {error}")))?;
     let status = response.status();
     if status != reqwest::StatusCode::OK {
-        return Err(io::Error::other(format!("LOCK expected 200, got {status}")));
+        return Err(io::Error::other(format!(
+            "LOCK expected 200, got {status}"
+        )));
     }
     response
         .headers()
@@ -256,7 +264,14 @@ async fn handle_proxy_connection(
         Ok(stream) => stream,
         Err(_) => return,
     };
-    if upstream.write_all(&request[..filled]).await.is_err() {
+
+    // Force one HTTP request per client connection so reqwest cannot reuse a
+    // prior PROPFIND tunnel for the DELETE that must be fault-injected.
+    let mut forwarded = Vec::with_capacity(filled + 24);
+    forwarded.extend_from_slice(&request[..request_head_end - 2]);
+    forwarded.extend_from_slice(b"Connection: close\r\n\r\n");
+    forwarded.extend_from_slice(&request[request_head_end..filled]);
+    if upstream.write_all(&forwarded).await.is_err() {
         return;
     }
 
