@@ -13,7 +13,7 @@
 //!   register_webdav_targets → keyring/env secret resolution →
 //!   resolve_webdav_provider → authenticated PROPFIND).
 //! - F5 items go through the real product path
-//!   (`build_webdav_copy_spec` → planner → executor), never direct PUT.
+//!   (`prepare_webdav_copy` → planner → executor), never direct PUT.
 //! - Apache-specific LOCK/proxy/fault behaviors stay in webdav_acceptance.rs.
 use super::webdav::{WebDavProvider, WebDavTarget};
 use crate::transfer::{ExecutorAvailability, TransferIntent, TransferPlanner, TransferRequest};
@@ -89,16 +89,14 @@ fn registry_with(p: &WebDavProvider) -> Arc<ProviderRegistry> {
     reg
 }
 
-/// Real F5 path: build_webdav_copy_spec -> planner -> executor. Identical to
-/// the Apache suite's helper; no direct PUT shortcut.
+/// Same canonical active-source preparation -> planner -> executor seam used
+/// by product F5. Identical to the Apache suite helper; no direct PUT shortcut.
 #[allow(clippy::too_many_arguments)]
 async fn run_f5(
     registry: &Arc<ProviderRegistry>,
     src_loc: Location,
     dst_loc: Location,
-    focused_listed: Option<&ListedEntry>,
-    other_listed: Option<&ListedEntry>,
-    filename: &str,
+    source_listed: ListedEntry,
 ) -> Result<(), String> {
     let src_provider = src_loc.provider_id();
     let dst_provider = dst_loc.provider_id();
@@ -109,15 +107,13 @@ async fn run_f5(
         .capabilities_for_location(&dst_loc)
         .unwrap_or_default();
 
-    let webdav_spec = crate::transfer::build_webdav_copy_spec(
-        src_provider,
-        dst_provider,
+    let (webdav_spec, queue_name) = crate::transfer::prepare_webdav_copy(
         &src_loc,
         &dst_loc,
-        focused_listed,
-        other_listed,
-    )
-    .map_err(|e| e.to_string())?;
+        &[],
+        Some(&source_listed),
+        &[&source_listed],
+    )?;
 
     let mut executors = ExecutorAvailability::local();
     executors.webdav = true;
@@ -139,7 +135,7 @@ async fn run_f5(
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     crate::transfer::executor::execute_transfer(
         &plan,
-        &[filename.to_string()],
+        &[queue_name],
         registry,
         cancel,
         crate::transfer_queue::PauseGate::disabled(),
@@ -289,8 +285,7 @@ with ARX_WEBDAV_INTEROP_REQUIRED=1 absence is a FAILURE)"
             target: target_id.clone(),
             path: root.clone(),
         },
-        None,
-        Some(&ListedEntry {
+        ListedEntry {
             entry: crate::vfs::Entry {
                 name: local_name.clone(),
                 kind: EntryKind::File,
@@ -298,8 +293,7 @@ with ARX_WEBDAV_INTEROP_REQUIRED=1 absence is a FAILURE)"
                 modified_unix_ms: None,
             },
             identity: EntryIdentity::Other,
-        }),
-        &local_name,
+        },
     )
     .await
     .expect("I5: Local -> WebDAV F5");
@@ -334,7 +328,7 @@ with ARX_WEBDAV_INTEROP_REQUIRED=1 absence is a FAILURE)"
             path: root.clone(),
         },
         Location::Local(dl_dir.path().to_path_buf()),
-        Some(&ListedEntry {
+        ListedEntry {
             entry: crate::vfs::Entry {
                 name: local_name.clone(),
                 kind: EntryKind::File,
@@ -342,9 +336,7 @@ with ARX_WEBDAV_INTEROP_REQUIRED=1 absence is a FAILURE)"
                 modified_unix_ms: None,
             },
             identity: EntryIdentity::WebDavObject(w_obj),
-        }),
-        None,
-        &local_name,
+        },
     )
     .await
     .expect("I6: WebDAV -> Local F5");
@@ -476,8 +468,7 @@ with ARX_WEBDAV_INTEROP_REQUIRED=1 absence is a FAILURE)"
             target: target_id.clone(),
             path: root.clone(),
         },
-        None,
-        Some(&ListedEntry {
+        ListedEntry {
             entry: crate::vfs::Entry {
                 name: ov.trim_start_matches('/').to_string(),
                 kind: EntryKind::File,
@@ -485,8 +476,7 @@ with ARX_WEBDAV_INTEROP_REQUIRED=1 absence is a FAILURE)"
                 modified_unix_ms: None,
             },
             identity: EntryIdentity::Other,
-        }),
-        ov.trim_start_matches('/'),
+        },
     )
     .await;
     assert!(conflict.is_err(), "I12: forbid/noclobber must fail closed");
