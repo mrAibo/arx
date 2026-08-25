@@ -1,8 +1,7 @@
 #![cfg(feature = "physical-webdav")]
 
 use arx::services::{
-    MutationService, WebDavDeleteError, WebDavRecursiveDeletePlan,
-    prepare_webdav_recursive_delete,
+    MutationService, WebDavDeleteError, WebDavRecursiveDeletePlan, prepare_webdav_recursive_delete,
 };
 use arx::vfs::webdav::{WebDavProvider, WebDavTarget};
 use arx::vfs::{CancellationFlag, Location, RemoteEditRevision, VfsProvider};
@@ -127,12 +126,7 @@ fn fixture_resource_url(upstream: &str, path: &str) -> String {
     )
 }
 
-async fn lock_resource(
-    upstream: &str,
-    path: &str,
-    user: &str,
-    pass: &str,
-) -> io::Result<String> {
+async fn lock_resource(upstream: &str, path: &str, user: &str, pass: &str) -> io::Result<String> {
     let body = r#"<?xml version="1.0" encoding="utf-8"?>
 <D:lockinfo xmlns:D="DAV:">
   <D:lockscope><D:exclusive/></D:lockscope>
@@ -154,9 +148,7 @@ async fn lock_resource(
         .map_err(|error| io::Error::other(format!("LOCK transport: {error}")))?;
     let status = response.status();
     if status != reqwest::StatusCode::OK {
-        return Err(io::Error::other(format!(
-            "LOCK expected 200, got {status}"
-        )));
+        return Err(io::Error::other(format!("LOCK expected 200, got {status}")));
     }
     response
         .headers()
@@ -361,12 +353,7 @@ async fn physical_webdav_recursive_delete_safety() {
         b"locked",
     )
     .await;
-    put(
-        &provider,
-        &format!("/{locked_root}/z-later.txt"),
-        b"later",
-    )
-    .await;
+    put(&provider, &format!("/{locked_root}/z-later.txt"), b"later").await;
     let locked_path = format!("/{locked_root}/a-locked.txt");
     let token = lock_resource(&upstream, &locked_path, &user, &pass)
         .await
@@ -395,10 +382,7 @@ async fn physical_webdav_recursive_delete_safety() {
     // state is therefore uncertain to ARX: RecoveryRequired, exactly one
     // DELETE request, and no later manifest node may be attempted.
     let ambiguous_root = format!("{}-ambiguous", physical_run_id());
-    provider
-        .mkdir(&format!("/{ambiguous_root}"))
-        .await
-        .unwrap();
+    provider.mkdir(&format!("/{ambiguous_root}")).await.unwrap();
     put(
         &provider,
         &format!("/{ambiguous_root}/a-first.txt"),
