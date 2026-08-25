@@ -14,7 +14,10 @@ use crate::transfer::{
 };
 use crate::transfer_queue::TypedTransferProgress;
 use crate::vfs::webdav::{NewCollectionError, WebDavProvider};
-use crate::vfs::{EntryIdentity, WebDavCollectionRef, WebDavObjectRef};
+use crate::vfs::{
+    EntryIdentity, MAX_WEBDAV_TREE_DEPTH, MAX_WEBDAV_TREE_DESCENDANTS, WebDavCollectionRef,
+    WebDavObjectRef,
+};
 use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -28,9 +31,6 @@ pub type UploadOutcome = u64;
 
 /// Result of a download: bytes physically written to the final path.
 pub type DownloadOutcome = u64;
-
-pub(crate) const MAX_WEBDAV_TREE_DESCENDANTS: usize = 50_000;
-pub(crate) const MAX_WEBDAV_TREE_DEPTH: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TreeDirectory {

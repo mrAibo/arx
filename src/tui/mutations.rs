@@ -2,11 +2,14 @@ use super::*;
 use arx::services::{MutationError, MutationService};
 use ratatui::{Frame, layout::Rect};
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_action(
     state: &mut AppState,
     action: &Action,
     focused: Option<&Entry>,
+    focused_listed: Option<&ListedEntry>,
     active_entries: &[&Entry],
+    active_listed: &[&ListedEntry],
     sync: &SyncUiRuntime,
     pane_loader: &PaneLoader,
 ) -> bool {
@@ -38,6 +41,29 @@ pub(super) fn handle_action(
                 .unwrap_or_default();
             if names.is_empty() {
                 state.message = Some("Select a file or directory to delete".into());
+                return true;
+            }
+
+            if state.active_pane().location.provider_id() == arx::vfs::ProviderId::WebDAV {
+                let selected_names: Vec<String> = state
+                    .selection_names(state.active, &state.active_pane().location)
+                    .map(|names| names.iter().cloned().collect())
+                    .unwrap_or_default();
+                match arx::services::prepare_webdav_recursive_delete(
+                    &state.active_pane().location,
+                    &selected_names,
+                    focused_listed,
+                    active_listed,
+                ) {
+                    Ok(plan) => {
+                        state.pending_webdav_delete = Some(plan);
+                        state.message = Some(
+                            "Permanently delete this WebDAV directory tree? Enter to confirm, Escape to cancel"
+                                .into(),
+                        );
+                    }
+                    Err(error) => state.message = Some(error),
+                }
                 return true;
             }
 
@@ -190,6 +216,125 @@ pub(super) fn handle_action(
             state.message = Some(format!("Trash queued ({id})"));
         }
         Action::ConfirmRemoteDelete => {
+            if let Some(plan) = state.pending_webdav_delete.take() {
+                let Location::WebDav { target, .. } = state.active_pane().location.clone() else {
+                    state.message = Some("WebDAV delete context changed".into());
+                    return true;
+                };
+                let provider = match state.registry.webdav_provider_for_mutation(&target) {
+                    Ok(provider) => provider,
+                    Err(error) => {
+                        state.message = Some(error.to_string());
+                        return true;
+                    }
+                };
+                let pane = state.active;
+                let location = state.active_pane().location.clone();
+                let loader = pane_loader.clone();
+                let jobs = sync.jobs.clone();
+                let tx = sync.job_events.clone();
+                let job = jobs.create_job(
+                    "webdav-recursive-delete",
+                    arx::jobs::JobKind::Delete,
+                    format!("Delete WebDAV tree {}", plan.presentation_name),
+                    Some(location.clone()),
+                    None,
+                );
+                state.jobs = jobs.snapshot();
+                let cancel = job.cancel.clone();
+                let id = job.id.clone();
+                let queued_id = id.clone();
+                let _ = jobs.publish_event(&tx, arx::jobs::JobEvent::Running { id: id.clone() });
+                tokio::spawn(async move {
+                    let progress_jobs = jobs.clone();
+                    let progress_tx = tx.clone();
+                    let progress_id = id.clone();
+                    let result = MutationService::delete_webdav_tree(
+                        provider,
+                        plan.source,
+                        cancel,
+                        move |progress| {
+                            let percent =
+                                progress.completed.saturating_mul(100) / progress.total.max(1);
+                            let _ = progress_jobs.publish_event(
+                                &progress_tx,
+                                arx::jobs::JobEvent::Progress {
+                                    id: progress_id.clone(),
+                                    progress: arx::jobs::Progress::Percent(percent as u8).into(),
+                                },
+                            );
+                        },
+                    )
+                    .await;
+                    let mutated = !matches!(
+                        &result,
+                        Err(arx::services::WebDavDeleteError::PreMutation { .. })
+                            | Err(arx::services::WebDavDeleteError::Cancelled { completed: 0, .. })
+                    );
+                    match result {
+                        Ok(outcome) => {
+                            let _ = jobs.publish_event(
+                                &tx,
+                                arx::jobs::JobEvent::Completed {
+                                    id: id.clone(),
+                                    result: arx::jobs::JobResult::generic(
+                                        format!("Deleted {} WebDAV item(s)", outcome.completed),
+                                        outcome.completed,
+                                    ),
+                                },
+                            );
+                        }
+                        Err(arx::services::WebDavDeleteError::Cancelled { completed, total }) => {
+                            let _ = jobs.publish_event(
+                                &tx,
+                                arx::jobs::JobEvent::Cancelled {
+                                    id: id.clone(),
+                                    result: arx::jobs::JobResult::generic(
+                                        format!("Cancelled after {completed} of {total} deleted"),
+                                        completed,
+                                    ),
+                                },
+                            );
+                        }
+                        Err(
+                            error @ arx::services::WebDavDeleteError::Partial { completed, .. },
+                        )
+                        | Err(
+                            error @ arx::services::WebDavDeleteError::RecoveryRequired {
+                                completed,
+                                ..
+                            },
+                        ) => {
+                            let _ = jobs.publish_event(
+                                &tx,
+                                arx::jobs::JobEvent::Failed {
+                                    id: id.clone(),
+                                    error: error.to_string(),
+                                    result: Some(arx::jobs::JobResult::generic(
+                                        error.to_string(),
+                                        completed,
+                                    )),
+                                },
+                            );
+                        }
+                        Err(error) => {
+                            let _ = jobs.publish_event(
+                                &tx,
+                                arx::jobs::JobEvent::Failed {
+                                    id: id.clone(),
+                                    error: error.to_string(),
+                                    result: None,
+                                },
+                            );
+                        }
+                    }
+                    if mutated {
+                        let _ = loader.load(pane, location, PaneLoadPurpose::Refresh);
+                    }
+                });
+                state.message = Some(format!("WebDAV recursive delete queued ({queued_id})"));
+                return true;
+            }
             let Some(plan) = state.pending_delete.take() else {
                 return true;
             };
@@ -432,6 +577,7 @@ pub(super) fn handle_action(
         }
         Action::CancelRemoteDelete => {
             state.pending_delete = None;
+            state.pending_webdav_delete = None;
             state.message = Some("Remote delete cancelled".into());
         }
         _ => return false,
@@ -536,6 +682,24 @@ pub(super) fn submit_mkdir(
 }
 
 pub(super) fn render_confirmation(frame: &mut Frame, area: Rect, state: &AppState) {
+    if let Some(plan) = &state.pending_webdav_delete {
+        let body = format!(
+            "PERMANENT WEBDAV TREE DELETE\n\n{}\n\nPermanently delete this WebDAV directory tree?\nNo Trash / Undo  Enter=Confirm  Esc=Cancel",
+            plan.presentation_name
+        );
+        let popup = centered_rect_lines(60, 9, area);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(body).block(
+                ratatui::widgets::Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red))
+                    .title(" Confirm WebDAV Tree Delete "),
+            ),
+            popup,
+        );
+        return;
+    }
     let Some(plan) = &state.pending_delete else {
         return;
     };

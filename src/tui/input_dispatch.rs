@@ -276,7 +276,7 @@ pub(super) async fn handle_event(
                 });
             }
             // Remote delete confirmation intercepts Enter/Escape
-            if state.pending_delete.is_some() {
+            if state.pending_delete.is_some() || state.pending_webdav_delete.is_some() {
                 match key.code {
                     KeyCode::Enter => {
                         dispatch_ui_action(

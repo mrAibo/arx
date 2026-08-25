@@ -1317,6 +1317,73 @@ async fn unlock_resource(
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn physical_webdav_recursive_delete_tree() {
+    let Some(provider) = target() else {
+        return;
+    };
+    let provider = Arc::new(provider);
+    let target_id = provider.target().id.clone();
+    let root_name = format!("{}-delete-tree", physical_run_id());
+    let root_path = format!("/{root_name}");
+    provider.mkdir(&root_path).await.unwrap();
+    provider.mkdir(&format!("{root_path}/empty")).await.unwrap();
+    provider
+        .mkdir(&format!("{root_path}/nested"))
+        .await
+        .unwrap();
+    for (path, bytes) in [
+        ("normal.txt", b"normal".as_slice()),
+        ("zero.bin", b"".as_slice()),
+        ("nested/child.txt", b"child".as_slice()),
+    ] {
+        provider
+            .write_file_bytes_if_unchanged(
+                &format!("{root_path}/{path}"),
+                bytes,
+                &RemoteEditRevision::new(vec![], 0, 0, 0),
+                &CancellationFlag::default(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let location = Location::WebDav {
+        target: target_id.clone(),
+        path: "/".into(),
+    };
+    let rows = provider.list_page(&location, None).await.unwrap().entries;
+    let selected = rows.iter().find(|row| row.entry.name == root_name).unwrap();
+    let plan = crate::services::prepare_webdav_recursive_delete(
+        &location,
+        &[],
+        Some(selected),
+        &rows.iter().collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let registry = registry_with(&provider);
+    let same = registry.webdav_provider_for_mutation(&target_id).unwrap();
+    assert_eq!(same.target().id, target_id);
+    let outcome = crate::services::MutationService::delete_webdav_tree(
+        same,
+        plan.source,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.completed, outcome.total);
+    assert!(
+        provider
+            .list_page(&location, None)
+            .await
+            .unwrap()
+            .entries
+            .iter()
+            .all(|row| row.entry.name != root_name)
+    );
+}
+
 #[test]
 fn fixture_resource_url_joins_with_exactly_one_slash() {
     assert_eq!(
