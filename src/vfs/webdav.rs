@@ -565,13 +565,24 @@ impl WebDavProvider {
     ) -> io::Result<()> {
         let src_url = self.resolve_url(src)?;
         let dst_url = self.destination_url(dst);
-        let req = self.auth_req(
-            self.client
-                .request(method, &src_url)
-                .header("Destination", dst_url)
-                .header("Overwrite", if overwrite { "T" } else { "F" })
-                .header("Depth", "0"),
-        )?;
+        // #242: RFC 4918 §9.9.2 — MOVE acts with implicit Depth: infinity and
+        // sabre/DAV servers (ownCloud 11, Nextcloud) reject `Depth: 0` on
+        // MOVE with 400. COPY keeps the explicit `Depth: 0`; MOVE omits the
+        // header entirely (never sends `infinity`).
+        let depth_header = if method == reqwest::Method::from_bytes(b"COPY").unwrap() {
+            Some(("Depth", "0"))
+        } else {
+            None
+        };
+        let base = self
+            .client
+            .request(method, &src_url)
+            .header("Destination", dst_url)
+            .header("Overwrite", if overwrite { "T" } else { "F" });
+        let req = self.auth_req(match depth_header {
+            Some((name, value)) => base.header(name, value),
+            None => base,
+        })?;
         let resp = req.send().await.map_err(map_reqwest)?;
         let status = resp.status();
         if status == reqwest::StatusCode::CREATED
