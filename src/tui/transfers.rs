@@ -50,15 +50,22 @@ pub(super) fn handle_action(
     focused: Option<&Entry>,
     focused_listed: Option<&ListedEntry>,
     other_listed: Option<&ListedEntry>,
+    active_listed: &[&ListedEntry],
     sync: &SyncUiRuntime,
 ) -> bool {
     match action {
         Action::Copy => {
-            let names: Vec<String> = state
+            let selected_names: Vec<String> = state
                 .selection_names(state.active, &state.active_pane().location)
                 .map(|names| names.iter().cloned().collect())
-                .or_else(|| focused.map(|entry| vec![entry.name.clone()]))
                 .unwrap_or_default();
+            let mut names: Vec<String> = if selected_names.is_empty() {
+                focused
+                    .map(|entry| vec![entry.name.clone()])
+                    .unwrap_or_default()
+            } else {
+                selected_names.clone()
+            };
             if names.is_empty() {
                 state.message = Some("Select a file or directory to copy".into());
                 return true;
@@ -120,18 +127,22 @@ pub(super) fn handle_action(
                     None
                 };
 
-            // WebDAV basic transfer: a single WebDAV object paired with a Local pane.
+            // WebDAV basic transfer: resolve exactly ONE source from the ACTIVE
+            // pane. Selection wins over cursor and is matched against current
+            // real ListedEntry rows; passive pane contributes Location only.
             let webdav_spec: Option<arx::transfer::WebDavTransferSpec> =
                 if src_provider == ProviderId::WebDAV || dst_provider == ProviderId::WebDAV {
-                    match arx::transfer::build_webdav_copy_spec(
-                        src_provider,
-                        dst_provider,
+                    match arx::transfer::prepare_webdav_copy(
                         &src_loc,
                         &dst_loc,
+                        &selected_names,
                         focused_listed,
-                        other_listed,
+                        active_listed,
                     ) {
-                        Ok(spec) => Some(spec),
+                        Ok((spec, queue_name)) => {
+                            names = vec![queue_name];
+                            Some(spec)
+                        }
                         Err(msg) => {
                             state.message = Some(msg);
                             return true;
@@ -420,6 +431,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn webdav_multi_selection_dispatch_fails_before_enqueue() {
+        let registry = ProviderRegistry::new();
+        let sync = sync_runtime(registry.clone());
+        let mut state = AppState {
+            registry,
+            ..AppState::default()
+        };
+        state.left.location = Location::Local(PathBuf::from("/active"));
+        state.right.location = Location::WebDav {
+            target: "dav".into(),
+            path: "/dst/".into(),
+        };
+        state.active = Pane::Left;
+        let scope = state.left.location.clone();
+        state.toggle_selection(Pane::Left, &scope, "A.txt");
+        state.toggle_selection(Pane::Left, &scope, "B.txt");
+        let a = ListedEntry {
+            entry: Entry {
+                name: "A.txt".into(),
+                kind: EntryKind::File,
+                size: Some(1),
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::Other,
+        };
+        let b = ListedEntry {
+            entry: Entry {
+                name: "B.txt".into(),
+                kind: EntryKind::File,
+                size: Some(1),
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::Other,
+        };
+
+        assert!(handle_action(
+            &mut state,
+            &Action::Copy,
+            Some(&a.entry),
+            Some(&a),
+            None,
+            &[&a, &b],
+            &sync,
+        ));
+        assert_eq!(
+            state.message.as_deref(),
+            Some("WebDAV copy currently supports one selected item")
+        );
+        assert!(sync.jobs.snapshot().is_empty(), "nothing enqueued");
+    }
+
     fn sync_runtime(registry: ProviderRegistry) -> SyncUiRuntime {
         let jobs = arx::jobs::JobManager::new();
         let (job_events, _job_rx) = mpsc::unbounded_channel();
@@ -455,6 +518,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &sync,
         ));
     }

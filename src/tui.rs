@@ -1561,6 +1561,7 @@ async fn dispatch_ui_action(
     focused_row: Option<VisiblePaneRow<'_>>,
     other_focused_row: Option<VisiblePaneRow<'_>>,
     active_entries: &[&Entry],
+    active_listed: &[&ListedEntry],
     visible_count: usize,
     workspace_scanner: &WorkspaceScanner,
     sync: &SyncUiRuntime,
@@ -1593,7 +1594,15 @@ async fn dispatch_ui_action(
     let focused_listed = focused_row.and_then(|row| row.listed());
     // ponytail: passive pane's focused entry — needed for cross-pane S3 transfer
     let other_listed = other_focused_row.and_then(|row| row.listed());
-    if transfers::handle_action(state, &action, focused, focused_listed, other_listed, sync) {
+    if transfers::handle_action(
+        state,
+        &action,
+        focused,
+        focused_listed,
+        other_listed,
+        active_listed,
+        sync,
+    ) {
         return Ok(());
     }
     if workspace::handle_action(state, &action, workspace_scanner, sync) {
@@ -1925,6 +1934,7 @@ async fn execute_command_target(
     focused: Option<VisiblePaneRow<'_>>,
     other_focused_row: Option<VisiblePaneRow<'_>>,
     active_entries: &[&Entry],
+    active_listed: &[&ListedEntry],
     visible_count: usize,
     workspace_scanner: &WorkspaceScanner,
     pane_loader: &PaneLoader,
@@ -1942,6 +1952,7 @@ async fn execute_command_target(
                 focused,
                 other_focused_row,
                 active_entries,
+                active_listed,
                 visible_count,
                 workspace_scanner,
                 sync,

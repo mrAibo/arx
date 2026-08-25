@@ -13,8 +13,8 @@
 //!   W4  unicode / spaces / raw href identity
 //!   W5  small preview (bounded read)
 //!   W6  oversized preview bounded
-//!   W7  Local -> WebDAV via REAL TUI F5 path (build_webdav_copy_spec -> planner -> executor)
-//!   W8  WebDAV -> Local via REAL TUI F5 path
+//!   W7  Local -> WebDAV via canonical source preparation -> planner -> executor
+//!   W8  WebDAV -> Local via canonical source preparation -> planner -> executor
 //!   W9  MKCOL
 //!   W10 async server-side COPY (provider copy_or_move seam)
 //!   W11 async server-side MOVE (provider copy_or_move seam)
@@ -105,16 +105,14 @@ fn registry_with(p: &WebDavProvider) -> Arc<ProviderRegistry> {
     reg
 }
 
-/// Run a WebDAV basic transfer through the EXACT same path as the TUI F5
-/// builder (`build_webdav_copy_spec`) and the transfer executor. No direct
-/// provider helper shortcuts.
+/// Run through the SAME canonical active-source preparation -> planner ->
+/// executor seam used by product F5. This harness does not claim to exercise
+/// keyboard/mouse dispatch; it has no direct provider PUT shortcut.
 async fn run_f5(
     registry: &Arc<ProviderRegistry>,
     src_loc: Location,
     dst_loc: Location,
-    focused_listed: Option<&ListedEntry>,
-    other_listed: Option<&ListedEntry>,
-    filename: &str,
+    source_listed: ListedEntry,
 ) -> Result<(), String> {
     let src_provider = src_loc.provider_id();
     let dst_provider = dst_loc.provider_id();
@@ -125,15 +123,13 @@ async fn run_f5(
         .capabilities_for_location(&dst_loc)
         .unwrap_or_default();
 
-    let webdav_spec = crate::transfer::build_webdav_copy_spec(
-        src_provider,
-        dst_provider,
+    let (webdav_spec, queue_name) = crate::transfer::prepare_webdav_copy(
         &src_loc,
         &dst_loc,
-        focused_listed,
-        other_listed,
-    )
-    .map_err(|e| e.to_string())?;
+        &[],
+        Some(&source_listed),
+        &[&source_listed],
+    )?;
 
     let mut executors = ExecutorAvailability::local();
     executors.webdav = true;
@@ -155,7 +151,7 @@ async fn run_f5(
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     crate::transfer::executor::execute_transfer(
         &plan,
-        &[filename.to_string()],
+        &[queue_name],
         registry,
         cancel,
         crate::transfer_queue::PauseGate::disabled(),
@@ -314,7 +310,8 @@ async fn physical_w1_through_w18() {
         "W6: bounded to real size"
     );
 
-    // W7: Local -> WebDAV via REAL TUI F5 path.
+    // W7: Local -> WebDAV through the SAME canonical source-preparation ->
+    // planner -> executor seam used by product F5 (not keyboard/mouse dispatch).
     std::fs::write(&local_path, b"local-source-bytes").expect("W7: write local src");
     let local_entry = ListedEntry {
         entry: crate::vfs::Entry {
@@ -330,16 +327,9 @@ async fn physical_w1_through_w18() {
         path: root.clone(),
     };
     let local_src = Location::Local(local_parent.clone());
-    run_f5(
-        &registry,
-        local_src,
-        webdav_dst.clone(),
-        None,
-        Some(&local_entry),
-        &local_name,
-    )
-    .await
-    .expect("W7: Local -> WebDAV F5");
+    run_f5(&registry, local_src, webdav_dst.clone(), local_entry)
+        .await
+        .expect("W7: Local -> WebDAV F5");
     let w7_page = p_arc
         .list_page(
             &Location::WebDav {
@@ -355,7 +345,7 @@ async fn physical_w1_through_w18() {
         "W7: upload landed on WebDAV"
     );
 
-    // W8: WebDAV -> Local via REAL TUI F5 path, keeping exact href.
+    // W8: WebDAV -> Local through the same canonical seam, keeping exact href.
     // Dedicated download dir so it never collides with W7's source file.
     let w8_dir = tempfile::tempdir().expect("W8: dest dir");
     let w8_page = p_arc
@@ -377,21 +367,20 @@ async fn physical_w1_through_w18() {
             _ => None,
         })
         .expect("W8: WebDavObject identity for download");
+    let w8_source = ListedEntry {
+        entry: crate::vfs::Entry {
+            name: local_name.clone(),
+            kind: EntryKind::File,
+            size: None,
+            modified_unix_ms: None,
+        },
+        identity: EntryIdentity::WebDavObject(w8_obj.clone()),
+    };
     run_f5(
         &registry,
         webdav_dst.clone(),
         Location::Local(w8_dir.path().to_path_buf()),
-        Some(&ListedEntry {
-            entry: crate::vfs::Entry {
-                name: local_name.clone(),
-                kind: EntryKind::File,
-                size: None,
-                modified_unix_ms: None,
-            },
-            identity: EntryIdentity::WebDavObject(w8_obj.clone()),
-        }),
-        None,
-        &dl_name,
+        w8_source,
     )
     .await
     .expect("W8: WebDAV -> Local F5");
@@ -624,8 +613,7 @@ async fn physical_w1_through_w18() {
             target: "accept".into(),
             path: root.clone(),
         },
-        None,
-        Some(&ListedEntry {
+        ListedEntry {
             entry: crate::vfs::Entry {
                 name: ov.trim_start_matches('/').to_string(),
                 kind: EntryKind::File,
@@ -633,8 +621,7 @@ async fn physical_w1_through_w18() {
                 modified_unix_ms: None,
             },
             identity: EntryIdentity::Other,
-        }),
-        ov.trim_start_matches('/'),
+        },
     )
     .await;
     // Product F5 must surface the conflict (Forbid => 412 => AlreadyExists).
@@ -778,7 +765,7 @@ async fn physical_w1_through_w18() {
         &registry_with(&w17_arc),
         w17_src_loc.clone(),
         Location::Local(w17_dir.path().to_path_buf()),
-        Some(&ListedEntry {
+        ListedEntry {
             entry: crate::vfs::Entry {
                 name: w17_file.trim_start_matches('/').to_string(),
                 kind: EntryKind::File,
@@ -786,9 +773,7 @@ async fn physical_w1_through_w18() {
                 modified_unix_ms: None,
             },
             identity: EntryIdentity::WebDavObject(w17_obj),
-        }),
-        None,
-        w17_file.trim_start_matches('/'),
+        },
     )
     .await;
     assert!(w17_res.is_err(), "W17: GET body drop -> error");
@@ -856,9 +841,7 @@ async fn physical_w1_through_w18() {
         &registry_with(&w18_arc),
         Location::Local(w18_local.parent().unwrap().to_path_buf()),
         w18_dst.clone(),
-        None,
-        Some(&w18_entry),
-        w18_file.trim_start_matches('/'),
+        w18_entry,
     )
     .await;
     // Truthful ambiguous error; ARX must NOT retry the PUT.

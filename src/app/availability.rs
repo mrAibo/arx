@@ -322,7 +322,15 @@ pub(crate) fn default_action_availability(id: ActionId, ctx: &ActionContext) -> 
         },
         ActionId::Copy => {
             let has_target = ctx.selection_count > 0 || ctx.focused_kind.is_some();
-            if !has_target {
+            let webdav_pair = (ctx.active_provider == ProviderId::Local
+                && ctx.passive_provider == ProviderId::WebDAV)
+                || (ctx.active_provider == ProviderId::WebDAV
+                    && ctx.passive_provider == ProviderId::Local);
+            if webdav_pair && ctx.selection_count > 1 {
+                ActionAvailability::Disabled {
+                    reason: "WebDAV copy currently supports one selected item".into(),
+                }
+            } else if !has_target {
                 ActionAvailability::Disabled {
                     reason: "Select a file or directory to copy".into(),
                 }
@@ -497,6 +505,35 @@ mod tests {
     use crate::vfs::capabilities::{
         ARCHIVE_CAPABILITIES, LOCAL_CAPABILITIES, SFTP_CAPABILITIES, WEBDAV_CAPABILITIES,
     };
+
+    #[test]
+    fn webdav_copy_disables_multi_selection_in_both_directions_only() {
+        let mut local_to_dav = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        local_to_dav.passive_provider = ProviderId::WebDAV;
+        local_to_dav.passive_capabilities = WEBDAV_CAPABILITIES;
+        local_to_dav.selection_count = 2;
+        assert!(matches!(
+            action_availability(ActionId::Copy, &local_to_dav),
+            ActionAvailability::Disabled { reason }
+                if reason == "WebDAV copy currently supports one selected item"
+        ));
+
+        let mut dav_to_local = context(ProviderId::WebDAV, WEBDAV_CAPABILITIES);
+        dav_to_local.selection_count = 2;
+        assert!(matches!(
+            action_availability(ActionId::Copy, &dav_to_local),
+            ActionAvailability::Disabled { reason }
+                if reason == "WebDAV copy currently supports one selected item"
+        ));
+
+        // T11: ordinary Local<->Local availability remains unchanged.
+        let mut local = context(ProviderId::Local, LOCAL_CAPABILITIES);
+        local.selection_count = 2;
+        assert_eq!(
+            action_availability(ActionId::Copy, &local),
+            ActionAvailability::Available
+        );
+    }
 
     fn context(active_provider: ProviderId, active_capabilities: CapabilitySet) -> ActionContext {
         ActionContext {

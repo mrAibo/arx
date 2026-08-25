@@ -424,78 +424,99 @@ pub fn webdav_spec_for_objects(
     }
 }
 
-/// Build a frozen WebDAV copy spec (single object + Local pane).
-/// Returns `DownloadOne` for WebDAV -> Local, `UploadOne` for Local -> WebDAV.
-///
-/// This is the single WebDAV F5 entry point shared by the TUI `Action::Copy`
-/// builder and the physical acceptance harness: both must go through the exact
-/// same spec construction so the product path is the only path.
-///
-/// The remote identity (raw href) is copied verbatim from the listing; the
-/// local filename is taken from the *display name* only. The href is never
-/// reconstructed from `parent + entry.name`.
+/// Resolve exactly one source from the ACTIVE pane for a single-object WebDAV
+/// copy. Selection wins over cursor focus and is resolved against CURRENT real
+/// listed rows. Stale or ambiguous selection fails closed; it never falls back
+/// to cursor focus.
+fn resolve_webdav_copy_source<'a>(
+    selected_names: &[String],
+    focused_source: Option<&'a ListedEntry>,
+    current_active_listed: &[&'a ListedEntry],
+) -> Result<&'a ListedEntry, String> {
+    match selected_names {
+        [] => focused_source.ok_or_else(|| "Focus a real file to copy".to_string()),
+        [selected] => {
+            let mut matches = current_active_listed
+                .iter()
+                .copied()
+                .filter(|listed| listed.entry.name == *selected);
+            let source = matches
+                .next()
+                .ok_or_else(|| format!("Selected item '{selected}' is no longer listed"))?;
+            if matches.next().is_some() {
+                return Err(format!(
+                    "Selected item '{selected}' is ambiguous in the current listing"
+                ));
+            }
+            Ok(source)
+        }
+        _ => Err("WebDAV copy currently supports one selected item".to_string()),
+    }
+}
+
+/// Build the frozen one-object WebDAV spec from ONE explicitly resolved ACTIVE
+/// source. There is no passive-row parameter, preventing active/passive source
+/// inversion by construction.
 pub fn build_webdav_copy_spec(
-    src_provider: ProviderId,
-    _dst_provider: ProviderId,
     src_loc: &Location,
     dst_loc: &Location,
-    focused_listed: Option<&ListedEntry>,
-    other_listed: Option<&ListedEntry>,
+    source: &ListedEntry,
 ) -> Result<WebDavTransferSpec, String> {
-    let webdav_is_source = src_provider == ProviderId::WebDAV;
-
-    if webdav_is_source {
-        // WebDAV -> Local download
-        let Location::Local(local_path) = &dst_loc else {
-            return Err("WebDAV download requires a Local destination".into());
-        };
-        let Some(listed) = focused_listed else {
-            return Err("Focus a WebDAV object to download".into());
-        };
-        let EntryIdentity::WebDavObject(obj) = &listed.identity else {
-            return Err("Download requires a WebDAV object (not a collection)".into());
-        };
-        let Location::WebDav { target, .. } = &src_loc else {
-            return Err("WebDAV source pane has no target".into());
-        };
-        if obj.target != *target {
-            return Err(format!(
-                "WebDAV object target '{}' does not match pane target '{}'",
-                obj.target, target
-            ));
-        }
-        // Local filename from the *display name* (presentation), not the href.
-        let local_name =
-            webdav_download_local_name(obj, &listed.entry.name).map_err(|e| e.to_string())?;
-        Ok(WebDavTransferSpec::DownloadOne {
-            source: obj.clone(),
-            local_destination: local_path.join(local_name),
-        })
-    } else {
-        // Local -> WebDAV upload
-        let Location::WebDav { target, path } = &dst_loc else {
-            return Err("WebDAV upload requires a WebDAV destination".into());
-        };
-        let Some(local_listed) = other_listed else {
-            return Err("Select a local file to upload".into());
-        };
-        if local_listed.entry.kind != EntryKind::File {
-            return Err("Upload requires a single local file".into());
-        }
-        let local_path = match &src_loc {
-            Location::Local(p) => p.clone(),
-            _ => return Err("WebDAV upload requires a Local source".into()),
-        };
-        let filename = local_listed.entry.name.as_str();
-        // Exact destination href: pane path + filename (percent-encoded).
-        let dest_href = format!("{}{}", path, encode_segment(filename));
-        let destination = webdav_upload_destination_ref(target, &dest_href, filename)
-            .map_err(|e| e.to_string())?;
-        Ok(WebDavTransferSpec::UploadOne {
-            local_source: local_path.join(filename),
-            destination,
-        })
+    if source.entry.kind != EntryKind::File {
+        return Err("WebDAV copy requires a single regular file".into());
     }
+
+    match (src_loc, dst_loc) {
+        (
+            Location::Local(local_root),
+            Location::WebDav {
+                target,
+                path: destination_path,
+            },
+        ) => {
+            let filename = source.entry.name.as_str();
+            let dest_href = format!("{}{}", destination_path, encode_segment(filename));
+            let destination = webdav_upload_destination_ref(target, &dest_href, filename)
+                .map_err(|e| e.to_string())?;
+            Ok(WebDavTransferSpec::UploadOne {
+                local_source: local_root.join(filename),
+                destination,
+            })
+        }
+        (Location::WebDav { target, .. }, Location::Local(local_root)) => {
+            let EntryIdentity::WebDavObject(object) = &source.identity else {
+                return Err("Download requires an exact WebDAV object identity".into());
+            };
+            if object.target != *target {
+                return Err(format!(
+                    "WebDAV object target '{}' does not match pane target '{}'",
+                    object.target, target
+                ));
+            }
+            let local_name = webdav_download_local_name(object, &source.entry.name)
+                .map_err(|e| e.to_string())?;
+            Ok(WebDavTransferSpec::DownloadOne {
+                source: object.clone(),
+                local_destination: local_root.join(local_name),
+            })
+        }
+        _ => Err("WebDAV copy requires exactly one Local pane and one WebDAV pane".into()),
+    }
+}
+
+/// ONE canonical preparation seam shared by product F5 and physical acceptance.
+/// Returns the spec and the exact single queue/display name from the SAME
+/// resolved source ListedEntry.
+pub fn prepare_webdav_copy(
+    src_loc: &Location,
+    dst_loc: &Location,
+    selected_names: &[String],
+    focused_source: Option<&ListedEntry>,
+    current_active_listed: &[&ListedEntry],
+) -> Result<(WebDavTransferSpec, String), String> {
+    let source = resolve_webdav_copy_source(selected_names, focused_source, current_active_listed)?;
+    let spec = build_webdav_copy_spec(src_loc, dst_loc, source)?;
+    Ok((spec, source.entry.name.clone()))
 }
 
 #[cfg(test)]
@@ -1003,6 +1024,157 @@ mod tests {
         assert!(s3_spec_for_objects(std::slice::from_ref(&one)).is_ok());
         assert!(s3_spec_for_objects(&[]).is_err());
         assert!(s3_spec_for_objects(&[one.clone(), one.clone()]).is_err());
+    }
+    #[test]
+    fn webdav_copy_source_truth_t1_through_t10() {
+        fn file(name: &str) -> ListedEntry {
+            ListedEntry {
+                entry: crate::vfs::Entry {
+                    name: name.into(),
+                    kind: EntryKind::File,
+                    size: Some(1),
+                    modified_unix_ms: None,
+                },
+                identity: EntryIdentity::Other,
+            }
+        }
+        fn dav(name: &str, target: &str, href: &str) -> ListedEntry {
+            ListedEntry {
+                entry: crate::vfs::Entry {
+                    name: name.into(),
+                    kind: EntryKind::File,
+                    size: Some(1),
+                    modified_unix_ms: None,
+                },
+                identity: EntryIdentity::WebDavObject(WebDavObjectRef {
+                    target: target.into(),
+                    href: href.into(),
+                }),
+            }
+        }
+        let local_src = Location::Local(PathBuf::from("/active"));
+        let local_dst = Location::Local(PathBuf::from("/passive"));
+        let dav_root = Location::WebDav {
+            target: "target-A".into(),
+            path: "/files/".into(),
+        };
+        let a = file("A.txt");
+        let b = file("B.txt");
+
+        // T1: no selection => ACTIVE focused Local A; queue/spec coupled to A.
+        let (spec, name) =
+            prepare_webdav_copy(&local_src, &dav_root, &[], Some(&a), &[&a, &b]).expect("T1");
+        assert_eq!(name, "A.txt");
+        match spec {
+            WebDavTransferSpec::UploadOne {
+                local_source,
+                destination,
+            } => {
+                assert_eq!(local_source, PathBuf::from("/active/A.txt"));
+                assert_eq!(destination.target, "target-A");
+                assert_eq!(destination.href, "/files/A.txt");
+            }
+            _ => panic!("T1 expected upload"),
+        }
+
+        // T2/T8/T10: selection A beats focus B; passive row cannot enter API;
+        // returned queue name comes from the SAME A used for UploadOne.
+        let (spec, name) = prepare_webdav_copy(
+            &local_src,
+            &dav_root,
+            &["A.txt".into()],
+            Some(&b),
+            &[&a, &b],
+        )
+        .expect("T2");
+        assert_eq!(name, "A.txt");
+        assert!(matches!(
+            spec,
+            WebDavTransferSpec::UploadOne { local_source, .. }
+                if local_source == std::path::Path::new("/active/A.txt")
+        ));
+
+        // T3/T10: selected exact A href beats focused B href; queue name A.
+        let da = dav("A.txt", "target-A", "/native/EXACT_A");
+        let db = dav("B.txt", "target-A", "/native/EXACT_B");
+        let (spec, name) = prepare_webdav_copy(
+            &dav_root,
+            &local_dst,
+            &["A.txt".into()],
+            Some(&db),
+            &[&da, &db],
+        )
+        .expect("T3");
+        assert_eq!(name, "A.txt");
+        assert!(matches!(
+            spec,
+            WebDavTransferSpec::DownloadOne { source, local_destination }
+                if source.href == "/native/EXACT_A"
+                    && local_destination == std::path::Path::new("/passive/A.txt")
+        ));
+
+        // T4: multi-selection fails closed.
+        assert_eq!(
+            prepare_webdav_copy(
+                &local_src,
+                &dav_root,
+                &["A.txt".into(), "B.txt".into()],
+                Some(&b),
+                &[&a, &b]
+            )
+            .unwrap_err(),
+            "WebDAV copy currently supports one selected item"
+        );
+
+        // T5: stale selection A with only B current; never falls back to focus B.
+        let stale = prepare_webdav_copy(&local_src, &dav_root, &["A.txt".into()], Some(&b), &[&b])
+            .unwrap_err();
+        assert!(stale.contains("no longer listed"));
+
+        // T6: ambiguous current presentation name; never picks first identity.
+        let dup1 = dav("duplicate", "target-A", "/native/one");
+        let dup2 = dav("duplicate", "target-A", "/native/two");
+        let ambiguous = prepare_webdav_copy(
+            &dav_root,
+            &local_dst,
+            &["duplicate".into()],
+            Some(&dup1),
+            &[&dup1, &dup2],
+        )
+        .unwrap_err();
+        assert!(ambiguous.contains("ambiguous"));
+
+        // T7: Parent/LoadMore/no row are represented as no real ListedEntry.
+        assert!(prepare_webdav_copy(&local_src, &dav_root, &[], None, &[]).is_err());
+
+        // T9: exact object target must equal ACTIVE WebDAV Location target.
+        let wrong = dav("A.txt", "target-B", "/native/A");
+        assert!(
+            prepare_webdav_copy(&dav_root, &local_dst, &[], Some(&wrong), &[&wrong])
+                .unwrap_err()
+                .contains("does not match")
+        );
+    }
+
+    #[test]
+    fn webdav_builder_rejects_non_file_and_unsupported_pair() {
+        let dir = ListedEntry {
+            entry: crate::vfs::Entry {
+                name: "dir".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::Other,
+        };
+        assert!(
+            build_webdav_copy_spec(
+                &Location::Local(PathBuf::from("/a")),
+                &Location::Local(PathBuf::from("/b")),
+                &dir,
+            )
+            .is_err()
+        );
     }
 }
 

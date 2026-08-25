@@ -101,6 +101,8 @@ pub(super) async fn handle_event(
                         left_visible.get(state.left.cursor).copied()
                     };
                     let visible_count = entries.len();
+                    let active_listed: Vec<&ListedEntry> =
+                        rows.iter().filter_map(|row| row.listed()).collect();
 
                     if available {
                         dispatch_ui_action(
@@ -109,6 +111,7 @@ pub(super) async fn handle_event(
                             focused,
                             other_focused_row,
                             entries,
+                            &active_listed,
                             visible_count,
                             workspace_scanner,
                             sync,
@@ -282,6 +285,7 @@ pub(super) async fn handle_event(
                             None, // no focused entry during confirmation
                             None,
                             &[],
+                            &[],
                             0,
                             workspace_scanner,
                             sync,
@@ -303,6 +307,7 @@ pub(super) async fn handle_event(
                             Action::CancelRemoteDelete,
                             None,
                             None,
+                            &[],
                             &[],
                             0,
                             workspace_scanner,
@@ -369,6 +374,14 @@ pub(super) async fn handle_event(
                             .filter_map(VisiblePaneRow::listed_entry)
                             .collect()
                     };
+                    let active_listed: Vec<&ListedEntry> = if state.active == Pane::Left {
+                        left_visible.iter().filter_map(|row| row.listed()).collect()
+                    } else {
+                        right_visible
+                            .iter()
+                            .filter_map(|row| row.listed())
+                            .collect()
+                    };
                     let other_focused_row = if state.active == Pane::Left {
                         right_visible.get(state.right.cursor).copied()
                     } else {
@@ -380,6 +393,7 @@ pub(super) async fn handle_event(
                         focused_row,
                         other_focused_row,
                         &active_entries,
+                        &active_listed,
                         visible_count,
                         workspace_scanner,
                         pane_loader,
@@ -678,12 +692,15 @@ pub(super) async fn handle_event(
                             } else {
                                 left_visible.get(state.left.cursor).copied()
                             };
+                            let active_listed: Vec<&ListedEntry> =
+                                visible_rows.iter().filter_map(|row| row.listed()).collect();
                             dispatch_ui_action(
                                 &mut *state,
                                 action,
                                 visible_rows.get(cursor).copied(),
                                 other_focused_row,
                                 entries,
+                                &active_listed,
                                 entries.len(),
                                 workspace_scanner,
                                 sync,
@@ -1619,6 +1636,7 @@ async fn execute_context_action(
         .iter()
         .filter_map(|row| row.listed_entry())
         .collect();
+    let active_listed: Vec<&ListedEntry> = visible.iter().filter_map(|row| row.listed()).collect();
     let other_focused_row = if target_pane == Pane::Left {
         right_visible.get(state.right.cursor).copied()
     } else {
@@ -1631,6 +1649,7 @@ async fn execute_context_action(
         Some(focused_row),
         other_focused_row,
         &active_entries,
+        &active_listed,
         visible.len(),
         workspace_scanner,
         sync,
