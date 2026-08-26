@@ -4,7 +4,7 @@ Terminal commander for local ↔ remote workspaces on Linux.
 
 ![ARX Remote Workspace — Compare, Preview, Sync, Verify](docs/assets/remote-workspace-update.gif)
 
-**Current release: [v0.21.0](https://github.com/mrAibo/arx/releases/tag/v0.21.0)**  
+**Current release: [v0.22.0](https://github.com/mrAibo/arx/releases/tag/v0.22.0)**  
 Linux x86_64 · Rust MSRV 1.88 · MIT
 
 Compare before touching anything. Preview the exact consequences. Execute. Verify the real result.
@@ -15,9 +15,9 @@ Compare before touching anything. Preview the exact consequences. Execute. Verif
 - **Compare before execution.** Workspace diff is a separate fact; a comparison never silently becomes a mutation.
 - **Preview exact consequences.** Destructive workspace sync requires a frozen Preview before execution.
 - **Truthful background work.** Queue, pause-pending, paused, retry-waiting, cancelled, failed, completed, and verification remain distinct states.
-- **Safe remote semantics.** ARX prefers noclobber/staged operations and does not blindly replay ambiguous remote mutations.
-- **Read-only storage visibility.** Inspect local directory usage and Linux filesystem capacity without turning observability into cleanup.
-- **Progressive discovery.** Command Center, effective keymap output, contextual availability, and the footer derive from runtime truth.
+- **Safe remote semantics.** ARX prefers noclobber/staged operations and never blindly replays ambiguous remote mutations.
+- **Provider-native identity.** Existing remote resources are addressed by provider truth, not reconstructed display names.
+- **Read-only storage visibility.** Local usage/capacity inspection stays separate from mutation and cleanup.
 
 Remote Workspace synchronization currently supports Local → Local, Local → SFTP, and SFTP → Local. SFTP → SFTP workspace synchronization remains intentionally unsupported.
 
@@ -27,9 +27,11 @@ ARX is intentionally a **Linux application**. The published release target is **
 
 When ARX runs inside SSH, the established session environment is authoritative. ARX preserves an existing `DISPLAY` but never invents one; X11 forwarding must already be provided by the SSH client/session.
 
-## Install v0.21.0
+## Install v0.22.0
 
-Download your preferred package and `SHA256SUMS` from the [v0.21.0 release](https://github.com/mrAibo/arx/releases/tag/v0.21.0).
+Published binaries and packages live under **GitHub Releases**, not in the source tree. The repository intentionally does not track a current `bin/arx` copy.
+
+Download your preferred artifact and `SHA256SUMS` from the [v0.22.0 release](https://github.com/mrAibo/arx/releases/tag/v0.22.0).
 
 Verify downloaded artifacts:
 
@@ -40,27 +42,27 @@ sha256sum --ignore-missing -c SHA256SUMS
 ### Debian / Ubuntu
 
 ```bash
-sudo apt install ./arx_0.21.0_amd64.deb
+sudo apt install ./arx_0.22.0_amd64.deb
 ```
 
 ### Fedora / RHEL family
 
 ```bash
-sudo dnf install ./arx-0.21.0-1.x86_64.rpm
+sudo dnf install ./arx-0.22.0-1.x86_64.rpm
 ```
 
 ### Portable tarball
 
 ```bash
-tar xzf arx-v0.21.0-x86_64-unknown-linux-gnu.tar.gz
-sudo install -m 755 arx-v0.21.0-x86_64-unknown-linux-gnu/arx /usr/local/bin/arx
+tar xzf arx-v0.22.0-x86_64-unknown-linux-gnu.tar.gz
+sudo install -m 755 arx-v0.22.0-x86_64-unknown-linux-gnu/arx /usr/local/bin/arx
 arx --version
 ```
 
 Expected output:
 
 ```text
-arx 0.21.0
+arx 0.22.0
 ```
 
 Release bundles include the MIT license and generated third-party license notices. Native packages install documentation under `/usr/share/doc/arx`.
@@ -101,8 +103,8 @@ arx
 | Embedded terminal | Built-in terminal plus hardened tmux / GNU Screen lifecycle |
 | S3 | AWS S3 + MinIO physically accepted; Moto emulated; R2/Wasabi best-effort/unverified |
 | WebDAV | Apache mod_dav + Nextcloud 34.0.2 + ownCloud 11.0.0 physically accepted with Basic auth |
-| Packages | tar.gz + `.deb` + `.rpm` + one `SHA256SUMS`, all from one validated ELF |
-| Extension surface | `arx.menu`; no embedded Lua/WASM plugin runtime |
+| Packages | tar.gz + `.deb` + `.rpm` + one `SHA256SUMS`, all published from one validated ELF |
+| Extension surface | `arx.menu`; no embedded Lua/WASM/native plugin runtime |
 
 ## File operations
 
@@ -110,30 +112,44 @@ arx
 |---|---|
 | **F3** | View — Local full preview; SFTP bounded text; S3 bounded object preview; WebDAV bounded one-file preview |
 | **F4** | Edit — Local editor; SFTP conflict-safe text edit; S3/WebDAV disabled |
-| **F5** | Copy — Local↔Local, Local↔SFTP, Local↔S3 single object, Local↔WebDAV one file; one exact selected WebDAV collection may be recursively downloaded to one new Local tree |
+| **F5** | Copy — Local↔Local, Local↔SFTP, Local↔S3 single object, Local↔WebDAV file/tree copy; WebDAV↔Local supports multiple selected sibling roots as one queued job |
 | **F6** | Move — Local↔Local product path; S3 disabled; cross-target WebDAV move unsupported |
 | **F7** | Create directory — Local/SFTP, S3 prefix marker, WebDAV MKCOL |
-| **F8** | Delete — Local trash; confirmed SFTP delete; exact S3 object / proven-empty marker delete; WebDAV non-recursive resource delete |
+| **F8** | Delete — Local trash; confirmed SFTP delete; exact S3 object / proven-empty marker delete; WebDAV supports safe bounded recursive delete for one exact selected collection |
 | Shift+F6 | Rename |
 | Ctrl+U | Swap panes |
 | Ctrl+X C / L / O / S | chmod / hardlink / chown / symlink |
 | Ctrl+\\ | Toggle split pane |
 
-### WebDAV recursive download in v0.21.0
+## WebDAV in v0.22.0
 
-ARX can copy **one selected WebDAV collection → one new Local directory tree** through the existing F5 → `TransferPlanner` → Transfer Queue → WebDAV executor path.
+v0.22.0 expands the recursive WebDAV surface while keeping the same planner/queue/provider authorities and the same exact-identity safety model.
 
-The implementation keeps provider-native `WebDavCollectionRef` / `WebDavObjectRef` href identity authoritative, uses bounded authenticated `PROPFIND Depth: 1`, builds the complete manifest before Local mutation, rejects unsafe/duplicate/cyclic identities and Local path components, stages files with noclobber semantics, and removes the attempt-owned Local root on failure/cancellation when possible.
+### Recursive WebDAV → Local download
 
-Physically accepted targets for this same product path:
+One selected WebDAV collection can be copied to one new Local directory tree. ARX uses exact server-returned href identities, bounded authenticated `PROPFIND Depth: 1`, complete manifest validation before Local mutation, staged noclobber downloads, and truthful cleanup/recovery outcomes.
+
+### Recursive Local → WebDAV upload
+
+One Local directory can be copied as one new remote tree. ARX pre-scans the Local tree, rejects symlinks/special/unsafe names, uses bounded depth/count limits, root-relative no-follow reads, destination-root noclobber semantics, and recovery-required classification for ambiguous remote mutation outcomes.
+
+### Safe recursive WebDAV delete
+
+One exact selected WebDAV collection can be deleted recursively. ARX builds and revalidates a complete bounded manifest, deletes deepest-first/root-last, performs a fresh exact empty proof before each collection DELETE, and never retries ambiguous destructive requests automatically.
+
+### Multi-root F5 Copy
+
+Multiple selected current sibling roots can be copied as one queued job in both Local → WebDAV and WebDAV → Local directions. Mixed files/directories are supported. Roots execute sequentially, progress is reported at root granularity, and earlier completed roots remain truthful if a later root fails or is cancelled.
+
+Physical acceptance for the same product path:
 
 | Backend | Status |
 |---|---|
-| Apache mod_dav | ✅ W1–W18 + recursive download |
-| Nextcloud 34.0.2-apache | ✅ I1–I12 + recursive download |
-| ownCloud 11.0.0 | ✅ I1–I12 + recursive download |
+| Apache mod_dav | ✅ W1–W18 + recursive download/upload/delete + destructive safety + multi-root F5 |
+| Nextcloud 34.0.2-apache | ✅ I1–I12 + recursive download/upload/delete + multi-root F5 |
+| ownCloud 11.0.0 | ✅ I1–I12 + recursive download/upload/delete + multi-root F5 |
 
-Intentionally not shipped yet: Local directory → WebDAV recursive upload, recursive WebDAV delete, WebDAV→WebDAV recursive/cross-target operations, multiple recursive roots, Digest/Bearer auth, and metadata/property mutation. These remain tracked under [#13](https://github.com/mrAibo/arx/issues/13).
+Still intentionally unsupported: multi-root recursive WebDAV delete, WebDAV→WebDAV recursive/cross-target copy or move, Digest/Bearer auth, and metadata/property mutation. See [#13](https://github.com/mrAibo/arx/issues/13).
 
 ## Navigation and discovery
 
@@ -224,6 +240,7 @@ t  "Disk usage"  df -h
 - WebDAV automatic HTTP mutation retries remain disabled.
 - Secrets stay in OS keyring/environment rather than plaintext target config.
 - Long-running operations reuse the existing Effect / Job / Transfer Queue authorities instead of creating parallel schedulers or lifecycle models.
+- S3 remains object storage; ARX does not fabricate POSIX filesystem-capacity semantics for it.
 
 ## Development
 
@@ -243,7 +260,7 @@ Provider behavior changes additionally require the relevant physical acceptance 
 - [ROADMAP.md](ROADMAP.md) — current product truth and future roadmap
 - [ARCHITECTURE.md](ARCHITECTURE.md) — architecture contracts and authority boundaries
 - [docs/DEVELOPMENT_HANDOFF.md](docs/DEVELOPMENT_HANDOFF.md) — continuation rules for development sessions
-- [docs/releases/v0.21.0.md](docs/releases/v0.21.0.md) — v0.21.0 release notes
+- [docs/releases/v0.22.0.md](docs/releases/v0.22.0.md) — v0.22.0 release notes
 - [GitHub Releases](https://github.com/mrAibo/arx/releases) — published binaries and checksums
 
 ## License
