@@ -10,6 +10,7 @@ Repository: `mrAibo/arx`
 - v0.23.0 tag target: `f66a25f3f2b4fb66832ecc50d85f9f105ebba086`
 - Published: 2026-08-26
 - Previous immutable release: **v0.22.0** → `8737bbd2afaf0d6e7146a5d8c59ee1a0606325bf`
+- Current main: `fe413aecfdc3bf5685849e73b396800f7f3ab7e0` — accepted/unreleased SFTP→SFTP Workspace Sync (#269 / PR #270)
 - Rust MSRV: **1.88**
 - Product platform: **Linux only**
 - Published target: **Linux x86_64**
@@ -36,18 +37,17 @@ Published package SHA-256 values:
 
 ## 2. Current phase
 
-The release phase is complete. The next phase is **contract freeze for SFTP → SFTP workspace synchronization**.
-
-Do not start implementation by casually extending transfer code. First create a dedicated issue that freezes identity, execution, verification, cancellation, and recovery semantics around the existing Compare → Preview → Execute → Verify model.
+SFTP → SFTP Workspace Sync has completed its feature cycle and is accepted on `main`; it remains **unreleased relative to v0.23.0**. The active phase is the focused **v0.24.0 release package**, tracked in #271.
 
 Current sequence:
 
-1. keep v0.23.0 release/tag immutable
-2. keep public docs and live GitHub state aligned
-3. freeze a dedicated SFTP→SFTP workspace-sync issue
-4. inspect existing workspace-sync controller, Transfer Queue, provider authority, retry, verification, and tests before designing changes
-5. implement one coherent feature slice on one branch
-6. require exact-head CI plus affected physical SFTP evidence before merge
+1. keep v0.23.0 and all older release tags immutable
+2. synchronize public truth: v0.23.0 is published; SFTP→SFTP is accepted/unreleased on current `main`
+3. prepare v0.24.0 as release-truth/version metadata only; add no new runtime feature
+4. require one exact release-candidate head to pass standard CI, Rust 1.88, SFTP physical, WebDAV interoperability and Release validation
+5. pinned squash merge using the reviewed head, then require post-merge CI and SFTP physical success
+6. create immutable v0.24.0 tag on the accepted release commit, publish through the existing Release workflow, and independently verify packages/checksums/binary truth
+7. close #271 only after canonical docs and cleanup reflect published v0.24.0
 
 ## 3. Shipped product truth
 
@@ -60,13 +60,13 @@ Current sequence:
 
 ### Remote Workspace
 
-Compare → Preview → Execute → Verify currently supports:
+Published v0.23.0 supports Compare → Preview → Execute → Verify for:
 
 - Local → Local
 - Local → SFTP
 - SFTP → Local
 
-SFTP → SFTP remains intentionally unsupported in v0.23.0 and is the selected next major feature.
+Current `main` additionally contains accepted/unreleased **SFTP → SFTP** Workspace Sync, for both same-host different-root and cross-host roots, using bounded remote → ARX → remote streaming and the existing verification/recovery authorities.
 
 ### Transfer runtime
 
@@ -177,39 +177,35 @@ Feature squash merge: `d95f6183c93932fba7f5ac10f421ce6abbe1f044`
 
 Real MinIO acceptance explicitly exercised `tests/s3_inspector_minio.rs`.
 
-## 6. Next feature contract — SFTP → SFTP workspace sync
+## 6. Accepted/unreleased feature — SFTP → SFTP workspace sync
 
-Freeze a dedicated issue before implementation.
+Issue #269 / PR #270 completed the frozen contract without introducing another synchronization engine.
 
-The feature must extend the existing Compare → Preview → Execute → Verify architecture, not create another synchronization engine.
+Accepted implementation truth:
 
-Required design boundaries:
+- exact source and destination SFTP host/path identities remain authoritative
+- same-host and cross-host are explicit and both stream bounded remote → ARX → remote
+- no server-side copy/rename fiction and no general Move expansion
+- existing workspace-sync controller, `ProviderRegistry`, Transfer Queue/Job lifecycle, retry/recovery authority, journal and verification model are reused
+- SFTP directory creation and deletion use existing Registry/provider mutation seams
+- frozen Preview, confirmation, stale validation, deterministic ordering, cancellation and post-execution verification are retained
+- source/destination precommit failures are classified truthfully; ambiguous mutations are not blindly replayed
+- permanent two-endpoint OpenSSH physical acceptance uses strict host-key checking
 
-- preserve exact source and destination SFTP host/path identities
-- make same-host vs cross-host execution explicit
-- reuse the existing workspace-sync controller, `ProviderRegistry`, Transfer Queue, `JobManager`, retry policy, and verification model
-- freeze Preview before destructive Mirror consequences
-- keep transfer/mutation ordering deterministic
-- verify the real destination after execution rather than treating transfer completion as synchronization proof
-- preserve cooperative cancellation and truthful partial completion
-- define ambiguity/recovery boundaries explicitly
-- never pretend a cross-host transfer is server-side rename/move
-- do not bundle general cross-provider Move or WebDAV→WebDAV recursive copy into this slice
+Evidence:
 
-Questions the issue must answer before implementation:
+- exact feature head: `9656102bc679b71ca49513b37735bc79a3874a91`
+- squash merge / current feature main: `fe413aecfdc3bf5685849e73b396800f7f3ab7e0`
+- accepted tree: `57463d53718fd1cdd2b838dbee5524d99a9de59c`
+- post-merge CI: run `33002995697` — success
+- post-merge SFTP physical: run `33002995516` — success
+- issue #269: completed
 
-1. What exact typed identity represents source and destination SFTP roots?
-2. Which operations differ for same-host and cross-host cases?
-3. How are conflicts and Mirror deletions represented in frozen Preview?
-4. What deterministic order is used for copy/create/delete actions?
-5. What destination evidence constitutes successful verification?
-6. What state is reported after cancellation or partial completion?
-7. Which failures are retryable, ambiguous, or recovery-required?
-8. What real SFTP fixture/evidence is required for acceptance?
+Release decision: publish this feature as focused **v0.24.0**, tracked in #271, before starting another major feature.
 
 ## 7. Later candidates
 
-After SFTP→SFTP:
+After v0.24.0:
 
 - WebDAV→WebDAV recursive copy under exact source/target semantics
 - general safe cross-provider Move modeled as copy → verify → delete-source

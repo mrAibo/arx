@@ -19,7 +19,7 @@ Compare before touching anything. Preview the exact consequences. Execute. Verif
 - **Provider-native identity.** Existing remote resources are addressed by provider truth, not reconstructed display names.
 - **Read-only storage intelligence.** `Alt+U` provides truthful Local usage analysis and exact S3 object plus bounded bucket/prefix inspection without inventing filesystem-capacity semantics.
 
-Remote Workspace synchronization currently supports Local → Local, Local → SFTP, and SFTP → Local. SFTP → SFTP workspace synchronization remains intentionally unsupported.
+Published v0.23.0 supports Local → Local, Local → SFTP, and SFTP → Local Workspace Sync. Current `main` additionally contains accepted, unreleased **SFTP → SFTP Workspace Sync** from [#269](https://github.com/mrAibo/arx/issues/269) / [#270](https://github.com/mrAibo/arx/pull/270), including same-host and cross-host bounded remote → ARX → remote streaming with real two-endpoint OpenSSH acceptance.
 
 **v0.23.0 ships the read-only S3 Object & Bucket Inspector** from [#264](https://github.com/mrAibo/arx/issues/264) / [#265](https://github.com/mrAibo/arx/pull/265), including exact object inspection and bounded bucket/prefix LiveScan analytics.
 
@@ -97,7 +97,7 @@ arx
 | Local / SFTP | Browsing, transactional file copy, SFTP bounded preview, conflict-safe text Remote Edit |
 | Transfer Queue | Bounded FIFO, concurrency 1..=8, progress/rate/ETA where known, Pause/Resume/Cancel, safe retry ≤3 attempts |
 | Transfer Center | Active / History / All views with runtime-owned controls |
-| Workspace Sync | Compare → Preview → Execute → Verify for supported Local/SFTP directions |
+| Workspace Sync | Compare → Preview → Execute → Verify; v0.23.0 covers Local/Local↔SFTP, while current `main` additionally contains accepted SFTP→SFTP sync (unreleased) |
 | Storage Inspector (`Alt+U`) | Local: read-only `du++`-style logical/allocated usage, drill-down/top files/cancellation. S3: exact object inspection plus bounded paginated bucket/prefix LiveScan analytics |
 | Filesystems | Read-only Linux `df++`-style capacity/inode view; S3 never receives fake `df` semantics |
 | Effective keymap | Conflict-safe user overrides + `arx --print-keymap` |
