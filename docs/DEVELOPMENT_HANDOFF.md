@@ -1,54 +1,80 @@
 # ARX Development Handoff
 
-This document is the canonical continuation point for active ARX development. It is intentionally compact: a new development session should be able to recover current product truth, frozen architecture rules, and the next work sequence without reconstructing chat history.
+This document is the canonical continuation point for active ARX development. It is intentionally compact: a new development session should be able to recover current product truth, frozen architecture rules, release state, and the next work sequence without reconstructing chat history.
 
-> **Authority rule:** live GitHub state wins over this file. Re-fetch current `main`, open issues/PRs, and release state before changing code. The v0.21.0 release tag target recorded below is immutable release evidence; current `main` may advance through later docs/bugfix work.
+> **Authority rule:** live GitHub state wins over this file. Re-fetch current `main`, open issues/PRs, workflow state, and releases before acting on any SHA or backlog statement recorded here. Published tags are immutable evidence; current `main` may be ahead of the latest release.
 
-## 1. Current release baseline
+## 1. Current release and main baseline
 
 Repository: `mrAibo/arx`
 
-- Current public release: **v0.21.0**
-- v0.21.0 tag target: `3427cd085740d2c3f8a4bffbbf55b34ba3d9bb85`
-- Published: 2026-08-25
+- Current public release: **v0.22.0**
+- v0.22.0 tag target: `8737bbd2afaf0d6e7146a5d8c59ee1a0606325bf`
+- Published: 2026-08-26
+- Accepted post-release `main` after S3 Inspector merge: `d95f6183c93932fba7f5ac10f421ce6abbe1f044`
 - Rust MSRV: **1.88**
 - Product platform: **Linux only**
 - Published target: **Linux x86_64**
 - Release assets: tar.gz, `.deb`, `.rpm`, and `SHA256SUMS`
 - Release publication uses one validated ELF and reuses the validated artifact bundle; do not rebuild between validation and publication.
 
-v0.20.0 remains an immutable historical release baseline. Never move/reinterpret old tags to absorb later work.
+v0.22.0 remains the immutable published baseline. `main` is currently ahead of it because issue #264 / PR #265 added the read-only S3 Object & Bucket Inspector after the release.
 
-## 2. Current phase — stabilization
+## 2. Current phase
 
-The immediate phase after v0.21.0 is **stabilization**, not another architecture pack.
+The immediate phase is **release preparation / public-truth synchronization**, not another architecture pack.
 
-Priorities:
+Current direction:
 
-1. keep public docs and live GitHub status synchronized with shipped truth
-2. prioritize real user regressions/bug reports over speculative features
-3. keep runtime architecture frozen unless a demonstrated correctness/safety blocker requires change
-4. preserve exact-head CI and affected physical provider acceptance
-5. clean obsolete GitHub PR/branch/status clutter only after verifying it is superseded
+1. keep README, ROADMAP, this handoff, and live GitHub state synchronized
+2. keep the merged S3 Inspector runtime frozen unless a genuine correctness/safety blocker is discovered
+3. prefer a minimal **v0.23.0** release before starting another major feature
+4. after that release, the preferred next major feature is **SFTP → SFTP workspace synchronization**
+5. preserve exact-head CI and affected physical provider acceptance
 
-The next major feature should be chosen only after stabilization is clean.
+Do not begin SFTP→SFTP implementation by silently extending the S3 or release slice. Freeze a dedicated issue/contract first.
 
 ## 3. Current product truth
 
-Completed post-v0.20.0 work now included in v0.21.0:
+### Published in v0.22.0
 
-- configurable conflict-safe effective keymap + `arx --print-keymap`
-- mouse follow-up and provider-aware typed context menu
-- tmux / GNU Screen lifecycle hardening
-- split panes: vertical + horizontal, explicit close, keyboard ratio resize, section-aware same-location mouse
-- deterministic transfer-pause acceptance
-- WebDAV F5 target/source truth hardening
-- RFC-compatible WebDAV MOVE Depth behavior
-- Nextcloud 34.0.2 and ownCloud 11.0.0 physical WebDAV certification
-- exact one-root WebDAV recursive download to one new Local tree
-- typed local SHA-256 / Touch / Compress Quick Actions
+- Local / SFTP browsing, transactional copy, bounded preview, and SFTP conflict-safe text Remote Edit
+- Remote Workspace Compare → Preview → Execute → Verify for Local→Local, Local→SFTP, and SFTP→Local
+- persistent bounded Transfer Queue with concurrency `1..=8`, truthful progress/rate/ETA where known, Pause/Resume/Cancel, bounded safe retry, and Transfer Center views
+- Local Storage Inspector and Linux Filesystems views
+- conflict-safe effective keymap + `arx --print-keymap`
+- typed local Quick Actions (SHA-256, Touch, Compress to tar.gz)
+- hardened tmux / GNU Screen lifecycle and split-pane/mouse behavior
+- AWS S3 + MinIO supported paths with Moto emulated evidence; R2/Wasabi best-effort/unverified
+- WebDAV Basic-auth provider path with Apache mod_dav, Nextcloud 34.0.2, and ownCloud 11.0.0 physical acceptance
+- recursive WebDAV → Local download
+- recursive Local → WebDAV upload
+- safe bounded recursive WebDAV delete for one exact collection
+- multi-root Local↔WebDAV F5 Copy as one queued job
+- Linux x86_64 tar.gz / DEB / RPM distribution from one validated ELF
 
-At this baseline, **#13 WebDAV post-MVP is the only active product issue**. Always re-query GitHub before relying on that count.
+### Completed on current main after v0.22.0
+
+Issue #264 / PR #265 added **S3 Object & Bucket Inspector**:
+
+- exact provider-native object identity
+- `HeadObject` facts only: size, last modified, ETag, content type, storage class, metadata, endpoint identity, version ID when returned
+- paginated `ListObjectsV2` bucket/prefix LiveScan
+- observed object count and logical bytes
+- bounded largest-object ranking
+- bounded immediate-prefix ranking
+- bounded storage-class cardinality
+- age and storage-class distributions
+- progress, cancellation, and truthful partial-state handling
+- no S3 cleanup/mutation UI in this slice
+- no fabricated POSIX capacity/free-space/`df` semantics
+- no invented cost/billing data
+- no second provider registry, S3 client cache, scheduler, or JobManager
+
+Accepted implementation head: `d0ceb64781777bd04fe51aeaff9b8d3dfa3c3343`  
+Squash merge on main: `d95f6183c93932fba7f5ac10f421ce6abbe1f044`
+
+Final exact-head CI and post-merge push CI were green across Quality, Rust 1.88 MSRV, MinIO/S3 physical acceptance, Apache WebDAV physical regression, and real PTY multiplexer acceptance. The MinIO lane explicitly executed `tests/s3_inspector_minio.rs` and proved the real object + prefix inspector path.
 
 ## 4. Architecture status
 
@@ -93,70 +119,68 @@ Do not introduce a second:
 
 Transfer execution remains owned by TransferPlanner / Transfer Queue / executor seams. Mutations remain routed through the existing typed mutation/provider authorities.
 
-## 5. WebDAV truth after v0.21.0
+## 5. WebDAV truth
 
 Physically accepted targets:
 
-- Apache mod_dav — W1–W18
-- Nextcloud 34.0.2-apache — I1–I12
-- ownCloud 11.0.0 — I1–I12
+- Apache mod_dav — W1–W18 plus recursive download/upload/delete and multi-root F5 coverage
+- Nextcloud 34.0.2-apache — I1–I12 plus recursive download/upload/delete and multi-root F5 coverage
+- ownCloud 11.0.0 — I1–I12 plus recursive download/upload/delete and multi-root F5 coverage
 
-Basic auth through keyring/environment-backed secrets is the shipped path. Digest/Bearer are not scheduled without concrete interoperability evidence.
+Basic auth through keyring/environment-backed secrets is the shipped path.
 
-v0.21.0 ships recursive **WebDAV → Local** for one exact selected collection:
+Still intentionally unsupported / enhancement-only under #13:
 
-- exact provider-native `WebDavCollectionRef` / `WebDavObjectRef` href identities
-- authenticated bounded `PROPFIND Depth: 1`
-- complete manifest before Local mutation
-- bounded descendants/depth and direct-child/root containment
-- cycle/duplicate/presentation-name/path-component fail-closed behavior
-- staged noclobber file downloads
-- attempt-owned root cleanup on failure/cancel
-- recovery-required outcome if cleanup itself fails
-- cumulative checked byte progress
+- multi-root recursive WebDAV delete
+- WebDAV→WebDAV recursive/cross-target copy or move
+- metadata/property mutation without a demonstrated admin use case
+- Digest/Bearer auth without interoperability evidence requiring it
 
-Not implied by that implementation:
+Do not treat these as v0.23.0 release blockers unless live GitHub state explicitly changes that decision.
 
-- Local directory → WebDAV recursive upload
-- recursive WebDAV delete
-- WebDAV→WebDAV recursive/cross-target copy/move
-- multiple recursive roots
-- metadata/property mutation
-- Digest/Bearer auth
+## 6. Recommended next sequence
 
-Those remain under #13 and require fresh contracts before implementation.
+### A. First — v0.23.0 release
 
-## 6. Recommended next feature sequence
+Recommended because the S3 Inspector is a complete user-visible feature already accepted on `main`.
 
-After stabilization, the preferred next design review is:
+Keep the release candidate minimal:
 
-### A. Local directory → WebDAV recursive upload
+- bump Cargo version and root Cargo.lock version to `0.23.0`
+- add `docs/releases/v0.23.0.md`
+- synchronize README/ROADMAP release truth
+- keep runtime code frozen unless a separately reviewed release blocker is found
+- run exact-head standard gates and affected physical lanes
+- run the existing one-build/no-rebuild release validation
+- merge with pinned expected head
+- tag the accepted main commit as immutable `v0.23.0`
+- allow the existing tag-triggered workflow to publish tar.gz / DEB / RPM / `SHA256SUMS`
+- independently verify tag target, release state, assets, checksums, packaged binary version, and v0.22.0 tag immutability
 
-Do not mirror the download implementation mechanically. Remote mutation requires a fresh contract covering at least:
+### B. After v0.23.0 — SFTP → SFTP workspace sync
 
-- exact destination collection identity
-- source pre-scan / manifest before remote mutation where feasible
-- MKCOL semantics and empty directories
-- staged/noclobber file upload reuse
-- symlink policy
-- partial remote-tree rollback/recovery
-- cancellation boundaries
-- retry ambiguity after remote mutations
-- cleanup failures and recovery evidence
-- progress semantics
-- Apache / Nextcloud / ownCloud physical acceptance through the same real product path
+Freeze a dedicated issue before implementation. Extend the existing Compare → Preview → Execute → Verify model rather than creating another synchronization engine.
 
-### B. Later candidates
+Required design concerns:
 
-- recursive WebDAV delete
-- multiple-root recursive planning
-- WebDAV↔WebDAV transfer under truthful target semantics
-- SFTP→SFTP workspace sync
-- safe cross-backend Move (`copy → verify → delete-source`, never optimistic provider-crossing rename semantics)
-- S3 Object/Bucket Inspector and evidence-based usage analytics
+- exact source and destination SFTP host/path identity
+- same-host vs cross-host execution truth
+- deterministic transfer/mutation ordering
+- Preview before destructive Mirror consequences
+- destination verification after execution
+- cooperative cancellation and truthful partial completion
+- recovery/ambiguity boundaries
+- reuse of existing workspace-sync controller, Transfer Queue, JobManager, provider registry, retry authority, and verification model
+- never pretend a cross-host transfer is a server-side rename
+
+### C. Later candidates
+
+- WebDAV→WebDAV recursive copy under exact source/target semantics
+- general safe cross-provider Move modeled as copy → verify → delete-source
+- binary remote editing
 - additional Linux architectures / signed repositories if justified
 
-Create/freshen dedicated issues before implementing backlog items that are currently roadmap-only.
+Create/freshen dedicated issues before implementing roadmap-only items.
 
 ## 7. External plugins — explicit decision gate
 
@@ -185,10 +209,10 @@ Additional rules:
 - exact-head CI is authoritative
 - provider/transfer semantic changes require their affected physical lanes
 - WebDAV semantic changes require Apache acceptance and, where portable behavior is affected, Nextcloud/ownCloud interoperability
-- S3 transfer/retry changes require MinIO physical evidence
+- S3 semantic changes require MinIO physical evidence
 - multiplexer terminal lifecycle changes require real PTY evidence
 - fail closed when identity/capability/safety is ambiguous
-- never fabricate progress, rate, ETA, capacity, or provider semantics
+- never fabricate progress, rate, ETA, capacity, cost, or provider semantics
 - do not change runtime semantics merely to satisfy timing-sensitive tests
 - destructive/remote mutation paths require truthful transaction, cancellation, retry, and recovery behavior
 - `Cargo.lock` remains authoritative
@@ -222,14 +246,14 @@ Never repurpose an already-published version identity.
 Before changing code:
 
 1. Read this file, `ROADMAP.md`, and `ARCHITECTURE.md`.
-2. Fetch current `main`; do not assume the v0.21.0 release target is still current main.
+2. Fetch current `main`; do not assume the SHA recorded here is still current.
 3. Query open issues and PRs from GitHub.
-4. Treat current public release/tag state as immutable evidence.
-5. Confirm whether the request is stabilization, bugfix, or a newly approved feature slice.
+4. Query the current release/tag state and treat published tags as immutable evidence.
+5. Confirm whether the request is release work, bugfix, or a newly approved feature slice.
 6. Check affected source and tests before freezing semantics.
 7. Use connected GitHub tooling for review/PR/merge/CI whenever available.
 8. Use Hermes only where Linux-local execution materially helps.
 
 Minimal continuation prompt:
 
-> Continue development of `github.com/mrAibo/arx`. Read `docs/DEVELOPMENT_HANDOFF.md`, `ROADMAP.md`, and `ARCHITECTURE.md`; treat live GitHub state as authoritative. Current public baseline is v0.21.0, with stabilization first and #13 WebDAV post-MVP as the active product umbrella unless GitHub now says otherwise. Preserve the frozen architecture authorities and use Hermes only for deterministic Linux-local execution.
+> Continue development of `github.com/mrAibo/arx`. Read `docs/DEVELOPMENT_HANDOFF.md`, `ROADMAP.md`, and `ARCHITECTURE.md`; treat live GitHub state as authoritative. Current public release is v0.22.0, while current main contains the accepted S3 Object & Bucket Inspector from #264/#265. Preserve the frozen architecture authorities. Prefer a minimal v0.23.0 release before beginning the next major feature, then freeze SFTP→SFTP workspace sync as a dedicated slice. Use Hermes only for deterministic Linux-local execution.
