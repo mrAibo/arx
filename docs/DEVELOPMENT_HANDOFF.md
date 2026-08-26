@@ -6,49 +6,51 @@ This is the canonical continuation point for active ARX development. Live GitHub
 
 Repository: `mrAibo/arx`
 
-- Current public release: **v0.23.0**
-- v0.23.0 tag target: `f66a25f3f2b4fb66832ecc50d85f9f105ebba086`
+- Current public release: **v0.24.0**
+- v0.24.0 tag target / release commit: `6d413fac5d5b493859bfadfbedbeb436b1140e0b`
 - Published: 2026-08-26
-- Previous immutable release: **v0.22.0** → `8737bbd2afaf0d6e7146a5d8c59ee1a0606325bf`
-- Current main: `cd5f1b147ac4ca78d7fdab134d548b97a7c20a00` — public-truth baseline after PR #272
-- Active release candidate: **v0.24.0** on `release/v0.24.0-prep` via #271; source version metadata is not publication
+- Previous immutable release: **v0.23.0** → `f66a25f3f2b4fb66832ecc50d85f9f105ebba086`
+- Canonical docs may advance `main` beyond the release commit without moving the v0.24.0 tag
 - Rust MSRV: **1.88**
 - Product platform: **Linux only**
 - Published target: **Linux x86_64**
 - Release assets: tar.gz, `.deb`, `.rpm`, `SHA256SUMS`
 
-v0.23.0 ships the accepted read-only S3 Object & Bucket Inspector. Publication is complete and independently verified.
+v0.24.0 ships the accepted SFTP → SFTP Workspace Sync and retains the read-only S3 Object & Bucket Inspector from v0.23.0. Publication is complete and independently verified.
 
 Release evidence:
 
-- PR #267 squash merge / release commit: `f66a25f3f2b4fb66832ecc50d85f9f105ebba086`
-- exact-head CI: run `32990258665` — success
-- exact-head Nextcloud/ownCloud interoperability: run `32990258700` — success
-- post-merge CI: run `32991066627` — success
-- final Release run: `32994286262` — validate success, publish success
+- release PR #273 exact candidate: `fd798b3117bec1f782f53cbedd48bdab72eaab08`
+- exact-head CI: run `33010488213` — success
+- exact-head SFTP physical: run `33010488203` — success
+- exact-head Nextcloud/ownCloud interoperability: run `33010488206` — success
+- exact-head Release validator: run `33010488294` — success
+- PR #273 squash merge / release commit: `6d413fac5d5b493859bfadfbedbeb436b1140e0b`
+- post-merge CI: run `33011943055` — success
+- post-merge SFTP physical: run `33011943080` — success
+- final Release run: `33012256020` — validate success, publish success
 - published Release: latest, non-draft, non-prerelease
-- independent package hashes matched `SHA256SUMS`
-- tarball binary reports `arx 0.23.0`; `--help` exits successfully
+- independent package hashes matched `SHA256SUMS` and published GitHub asset digests
+- tarball binary reports `arx 0.24.0`; `--help` exits successfully
+- v0.23.0 and v0.22.0 tag targets remained unchanged
 
 Published package SHA-256 values:
 
-- tar.gz: `67946d5cbf19130f8c9783cd9a18377ec5586bb6df84d8f9e9dc0840162f69cc`
-- DEB: `b00af1a1da4a65548fc1fe43e8ca7144686433eddf7a1e39733d181b2dc6c8fc`
-- RPM: `278d4d3733aed26b801e971852315859f933cf9092c6481dc8313bd5d4f782e5`
+- tar.gz: `d8463a3d78e1d19e61f7cb3383b17d5f4cf0fb4f046e989d1f1129aa18237f42`
+- DEB: `697c7f6e5c69d23ee97ae4664fb60af26f140ef5005686f10db97895a692fda4`
+- RPM: `9a5f6a99ed5dc4ed7db77def9f1ab7efe1feb419c1b76a674b586dcc7ece1bc2`
 
 ## 2. Current phase
 
-SFTP → SFTP Workspace Sync has completed its feature cycle and is accepted on `main`; it remains **unreleased relative to v0.23.0**. Public-truth sync Task A is complete at `cd5f1b147ac4ca78d7fdab134d548b97a7c20a00`. The active phase is freezing the focused **v0.24.0 release candidate** on `release/v0.24.0-prep`, tracked in #271, with no new runtime feature.
+The focused **v0.24.0** release package is complete: SFTP → SFTP Workspace Sync is published, the immutable tag points to the accepted release commit, and package/checksum/binary verification is complete. #271 is the release closure record.
 
 Current sequence:
 
-1. keep v0.23.0 and all older release tags immutable
-2. public-truth sync is complete: PR #272 → `cd5f1b147ac4ca78d7fdab134d548b97a7c20a00`, with post-merge CI and SFTP physical success
-3. freeze v0.24.0 release-truth/version metadata only; add no new runtime feature
-4. require the resulting exact release-candidate head to pass standard CI, Rust 1.88, SFTP physical, WebDAV interoperability and Release validation
-5. pinned squash merge using the reviewed head, then require post-merge CI and SFTP physical success
-6. create immutable v0.24.0 tag on the accepted release commit, publish through the existing Release workflow, and independently verify packages/checksums/binary truth
-7. close #271 only after canonical docs and cleanup reflect published v0.24.0
+1. keep v0.24.0 and all older release tags immutable
+2. keep the WebDAV #13 backlog explicit; released WebDAV functionality remains supported
+3. next candidate: WebDAV → WebDAV recursive/cross-target copy only after exact source/target identity, copy semantics, confirmation and recovery truth are frozen
+4. after that, consider general cross-provider Move only as copy → verify → delete-source
+5. continue exact-head, physical-provider and one-build release discipline for every future slice
 
 ## 3. Shipped product truth
 
@@ -61,13 +63,12 @@ Current sequence:
 
 ### Remote Workspace
 
-Published v0.23.0 supports Compare → Preview → Execute → Verify for:
+Published v0.24.0 supports Compare → Preview → Execute → Verify for:
 
 - Local → Local
 - Local → SFTP
 - SFTP → Local
-
-Current `main` additionally contains accepted/unreleased **SFTP → SFTP** Workspace Sync, for both same-host different-root and cross-host roots, using bounded remote → ARX → remote streaming and the existing verification/recovery authorities.
+- SFTP → SFTP, for both same-host different-root and cross-host roots, using bounded remote → ARX → remote streaming and the existing verification/recovery authorities.
 
 ### Transfer runtime
 
@@ -112,7 +113,8 @@ Shipped recursive surface:
 Remaining issue #13 enhancements:
 
 - multi-root recursive WebDAV delete
-- WebDAV→WebDAV recursive/cross-target copy or move
+- WebDAV→WebDAV recursive/cross-target copy with exact source/target identity and truthful staging/recovery semantics
+- WebDAV→WebDAV move only after copy → verify → delete-source semantics are separately proven
 - metadata/property mutation only for a demonstrated admin use case
 - Digest/Bearer auth only if interoperability evidence requires it
 
@@ -178,7 +180,7 @@ Feature squash merge: `d95f6183c93932fba7f5ac10f421ce6abbe1f044`
 
 Real MinIO acceptance explicitly exercised `tests/s3_inspector_minio.rs`.
 
-## 6. Accepted/unreleased feature — SFTP → SFTP workspace sync
+## 6. Released feature — SFTP → SFTP workspace sync
 
 Issue #269 / PR #270 completed the frozen contract without introducing another synchronization engine.
 
@@ -203,13 +205,18 @@ Evidence:
 - public-truth baseline: `cd5f1b147ac4ca78d7fdab134d548b97a7c20a00`
 - public-truth post-merge CI: run `33007674598` — success
 - public-truth post-merge SFTP physical: run `33007674646` — success
+- v0.24.0 release candidate: `fd798b3117bec1f782f53cbedd48bdab72eaab08`
+- v0.24.0 release commit/tag target: `6d413fac5d5b493859bfadfbedbeb436b1140e0b`
+- v0.24.0 post-merge CI: run `33011943055` — success
+- v0.24.0 post-merge SFTP physical: run `33011943080` — success
+- v0.24.0 Release run: `33012256020` — validate success, publish success
 - issue #269: completed
 
-Release decision: publish this feature as focused **v0.24.0**, tracked in #271, before starting another major feature.
+Release status: published as focused **v0.24.0**; #271 records final release closure evidence.
 
 ## 7. Later candidates
 
-After v0.24.0:
+Next after v0.24.0:
 
 - WebDAV→WebDAV recursive copy under exact source/target semantics
 - general safe cross-provider Move modeled as copy → verify → delete-source
@@ -287,4 +294,4 @@ Before changing code:
 
 Minimal continuation prompt:
 
-> Continue development of `github.com/mrAibo/arx`. Read `docs/DEVELOPMENT_HANDOFF.md`, `ROADMAP.md`, and `ARCHITECTURE.md`; treat live GitHub state as authoritative. Current public release is v0.23.0 at `f66a25f3f2b4fb66832ecc50d85f9f105ebba086`, shipping the accepted S3 Object & Bucket Inspector. Preserve frozen architecture authorities. The next major slice is SFTP→SFTP workspace synchronization: freeze its dedicated issue/contract around the existing Compare → Preview → Execute → Verify and Transfer Queue authorities before implementation. Use Hermes only for deterministic Linux-local execution.
+> Continue development of `github.com/mrAibo/arx`. Read `docs/DEVELOPMENT_HANDOFF.md`, `ROADMAP.md`, and `ARCHITECTURE.md`; treat live GitHub state as authoritative. Current public release is v0.24.0 at tag target `6d413fac5d5b493859bfadfbedbeb436b1140e0b`, shipping SFTP→SFTP Workspace Sync and retaining the v0.23.0 S3 Inspector plus released WebDAV recursive operations. Preserve frozen architecture authorities. The next recommended major slice is WebDAV→WebDAV recursive/cross-target copy under issue #13: freeze exact source/target identity, copy semantics, confirmation, cancellation, staged destination and recovery truth before implementation. Keep Move as a separate later copy → verify → delete-source decision. Use Hermes only for deterministic Linux-local execution.

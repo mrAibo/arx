@@ -2,48 +2,51 @@
 
 GitHub state is authoritative over this document. Re-fetch current `main`, issues, PRs, tags, workflow state, and releases before acting on any recorded SHA or backlog item.
 
-## CURRENT — v0.23.0 published / v0.24.0 release preparation
+## CURRENT — v0.24.0 published / WebDAV backlog next
 
-**Current public release:** `v0.23.0`  
-**Release tag target:** `f66a25f3f2b4fb66832ecc50d85f9f105ebba086`  
-**Published:** 2026-08-26  
-**Platform:** Linux only; published target Linux x86_64  
-**MSRV:** Rust 1.88  
-**Previous immutable release:** `v0.22.0` → `8737bbd2afaf0d6e7146a5d8c59ee1a0606325bf`
-**Current main:** `cd5f1b147ac4ca78d7fdab134d548b97a7c20a00` — public-truth baseline after PR #272
-**Active release candidate:** `v0.24.0` via #271 / `release/v0.24.0-prep`; source version metadata does not imply publication
+**Current public release:** `v0.24.0`
+**Release tag target:** `6d413fac5d5b493859bfadfbedbeb436b1140e0b`
+**Published:** 2026-08-26
+**Platform:** Linux only; published target Linux x86_64
+**MSRV:** Rust 1.88
+**Previous immutable release:** `v0.23.0` → `f66a25f3f2b4fb66832ecc50d85f9f105ebba086`
+**Release commit / publication baseline:** `6d413fac5d5b493859bfadfbedbeb436b1140e0b`; later docs-only commits may advance `main` without moving the release tag.
 
-v0.23.0 ships the read-only **S3 Object & Bucket Inspector** on top of the v0.22.0 WebDAV recursive-operation baseline.
+v0.24.0 ships **SFTP → SFTP Workspace Sync** on top of the v0.23.0 read-only S3 Object & Bucket Inspector and the retained WebDAV recursive-operation surface.
 
 Release acceptance evidence:
 
-- release PR: #267, squash-merged as `f66a25f3f2b4fb66832ecc50d85f9f105ebba086`
-- exact-head CI on `e0264de19c58c8e22be573ddad6af2734cec9a6c`: run `32990258665` — success
-- exact-head Nextcloud/ownCloud interoperability: run `32990258700` — success
-- post-merge CI on `f66a25f3...`: run `32991066627` — success
-- release workflow on `v0.23.0`: run `32994286262` — validate success, publish success
+- release PR: #273; exact candidate head `fd798b3117bec1f782f53cbedd48bdab72eaab08`
+- exact-head CI: run `33010488213` — success
+- exact-head SFTP physical: run `33010488203` — success
+- exact-head Nextcloud/ownCloud interoperability: run `33010488206` — success
+- exact-head Release validator: run `33010488294` — success
+- release squash merge / release commit: `6d413fac5d5b493859bfadfbedbeb436b1140e0b`
+- post-merge CI: run `33011943055` — success
+- post-merge SFTP physical: run `33011943080` — success
+- release workflow on immutable `v0.24.0`: run `33012256020` — validate success, publish success
 - tag ↔ Cargo version, release notes, hero asset, Format, Clippy, tests, Rust 1.88 MSRV, one release build, third-party licenses, TAR/DEB/RPM payloads, packaged-binary smoke, checksums, and artifact publication all passed
 - published Release is latest, `draft=false`, `prerelease=false`
-- independent artifact verification: all three package hashes match `SHA256SUMS`; tarball binary reports `arx 0.23.0`; `--help` exits successfully
-- v0.22.0 tag remained unchanged throughout the release
+- independent artifact verification: all three package hashes match `SHA256SUMS`; published GitHub asset digests match; tarball binary reports `arx 0.24.0`; `--help` exits successfully
+- v0.23.0 and v0.22.0 tag targets remained unchanged throughout the release
 
 Published artifacts:
 
-- `arx-v0.23.0-x86_64-unknown-linux-gnu.tar.gz`
-- `arx_0.23.0_amd64.deb`
-- `arx-0.23.0-1.x86_64.rpm`
+- `arx-v0.24.0-x86_64-unknown-linux-gnu.tar.gz`
+- `arx_0.24.0_amd64.deb`
+- `arx-0.24.0-1.x86_64.rpm`
 - `SHA256SUMS`
 
 Published SHA-256 values:
 
-- tar.gz: `67946d5cbf19130f8c9783cd9a18377ec5586bb6df84d8f9e9dc0840162f69cc`
-- DEB: `b00af1a1da4a65548fc1fe43e8ca7144686433eddf7a1e39733d181b2dc6c8fc`
-- RPM: `278d4d3733aed26b801e971852315859f933cf9092c6481dc8313bd5d4f782e5`
+- tar.gz: `d8463a3d78e1d19e61f7cb3383b17d5f4cf0fb4f046e989d1f1129aa18237f42`
+- DEB: `697c7f6e5c69d23ee97ae4664fb60af26f140ef5005686f10db97895a692fda4`
+- RPM: `9a5f6a99ed5dc4ed7db77def9f1ab7efe1feb419c1b76a674b586dcc7ece1bc2`
 
 ## CURRENT PRODUCT TRUTH
 
 - **Local / SFTP:** browsing, transactional copy, bounded preview, SFTP conflict-safe text Remote Edit, OpenSSH-backed host/session behavior.
-- **Remote Workspace:** published v0.23.0 provides Compare → Preview → Execute → Verify for Local→Local, Local→SFTP, and SFTP→Local; the v0.24.0 release candidate adds the already accepted SFTP→SFTP sync with same-host/cross-host bounded streaming and real two-endpoint OpenSSH acceptance.
+- **Remote Workspace:** published v0.24.0 provides Compare → Preview → Execute → Verify for Local→Local, Local→SFTP, SFTP→Local, and same-host/cross-host SFTP→SFTP sync with bounded remote → ARX → remote streaming and real two-endpoint OpenSSH acceptance.
 - **Transfer Queue:** one persistent bounded FIFO runtime, configurable concurrency `1..=8`, truthful progress/rate/ETA where known, cooperative Pause/Resume/Cancel, and bounded safe retry.
 - **Transfer Center v2:** Active / History / All views and controls routed to the existing `TransferQueueRuntime`.
 - **Storage Inspector (`Alt+U`):** Local read-only logical/allocated usage plus exact S3 object inspection and bounded paginated bucket/prefix LiveScan analytics.
@@ -110,7 +113,7 @@ Real MinIO acceptance explicitly exercises `tests/s3_inspector_minio.rs`. AWS S3
 
 ## WEBDAV POST-MVP — ISSUE #13
 
-Released and retained in v0.23.0:
+Released and retained in v0.24.0:
 
 - core WebDAV provider semantics
 - Apache mod_dav W1–W18 physical acceptance
@@ -124,15 +127,16 @@ Released and retained in v0.23.0:
 Remaining enhancements under #13:
 
 - [ ] multi-root recursive WebDAV delete
-- [ ] WebDAV→WebDAV recursive/cross-target copy or move with truthful target/recovery semantics
+- [ ] WebDAV→WebDAV recursive/cross-target copy with exact source/target identity and truthful staging/recovery semantics
+- [ ] WebDAV→WebDAV move only after copy → verify → delete-source semantics are separately proven
 - [ ] optional metadata/property mutation only for a demonstrated admin use case
 - [ ] Digest/Bearer auth only if interoperability evidence requires it
 
 These are enhancements, not regressions or current release blockers.
 
-## ACCEPTED / UNRELEASED — SFTP → SFTP WORKSPACE SYNC
+## RELEASED — SFTP → SFTP WORKSPACE SYNC
 
-Issue #269 was completed by PR #270 and feature-merged as `fe413aecfdc3bf5685849e73b396800f7f3ab7e0`. Public-truth baseline `cd5f1b147ac4ca78d7fdab134d548b97a7c20a00` retains the feature. It is **not part of published v0.23.0** and is the sole major feature targeted by the v0.24.0 release candidate.
+Issue #269 was completed by PR #270 and feature-merged as `fe413aecfdc3bf5685849e73b396800f7f3ab7e0`. The focused release package in #271 published it as **v0.24.0** on release commit/tag target `6d413fac5d5b493859bfadfbedbeb436b1140e0b`.
 
 Accepted truth:
 
@@ -146,20 +150,28 @@ Accepted truth:
 - cancellation and partial/recovery truth retained
 - permanent two-endpoint OpenSSH physical lane with strict host-key checking
 - exact feature head `9656102bc679b71ca49513b37735bc79a3874a91`; squash merge `fe413aecfdc3bf5685849e73b396800f7f3ab7e0`
-- exact-head CI / WebDAV interop / SFTP physical all success; post-merge CI run `33002995697` and post-merge SFTP physical run `33002995516` success
+- exact-head CI / WebDAV interop / SFTP physical all success; feature post-merge CI run `33002995697` and SFTP physical run `33002995516` success
+- v0.24.0 release candidate `fd798b3117bec1f782f53cbedd48bdab72eaab08`; release commit/tag target `6d413fac5d5b493859bfadfbedbeb436b1140e0b`
+- v0.24.0 release workflow `33012256020` — validate success, publish success
 
-The focused release package is tracked in #271 and targets **v0.24.0** without another major feature.
+The focused release package was published as **v0.24.0**; #271 records the release acceptance and closure evidence.
 
 ## RECOMMENDED FEATURE SEQUENCE
 
-1. **Next:** publish focused v0.24.0 with the already accepted SFTP→SFTP Workspace Sync.
-2. **After v0.24.0:** WebDAV → WebDAV recursive copy, only after exact source/target and recovery semantics are frozen.
-3. **Later:** general safe cross-provider Move modeled as copy → verify → delete-source.
-4. Other candidates: binary remote editing, additional Linux architectures, signed repositories, provider-specific read-only analytics where evidence is truthful.
+1. **Next:** WebDAV → WebDAV recursive/cross-target copy under #13, only after exact source/target and recovery semantics are frozen.
+2. **Later:** general safe cross-provider Move modeled as copy → verify → delete-source.
+3. Other candidates: binary remote editing, additional Linux architectures, signed repositories, provider-specific read-only analytics where evidence is truthful.
 
 Native Windows support remains out of scope. Windows SSH clients may interoperate with ARX running on Linux; that does not change the Linux-only product policy.
 
 ## RELEASE HISTORY
+
+### v0.24.0 — 2026-08-26
+
+- SFTP → SFTP Workspace Sync for same-host and cross-host roots
+- bounded remote → ARX → remote streaming with frozen Preview and verification
+- real two-endpoint OpenSSH physical acceptance
+- v0.23.0 S3 Inspector and v0.22.0 WebDAV recursive surface retained
 
 ### v0.23.0 — 2026-08-26
 
