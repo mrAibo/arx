@@ -40,18 +40,29 @@ jobs:
           python3 scripts/arx264_fix1.py
           printf '\n          cargo test --locked --test s3_inspector_minio -- --nocapture\n' >> .github/workflows/ci.yml
 
-      - name: Quality and MSRV gates
-        shell: bash
+      - name: Format
         run: |
           set -euo pipefail
           cargo fmt
           cargo fmt --check
-          cargo check --locked --all-features
-          cargo clippy --locked --all-targets --all-features -- -D warnings
-          cargo test --locked --all-features
+
+      - name: Check
+        run: cargo check --locked --all-features
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked --all-features
+
+      - name: MSRV
+        run: |
+          set -euo pipefail
           rustup toolchain install 1.88 --profile minimal
           cargo +1.88 check --locked --all-features
-          git diff --check
+
+      - name: Diff check
+        run: git diff --check
 
       - name: Commit integration
         shell: bash
