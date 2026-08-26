@@ -169,7 +169,7 @@ async fn execute_sftp_remote_copy(
         Ok(connection) => connection,
         Err(error) => {
             let _ = source.close().await;
-            return Err(error);
+            return Err(TransferExecutionError::safe_to_retry(error));
         }
     };
 
