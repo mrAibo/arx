@@ -15,76 +15,32 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 2
+          fetch-depth: 1
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
-      - name: Apply reviewed core patch and corrective tests
+      - name: Apply exact reviewed patch and update obsolete characterization
         shell: bash
         run: |
           set -euo pipefail
-          git merge-base --is-ancestor 4355f24e8a74c3393c34bc3dbe05a8e5753457c0 HEAD
-
-          # Reuse the reviewed deterministic patch script from this workflow's
-          # immediate predecessor, then apply the two narrow corrections found
-          # by the exact-head diagnostic run.
-          git show HEAD^:.github/workflows/dev-webdav-multi-root-patch.yml > /tmp/previous-patch.yml
+          printf '%s' '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' | base64 -d | gzip -d > /tmp/multi-root.patch
+          git apply --check /tmp/multi-root.patch
+          git apply /tmp/multi-root.patch
           python3 - <<'PY'
           from pathlib import Path
-          src = Path('/tmp/previous-patch.yml').read_text().splitlines()
-          start = next(i for i, line in enumerate(src) if "python3 - <<'PY'" in line) + 1
-          end = next(i for i in range(start, len(src)) if src[i].strip() == 'PY')
-          lines = src[start:end]
-          indents = [len(line) - len(line.lstrip()) for line in lines if line.strip()]
-          trim = min(indents)
-          Path('/tmp/arx-multi-root-core.py').write_text(
-              '\n'.join(line[trim:] if line.strip() else '' for line in lines) + '\n'
-          )
-          PY
-          python3 /tmp/arx-multi-root-core.py
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          def replace_once(path: str, old: str, new: str) -> None:
-              p = Path(path)
-              text = p.read_text()
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"{path}: expected one replacement, found {count}")
-              p.write_text(text.replace(old, new, 1))
-
-          # Keep #257 dependency-free: use a unique std::env temp directory in
-          # the new library tests rather than introducing a Cargo dependency.
-          replace_once(
-              'src/transfer/webdav_batch.rs',
-              '''    use std::path::PathBuf;\n\n    fn local_file(name: &str) -> ListedEntry {\n''',
-              '''    use std::path::PathBuf;\n\n    fn test_temp_dir(label: &str) -> PathBuf {\n        let nanos = std::time::SystemTime::now()\n            .duration_since(std::time::UNIX_EPOCH)\n            .expect("clock")\n            .as_nanos();\n        let path = std::env::temp_dir().join(format!(\n            "arx-webdav-batch-{label}-{}-{nanos}",\n            std::process::id()\n        ));\n        std::fs::create_dir_all(&path).unwrap();\n        path\n    }\n\n    fn local_file(name: &str) -> ListedEntry {\n''',
-          )
-          replace_once(
-              'src/transfer/webdav_batch.rs',
-              '''        let destination = tempfile::tempdir().unwrap();\n        let (spec, names) = prepare_webdav_copy_batch(\n            &dav_location("dav", "/presentation/ignored"),\n            &Location::Local(destination.path().to_path_buf()),\n''',
-              '''        let destination = test_temp_dir("download");\n        let (spec, names) = prepare_webdav_copy_batch(\n            &dav_location("dav", "/presentation/ignored"),\n            &Location::Local(destination.clone()),\n''',
-          )
-          replace_once(
-              'src/transfer/webdav_batch.rs',
-              '''        let destination = tempfile::tempdir().unwrap();\n        std::fs::write(destination.path().join("a"), b"existing").unwrap();\n        let error = prepare_webdav_copy_batch(\n            &dav_location("dav", "/"),\n            &Location::Local(destination.path().to_path_buf()),\n''',
-              '''        let destination = test_temp_dir("collision");\n        std::fs::write(destination.join("a"), b"existing").unwrap();\n        let error = prepare_webdav_copy_batch(\n            &dav_location("dav", "/"),\n            &Location::Local(destination.clone()),\n''',
-          )
-
-          # The old characterization test intentionally rejected WebDAV multi-
-          # selection. #257 makes that behavior valid, so turn it into a Tokio
-          # acceptance proving one multi-root selection creates exactly one job.
+          p = Path('src/tui/transfers.rs')
+          text = p.read_text()
           old = '''    #[test]\n    fn webdav_multi_selection_dispatch_fails_before_enqueue() {\n'''
           new = '''    #[tokio::test]\n    async fn webdav_multi_selection_dispatch_queues_one_job() {\n'''
-          replace_once('src/tui/transfers.rs', old, new)
-          replace_once(
-              'src/tui/transfers.rs',
-              '''        assert_eq!(\n            state.message.as_deref(),\n            Some("WebDAV copy currently supports one selected item")\n        );\n        assert!(sync.jobs.snapshot().is_empty(), "nothing enqueued");\n''',
-              '''        let message = state.message.as_deref().expect("queue confirmation");\n        assert!(message.starts_with("Copy queued ("), "unexpected message: {message}");\n        assert_eq!(sync.jobs.snapshot().len(), 1, "one batch selection = one job");\n''',
-          )
+          if text.count(old) != 1:
+              raise SystemExit('obsolete multi-root test header mismatch')
+          text = text.replace(old, new, 1)
+          old = '''        assert_eq!(\n            state.message.as_deref(),\n            Some("WebDAV copy currently supports one selected item")\n        );\n        assert!(sync.jobs.snapshot().is_empty(), "nothing enqueued");\n'''
+          new = '''        let message = state.message.as_deref().expect("queue confirmation");\n        assert!(message.starts_with("Copy queued ("), "unexpected message: {message}");\n        assert_eq!(sync.jobs.snapshot().len(), 1, "one batch selection = one job");\n'''
+          if text.count(old) != 1:
+              raise SystemExit('obsolete multi-root assertion mismatch')
+          p.write_text(text.replace(old, new, 1))
           PY
-
       - name: Standard acceptance
         shell: bash
         run: |
@@ -97,7 +53,6 @@ jobs:
           rustup toolchain install 1.88 --profile minimal
           cargo +1.88 check --locked --all-features
           git diff --check
-
       - name: Commit clean production implementation
         shell: bash
         run: |
