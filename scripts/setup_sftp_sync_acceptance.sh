@@ -14,6 +14,7 @@ mkdir -p "$FIXTURE_ROOT"
 chmod 700 "$FIXTURE_ROOT"
 
 CLIENT_KEY="$FIXTURE_ROOT/client_ed25519"
+KNOWN_HOSTS="$FIXTURE_ROOT/known_hosts"
 ssh-keygen -q -t ed25519 -N '' -f "$CLIENT_KEY"
 chmod 600 "$CLIENT_KEY"
 
@@ -115,6 +116,14 @@ sudo mkdir -p /run/sshd
 make_sshd_config a "$PORT_A"
 make_sshd_config b "$PORT_B"
 
+# Production OpenSshSftpConnection always enforces StrictHostKeyChecking=yes.
+# Seed the exact disposable endpoint host keys instead of weakening that safety
+# contract in the fixture.
+: > "$KNOWN_HOSTS"
+ssh-keyscan -T 5 -t ed25519 -p "$PORT_A" 127.0.0.1 >> "$KNOWN_HOSTS"
+ssh-keyscan -T 5 -t ed25519 -p "$PORT_B" 127.0.0.1 >> "$KNOWN_HOSTS"
+chmod 600 "$KNOWN_HOSTS"
+
 cat >> "$SSH_CONFIG" <<EOF
 
 Host arx-sftp-a
@@ -124,8 +133,8 @@ Host arx-sftp-a
   IdentityFile $CLIENT_KEY
   IdentitiesOnly yes
   BatchMode yes
-  StrictHostKeyChecking no
-  UserKnownHostsFile /dev/null
+  StrictHostKeyChecking yes
+  UserKnownHostsFile $KNOWN_HOSTS
   LogLevel ERROR
 
 Host arx-sftp-b
@@ -135,8 +144,8 @@ Host arx-sftp-b
   IdentityFile $CLIENT_KEY
   IdentitiesOnly yes
   BatchMode yes
-  StrictHostKeyChecking no
-  UserKnownHostsFile /dev/null
+  StrictHostKeyChecking yes
+  UserKnownHostsFile $KNOWN_HOSTS
   LogLevel ERROR
 EOF
 chmod 600 "$SSH_CONFIG"
