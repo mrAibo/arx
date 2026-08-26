@@ -10,9 +10,10 @@ use crate::vfs::{Location, ProviderRegistry, local::LocalFs, webdav::WebDavProvi
 use super::s3_download;
 use super::s3_upload;
 use super::webdav_transfer::{
-    TreeCleanupFailure, UploadTreeCleanupFailure, UploadTreeRootAmbiguous, WebDavOverwritePolicy,
-    download_one as webdav_download_one, download_tree as webdav_download_tree,
-    upload_one as webdav_upload_one, upload_tree as webdav_upload_tree,
+    CopyTreeFailure, TreeCleanupFailure, UploadTreeCleanupFailure, UploadTreeRootAmbiguous,
+    WebDavOverwritePolicy, copy_tree as webdav_copy_tree, download_one as webdav_download_one,
+    download_tree as webdav_download_tree, upload_one as webdav_upload_one,
+    upload_tree as webdav_upload_tree,
 };
 use super::{S3TransferSpec, TransferIntent, TransferMethod, TransferPlan, WebDavTransferSpec};
 use crate::transfer::sftp_copy;
@@ -124,6 +125,31 @@ fn classify_webdav_upload_tree_error(error: io::Error) -> TransferExecutionError
     }
 }
 
+fn classify_webdav_copy_tree_error(error: io::Error) -> TransferExecutionError {
+    if error.kind() == io::ErrorKind::Interrupted {
+        return TransferExecutionError::Cancelled { completed: 0 };
+    }
+    match error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<CopyTreeFailure>())
+    {
+        Some(CopyTreeFailure::RootAmbiguous { .. } | CopyTreeFailure::CleanupFailure { .. }) => {
+            TransferExecutionError::Io {
+                source: error,
+                disposition: crate::transfer_queue::RetryDisposition::RecoveryRequired,
+            }
+        }
+        Some(CopyTreeFailure::AmbiguousMutation { .. }) => TransferExecutionError::Io {
+            source: error,
+            disposition: crate::transfer_queue::RetryDisposition::AmbiguousMutation,
+        },
+        None => TransferExecutionError::Io {
+            source: error,
+            disposition: crate::transfer_queue::RetryDisposition::NeverRetry,
+        },
+    }
+}
+
 fn classify_webdav_tree_error(error: io::Error) -> TransferExecutionError {
     if error.kind() == io::ErrorKind::Interrupted {
         TransferExecutionError::Cancelled { completed: 0 }
@@ -218,6 +244,12 @@ async fn execute_webdav_batch_item(
             webdav_download_tree(provider, spec, cancel, pause, &mut discard_progress)
                 .await
                 .map_err(classify_webdav_tree_error)?;
+        }
+        WebDavTransferSpec::CopyTree { .. } => {
+            return Err(TransferExecutionError::InvalidPlan {
+                method: TransferMethod::WebDav,
+                reason: "WebDAV remote CopyTree cannot be nested in a batch".into(),
+            });
         }
         WebDavTransferSpec::Batch { .. } => {
             return Err(TransferExecutionError::InvalidPlan {
@@ -398,6 +430,39 @@ pub async fn execute_transfer(
                         method: plan.method,
                         reason: "WebDAV transfer plan missing frozen spec".into(),
                     })?;
+            if let WebDavTransferSpec::CopyTree {
+                source,
+                destination_root,
+            } = spec
+            {
+                let source_provider = registry
+                    .webdav_provider_for_transfer(&source.target)
+                    .map_err(|error| TransferExecutionError::InvalidPlan {
+                        method: TransferMethod::WebDav,
+                        reason: error.to_string(),
+                    })?;
+                let destination_provider = registry
+                    .webdav_provider_for_transfer(&destination_root.target)
+                    .map_err(|error| TransferExecutionError::InvalidPlan {
+                        method: TransferMethod::WebDav,
+                        reason: error.to_string(),
+                    })?;
+                let items = webdav_copy_tree(
+                    &source_provider,
+                    &destination_provider,
+                    spec,
+                    cancel.clone(),
+                    pause,
+                    &mut on_progress,
+                )
+                .await
+                .map_err(classify_webdav_copy_tree_error)?;
+                return Ok(TransferOutcome {
+                    completed: items,
+                    total: items,
+                });
+            }
+
             let target = spec.target();
             let provider = registry.webdav_provider_for_transfer(target).map_err(|e| {
                 TransferExecutionError::InvalidPlan {
@@ -482,6 +547,9 @@ pub async fn execute_transfer(
                         completed: items,
                         total: items,
                     });
+                }
+                WebDavTransferSpec::CopyTree { .. } => {
+                    unreachable!("CopyTree is handled before the single-provider WebDAV executor")
                 }
                 WebDavTransferSpec::Batch { target, items } => {
                     return execute_webdav_batch(

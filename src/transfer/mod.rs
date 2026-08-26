@@ -156,6 +156,13 @@ pub enum WebDavTransferSpec {
         source: crate::vfs::WebDavCollectionRef,
         local_destination: PathBuf,
     },
+    /// One exact WebDAV collection copied recursively into one NEW WebDAV
+    /// destination root. Source and destination target ids are independently
+    /// frozen; existing source identity is never reconstructed from display.
+    CopyTree {
+        source: crate::vfs::WebDavCollectionRef,
+        destination_root: WebDavWriteTarget,
+    },
     /// Two or more frozen sibling roots executed sequentially through the
     /// existing WebDAV executor and one concrete provider authority.
     Batch {
@@ -174,6 +181,7 @@ impl WebDavTransferSpec {
             } => &destination_root.target,
             Self::DownloadOne { source, .. } => &source.target,
             Self::DownloadTree { source, .. } => &source.target,
+            Self::CopyTree { source, .. } => &source.target,
             Self::Batch { target, .. } => target,
         }
     }
@@ -335,13 +343,23 @@ impl TransferPlanner {
             )
     }
 
-    /// Local<->WebDAV `Copy` is the only WebDAV shape the planner supports.
+    /// WebDAV Copy supports the existing Local<->WebDAV shapes plus one
+    /// frozen WebDAV->WebDAV recursive collection spec. Move/Synchronize stay
+    /// fail-closed.
     fn is_webdav_pair(request: &TransferRequest) -> bool {
-        request.intent == TransferIntent::Copy
-            && matches!(
-                (request.source_provider, request.destination_provider),
-                (ProviderId::Local, ProviderId::WebDAV) | (ProviderId::WebDAV, ProviderId::Local)
-            )
+        if request.intent != TransferIntent::Copy {
+            return false;
+        }
+        match (request.source_provider, request.destination_provider) {
+            (ProviderId::Local, ProviderId::WebDAV) | (ProviderId::WebDAV, ProviderId::Local) => {
+                true
+            }
+            (ProviderId::WebDAV, ProviderId::WebDAV) => matches!(
+                request.webdav_spec,
+                Some(WebDavTransferSpec::CopyTree { .. })
+            ),
+            _ => false,
+        }
     }
 
     fn native_operation_supported(request: &TransferRequest) -> bool {
@@ -580,7 +598,40 @@ pub fn build_webdav_copy_spec(
                 _ => Err("WebDAV download requires an exact file or collection identity".into()),
             }
         }
-        _ => Err("WebDAV copy requires exactly one Local pane and one WebDAV pane".into()),
+        (
+            Location::WebDav {
+                target: source_target,
+                ..
+            },
+            Location::WebDav {
+                target: destination_target,
+                path: destination_path,
+            },
+        ) => match (&source.entry.kind, &source.identity) {
+            (EntryKind::Directory, EntryIdentity::WebDavCollection(collection)) => {
+                if collection.target != *source_target {
+                    return Err(format!(
+                        "WebDAV collection target '{}' does not match source pane target '{}'",
+                        collection.target, source_target
+                    ));
+                }
+                let destination_root = webdav_write_child_target(
+                    destination_target,
+                    destination_path,
+                    &source.entry.name,
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(WebDavTransferSpec::CopyTree {
+                    source: collection.clone(),
+                    destination_root,
+                })
+            }
+            (EntryKind::Directory, _) => {
+                Err("WebDAV to WebDAV recursive copy requires an exact collection identity".into())
+            }
+            _ => Err("WebDAV to WebDAV copy currently supports exactly one collection root".into()),
+        },
+        _ => Err("WebDAV copy requires Local/WebDAV or WebDAV/WebDAV panes".into()),
     }
 }
 
@@ -711,6 +762,56 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn webdav_remote_copy_requires_frozen_copy_tree_and_rejects_move() {
+        let source = crate::vfs::WebDavCollectionRef {
+            target: "dav-a".into(),
+            href: "/dav/source/".into(),
+        };
+        let destination_root = WebDavWriteTarget {
+            target: "dav-b".into(),
+            logical_path: "/copied".into(),
+        };
+        let base = TransferRequest {
+            source: Location::WebDav {
+                target: "dav-a".into(),
+                path: "/source".into(),
+            },
+            destination: Location::WebDav {
+                target: "dav-b".into(),
+                path: "/".into(),
+            },
+            source_provider: ProviderId::WebDAV,
+            destination_provider: ProviderId::WebDAV,
+            source_capabilities: builtin_capabilities(ProviderId::WebDAV),
+            destination_capabilities: builtin_capabilities(ProviderId::WebDAV),
+            intent: TransferIntent::Copy,
+            executors: ExecutorAvailability {
+                native: false,
+                rsync: false,
+                sftp: false,
+                s3: false,
+                webdav: true,
+            },
+            delete_extraneous: false,
+            s3_spec: None,
+            webdav_spec: Some(WebDavTransferSpec::CopyTree {
+                source,
+                destination_root,
+            }),
+        };
+        assert_eq!(
+            TransferPlanner::plan(base.clone()).unwrap().method,
+            TransferMethod::WebDav
+        );
+        let mut without_spec = base.clone();
+        without_spec.webdav_spec = None;
+        assert!(TransferPlanner::plan(without_spec).is_err());
+        let mut moved = base;
+        moved.intent = TransferIntent::Move;
+        assert!(TransferPlanner::plan(moved).is_err());
+    }
+
     fn remote_to_remote_uses_sftp_and_never_rsync() {
         let plan = TransferPlanner::plan(TransferRequest {
             source: sftp("prod-a", "/src"),

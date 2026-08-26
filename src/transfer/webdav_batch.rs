@@ -78,11 +78,13 @@ pub fn build_webdav_batch_spec(
     if items.len() < 2 {
         return Err("WebDAV batch copy requires at least two roots".into());
     }
-    if items
-        .iter()
-        .any(|item| matches!(item, WebDavTransferSpec::Batch { .. }))
-    {
-        return Err("nested WebDAV transfer batches are not supported".into());
+    if items.iter().any(|item| {
+        matches!(
+            item,
+            WebDavTransferSpec::Batch { .. } | WebDavTransferSpec::CopyTree { .. }
+        )
+    }) {
+        return Err("WebDAV batch supports only Local/WebDAV root transfers".into());
     }
 
     let target = items[0].target().to_string();
@@ -107,6 +109,16 @@ pub fn prepare_webdav_copy_batch(
 ) -> Result<(WebDavTransferSpec, Vec<String>), String> {
     let sources =
         resolve_webdav_copy_sources(selected_names, focused_source, current_active_listed)?;
+
+    let remote_to_remote = matches!(
+        (src_loc, dst_loc),
+        (Location::WebDav { .. }, Location::WebDav { .. })
+    );
+    if remote_to_remote && sources.len() != 1 {
+        return Err(
+            "WebDAV to WebDAV recursive copy currently requires exactly one collection root".into(),
+        );
+    }
 
     let mut specs = Vec::with_capacity(sources.len());
     let mut names = Vec::with_capacity(sources.len());
@@ -341,6 +353,60 @@ mod tests {
 
         let valid = build_webdav_batch_spec(vec![one.clone(), one.clone()]).unwrap();
         assert!(build_webdav_batch_spec(vec![one, valid]).is_err());
+    }
+
+    #[test]
+    fn webdav_to_webdav_freezes_exact_collection_and_new_destination() {
+        let collection = dav_dir("tree", "src", "/dav/native/tree%20raw/");
+        let (spec, names) = prepare_webdav_copy_batch(
+            &dav_location("src", "/presentation/ignored"),
+            &dav_location("dst", "/backups"),
+            &[],
+            Some(&collection),
+            &[&collection],
+        )
+        .unwrap();
+        assert_eq!(names, vec!["tree"]);
+        let WebDavTransferSpec::CopyTree {
+            source,
+            destination_root,
+        } = spec
+        else {
+            panic!("expected CopyTree");
+        };
+        assert_eq!(source.target, "src");
+        assert_eq!(source.href, "/dav/native/tree%20raw/");
+        assert_eq!(destination_root.target, "dst");
+        assert_eq!(destination_root.logical_path, "/backups/tree");
+    }
+
+    #[test]
+    fn webdav_to_webdav_rejects_file_and_multi_root() {
+        let file = dav_file("file.txt", "src", "/dav/file.txt");
+        assert!(
+            prepare_webdav_copy_batch(
+                &dav_location("src", "/"),
+                &dav_location("dst", "/"),
+                &[],
+                Some(&file),
+                &[&file],
+            )
+            .is_err()
+        );
+
+        let one = dav_dir("one", "src", "/dav/one/");
+        let two = dav_dir("two", "src", "/dav/two/");
+        assert!(
+            prepare_webdav_copy_batch(
+                &dav_location("src", "/"),
+                &dav_location("dst", "/"),
+                &["one".into(), "two".into()],
+                None,
+                &[&one, &two],
+            )
+            .unwrap_err()
+            .contains("exactly one collection root")
+        );
     }
 
     #[test]

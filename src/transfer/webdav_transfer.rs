@@ -13,7 +13,7 @@ use crate::transfer::{
     webdav_write_child_target,
 };
 use crate::transfer_queue::TypedTransferProgress;
-use crate::vfs::webdav::{NewCollectionError, WebDavProvider};
+use crate::vfs::webdav::{NewCollectionError, StreamPutError, WebDavProvider};
 use crate::vfs::{
     EntryIdentity, MAX_WEBDAV_TREE_DEPTH, MAX_WEBDAV_TREE_DESCENDANTS, WebDavCollectionRef,
     WebDavObjectRef,
@@ -100,6 +100,31 @@ pub(crate) struct UploadTreeCleanupFailure {
     pub logical_path: String,
     pub original: String,
     pub cleanup: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CopyTreeFailure {
+    #[error("WebDAV copy root ownership is ambiguous at {target}:{logical_path}: {reason}")]
+    RootAmbiguous {
+        target: String,
+        logical_path: String,
+        reason: String,
+    },
+    #[error("WebDAV copy mutation outcome is ambiguous at {target}:{logical_path}: {reason}")]
+    AmbiguousMutation {
+        target: String,
+        logical_path: String,
+        reason: String,
+    },
+    #[error(
+        "WebDAV copy failed and cleanup of {target}:{logical_path} failed: original={original}; cleanup={cleanup}"
+    )]
+    CleanupFailure {
+        target: String,
+        logical_path: String,
+        original: String,
+        cleanup: String,
+    },
 }
 
 fn accept_unique_identity(
@@ -1086,6 +1111,329 @@ pub(crate) async fn download_tree(
 
     if let Err(error) = materialize {
         return Err(cleanup_owned_root(final_root, error).await);
+    }
+    Ok(1 + manifest.descendant_count)
+}
+
+async fn revalidate_tree_manifest(
+    provider: &WebDavProvider,
+    source: &WebDavCollectionRef,
+    frozen: &WebDavTreeManifest,
+    cancel: &AtomicBool,
+    pause: &crate::transfer_queue::PauseGate,
+) -> io::Result<()> {
+    let current = build_tree_manifest(provider, source, cancel, pause).await?;
+    if &current != frozen {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WebDAV source tree changed after manifest freeze",
+        ));
+    }
+    Ok(())
+}
+
+fn verified_manifest_shape(
+    source: &WebDavTreeManifest,
+    destination: &WebDavTreeManifest,
+) -> io::Result<()> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let source_dirs = source
+        .directories
+        .iter()
+        .map(|entry| entry.relative.clone())
+        .collect::<BTreeSet<_>>();
+    let destination_dirs = destination
+        .directories
+        .iter()
+        .map(|entry| entry.relative.clone())
+        .collect::<BTreeSet<_>>();
+    if source_dirs != destination_dirs {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WebDAV copy verification failed: directory manifest differs",
+        ));
+    }
+    let source_files = source
+        .files
+        .iter()
+        .map(|entry| (entry.relative.clone(), entry.advertised_size))
+        .collect::<BTreeMap<_, _>>();
+    let destination_files = destination
+        .files
+        .iter()
+        .map(|entry| (entry.relative.clone(), entry.advertised_size))
+        .collect::<BTreeMap<_, _>>();
+    if source_files.len() != destination_files.len()
+        || source_files.keys().ne(destination_files.keys())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WebDAV copy verification failed: file manifest differs",
+        ));
+    }
+    for (relative, source_size) in source_files {
+        if let Some(expected) = source_size {
+            if destination_files.get(&relative).copied().flatten() != Some(expected) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "WebDAV copy verification failed: size differs for {}",
+                        relative.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cleanup_copied_root(
+    provider: &WebDavProvider,
+    root: &WebDavWriteTarget,
+    original: io::Error,
+) -> io::Error {
+    match provider.delete_logical_collection(&root.logical_path).await {
+        Ok(()) => original,
+        Err(cleanup) => io::Error::other(CopyTreeFailure::CleanupFailure {
+            target: root.target.clone(),
+            logical_path: root.logical_path.clone(),
+            original: original.to_string(),
+            cleanup: cleanup.to_string(),
+        }),
+    }
+}
+
+const WEBDAV_REMOTE_COPY_PIPE_BYTES: usize = 64 * 1024;
+const MAX_WEBDAV_REMOTE_COPY_FILE_BYTES: usize = 16 * 1024 * 1024 * 1024;
+
+async fn copy_tree_file_streamed(
+    source_provider: &WebDavProvider,
+    destination_provider: &WebDavProvider,
+    file: &TreeFile,
+    destination: &WebDavWriteTarget,
+    cancel: Arc<AtomicBool>,
+    pause: crate::transfer_queue::PauseGate,
+    base: u64,
+    total: Option<u64>,
+    on_progress: &mut impl FnMut(TypedTransferProgress),
+) -> io::Result<u64> {
+    let (mut writer, reader) = tokio::io::duplex(WEBDAV_REMOTE_COPY_PIPE_BYTES);
+    let get = async {
+        let result = source_provider
+            .get_stream(
+                &file.source.href,
+                MAX_WEBDAV_REMOTE_COPY_FILE_BYTES,
+                &mut writer,
+                Some(&cancel),
+                Some(&pause),
+                |completed, _| {
+                    if let Some(completed) = base.checked_add(completed) {
+                        on_progress(TypedTransferProgress::Bytes { completed, total });
+                    }
+                },
+            )
+            .await;
+        drop(writer);
+        result
+    };
+    let put = destination_provider.put_logical_stream_with_policy(
+        &destination.logical_path,
+        reader,
+        file.advertised_size,
+        WebDavOverwritePolicy::Forbid,
+    );
+    let (get_result, put_result) = tokio::join!(get, put);
+
+    match put_result {
+        Ok(()) => {}
+        Err(StreamPutError::Definitive(error)) => return Err(error),
+        Err(StreamPutError::Ambiguous(error)) => {
+            return Err(io::Error::other(CopyTreeFailure::AmbiguousMutation {
+                target: destination.target.clone(),
+                logical_path: destination.logical_path.clone(),
+                reason: error.to_string(),
+            }));
+        }
+    }
+    let copied = get_result?;
+    if let Some(expected) = file.advertised_size {
+        if copied != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "WebDAV source size changed while streaming {}: expected {expected}, got {copied}",
+                    file.relative.display()
+                ),
+            ));
+        }
+    }
+    Ok(copied)
+}
+
+/// Copy one exact WebDAV collection into one NEW WebDAV root. The destination
+/// root remains attempt-owned until independent manifest verification succeeds.
+pub(crate) async fn copy_tree(
+    source_provider: &WebDavProvider,
+    destination_provider: &WebDavProvider,
+    spec: &WebDavTransferSpec,
+    cancel: Arc<AtomicBool>,
+    pause: crate::transfer_queue::PauseGate,
+    on_progress: &mut impl FnMut(TypedTransferProgress),
+) -> io::Result<usize> {
+    let (source, destination_root) = match spec {
+        WebDavTransferSpec::CopyTree {
+            source,
+            destination_root,
+        } => (source, destination_root),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "copy_tree requires WebDavTransferSpec::CopyTree",
+            ));
+        }
+    };
+    if source_provider.target().id != source.target {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "WebDAV copy source target does not match source provider",
+        ));
+    }
+    if destination_provider.target().id != destination_root.target {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "WebDAV copy destination target does not match destination provider",
+        ));
+    }
+    if source.target == destination_root.target {
+        source_provider
+            .ensure_logical_destination_disjoint(source, &destination_root.logical_path)?;
+    }
+
+    // Freeze without destination mutation, then independently rebuild immediately
+    // before the first MKCOL.
+    let manifest = build_tree_manifest(source_provider, source, &cancel, &pause).await?;
+    pause.checkpoint().await;
+    if cancel.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "WebDAV remote tree copy cancelled",
+        ));
+    }
+    revalidate_tree_manifest(source_provider, source, &manifest, &cancel, &pause).await?;
+    pause.checkpoint().await;
+    if cancel.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "WebDAV remote tree copy cancelled",
+        ));
+    }
+
+    match destination_provider
+        .create_new_collection(&destination_root.logical_path)
+        .await
+    {
+        Ok(()) => {}
+        Err(NewCollectionError::Definitive(error)) => return Err(error),
+        Err(NewCollectionError::Ambiguous(error)) => {
+            return Err(io::Error::other(CopyTreeFailure::RootAmbiguous {
+                target: destination_root.target.clone(),
+                logical_path: destination_root.logical_path.clone(),
+                reason: error.to_string(),
+            }));
+        }
+    }
+
+    let materialize: io::Result<()> = async {
+        for directory in &manifest.directories {
+            pause.checkpoint().await;
+            if cancel.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "WebDAV remote tree copy cancelled",
+                ));
+            }
+            let target = upload_target_for_relative(destination_root, &directory.relative)?;
+            destination_provider
+                .create_new_collection(&target.logical_path)
+                .await
+                .map_err(|error| match error {
+                    NewCollectionError::Definitive(error) => error,
+                    NewCollectionError::Ambiguous(error) => {
+                        io::Error::other(CopyTreeFailure::AmbiguousMutation {
+                            target: target.target.clone(),
+                            logical_path: target.logical_path.clone(),
+                            reason: error.to_string(),
+                        })
+                    }
+                })?;
+        }
+
+        let mut completed_before = 0u64;
+        for file in &manifest.files {
+            pause.checkpoint().await;
+            if cancel.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "WebDAV remote tree copy cancelled",
+                ));
+            }
+            let target = upload_target_for_relative(destination_root, &file.relative)?;
+            let copied = copy_tree_file_streamed(
+                source_provider,
+                destination_provider,
+                file,
+                &target,
+                cancel.clone(),
+                pause.clone(),
+                completed_before,
+                manifest.total_bytes,
+                on_progress,
+            )
+            .await?;
+            completed_before = completed_before.checked_add(copied).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WebDAV copy byte count overflow",
+                )
+            })?;
+            on_progress(TypedTransferProgress::Bytes {
+                completed: completed_before,
+                total: manifest.total_bytes,
+            });
+        }
+        if manifest.files.is_empty() {
+            on_progress(TypedTransferProgress::Bytes {
+                completed: 0,
+                total: Some(0),
+            });
+        }
+
+        pause.checkpoint().await;
+        if cancel.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "WebDAV remote tree copy cancelled",
+            ));
+        }
+        let exact_destination = destination_provider
+            .resolve_logical_collection_exact(&destination_root.logical_path)
+            .await?;
+        let destination_manifest =
+            build_tree_manifest(destination_provider, &exact_destination, &cancel, &pause).await?;
+        verified_manifest_shape(&manifest, &destination_manifest)?;
+        pause.checkpoint().await;
+        if cancel.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "WebDAV remote tree copy cancelled",
+            ));
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = materialize {
+        return Err(cleanup_copied_root(destination_provider, destination_root, error).await);
     }
     Ok(1 + manifest.descendant_count)
 }
