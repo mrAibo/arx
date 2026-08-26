@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::vfs::{Location, ProviderRegistry, local::LocalFs};
+use crate::vfs::{Location, ProviderRegistry, local::LocalFs, webdav::WebDavProvider};
 
 use super::s3_download;
 use super::s3_upload;
@@ -141,6 +141,151 @@ fn classify_webdav_tree_error(error: io::Error) -> TransferExecutionError {
             disposition: crate::transfer_queue::RetryDisposition::NeverRetry,
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("WebDAV batch root '{item}' failed after {completed} of {total} completed: {source}")]
+struct WebDavBatchFailure {
+    item: String,
+    completed: usize,
+    total: usize,
+    #[source]
+    source: Box<TransferExecutionError>,
+}
+
+fn webdav_batch_failure_disposition(
+    error: &TransferExecutionError,
+) -> crate::transfer_queue::RetryDisposition {
+    match error.retry_disposition() {
+        crate::transfer_queue::RetryDisposition::RecoveryRequired => {
+            crate::transfer_queue::RetryDisposition::RecoveryRequired
+        }
+        crate::transfer_queue::RetryDisposition::AmbiguousMutation => {
+            crate::transfer_queue::RetryDisposition::AmbiguousMutation
+        }
+        _ => crate::transfer_queue::RetryDisposition::NeverRetry,
+    }
+}
+
+async fn execute_webdav_batch_item(
+    provider: &WebDavProvider,
+    spec: &WebDavTransferSpec,
+    cancel: Arc<AtomicBool>,
+    pause: crate::transfer_queue::PauseGate,
+) -> Result<(), TransferExecutionError> {
+    let mut discard_progress = |_| {};
+    match spec {
+        WebDavTransferSpec::UploadOne { .. } => {
+            webdav_upload_one(
+                provider,
+                spec,
+                WebDavOverwritePolicy::Forbid,
+                cancel,
+                &mut discard_progress,
+            )
+            .await
+            .map_err(|error| {
+                match error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<TransferExecutionError>())
+                {
+                    Some(typed) => TransferExecutionError::Io {
+                        disposition: typed.retry_disposition(),
+                        source: error,
+                    },
+                    None => TransferExecutionError::ambiguous(error),
+                }
+            })?;
+        }
+        WebDavTransferSpec::UploadTree { .. } => {
+            webdav_upload_tree(provider, spec, cancel, pause, &mut discard_progress)
+                .await
+                .map_err(classify_webdav_upload_tree_error)?;
+        }
+        WebDavTransferSpec::DownloadOne { .. } => {
+            webdav_download_one(
+                provider,
+                spec,
+                WebDavOverwritePolicy::Forbid,
+                cancel,
+                pause,
+                &mut discard_progress,
+            )
+            .await
+            .map_err(TransferExecutionError::from)?;
+        }
+        WebDavTransferSpec::DownloadTree { .. } => {
+            webdav_download_tree(provider, spec, cancel, pause, &mut discard_progress)
+                .await
+                .map_err(classify_webdav_tree_error)?;
+        }
+        WebDavTransferSpec::Batch { .. } => {
+            return Err(TransferExecutionError::InvalidPlan {
+                method: TransferMethod::WebDav,
+                reason: "nested WebDAV transfer batch".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn execute_webdav_batch(
+    provider: &WebDavProvider,
+    target: &str,
+    items: &[WebDavTransferSpec],
+    names: &[String],
+    cancel: Arc<AtomicBool>,
+    pause: crate::transfer_queue::PauseGate,
+    on_progress: &mut impl FnMut(TypedTransferProgress),
+) -> Result<TransferOutcome, TransferExecutionError> {
+    if items.len() < 2 || names.len() != items.len() {
+        return Err(TransferExecutionError::InvalidPlan {
+            method: TransferMethod::WebDav,
+            reason: "WebDAV batch requires matching root specs and names".into(),
+        });
+    }
+    if items
+        .iter()
+        .any(|item| matches!(item, WebDavTransferSpec::Batch { .. }) || item.target() != target)
+    {
+        return Err(TransferExecutionError::InvalidPlan {
+            method: TransferMethod::WebDav,
+            reason: "WebDAV batch contains a nested or mixed-target root".into(),
+        });
+    }
+
+    let total = items.len();
+    let mut completed = 0usize;
+    for (index, item) in items.iter().enumerate() {
+        pause.checkpoint().await;
+        ensure_not_cancelled(&cancel, completed)?;
+        match execute_webdav_batch_item(provider, item, cancel.clone(), pause.clone()).await {
+            Ok(()) => {
+                completed += 1;
+                on_progress(TypedTransferProgress::Items {
+                    completed: completed as u64,
+                    total: Some(total as u64),
+                });
+            }
+            Err(TransferExecutionError::Cancelled { .. }) => {
+                return Err(TransferExecutionError::Cancelled { completed });
+            }
+            Err(error) => {
+                let disposition = webdav_batch_failure_disposition(&error);
+                return Err(TransferExecutionError::Io {
+                    source: io::Error::other(WebDavBatchFailure {
+                        item: names[index].clone(),
+                        completed,
+                        total,
+                        source: Box::new(error),
+                    }),
+                    disposition,
+                });
+            }
+        }
+    }
+
+    Ok(TransferOutcome { completed, total })
 }
 
 /// Execute a previously validated transfer plan without blocking the async TUI.
@@ -337,6 +482,18 @@ pub async fn execute_transfer(
                         completed: items,
                         total: items,
                     });
+                }
+                WebDavTransferSpec::Batch { target, items } => {
+                    return execute_webdav_batch(
+                        &provider,
+                        target,
+                        items,
+                        names,
+                        cancel.clone(),
+                        pause,
+                        &mut on_progress,
+                    )
+                    .await;
                 }
             }
             Ok(TransferOutcome {

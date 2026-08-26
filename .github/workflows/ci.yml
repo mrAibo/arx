@@ -98,6 +98,7 @@ jobs:
           cargo test --locked --lib --features physical-webdav physical_webdav_recursive_download_tree -- --nocapture
           cargo test --locked --lib --features physical-webdav physical_webdav_recursive_upload_tree -- --nocapture
           cargo test --locked --lib --features physical-webdav physical_webdav_recursive_delete_tree -- --nocapture
+          cargo test --locked --lib --features physical-webdav physical_webdav_multi_root_copy -- --nocapture
           cargo test --locked --test webdav_recursive_delete_safety --features physical-webdav -- --nocapture --test-threads=1
 
   # #7: real PTY + real tmux/GNU screen interactive lifecycle acceptance.
