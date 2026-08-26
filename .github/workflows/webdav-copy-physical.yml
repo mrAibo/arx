@@ -1,0 +1,51 @@
+name: WebDAV Remote Copy Physical
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  webdav-remote-copy-physical:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Exact-SHA evidence
+        run: |
+          set -euo pipefail
+          TESTED_SHA="$(git rev-parse HEAD)"
+          EXPECTED="${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "TESTED_SHA=$TESTED_SHA"
+          echo "EXPECTED_SHA=$EXPECTED"
+          if [ "$EXPECTED" != "$TESTED_SHA" ]; then
+            echo "::error::checked-out SHA ($TESTED_SHA) != expected head ($EXPECTED)"
+            exit 1
+          fi
+
+      - name: Provision two Apache mod_dav endpoints and run #275 matrix
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          source ./scripts/setup_webdav_copy_acceptance.sh
+          cargo test --locked --lib --features physical-webdav \
+            physical_webdav_remote_recursive_copy -- --nocapture --test-threads=1
+
+      - name: Retry-disposition regression evidence
+        run: |
+          set -euo pipefail
+          cargo test --locked --test transfer_queue_contracts \
+            ambiguous_and_recovery_dispositions_stop_after_one_attempt -- --nocapture
