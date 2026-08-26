@@ -7,6 +7,7 @@ pub mod sftp_copy;
 pub mod s3_download;
 pub mod s3_multipart;
 pub mod s3_upload;
+pub mod webdav_batch;
 pub mod webdav_transfer;
 
 pub use self::executor::TransferOutcome;
@@ -155,6 +156,12 @@ pub enum WebDavTransferSpec {
         source: crate::vfs::WebDavCollectionRef,
         local_destination: PathBuf,
     },
+    /// Two or more frozen sibling roots executed sequentially through the
+    /// existing WebDAV executor and one concrete provider authority.
+    Batch {
+        target: String,
+        items: Vec<WebDavTransferSpec>,
+    },
 }
 
 impl WebDavTransferSpec {
@@ -167,6 +174,7 @@ impl WebDavTransferSpec {
             } => &destination_root.target,
             Self::DownloadOne { source, .. } => &source.target,
             Self::DownloadTree { source, .. } => &source.target,
+            Self::Batch { target, .. } => target,
         }
     }
 }

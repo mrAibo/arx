@@ -127,20 +127,20 @@ pub(super) fn handle_action(
                     None
                 };
 
-            // WebDAV basic transfer: resolve exactly ONE source from the ACTIVE
-            // pane. Selection wins over cursor and is matched against current
-            // real ListedEntry rows; passive pane contributes Location only.
+            // WebDAV transfer: resolve one or many roots only from CURRENT
+            // real rows of the ACTIVE source pane. Multi-selection is frozen as
+            // one sequential Batch; the passive pane contributes Location only.
             let webdav_spec: Option<arx::transfer::WebDavTransferSpec> =
                 if src_provider == ProviderId::WebDAV || dst_provider == ProviderId::WebDAV {
-                    match arx::transfer::prepare_webdav_copy(
+                    match arx::transfer::webdav_batch::prepare_webdav_copy_batch(
                         &src_loc,
                         &dst_loc,
                         &selected_names,
                         focused_listed,
                         active_listed,
                     ) {
-                        Ok((spec, queue_name)) => {
-                            names = vec![queue_name];
+                        Ok((spec, queue_names)) => {
+                            names = queue_names;
                             Some(spec)
                         }
                         Err(msg) => {
@@ -431,8 +431,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn webdav_multi_selection_dispatch_fails_before_enqueue() {
+    #[tokio::test]
+    async fn webdav_multi_selection_dispatch_queues_one_job() {
         let registry = ProviderRegistry::new();
         let sync = sync_runtime(registry.clone());
         let mut state = AppState {
@@ -476,11 +476,16 @@ mod tests {
             &[&a, &b],
             &sync,
         ));
-        assert_eq!(
-            state.message.as_deref(),
-            Some("WebDAV copy currently supports one selected item")
+        let message = state.message.as_deref().expect("queue confirmation");
+        assert!(
+            message.starts_with("Copy queued ("),
+            "unexpected message: {message}"
         );
-        assert!(sync.jobs.snapshot().is_empty(), "nothing enqueued");
+        assert_eq!(
+            sync.jobs.snapshot().len(),
+            1,
+            "one batch selection = one job"
+        );
     }
 
     fn sync_runtime(registry: ProviderRegistry) -> SyncUiRuntime {

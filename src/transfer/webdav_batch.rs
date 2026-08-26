@@ -105,11 +105,8 @@ pub fn prepare_webdav_copy_batch(
     focused_source: Option<&ListedEntry>,
     current_active_listed: &[&ListedEntry],
 ) -> Result<(WebDavTransferSpec, Vec<String>), String> {
-    let sources = resolve_webdav_copy_sources(
-        selected_names,
-        focused_source,
-        current_active_listed,
-    )?;
+    let sources =
+        resolve_webdav_copy_sources(selected_names, focused_source, current_active_listed)?;
 
     let mut specs = Vec::with_capacity(sources.len());
     let mut names = Vec::with_capacity(sources.len());
@@ -136,10 +133,21 @@ pub fn prepare_webdav_copy_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vfs::{
-        Entry, EntryIdentity, EntryKind, WebDavCollectionRef, WebDavObjectRef,
-    };
+    use crate::vfs::{Entry, EntryIdentity, EntryKind, WebDavCollectionRef, WebDavObjectRef};
     use std::path::PathBuf;
+
+    fn test_temp_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "arx-webdav-batch-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     fn local_file(name: &str) -> ListedEntry {
         ListedEntry {
@@ -243,10 +251,10 @@ mod tests {
     fn multi_download_preserves_exact_native_refs() {
         let object = dav_file("file.txt", "dav", "/native/f%20x?rev=1");
         let collection = dav_dir("tree", "dav", "/native/tree%2Fraw/?rev=2");
-        let destination = tempfile::tempdir().unwrap();
+        let destination = test_temp_dir("download");
         let (spec, names) = prepare_webdav_copy_batch(
             &dav_location("dav", "/presentation/ignored"),
-            &Location::Local(destination.path().to_path_buf()),
+            &Location::Local(destination.clone()),
             &["tree".into(), "file.txt".into()],
             None,
             &[&object, &collection],
@@ -339,11 +347,11 @@ mod tests {
     fn known_local_collision_fails_before_enqueue() {
         let first = dav_file("a", "dav", "/a");
         let second = dav_dir("b", "dav", "/b/");
-        let destination = tempfile::tempdir().unwrap();
-        std::fs::write(destination.path().join("a"), b"existing").unwrap();
+        let destination = test_temp_dir("collision");
+        std::fs::write(destination.join("a"), b"existing").unwrap();
         let error = prepare_webdav_copy_batch(
             &dav_location("dav", "/"),
-            &Location::Local(destination.path().to_path_buf()),
+            &Location::Local(destination.clone()),
             &["a".into(), "b".into()],
             None,
             &[&first, &second],
