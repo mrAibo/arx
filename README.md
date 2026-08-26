@@ -4,7 +4,7 @@ Terminal commander for local ↔ remote workspaces on Linux.
 
 ![ARX Remote Workspace — Compare, Preview, Sync, Verify](docs/assets/remote-workspace-update.gif)
 
-**Current release: [v0.22.0](https://github.com/mrAibo/arx/releases/tag/v0.22.0)**  
+**Current release: [v0.23.0](https://github.com/mrAibo/arx/releases/tag/v0.23.0)**  
 Linux x86_64 · Rust MSRV 1.88 · MIT
 
 Compare before touching anything. Preview the exact consequences. Execute. Verify the real result.
@@ -17,11 +17,11 @@ Compare before touching anything. Preview the exact consequences. Execute. Verif
 - **Truthful background work.** Queue, pause-pending, paused, retry-waiting, cancelled, failed, completed, and verification remain distinct states.
 - **Safe remote semantics.** ARX prefers noclobber/staged operations and never blindly replays ambiguous remote mutations.
 - **Provider-native identity.** Existing remote resources are addressed by provider truth, not reconstructed display names.
-- **Read-only storage intelligence.** `Alt+U` provides truthful Local usage analysis and, on current `main`, exact S3 object plus bounded bucket/prefix inspection without inventing filesystem-capacity semantics.
+- **Read-only storage intelligence.** `Alt+U` provides truthful Local usage analysis and exact S3 object plus bounded bucket/prefix inspection without inventing filesystem-capacity semantics.
 
 Remote Workspace synchronization currently supports Local → Local, Local → SFTP, and SFTP → Local. SFTP → SFTP workspace synchronization remains intentionally unsupported.
 
-**Current `main` is ahead of v0.22.0.** It includes the read-only S3 Object & Bucket Inspector from [#264](https://github.com/mrAibo/arx/issues/264) / [#265](https://github.com/mrAibo/arx/pull/265). The latest published binaries remain v0.22.0 until a new release is cut.
+**v0.23.0 ships the read-only S3 Object & Bucket Inspector** from [#264](https://github.com/mrAibo/arx/issues/264) / [#265](https://github.com/mrAibo/arx/pull/265), including exact object inspection and bounded bucket/prefix LiveScan analytics.
 
 ## Platform support
 
@@ -29,11 +29,11 @@ ARX is intentionally a **Linux application**. The published release target is **
 
 When ARX runs inside SSH, the established session environment is authoritative. ARX preserves an existing `DISPLAY` but never invents one; X11 forwarding must already be provided by the SSH client/session.
 
-## Install v0.22.0
+## Install v0.23.0
 
 Published binaries and packages live under **GitHub Releases**, not in the source tree. The repository intentionally does not track a current `bin/arx` copy.
 
-Download your preferred artifact and `SHA256SUMS` from the [v0.22.0 release](https://github.com/mrAibo/arx/releases/tag/v0.22.0).
+Download your preferred artifact and `SHA256SUMS` from the [v0.23.0 release](https://github.com/mrAibo/arx/releases/tag/v0.23.0).
 
 Verify downloaded artifacts:
 
@@ -44,27 +44,27 @@ sha256sum --ignore-missing -c SHA256SUMS
 ### Debian / Ubuntu
 
 ```bash
-sudo apt install ./arx_0.22.0_amd64.deb
+sudo apt install ./arx_0.23.0_amd64.deb
 ```
 
 ### Fedora / RHEL family
 
 ```bash
-sudo dnf install ./arx-0.22.0-1.x86_64.rpm
+sudo dnf install ./arx-0.23.0-1.x86_64.rpm
 ```
 
 ### Portable tarball
 
 ```bash
-tar xzf arx-v0.22.0-x86_64-unknown-linux-gnu.tar.gz
-sudo install -m 755 arx-v0.22.0-x86_64-unknown-linux-gnu/arx /usr/local/bin/arx
+tar xzf arx-v0.23.0-x86_64-unknown-linux-gnu.tar.gz
+sudo install -m 755 arx-v0.23.0-x86_64-unknown-linux-gnu/arx /usr/local/bin/arx
 arx --version
 ```
 
 Expected output:
 
 ```text
-arx 0.22.0
+arx 0.23.0
 ```
 
 Release bundles include the MIT license and generated third-party license notices. Native packages install documentation under `/usr/share/doc/arx`.
@@ -98,12 +98,12 @@ arx
 | Transfer Queue | Bounded FIFO, concurrency 1..=8, progress/rate/ETA where known, Pause/Resume/Cancel, safe retry ≤3 attempts |
 | Transfer Center | Active / History / All views with runtime-owned controls |
 | Workspace Sync | Compare → Preview → Execute → Verify for supported Local/SFTP directions |
-| Storage Inspector (`Alt+U`) | Local: read-only `du++`-style logical/allocated usage, drill-down/top files/cancellation. S3 on current `main`: exact object inspection plus bounded paginated bucket/prefix LiveScan analytics |
+| Storage Inspector (`Alt+U`) | Local: read-only `du++`-style logical/allocated usage, drill-down/top files/cancellation. S3: exact object inspection plus bounded paginated bucket/prefix LiveScan analytics |
 | Filesystems | Read-only Linux `df++`-style capacity/inode view; S3 never receives fake `df` semantics |
 | Effective keymap | Conflict-safe user overrides + `arx --print-keymap` |
 | Quick Actions | Typed local SHA-256, Touch, Compress to tar.gz; existing mkdir/chmod/symlink surface retained |
 | Embedded terminal | Built-in terminal plus hardened tmux / GNU Screen lifecycle |
-| S3 | AWS S3 + MinIO physically accepted; current `main` adds exact Object & Bucket/Prefix Inspector; Moto emulated; R2/Wasabi best-effort/unverified |
+| S3 | AWS S3 + MinIO physically accepted; v0.23.0 adds exact Object & Bucket/Prefix Inspector; Moto emulated; R2/Wasabi best-effort/unverified |
 | WebDAV | Apache mod_dav + Nextcloud 34.0.2 + ownCloud 11.0.0 physically accepted with Basic auth |
 | Packages | tar.gz + `.deb` + `.rpm` + one `SHA256SUMS`, all published from one validated ELF |
 | Extension surface | `arx.menu`; no embedded Lua/WASM/native plugin runtime |
@@ -123,9 +123,9 @@ arx
 | Ctrl+X C / L / O / S | chmod / hardlink / chown / symlink |
 | Ctrl+\\ | Toggle split pane |
 
-## S3 Object & Bucket Inspector on current main
+## S3 Object & Bucket Inspector in v0.23.0
 
-The post-v0.22.0 `main` adds read-only S3 storage intelligence without treating object storage like a POSIX filesystem.
+v0.23.0 adds read-only S3 storage intelligence without treating object storage like a POSIX filesystem.
 
 ### Exact object inspection
 
@@ -278,7 +278,7 @@ Provider behavior changes additionally require the relevant physical acceptance 
 - [ROADMAP.md](ROADMAP.md) — current product truth and future roadmap
 - [ARCHITECTURE.md](ARCHITECTURE.md) — architecture contracts and authority boundaries
 - [docs/DEVELOPMENT_HANDOFF.md](docs/DEVELOPMENT_HANDOFF.md) — continuation rules for development sessions
-- [docs/releases/v0.22.0.md](docs/releases/v0.22.0.md) — v0.22.0 release notes
+- [docs/releases/v0.23.0.md](docs/releases/v0.23.0.md) — v0.23.0 release notes
 - [GitHub Releases](https://github.com/mrAibo/arx/releases) — published binaries and checksums
 
 ## License
