@@ -1,0 +1,1820 @@
+name: ARX264 Bootstrap
+
+on:
+  push:
+    branches: [feature/s3-object-bucket-inspector]
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    if: github.event.head_commit.message == 'chore: bootstrap #264 implementation'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feature/s3-object-bucket-inspector
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Implement S3 inspector macro batch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          core = r'''//! Read-only S3 object and bucket/prefix inspection.
+//!
+//! The inspector deliberately reuses the concrete `S3Provider` and its lazy
+//! client. It never creates a second client cache, registry, scheduler, or job
+//! runtime. Aggregate scans are page-at-a-time and bounded in memory.
+
+use std::collections::BTreeMap;
+use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::vfs::Location;
+use crate::vfs::s3::{S3BucketRef, S3ObjectRef, S3PrefixRef, S3Provider};
+
+const INSPECT_PAGE_SIZE: i32 = 1000;
+const TOP_OBJECTS_LIMIT: usize = 20;
+const TOP_PREFIXES_LIMIT: usize = 20;
+const PREFIX_CARDINALITY_LIMIT: usize = 2048;
+const DAY_MS: u64 = 86_400_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S3EvidenceSource {
+    LiveScan,
+    StorageLens,
+    Inventory,
+    OtherProvider,
+    Unavailable,
+}
+
+impl S3EvidenceSource {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LiveScan => "LiveScan",
+            Self::StorageLens => "StorageLens",
+            Self::Inventory => "Inventory",
+            Self::OtherProvider => "OtherProvider",
+            Self::Unavailable => "Unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Evidence<T> {
+    pub source: S3EvidenceSource,
+    pub value: Option<T>,
+    pub note: Option<String>,
+}
+
+impl<T> S3Evidence<T> {
+    fn live(value: T) -> Self {
+        Self {
+            source: S3EvidenceSource::LiveScan,
+            value: Some(value),
+            note: None,
+        }
+    }
+
+    fn unavailable(note: impl Into<String>) -> Self {
+        Self {
+            source: S3EvidenceSource::Unavailable,
+            value: None,
+            note: Some(note.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum S3InspectionScope {
+    Bucket(S3BucketRef),
+    Prefix(S3PrefixRef),
+}
+
+impl S3InspectionScope {
+    pub fn target_id(&self) -> &str {
+        match self {
+            Self::Bucket(reference) => &reference.target,
+            Self::Prefix(reference) => &reference.target,
+        }
+    }
+
+    pub fn bucket(&self) -> &str {
+        match self {
+            Self::Bucket(reference) => &reference.bucket,
+            Self::Prefix(reference) => &reference.bucket,
+        }
+    }
+
+    pub fn wire_prefix(&self) -> &str {
+        match self {
+            Self::Bucket(_) => "",
+            Self::Prefix(reference) => &reference.prefix,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum S3InspectionTarget {
+    Object(S3ObjectRef),
+    Scope(S3InspectionScope),
+}
+
+impl S3InspectionTarget {
+    pub fn target_id(&self) -> &str {
+        match self {
+            Self::Object(reference) => &reference.target,
+            Self::Scope(scope) => scope.target_id(),
+        }
+    }
+}
+
+/// Convert the current typed S3 navigation location into an exact inspection
+/// scope. A non-empty navigation prefix receives exactly one protocol `/`,
+/// matching the existing ListObjectsV2 navigation contract. No trimming or
+/// filesystem normalization is performed.
+pub fn scope_from_location(location: &Location) -> Option<S3InspectionScope> {
+    let Location::S3 {
+        target,
+        bucket: Some(bucket),
+        prefix,
+    } = location
+    else {
+        return None;
+    };
+    if prefix.is_empty() {
+        Some(S3InspectionScope::Bucket(S3BucketRef {
+            target: target.clone(),
+            bucket: bucket.clone(),
+        }))
+    } else {
+        Some(S3InspectionScope::Prefix(S3PrefixRef {
+            target: target.clone(),
+            bucket: bucket.clone(),
+            prefix: format!("{prefix}/"),
+        }))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3ObjectSnapshot {
+    pub evidence: S3EvidenceSource,
+    pub observed_at_unix_ms: u64,
+    pub target: String,
+    pub endpoint_override: Option<String>,
+    pub bucket: String,
+    pub key: String,
+    pub size: Option<u64>,
+    pub last_modified_unix_ms: Option<u64>,
+    pub etag: Option<String>,
+    pub content_type: Option<String>,
+    pub storage_class: Option<String>,
+    pub metadata: BTreeMap<String, String>,
+    pub version_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3LargestObject {
+    pub key: String,
+    pub size: u64,
+    pub last_modified_unix_ms: Option<u64>,
+    pub etag: Option<String>,
+    pub storage_class: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3PrefixAggregate {
+    pub prefix: String,
+    pub object_count: u64,
+    pub logical_bytes: u128,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct S3AgeDistribution {
+    pub under_30_days: u64,
+    pub days_30_to_89: u64,
+    pub days_90_to_364: u64,
+    pub days_365_plus: u64,
+    pub unavailable: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3ScanSnapshot {
+    pub evidence: S3EvidenceSource,
+    pub observed_at_unix_ms: u64,
+    pub scope: S3InspectionScope,
+    pub complete: bool,
+    pub cancelled: bool,
+    pub terminal_note: Option<String>,
+    pub pages_seen: u64,
+    pub object_count: u64,
+    pub total_logical_bytes: u128,
+    pub objects_without_size: u64,
+    pub largest_objects: Vec<S3LargestObject>,
+    pub largest_prefixes: S3Evidence<Vec<S3PrefixAggregate>>,
+    pub age_distribution: S3AgeDistribution,
+    pub storage_classes: BTreeMap<String, u64>,
+    pub objects_without_storage_class: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum S3InspectorSnapshot {
+    Object(S3ObjectSnapshot),
+    Scan(S3ScanSnapshot),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct S3ScanProgress {
+    pub pages_seen: u64,
+    pub objects_seen: u64,
+    pub logical_bytes_seen: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum S3ScanOutcome {
+    Complete(S3ScanSnapshot),
+    Cancelled(S3ScanSnapshot),
+    Partial {
+        snapshot: S3ScanSnapshot,
+        error: String,
+    },
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn validate_provider_target(provider: &S3Provider, target: &str, bucket: &str) -> io::Result<()> {
+    if target != provider.target.id {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "S3 inspector target mismatch",
+        ));
+    }
+    if bucket.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "S3 inspector requires a non-empty bucket",
+        ));
+    }
+    if provider
+        .target
+        .bucket
+        .as_deref()
+        .is_some_and(|bound| bound != bucket)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "S3 inspector bucket escape rejected",
+        ));
+    }
+    Ok(())
+}
+
+pub async fn inspect_object(
+    provider: Arc<S3Provider>,
+    object: S3ObjectRef,
+    cancellation: Arc<AtomicBool>,
+) -> io::Result<S3ObjectSnapshot> {
+    validate_provider_target(&provider, &object.target, &object.bucket)?;
+    if object.key.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "S3 object inspection requires a non-empty key",
+        ));
+    }
+    if cancellation.load(Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "S3 object inspection cancelled before request",
+        ));
+    }
+
+    let observed_at_unix_ms = now_unix_ms();
+    let client = provider.client().await?;
+    let head = client
+        .head_object()
+        .bucket(&object.bucket)
+        .key(&object.key)
+        .send()
+        .await
+        .map_err(|_| io::Error::other("S3 HeadObject inspection request failed"))?;
+
+    let size = head
+        .content_length()
+        .and_then(|value| (value >= 0).then_some(value as u64));
+    let last_modified_unix_ms = head
+        .last_modified()
+        .and_then(|value| value.to_millis().ok())
+        .and_then(|value| (value >= 0).then_some(value as u64));
+    let metadata = head
+        .metadata()
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+
+    Ok(S3ObjectSnapshot {
+        evidence: S3EvidenceSource::LiveScan,
+        observed_at_unix_ms,
+        target: object.target,
+        endpoint_override: provider.target.endpoint_url.clone(),
+        bucket: object.bucket,
+        key: object.key,
+        size,
+        last_modified_unix_ms,
+        etag: head.e_tag().map(str::to_owned),
+        content_type: head.content_type().map(str::to_owned),
+        storage_class: head
+            .storage_class()
+            .map(|value| value.as_str().to_string()),
+        metadata,
+        version_id: head.version_id().map(str::to_owned),
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+struct PrefixTally {
+    object_count: u64,
+    logical_bytes: u128,
+}
+
+struct ScanAccumulator {
+    scope: S3InspectionScope,
+    observed_at_unix_ms: u64,
+    pages_seen: u64,
+    object_count: u64,
+    total_logical_bytes: u128,
+    objects_without_size: u64,
+    largest_objects: Vec<S3LargestObject>,
+    prefix_tallies: BTreeMap<String, PrefixTally>,
+    prefix_cardinality_exceeded: bool,
+    age_distribution: S3AgeDistribution,
+    storage_classes: BTreeMap<String, u64>,
+    objects_without_storage_class: u64,
+}
+
+impl ScanAccumulator {
+    fn new(scope: S3InspectionScope, observed_at_unix_ms: u64) -> Self {
+        Self {
+            scope,
+            observed_at_unix_ms,
+            pages_seen: 0,
+            object_count: 0,
+            total_logical_bytes: 0,
+            objects_without_size: 0,
+            largest_objects: Vec::new(),
+            prefix_tallies: BTreeMap::new(),
+            prefix_cardinality_exceeded: false,
+            age_distribution: S3AgeDistribution::default(),
+            storage_classes: BTreeMap::new(),
+            objects_without_storage_class: 0,
+        }
+    }
+
+    fn progress(&self) -> S3ScanProgress {
+        S3ScanProgress {
+            pages_seen: self.pages_seen,
+            objects_seen: self.object_count,
+            logical_bytes_seen: self.total_logical_bytes,
+        }
+    }
+
+    fn ingest(
+        &mut self,
+        key: &str,
+        size: Option<u64>,
+        last_modified_unix_ms: Option<u64>,
+        etag: Option<&str>,
+        storage_class: Option<&str>,
+    ) -> io::Result<()> {
+        if !key.starts_with(self.scope.wire_prefix()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "S3 inspection response contained a key outside the requested prefix",
+            ));
+        }
+
+        self.object_count = self.object_count.saturating_add(1);
+        if let Some(size) = size {
+            self.total_logical_bytes = self
+                .total_logical_bytes
+                .checked_add(u128::from(size))
+                .ok_or_else(|| io::Error::other("S3 logical-byte total overflow"))?;
+            self.largest_objects.push(S3LargestObject {
+                key: key.to_string(),
+                size,
+                last_modified_unix_ms,
+                etag: etag.map(str::to_owned),
+                storage_class: storage_class.map(str::to_owned),
+            });
+            self.largest_objects.sort_by(|left, right| {
+                right
+                    .size
+                    .cmp(&left.size)
+                    .then_with(|| left.key.cmp(&right.key))
+            });
+            self.largest_objects.truncate(TOP_OBJECTS_LIMIT);
+        } else {
+            self.objects_without_size = self.objects_without_size.saturating_add(1);
+        }
+
+        if !self.prefix_cardinality_exceeded {
+            let relative = key
+                .strip_prefix(self.scope.wire_prefix())
+                .expect("prefix checked above");
+            if let Some(index) = relative.find('/') {
+                let child_prefix = format!(
+                    "{}{}",
+                    self.scope.wire_prefix(),
+                    &relative[..=index]
+                );
+                if !self.prefix_tallies.contains_key(&child_prefix)
+                    && self.prefix_tallies.len() >= PREFIX_CARDINALITY_LIMIT
+                {
+                    self.prefix_cardinality_exceeded = true;
+                    self.prefix_tallies.clear();
+                } else {
+                    let tally = self.prefix_tallies.entry(child_prefix).or_default();
+                    tally.object_count = tally.object_count.saturating_add(1);
+                    if let Some(size) = size {
+                        tally.logical_bytes = tally
+                            .logical_bytes
+                            .checked_add(u128::from(size))
+                            .ok_or_else(|| io::Error::other("S3 prefix-byte total overflow"))?;
+                    }
+                }
+            }
+        }
+
+        match last_modified_unix_ms {
+            Some(modified) => {
+                let age = self.observed_at_unix_ms.saturating_sub(modified);
+                if age < 30 * DAY_MS {
+                    self.age_distribution.under_30_days += 1;
+                } else if age < 90 * DAY_MS {
+                    self.age_distribution.days_30_to_89 += 1;
+                } else if age < 365 * DAY_MS {
+                    self.age_distribution.days_90_to_364 += 1;
+                } else {
+                    self.age_distribution.days_365_plus += 1;
+                }
+            }
+            None => self.age_distribution.unavailable += 1,
+        }
+
+        match storage_class {
+            Some(class) => {
+                *self.storage_classes.entry(class.to_string()).or_insert(0) += 1;
+            }
+            None => self.objects_without_storage_class += 1,
+        }
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        complete: bool,
+        cancelled: bool,
+        terminal_note: Option<String>,
+    ) -> S3ScanSnapshot {
+        let largest_prefixes = if self.prefix_cardinality_exceeded {
+            S3Evidence::unavailable(format!(
+                "more than {PREFIX_CARDINALITY_LIMIT} immediate prefixes; exact ranking not retained"
+            ))
+        } else {
+            let mut prefixes = self
+                .prefix_tallies
+                .into_iter()
+                .map(|(prefix, tally)| S3PrefixAggregate {
+                    prefix,
+                    object_count: tally.object_count,
+                    logical_bytes: tally.logical_bytes,
+                })
+                .collect::<Vec<_>>();
+            prefixes.sort_by(|left, right| {
+                right
+                    .logical_bytes
+                    .cmp(&left.logical_bytes)
+                    .then_with(|| right.object_count.cmp(&left.object_count))
+                    .then_with(|| left.prefix.cmp(&right.prefix))
+            });
+            prefixes.truncate(TOP_PREFIXES_LIMIT);
+            S3Evidence::live(prefixes)
+        };
+
+        S3ScanSnapshot {
+            evidence: S3EvidenceSource::LiveScan,
+            observed_at_unix_ms: self.observed_at_unix_ms,
+            scope: self.scope,
+            complete,
+            cancelled,
+            terminal_note,
+            pages_seen: self.pages_seen,
+            object_count: self.object_count,
+            total_logical_bytes: self.total_logical_bytes,
+            objects_without_size: self.objects_without_size,
+            largest_objects: self.largest_objects,
+            largest_prefixes,
+            age_distribution: self.age_distribution,
+            storage_classes: self.storage_classes,
+            objects_without_storage_class: self.objects_without_storage_class,
+        }
+    }
+}
+
+fn next_token(
+    consumed: Option<&str>,
+    is_truncated: Option<bool>,
+    returned: Option<&str>,
+) -> io::Result<Option<String>> {
+    match is_truncated {
+        Some(false) if returned.is_none() => Ok(None),
+        Some(false) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "S3 inspection pagination contradiction",
+        )),
+        Some(true) => match returned {
+            Some(token) if !token.is_empty() && Some(token) != consumed => Ok(Some(token.to_string())),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "S3 inspection pagination token did not advance",
+            )),
+        },
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "S3 inspection pagination missing IsTruncated",
+        )),
+    }
+}
+
+pub async fn scan_scope<F>(
+    provider: Arc<S3Provider>,
+    scope: S3InspectionScope,
+    cancellation: Arc<AtomicBool>,
+    mut on_progress: F,
+) -> io::Result<S3ScanOutcome>
+where
+    F: FnMut(S3ScanProgress),
+{
+    validate_provider_target(&provider, scope.target_id(), scope.bucket())?;
+    if matches!(&scope, S3InspectionScope::Prefix(reference) if !reference.prefix.ends_with('/')) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "S3 prefix inspection requires an exact delimiter-terminated prefix",
+        ));
+    }
+
+    let observed_at_unix_ms = now_unix_ms();
+    let mut accumulator = ScanAccumulator::new(scope.clone(), observed_at_unix_ms);
+    let client = provider.client().await?;
+    let bucket = scope.bucket().to_string();
+    let wire_prefix = scope.wire_prefix().to_string();
+    let mut continuation: Option<String> = None;
+
+    loop {
+        if cancellation.load(Ordering::Relaxed) {
+            return Ok(S3ScanOutcome::Cancelled(accumulator.finish(
+                false,
+                true,
+                Some("cancelled between ListObjectsV2 pages".into()),
+            )));
+        }
+
+        let consumed = continuation.clone();
+        let mut request = client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .prefix(&wire_prefix)
+            .max_keys(INSPECT_PAGE_SIZE);
+        if let Some(token) = consumed.as_deref() {
+            request = request.continuation_token(token);
+        }
+
+        let output = match request.send().await {
+            Ok(output) => output,
+            Err(_) if accumulator.pages_seen > 0 => {
+                let error = "S3 ListObjectsV2 inspection request failed".to_string();
+                let snapshot = accumulator.finish(false, false, Some(error.clone()));
+                return Ok(S3ScanOutcome::Partial { snapshot, error });
+            }
+            Err(_) => return Err(io::Error::other("S3 ListObjectsV2 inspection request failed")),
+        };
+
+        accumulator.pages_seen = accumulator.pages_seen.saturating_add(1);
+        for object in output.contents() {
+            let Some(key) = object.key() else {
+                continue;
+            };
+            let size = object
+                .size()
+                .and_then(|value| (value >= 0).then_some(value as u64));
+            let last_modified_unix_ms = object
+                .last_modified()
+                .and_then(|value| value.to_millis().ok())
+                .and_then(|value| (value >= 0).then_some(value as u64));
+            let storage_class = object.storage_class().map(|value| value.as_str());
+            if let Err(error) = accumulator.ingest(
+                key,
+                size,
+                last_modified_unix_ms,
+                object.e_tag(),
+                storage_class,
+            ) {
+                if accumulator.pages_seen > 1 || accumulator.object_count > 0 {
+                    let message = error.to_string();
+                    let snapshot = accumulator.finish(false, false, Some(message.clone()));
+                    return Ok(S3ScanOutcome::Partial {
+                        snapshot,
+                        error: message,
+                    });
+                }
+                return Err(error);
+            }
+        }
+        on_progress(accumulator.progress());
+
+        if cancellation.load(Ordering::Relaxed) {
+            return Ok(S3ScanOutcome::Cancelled(accumulator.finish(
+                false,
+                true,
+                Some("cancelled after a completed ListObjectsV2 page".into()),
+            )));
+        }
+
+        continuation = match next_token(
+            consumed.as_deref(),
+            output.is_truncated(),
+            output.next_continuation_token(),
+        ) {
+            Ok(next) => next,
+            Err(error) => {
+                let message = error.to_string();
+                let snapshot = accumulator.finish(false, false, Some(message.clone()));
+                return Ok(S3ScanOutcome::Partial {
+                    snapshot,
+                    error: message,
+                });
+            }
+        };
+        if continuation.is_none() {
+            return Ok(S3ScanOutcome::Complete(accumulator.finish(true, false, None)));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evidence_model_keeps_all_frozen_classes_distinct() {
+        let all = [
+            S3EvidenceSource::LiveScan,
+            S3EvidenceSource::StorageLens,
+            S3EvidenceSource::Inventory,
+            S3EvidenceSource::OtherProvider,
+            S3EvidenceSource::Unavailable,
+        ];
+        assert_eq!(all.len(), 5);
+        assert_ne!(all[0], all[4]);
+    }
+
+    #[test]
+    fn location_scope_preserves_navigation_delimiter_semantics() {
+        let location = Location::S3 {
+            target: "t".into(),
+            bucket: Some("b".into()),
+            prefix: "foo//".into(),
+        };
+        assert_eq!(
+            scope_from_location(&location),
+            Some(S3InspectionScope::Prefix(S3PrefixRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                prefix: "foo///".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn accumulator_is_bounded_and_truthful_when_prefix_cardinality_exceeds_cap() {
+        let scope = S3InspectionScope::Bucket(S3BucketRef {
+            target: "t".into(),
+            bucket: "b".into(),
+        });
+        let mut accumulator = ScanAccumulator::new(scope, 400 * DAY_MS);
+        for index in 0..=PREFIX_CARDINALITY_LIMIT {
+            accumulator
+                .ingest(
+                    &format!("p{index}/file"),
+                    Some(index as u64 + 1),
+                    Some(10 * DAY_MS),
+                    None,
+                    Some("STANDARD"),
+                )
+                .unwrap();
+        }
+        let snapshot = accumulator.finish(true, false, None);
+        assert_eq!(snapshot.object_count, PREFIX_CARDINALITY_LIMIT as u64 + 1);
+        assert_eq!(snapshot.largest_objects.len(), TOP_OBJECTS_LIMIT);
+        assert_eq!(snapshot.largest_prefixes.source, S3EvidenceSource::Unavailable);
+        assert!(snapshot.largest_prefixes.value.is_none());
+    }
+
+    #[test]
+    fn accumulator_reports_age_storage_class_and_top_objects_from_observed_facts() {
+        let scope = S3InspectionScope::Prefix(S3PrefixRef {
+            target: "t".into(),
+            bucket: "b".into(),
+            prefix: "root/".into(),
+        });
+        let now = 400 * DAY_MS;
+        let mut accumulator = ScanAccumulator::new(scope, now);
+        accumulator
+            .ingest("root/a.bin", Some(5), Some(now - 10 * DAY_MS), Some("e1"), Some("STANDARD"))
+            .unwrap();
+        accumulator
+            .ingest("root/child/b.bin", Some(9), Some(now - 100 * DAY_MS), None, Some("GLACIER"))
+            .unwrap();
+        accumulator
+            .ingest("root/unknown", None, None, None, None)
+            .unwrap();
+        let snapshot = accumulator.finish(true, false, None);
+        assert_eq!(snapshot.object_count, 3);
+        assert_eq!(snapshot.total_logical_bytes, 14);
+        assert_eq!(snapshot.objects_without_size, 1);
+        assert_eq!(snapshot.largest_objects[0].key, "root/child/b.bin");
+        assert_eq!(snapshot.age_distribution.under_30_days, 1);
+        assert_eq!(snapshot.age_distribution.days_90_to_364, 1);
+        assert_eq!(snapshot.age_distribution.unavailable, 1);
+        assert_eq!(snapshot.storage_classes.get("STANDARD"), Some(&1));
+        assert_eq!(snapshot.objects_without_storage_class, 1);
+        let prefixes = snapshot.largest_prefixes.value.unwrap();
+        assert_eq!(prefixes[0].prefix, "root/child/");
+        assert_eq!(prefixes[0].logical_bytes, 9);
+    }
+
+    #[test]
+    fn pagination_rejects_missing_empty_and_nonadvancing_tokens() {
+        assert_eq!(next_token(None, Some(false), None).unwrap(), None);
+        assert_eq!(
+            next_token(None, Some(true), Some("next")).unwrap(),
+            Some("next".into())
+        );
+        assert!(next_token(Some("same"), Some(true), Some("same")).is_err());
+        assert!(next_token(None, Some(true), None).is_err());
+        assert!(next_token(None, None, None).is_err());
+    }
+}
+'''
+
+          ui = r'''//! Read-only S3 Inspector presentation and JobManager adapter.
+
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+
+use crate::app::{AppState, OverlayKind};
+use crate::jobs::{JobEvent, JobKind, JobProgress, JobResult, JobStatus, Progress};
+use crate::s3_inspector::{
+    S3EvidenceSource, S3InspectionScope, S3InspectionTarget, S3InspectorSnapshot, S3ScanOutcome,
+    inspect_object, scan_scope, scope_from_location,
+};
+use crate::vfs::{EntryIdentity, ListedEntry, Location};
+
+#[derive(Debug, Clone)]
+pub struct S3InspectorUiState {
+    pub job_id: String,
+    pub target: S3InspectionTarget,
+    pub snapshot: Arc<Mutex<Option<Arc<S3InspectorSnapshot>>>>,
+    pub scroll: u16,
+}
+
+impl S3InspectorUiState {
+    fn snapshot(&self) -> Option<Arc<S3InspectorSnapshot>> {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+fn identity_matches_location(location: &Location, target: &str, bucket: &str) -> bool {
+    match location {
+        Location::S3 {
+            target: current_target,
+            bucket: current_bucket,
+            ..
+        } => {
+            current_target == target
+                && current_bucket
+                    .as_deref()
+                    .is_none_or(|current_bucket| current_bucket == bucket)
+        }
+        _ => false,
+    }
+}
+
+pub fn target_from_context(
+    location: &Location,
+    focused: Option<&ListedEntry>,
+) -> Result<S3InspectionTarget, String> {
+    let Location::S3 { .. } = location else {
+        return Err("S3 Inspector requires an S3 pane".into());
+    };
+
+    if let Some(listed) = focused {
+        match &listed.identity {
+            EntryIdentity::S3Object(reference) => {
+                if !identity_matches_location(location, &reference.target, &reference.bucket) {
+                    return Err("S3 Inspector target is stale for the active pane".into());
+                }
+                return Ok(S3InspectionTarget::Object(reference.clone()));
+            }
+            EntryIdentity::S3Prefix(reference) => {
+                if !identity_matches_location(location, &reference.target, &reference.bucket) {
+                    return Err("S3 Inspector prefix is stale for the active pane".into());
+                }
+                return Ok(S3InspectionTarget::Scope(S3InspectionScope::Prefix(
+                    reference.clone(),
+                )));
+            }
+            EntryIdentity::S3Bucket(reference) => {
+                if !identity_matches_location(location, &reference.target, &reference.bucket) {
+                    return Err("S3 Inspector bucket is stale for the active pane".into());
+                }
+                return Ok(S3InspectionTarget::Scope(S3InspectionScope::Bucket(
+                    reference.clone(),
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    scope_from_location(location)
+        .map(S3InspectionTarget::Scope)
+        .ok_or_else(|| "Choose an S3 bucket, prefix, or exact object to inspect".into())
+}
+
+pub fn launch_s3_inspector(
+    state: &mut AppState,
+    focused: Option<&ListedEntry>,
+) -> Result<String, String> {
+    let location = state.active_pane().location.clone();
+    let target = target_from_context(&location, focused)?;
+    let manager = state
+        .job_manager
+        .clone()
+        .ok_or_else(|| "S3 Inspector: JobManager is not bound".to_string())?;
+    let events = state
+        .job_events
+        .clone()
+        .ok_or_else(|| "S3 Inspector: job event channel is not bound".to_string())?;
+
+    if let Some(existing) = state.storage_inspector.s3.as_ref()
+        && existing.target == target
+        && manager
+            .get(&existing.job_id)
+            .is_some_and(|job| !job.status.is_terminal())
+    {
+        let id = existing.job_id.clone();
+        state.open_overlay(OverlayKind::StorageInspector);
+        return Ok(id);
+    }
+
+    if let Some(existing) = state.storage_inspector.s3.take()
+        && manager
+            .get(&existing.job_id)
+            .is_some_and(|job| !job.status.is_terminal())
+    {
+        manager.cancel(&existing.job_id);
+    }
+    if let Some(local_id) = state.storage_inspector.job_id.take() {
+        if manager
+            .get(&local_id)
+            .is_some_and(|job| !job.status.is_terminal())
+        {
+            manager.cancel(&local_id);
+        }
+        state.storage_scan_snapshots.remove(&local_id);
+    }
+    state.storage_inspector.root = None;
+    state.storage_inspector.current_dir = None;
+
+    // Existing same-instance resolver: despite its historical name it returns
+    // the exact Arc<S3Provider> used by listing/transfers, including the one
+    // lazy client cache. The inspector intentionally introduces no new cache.
+    let provider = state
+        .registry
+        .s3_provider_for_transfer(target.target_id())
+        .map_err(|_| "S3 Inspector: configured target is unavailable".to_string())?;
+
+    let description = format!("Inspect S3 {}", display_safe(&target_label(&target)));
+    let job = manager.create_job(
+        "s3-inspect",
+        JobKind::Custom("s3-inspector".into()),
+        description,
+        Some(location),
+        None,
+    );
+    let id = job.id.clone();
+    let cancellation = job.cancel.clone();
+    let snapshot = Arc::new(Mutex::new(None));
+    state.storage_inspector.s3 = Some(S3InspectorUiState {
+        job_id: id.clone(),
+        target: target.clone(),
+        snapshot: Arc::clone(&snapshot),
+        scroll: 0,
+    });
+    state.jobs = manager.snapshot();
+    state.open_overlay(OverlayKind::StorageInspector);
+
+    let worker_id = id.clone();
+    let worker_manager = manager.clone();
+    let worker_events = events.clone();
+    tokio::spawn(async move {
+        let _ = worker_manager.publish_event(
+            &worker_events,
+            JobEvent::Running {
+                id: worker_id.clone(),
+            },
+        );
+
+        match target {
+            S3InspectionTarget::Object(object) => {
+                let _ = worker_manager.publish_event(
+                    &worker_events,
+                    JobEvent::Progress {
+                        id: worker_id.clone(),
+                        progress: JobProgress::Generic(Progress::Phase {
+                            phase: "HEAD exact object metadata".into(),
+                            percent: None,
+                        }),
+                    },
+                );
+                match inspect_object(provider, object, Arc::clone(&cancellation)).await {
+                    Ok(result) => {
+                        store_snapshot(&snapshot, S3InspectorSnapshot::Object(result));
+                        let _ = worker_manager.publish_event(
+                            &worker_events,
+                            JobEvent::Completed {
+                                id: worker_id,
+                                result: JobResult::generic_message(
+                                    "S3 object inspection complete · LiveScan",
+                                ),
+                            },
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        let _ = worker_manager.publish_event(
+                            &worker_events,
+                            JobEvent::Cancelled {
+                                id: worker_id,
+                                result: JobResult::generic_message("S3 object inspection cancelled"),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        let _ = worker_manager.publish_event(
+                            &worker_events,
+                            JobEvent::Failed {
+                                id: worker_id,
+                                error: error.to_string(),
+                                result: None,
+                            },
+                        );
+                    }
+                }
+            }
+            S3InspectionTarget::Scope(scope) => {
+                let progress_manager = worker_manager.clone();
+                let progress_events = worker_events.clone();
+                let progress_id = worker_id.clone();
+                match scan_scope(provider, scope, Arc::clone(&cancellation), move |progress| {
+                    let _ = progress_manager.publish_event(
+                        &progress_events,
+                        JobEvent::Progress {
+                            id: progress_id.clone(),
+                            progress: JobProgress::Generic(Progress::Phase {
+                                phase: format!(
+                                    "{} pages · {} objects · {} logical · total unknown",
+                                    progress.pages_seen,
+                                    progress.objects_seen,
+                                    format_bytes_u128(progress.logical_bytes_seen)
+                                ),
+                                percent: None,
+                            }),
+                        },
+                    );
+                })
+                .await
+                {
+                    Ok(S3ScanOutcome::Complete(result)) => {
+                        store_snapshot(&snapshot, S3InspectorSnapshot::Scan(result));
+                        let _ = worker_manager.publish_event(
+                            &worker_events,
+                            JobEvent::Completed {
+                                id: worker_id,
+                                result: JobResult::generic_message(
+                                    "S3 aggregate inspection complete · LiveScan",
+                                ),
+                            },
+                        );
+                    }
+                    Ok(S3ScanOutcome::Cancelled(result)) => {
+                        store_snapshot(&snapshot, S3InspectorSnapshot::Scan(result));
+                        let _ = worker_manager.publish_event(
+                            &worker_events,
+                            JobEvent::Cancelled {
+                                id: worker_id,
+                                result: JobResult::generic_message(
+                                    "S3 aggregate inspection cancelled · partial snapshot retained",
+                                ),
+                            },
+                        );
+                    }
+                    Ok(S3ScanOutcome::Partial { snapshot: result, error }) => {
+                        store_snapshot(&snapshot, S3InspectorSnapshot::Scan(result));
+                        let _ = worker_manager.publish_event(
+                            &worker_events,
+                            JobEvent::Failed {
+                                id: worker_id,
+                                error,
+                                result: Some(JobResult::generic_message(
+                                    "S3 aggregate inspection partial · snapshot retained",
+                                )),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        let _ = worker_manager.publish_event(
+                            &worker_events,
+                            JobEvent::Failed {
+                                id: worker_id,
+                                error: error.to_string(),
+                                result: None,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(id)
+}
+
+fn store_snapshot(
+    slot: &Arc<Mutex<Option<Arc<S3InspectorSnapshot>>>>,
+    snapshot: S3InspectorSnapshot,
+) {
+    *slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(snapshot));
+}
+
+pub fn handle_s3_inspector_key(state: &mut AppState, key: KeyEvent) {
+    if state.storage_inspector.s3.is_none() {
+        return;
+    }
+    match key.code {
+        KeyCode::Esc => state.close_overlay(OverlayKind::StorageInspector),
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(ui) = state.storage_inspector.s3.as_mut() {
+                ui.scroll = ui.scroll.saturating_sub(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(ui) = state.storage_inspector.s3.as_mut() {
+                ui.scroll = ui.scroll.saturating_add(1);
+            }
+        }
+        KeyCode::PageUp => {
+            if let Some(ui) = state.storage_inspector.s3.as_mut() {
+                ui.scroll = ui.scroll.saturating_sub(10);
+            }
+        }
+        KeyCode::PageDown => {
+            if let Some(ui) = state.storage_inspector.s3.as_mut() {
+                ui.scroll = ui.scroll.saturating_add(10);
+            }
+        }
+        KeyCode::Home => {
+            if let Some(ui) = state.storage_inspector.s3.as_mut() {
+                ui.scroll = 0;
+            }
+        }
+        KeyCode::End => {
+            let last = inspector_lines(state).len().saturating_sub(1).min(u16::MAX as usize) as u16;
+            if let Some(ui) = state.storage_inspector.s3.as_mut() {
+                ui.scroll = last;
+            }
+        }
+        KeyCode::Char('c') => cancel_scan(state),
+        _ => {}
+    }
+}
+
+fn cancel_scan(state: &mut AppState) {
+    let Some(ui) = state.storage_inspector.s3.as_ref() else {
+        return;
+    };
+    let id = ui.job_id.clone();
+    let Some(manager) = state.job_manager.clone() else {
+        return;
+    };
+    match manager.get(&id) {
+        Some(job) if !job.status.is_terminal() => {
+            if manager.cancel(&id) {
+                state.jobs = manager.snapshot();
+                state.message = Some(format!("Cancelling S3 inspection {id}…"));
+            }
+        }
+        Some(_) => state.message = Some("S3 inspection has already finished".into()),
+        None => state.message = Some("S3 inspection job is no longer available".into()),
+    }
+}
+
+pub fn render_s3_inspector(frame: &mut ratatui::Frame, area: Rect, state: &mut AppState) {
+    let popup = centered_rect(92, 88, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" S3 Inspector · read-only storage intelligence ")
+        .borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(2)])
+        .split(inner);
+    let scroll = state
+        .storage_inspector
+        .s3
+        .as_ref()
+        .map(|ui| ui.scroll)
+        .unwrap_or(0);
+    frame.render_widget(
+        Paragraph::new(inspector_lines(state))
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new("Esc close · ↑/↓ PgUp/PgDn scroll · c cancel scan · no delete / no df semantics"),
+        chunks[1],
+    );
+}
+
+fn inspector_lines(state: &AppState) -> Vec<Line<'static>> {
+    let Some(ui) = state.storage_inspector.s3.as_ref() else {
+        return vec![Line::from("S3 Inspector state unavailable")];
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled("status: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(job_status(state, &ui.job_id)),
+    ])];
+    lines.push(Line::from(format!(
+        "target: {}",
+        display_safe(&target_label(&ui.target))
+    )));
+    lines.push(Line::from("evidence model: LiveScan | StorageLens | Inventory | OtherProvider | Unavailable"));
+    lines.push(Line::from(""));
+
+    let Some(snapshot) = ui.snapshot() else {
+        lines.push(Line::from("Collecting provider-proven facts…"));
+        lines.push(Line::from("Aggregate total is intentionally unknown while pagination is in progress."));
+        return lines;
+    };
+
+    match snapshot.as_ref() {
+        S3InspectorSnapshot::Object(object) => {
+            lines.push(Line::from(format!("evidence: {} @ {} unix-ms", object.evidence.label(), object.observed_at_unix_ms)));
+            lines.push(Line::from(format!("configured target id: {}", display_safe(&object.target))));
+            lines.push(Line::from(format!(
+                "endpoint override: {}",
+                object
+                    .endpoint_override
+                    .as_deref()
+                    .map(display_safe)
+                    .unwrap_or_else(|| "<none; provider default>".into())
+            )));
+            lines.push(Line::from(format!("bucket: {}", display_safe(&object.bucket))));
+            lines.push(Line::from(format!("exact key: {}", display_safe(&object.key))));
+            lines.push(Line::from(format!("size: {}", optional_bytes(object.size))));
+            lines.push(Line::from(format!("last modified unix-ms: {}", optional_u64(object.last_modified_unix_ms))));
+            lines.push(Line::from(format!("ETag: {}", optional_text(object.etag.as_deref()))));
+            lines.push(Line::from(format!("content type: {}", optional_text(object.content_type.as_deref()))));
+            lines.push(Line::from(format!("storage class: {}", optional_text(object.storage_class.as_deref()))));
+            lines.push(Line::from(format!("version id: {}", optional_text(object.version_id.as_deref()))));
+            lines.push(Line::from(""));
+            lines.push(Line::from("metadata:"));
+            if object.metadata.is_empty() {
+                lines.push(Line::from("  <none reported>"));
+            } else {
+                for (key, value) in &object.metadata {
+                    lines.push(Line::from(format!("  {} = {}", display_safe(key), display_safe(value))));
+                }
+            }
+        }
+        S3InspectorSnapshot::Scan(scan) => {
+            let terminal = if scan.complete {
+                "complete"
+            } else if scan.cancelled {
+                "cancelled / partial"
+            } else {
+                "partial"
+            };
+            lines.push(Line::from(format!("evidence: {} @ {} unix-ms · {terminal}", scan.evidence.label(), scan.observed_at_unix_ms)));
+            lines.push(Line::from(format!("scope: {}", display_safe(&scope_label(&scan.scope)))));
+            lines.push(Line::from(format!("pages observed: {}", scan.pages_seen)));
+            lines.push(Line::from(format!("objects observed: {}", scan.object_count)));
+            let logical_suffix = if scan.objects_without_size == 0 {
+                "complete for observed objects".to_string()
+            } else {
+                format!("incomplete: {} objects lacked size", scan.objects_without_size)
+            };
+            lines.push(Line::from(format!(
+                "logical bytes: {} · {logical_suffix}",
+                format_bytes_u128(scan.total_logical_bytes)
+            )));
+            if let Some(note) = &scan.terminal_note {
+                lines.push(Line::from(format!("terminal note: {}", display_safe(note))));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from("largest objects (bounded top 20):"));
+            if scan.largest_objects.is_empty() {
+                lines.push(Line::from("  <none with provider-reported size>"));
+            } else {
+                for object in &scan.largest_objects {
+                    lines.push(Line::from(format!(
+                        "  {:>10}  {}",
+                        format_bytes_u128(u128::from(object.size)),
+                        display_safe(&object.key)
+                    )));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!(
+                "largest immediate prefixes · evidence {}:",
+                scan.largest_prefixes.source.label()
+            )));
+            match &scan.largest_prefixes.value {
+                Some(prefixes) if prefixes.is_empty() => lines.push(Line::from("  <none>")),
+                Some(prefixes) => {
+                    for prefix in prefixes {
+                        lines.push(Line::from(format!(
+                            "  {:>10}  {:>7} objects  {}",
+                            format_bytes_u128(prefix.logical_bytes),
+                            prefix.object_count,
+                            display_safe(&prefix.prefix)
+                        )));
+                    }
+                }
+                None => lines.push(Line::from(format!(
+                    "  unavailable: {}",
+                    scan.largest_prefixes
+                        .note
+                        .as_deref()
+                        .map(display_safe)
+                        .unwrap_or_else(|| "provider evidence unavailable".into())
+                ))),
+            }
+            lines.push(Line::from(""));
+            let age = &scan.age_distribution;
+            lines.push(Line::from(format!(
+                "age distribution: <30d {} · 30-89d {} · 90-364d {} · >=365d {} · unavailable {}",
+                age.under_30_days,
+                age.days_30_to_89,
+                age.days_90_to_364,
+                age.days_365_plus,
+                age.unavailable
+            )));
+            lines.push(Line::from("storage classes:"));
+            if scan.storage_classes.is_empty() {
+                lines.push(Line::from("  <none reported>"));
+            } else {
+                for (class, count) in &scan.storage_classes {
+                    lines.push(Line::from(format!("  {}: {count}", display_safe(class))));
+                }
+            }
+            if scan.objects_without_storage_class > 0 {
+                lines.push(Line::from(format!(
+                    "  unavailable: {} objects",
+                    scan.objects_without_storage_class
+                )));
+            }
+        }
+    }
+    lines
+}
+
+fn job_status(state: &AppState, id: &str) -> String {
+    let Some(job) = state.jobs.iter().find(|job| job.id == id) else {
+        return format!("UNKNOWN · job {id} unavailable");
+    };
+    match job.status {
+        JobStatus::Pending => "PENDING".into(),
+        JobStatus::Running => format!("RUNNING · {}", job.progress),
+        JobStatus::Cancelling => format!("CANCELLING · {}", job.progress),
+        JobStatus::Completed => job
+            .result
+            .as_ref()
+            .and_then(JobResult::message)
+            .map(|message| format!("COMPLETE · {message}"))
+            .unwrap_or_else(|| "COMPLETE".into()),
+        JobStatus::Cancelled => job
+            .result
+            .as_ref()
+            .and_then(JobResult::message)
+            .map(|message| format!("CANCELLED · {message}"))
+            .unwrap_or_else(|| "CANCELLED".into()),
+        JobStatus::Failed => format!(
+            "FAILED · {}",
+            job.error.as_deref().unwrap_or("inspection failed")
+        ),
+        JobStatus::PausePending | JobStatus::Paused | JobStatus::RetryWaiting => {
+            format!("{:?}", job.status).to_uppercase()
+        }
+    }
+}
+
+fn target_label(target: &S3InspectionTarget) -> String {
+    match target {
+        S3InspectionTarget::Object(object) => {
+            format!("s3://{}/{}", object.bucket, object.key)
+        }
+        S3InspectionTarget::Scope(scope) => scope_label(scope),
+    }
+}
+
+fn scope_label(scope: &S3InspectionScope) -> String {
+    match scope {
+        S3InspectionScope::Bucket(bucket) => format!("s3://{}/", bucket.bucket),
+        S3InspectionScope::Prefix(prefix) => format!("s3://{}/{}", prefix.bucket, prefix.prefix),
+    }
+}
+
+fn optional_text(value: Option<&str>) -> String {
+    value.map(display_safe).unwrap_or_else(|| "<unavailable>".into())
+}
+
+fn optional_u64(value: Option<u64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_else(|| "<unavailable>".into())
+}
+
+fn optional_bytes(value: Option<u64>) -> String {
+    value
+        .map(|value| format_bytes_u128(u128::from(value)))
+        .unwrap_or_else(|| "<unavailable>".into())
+}
+
+pub(crate) fn format_bytes_u128(bytes: u128) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn display_safe(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x1b' => out.push_str("\\x1b"),
+            ch if (ch as u32) < 0x20 || ch as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", ch as u32));
+            }
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vfs::s3::{S3BucketRef, S3ObjectRef, S3PrefixRef};
+
+    #[test]
+    fn exact_focused_identity_wins_over_presentation_name() {
+        let location = Location::S3 {
+            target: "t".into(),
+            bucket: Some("b".into()),
+            prefix: "folder".into(),
+        };
+        let listed = ListedEntry {
+            entry: crate::vfs::Entry {
+                name: "DISPLAY-ONLY".into(),
+                kind: crate::vfs::EntryKind::File,
+                size: Some(7),
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                key: "folder/exact-key".into(),
+            }),
+        };
+        assert_eq!(
+            target_from_context(&location, Some(&listed)).unwrap(),
+            S3InspectionTarget::Object(S3ObjectRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                key: "folder/exact-key".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn account_root_requires_exact_bucket_focus() {
+        let location = Location::S3 {
+            target: "t".into(),
+            bucket: None,
+            prefix: String::new(),
+        };
+        assert!(target_from_context(&location, None).is_err());
+        let listed = ListedEntry {
+            entry: crate::vfs::Entry {
+                name: "display".into(),
+                kind: crate::vfs::EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Bucket(S3BucketRef {
+                target: "t".into(),
+                bucket: "Exact-Bucket".into(),
+            }),
+        };
+        assert_eq!(
+            target_from_context(&location, Some(&listed)).unwrap(),
+            S3InspectionTarget::Scope(S3InspectionScope::Bucket(S3BucketRef {
+                target: "t".into(),
+                bucket: "Exact-Bucket".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn prefix_identity_is_not_reconstructed_from_display_name() {
+        let location = Location::S3 {
+            target: "t".into(),
+            bucket: Some("b".into()),
+            prefix: "root".into(),
+        };
+        let listed = ListedEntry {
+            entry: crate::vfs::Entry {
+                name: "pretty".into(),
+                kind: crate::vfs::EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::S3Prefix(S3PrefixRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                prefix: "root//exact/".into(),
+            }),
+        };
+        assert_eq!(
+            target_from_context(&location, Some(&listed)).unwrap(),
+            S3InspectionTarget::Scope(S3InspectionScope::Prefix(S3PrefixRef {
+                target: "t".into(),
+                bucket: "b".into(),
+                prefix: "root//exact/".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn display_escape_does_not_mutate_printable_unicode() {
+        assert_eq!(display_safe("日本語/ok\n\x1b"), "日本語/ok\\n\\x1b");
+    }
+}
+'''
+
+          physical = r'''//! Physical #264 acceptance against disposable MinIO.
+//!
+//! Fixture setup may use the existing transfer path, while every assertion of
+//! inspector behavior goes through the production S3 Inspector core and the
+//! same concrete S3Provider/client used by listing and transfers.
+
+mod s3_acceptance;
+
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use arx::s3_inspector::{
+    S3EvidenceSource, S3InspectionScope, S3InspectorSnapshot, S3ScanOutcome, inspect_object,
+    scan_scope,
+};
+use arx::transfer::executor::execute_transfer;
+use arx::transfer::{S3TransferSpec, TransferIntent, TransferMethod, TransferPlan};
+use arx::vfs::s3::{S3ObjectRef, S3PrefixRef};
+use arx::vfs::{Location, ProviderRegistry};
+
+fn minio_root() -> Location {
+    s3_acceptance::bucket_root("minio", "arxtest")
+}
+
+async fn upload_bytes(registry: &ProviderRegistry, key: &str, data: &[u8]) {
+    let tmp = std::env::temp_dir().join(format!(
+        "arx-inspector-{}-{}",
+        std::process::id(),
+        key.bytes().map(|byte| format!("{byte:02x}")).collect::<String>()
+    ));
+    std::fs::write(&tmp, data).expect("write inspector fixture");
+    let plan = TransferPlan {
+        source: Location::Local(std::env::temp_dir()),
+        destination: minio_root(),
+        intent: TransferIntent::Copy,
+        method: TransferMethod::S3,
+        s3_spec: Some(S3TransferSpec::UploadOne {
+            local_source: tmp.clone(),
+            destination: S3ObjectRef {
+                target: "minio".into(),
+                bucket: "arxtest".into(),
+                key: key.into(),
+            },
+        }),
+        webdav_spec: None,
+    };
+    let outcome = execute_transfer(
+        &plan,
+        &[key.to_string()],
+        registry,
+        Arc::new(AtomicBool::new(false)),
+        arx::transfer_queue::PauseGate::disabled(),
+        |_| {},
+    )
+    .await
+    .expect("upload inspector fixture through production transfer path");
+    assert_eq!(outcome.completed, 1);
+    let _ = std::fs::remove_file(tmp);
+}
+
+#[tokio::test]
+async fn minio_object_and_prefix_inspector_are_live_bounded_and_exact() {
+    let Some(registry) = s3_acceptance::maybe_skip_minio() else {
+        return;
+    };
+    let run = s3_acceptance::run_id();
+    let root = format!("arx-acceptance/{run}/inspector/");
+    let key_a = format!("{root}a.bin");
+    let key_b = format!("{root}child/b.bin");
+    let key_c = format!("{root}child/c.bin");
+    upload_bytes(&registry, &key_a, b"abc").await;
+    upload_bytes(&registry, &key_b, b"12345").await;
+    upload_bytes(&registry, &key_c, b"1234567").await;
+
+    let provider = registry
+        .s3_provider_for_transfer("minio")
+        .expect("same concrete MinIO provider");
+    let object = inspect_object(
+        Arc::clone(&provider),
+        S3ObjectRef {
+            target: "minio".into(),
+            bucket: "arxtest".into(),
+            key: key_c.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .expect("HeadObject inspector");
+    assert_eq!(object.evidence, S3EvidenceSource::LiveScan);
+    assert_eq!(object.target, "minio");
+    assert_eq!(object.bucket, "arxtest");
+    assert_eq!(object.key, key_c);
+    assert_eq!(object.size, Some(7));
+    assert!(object.etag.is_some(), "MinIO must prove an ETag");
+
+    let mut progress = Vec::new();
+    let outcome = scan_scope(
+        provider,
+        S3InspectionScope::Prefix(S3PrefixRef {
+            target: "minio".into(),
+            bucket: "arxtest".into(),
+            prefix: root.clone(),
+        }),
+        Arc::new(AtomicBool::new(false)),
+        |update| progress.push(update),
+    )
+    .await
+    .expect("prefix LiveScan");
+    let S3ScanOutcome::Complete(scan) = outcome else {
+        panic!("physical MinIO scan must complete");
+    };
+    assert_eq!(scan.evidence, S3EvidenceSource::LiveScan);
+    assert!(scan.complete);
+    assert!(!scan.cancelled);
+    assert_eq!(scan.object_count, 3);
+    assert_eq!(scan.total_logical_bytes, 15);
+    assert_eq!(scan.objects_without_size, 0);
+    assert_eq!(scan.largest_objects[0].size, 7);
+    assert_eq!(scan.largest_objects[0].key, key_c);
+    assert_eq!(scan.largest_prefixes.source, S3EvidenceSource::LiveScan);
+    let prefixes = scan.largest_prefixes.value.expect("bounded prefix analytics");
+    assert!(
+        prefixes
+            .iter()
+            .any(|prefix| prefix.prefix == format!("{root}child/") && prefix.logical_bytes == 12)
+    );
+    assert!(!progress.is_empty());
+    assert_eq!(progress.last().unwrap().objects_seen, 3);
+    assert_eq!(progress.last().unwrap().logical_bytes_seen, 15);
+
+    let cancelled = scan_scope(
+        registry
+            .s3_provider_for_transfer("minio")
+            .expect("same provider for cancellation"),
+        S3InspectionScope::Prefix(S3PrefixRef {
+            target: "minio".into(),
+            bucket: "arxtest".into(),
+            prefix: root,
+        }),
+        Arc::new(AtomicBool::new(true)),
+        |_| {},
+    )
+    .await
+    .expect("pre-page cancellation is a typed outcome");
+    let S3ScanOutcome::Cancelled(cancelled) = cancelled else {
+        panic!("pre-page cancellation must not become failure");
+    };
+    assert_eq!(cancelled.pages_seen, 0);
+    assert_eq!(cancelled.object_count, 0);
+
+    for key in [&key_a, &key_b, &key_c] {
+        registry
+            .delete_s3_at(&minio_root(), key)
+            .await
+            .expect("cleanup inspector fixture");
+    }
+}
+'''
+
+          Path('src/s3_inspector.rs').write_text(core)
+          Path('src/s3_inspector_ui.rs').write_text(ui)
+          Path('tests/s3_inspector_minio.rs').write_text(physical)
+
+          def replace(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              if old not in text:
+                  raise SystemExit(f'anchor not found in {path}: {old[:120]!r}')
+              p.write_text(text.replace(old, new, 1))
+
+          replace(
+              'src/lib.rs',
+              'pub mod remote;\npub mod services;\n',
+              'pub mod remote;\n#[cfg(target_os = "linux")]\npub mod s3_inspector;\n#[cfg(target_os = "linux")]\npub mod s3_inspector_ui;\npub mod services;\n',
+          )
+
+          replace(
+              'src/storage_inspector_ui.rs',
+              'use crate::app::{AppState, OverlayKind};\nuse crate::jobs::{JobProgress, JobResult, JobStatus};\n',
+              'use crate::app::{AppState, OverlayKind};\nuse crate::jobs::{JobProgress, JobResult, JobStatus};\nuse crate::vfs::ListedEntry;\n',
+          )
+          replace(
+              'src/storage_inspector_ui.rs',
+              '    pub view: StorageView,\n}\n',
+              '    pub view: StorageView,\n    /// S3 uses the same exclusive Storage Inspector overlay but a distinct\n    /// read-only state machine and immutable snapshot slot.\n    pub s3: Option<crate::s3_inspector_ui::S3InspectorUiState>,\n}\n',
+          )
+          replace(
+              'src/storage_inspector_ui.rs',
+              '        self.view = StorageView::Directory;\n    }\n',
+              '        self.view = StorageView::Directory;\n        self.s3 = None;\n    }\n',
+          )
+          old_launch = '''pub fn launch_storage_inspector(state: &mut AppState) -> Result<String, String> {\n    let root = match &state.active_pane().location {\n        crate::vfs::Location::Local(path) => path.clone(),\n        _ => return Err("Storage Inspector is available for local paths only".into()),\n    };\n\n    let manager = state\n'''
+          new_launch = '''pub fn launch_storage_inspector(\n    state: &mut AppState,\n    focused_listed: Option<&ListedEntry>,\n) -> Result<String, String> {\n    match &state.active_pane().location {\n        crate::vfs::Location::S3 { .. } => {\n            return crate::s3_inspector_ui::launch_s3_inspector(state, focused_listed);\n        }\n        crate::vfs::Location::Local(_) => {}\n        _ => {\n            return Err("Storage Inspector is available for Local and S3 paths".into());\n        }\n    }\n\n    launch_local_storage_inspector(state)\n}\n\nfn launch_local_storage_inspector(state: &mut AppState) -> Result<String, String> {\n    let root = match &state.active_pane().location {\n        crate::vfs::Location::Local(path) => path.clone(),\n        _ => return Err("Local Storage Inspector requires a local path".into()),\n    };\n\n    let manager = state\n'''
+          replace('src/storage_inspector_ui.rs', old_launch, new_launch)
+          replace(
+              'src/storage_inspector_ui.rs',
+              '    let events = state\n        .job_events\n        .clone()\n        .ok_or_else(|| "Storage Inspector: job event channel is not bound".to_string())?;\n\n    if let Some(id) = state.storage_inspector.job_id.clone()\n',
+              '    let events = state\n        .job_events\n        .clone()\n        .ok_or_else(|| "Storage Inspector: job event channel is not bound".to_string())?;\n\n    if let Some(s3) = state.storage_inspector.s3.take()\n        && manager\n            .get(&s3.job_id)\n            .is_some_and(|job| !job.status.is_terminal())\n    {\n        manager.cancel(&s3.job_id);\n    }\n\n    if let Some(id) = state.storage_inspector.job_id.clone()\n',
+          )
+          replace(
+              'src/storage_inspector_ui.rs',
+              'pub fn handle_storage_inspector_key(state: &mut AppState, key: KeyEvent) {\n    match key.code {\n',
+              'pub fn handle_storage_inspector_key(state: &mut AppState, key: KeyEvent) {\n    if state.storage_inspector.s3.is_some() {\n        crate::s3_inspector_ui::handle_s3_inspector_key(state, key);\n        return;\n    }\n    match key.code {\n',
+          )
+          replace(
+              'src/storage_inspector_ui.rs',
+              'pub fn render_storage_inspector(frame: &mut ratatui::Frame, area: Rect, state: &mut AppState) {\n    let popup = centered_rect(90, 86, area);\n',
+              'pub fn render_storage_inspector(frame: &mut ratatui::Frame, area: Rect, state: &mut AppState) {\n    if state.storage_inspector.s3.is_some() {\n        crate::s3_inspector_ui::render_s3_inspector(frame, area, state);\n        return;\n    }\n    let popup = centered_rect(90, 86, area);\n',
+          )
+
+          replace(
+              'src/tui/feature_registry.rs',
+              'use arx::vfs::Entry;\n',
+              'use arx::vfs::{Entry, ListedEntry};\n',
+          )
+          replace(
+              'src/tui/feature_registry.rs',
+              '    pub focused: Option<&\'a Entry>,\n    pub active_entries: &\'a [&\'a Entry],\n',
+              '    pub focused: Option<&\'a Entry>,\n    pub focused_listed: Option<&\'a ListedEntry>,\n    pub active_entries: &\'a [&\'a Entry],\n',
+          )
+          replace(
+              'src/tui/feature_registry.rs',
+              '        focused,\n        active_entries,\n        effect_dispatcher,\n',
+              '        focused,\n        focused_listed: _,\n        active_entries,\n        effect_dispatcher,\n',
+          )
+          replace(
+              'src/tui/feature_registry.rs',
+              'fn storage_handler(ctx: &mut FeatureActionContext, _action: &Action) -> bool {\n    match arx::storage_inspector_ui::launch_storage_inspector(ctx.state) {\n',
+              'fn storage_handler(ctx: &mut FeatureActionContext, _action: &Action) -> bool {\n    match arx::storage_inspector_ui::launch_storage_inspector(ctx.state, ctx.focused_listed) {\n',
+          )
+          replace(
+              'src/tui/feature_registry.rs',
+              '            focused: None,\n            active_entries: &[],\n',
+              '            focused: None,\n            focused_listed: None,\n            active_entries: &[],\n',
+          )
+          replace(
+              'src/tui/feature_registry.rs',
+              '            focused: None,\n            active_entries: &[],\n',
+              '            focused: None,\n            focused_listed: None,\n            active_entries: &[],\n',
+          )
+
+          replace(
+              'src/tui.rs',
+              '''    let focused = focused_row\n        .and_then(|row| row.listed())\n        .map(|listed| &listed.entry);\n    // PACK R: proof-feature activation through the registered controller seam.\n    {\n        let focused_ref = focused;\n        let mut ctx = feature_registry::FeatureActionContext {\n            state,\n            focused: focused_ref,\n            active_entries,\n            effect_dispatcher,\n        };\n''',
+              '''    // Exact ListedEntry identity is frozen before feature dispatch so S3\n    // inspection never reconstructs remote identity from presentation names.\n    let focused_listed = focused_row.and_then(|row| row.listed());\n    let focused = focused_listed.map(|listed| &listed.entry);\n    // PACK R: proof-feature activation through the registered controller seam.\n    {\n        let focused_ref = focused;\n        let mut ctx = feature_registry::FeatureActionContext {\n            state,\n            focused: focused_ref,\n            focused_listed,\n            active_entries,\n            effect_dispatcher,\n        };\n''',
+          )
+          replace(
+              'src/tui.rs',
+              '    // ponytail: keep the ListedEntry (exact identity) for preview, not &Entry\n    let focused_listed = focused_row.and_then(|row| row.listed());\n',
+              '    // `focused_listed` above remains the exact identity authority for preview/transfers too.\n',
+          )
+
+          replace(
+              '.github/workflows/ci.yml',
+              '          cargo test --locked --test transfer_queue_s3_retry_physical -- --nocapture\n',
+              '          cargo test --locked --test transfer_queue_s3_retry_physical -- --nocapture\n          cargo test --locked --test s3_inspector_minio -- --nocapture\n',
+          )
+          PY
+
+          cargo fmt
+          cargo fmt --check
+          cargo check --locked --all-features
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-features
+          rustup toolchain install 1.88 --profile minimal
+          cargo +1.88 check --locked --all-features
+          git diff --check
+
+      - name: Commit implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/s3_inspector.rs src/s3_inspector_ui.rs src/lib.rs src/storage_inspector_ui.rs src/tui/feature_registry.rs src/tui.rs tests/s3_inspector_minio.rs .github/workflows/ci.yml
+          git commit -m 'feat: add read-only S3 object and bucket inspector'
+          git push origin HEAD:feature/s3-object-bucket-inspector
