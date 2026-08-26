@@ -1,0 +1,45 @@
+name: Format SFTP physical test
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt
+
+      - name: Format exactly the new physical test
+        run: |
+          set -euo pipefail
+          cargo fmt
+          CHANGED="$(git diff --name-only)"
+          if [ "$CHANGED" != "tests/sftp_workspace_sync_physical.rs" ]; then
+            echo "::error::rustfmt changed unexpected files: $CHANGED"
+            git diff --stat
+            exit 1
+          fi
+          git diff --check
+
+      - name: Commit formatted test and remove helper
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          rm .github/workflows/fmt-sftp-physical.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tests/sftp_workspace_sync_physical.rs .github/workflows/fmt-sftp-physical.yml
+          git commit -m "test: format SFTP workspace sync physical matrix"
+          git push origin "HEAD:${HEAD_REF}"
