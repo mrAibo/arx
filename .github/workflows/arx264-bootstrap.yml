@@ -37,6 +37,7 @@ jobs:
           p.write_text(text)
           PY
           python3 scripts/arx264_integrate.py
+          python3 scripts/arx264_fix1.py
           printf '\n          cargo test --locked --test s3_inspector_minio -- --nocapture\n' >> .github/workflows/ci.yml
 
       - name: Quality and MSRV gates
@@ -58,6 +59,6 @@ jobs:
           set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/lib.rs src/storage_inspector_ui.rs src/tui/feature_registry.rs src/tui.rs .github/workflows/ci.yml
+          git add src/lib.rs src/s3_inspector.rs src/storage_inspector_ui.rs src/tui/feature_registry.rs src/tui.rs src/app/registration.rs src/app/availability.rs .github/workflows/ci.yml
           git commit -m 'feat: integrate S3 inspector with Alt+U and MinIO CI'
           git push origin HEAD:feature/s3-object-bucket-inspector
