@@ -1,0 +1,48 @@
+name: Apply WebDAV remote copy core
+
+on:
+  push:
+    branches:
+      - feature/webdav-webdav-recursive-copy
+    paths:
+      - '.github/workflows/apply-webdav-webdav-copy.yml'
+      - 'scripts/apply_webdav_webdav_copy.py'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.ref == 'refs/heads/feature/webdav-webdav-recursive-copy'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Apply frozen #275 core
+        run: python3 scripts/apply_webdav_webdav_copy.py
+
+      - name: Format and compile
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo check
+          cargo test --locked webdav_remote_copy_requires_frozen_copy_tree_and_rejects_move
+          cargo test --locked webdav_to_webdav_freezes_exact_collection_and_new_destination
+          cargo test --locked webdav_to_webdav_rejects_file_and_multi_root
+
+      - name: Validate scope and commit production patch
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/apply-webdav-webdav-copy.yml scripts/apply_webdav_webdav_copy.py
+          git add -A
+          git diff --cached --check
+          git diff --cached --name-only
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat: add WebDAV-to-WebDAV recursive copy core'
+          git push origin HEAD:feature/webdav-webdav-recursive-copy
