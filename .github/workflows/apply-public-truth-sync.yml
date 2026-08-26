@@ -21,6 +21,18 @@ jobs:
           fetch-depth: 0
       - name: Apply exact public-truth replacements
         run: python3 scripts/apply_public_truth_sync.py
+      - name: Normalize new ROADMAP line
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ROADMAP.md')
+          text = p.read_text()
+          old = '**Previous immutable release:** `v0.22.0` → `8737bbd2afaf0d6e7146a5d8c59ee1a0606325bf`  \n**Current main:**'
+          new = '**Previous immutable release:** `v0.22.0` → `8737bbd2afaf0d6e7146a5d8c59ee1a0606325bf`\n**Current main:**'
+          if text.count(old) != 1:
+              raise SystemExit('expected one ROADMAP whitespace anchor')
+          p.write_text(text.replace(old, new, 1))
+          PY
       - name: Validate docs diff
         run: git diff --check
       - name: Commit docs and remove helper
