@@ -64,6 +64,7 @@ jobs:
       - name: Capture exact gate diagnostics
         shell: bash
         run: |
+          set +e
           set -u
           cargo fmt --all
           : > /tmp/multi-root-diagnostics.txt
@@ -84,7 +85,9 @@ jobs:
           printf '\n===== git status --short =====\n' >> /tmp/multi-root-diagnostics.txt
           git status --short >> /tmp/multi-root-diagnostics.txt 2>&1 || true
           git diff -- src/transfer/mod.rs src/transfer/webdav_batch.rs src/transfer/executor.rs src/tui/transfers.rs > /tmp/multi-root.patch
+          exit 0
       - name: Upload diagnostics
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: multi-root-diagnostics
