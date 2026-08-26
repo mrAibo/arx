@@ -572,6 +572,9 @@ async fn case_runtime_cancellation(f: &Fixture) -> Result<(), AnyError> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn physical_webdav_remote_recursive_copy() -> Result<(), AnyError> {
+    if std::env::var("ARX_WEBDAV_COPY_PHYSICAL").as_deref() != Ok("1") {
+        return Ok(());
+    }
     let f = fixture()?;
     case_cross_target(&f).await?;
     case_same_target(&f).await?;

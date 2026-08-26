@@ -1253,6 +1253,20 @@ async fn copy_tree_file_streamed(
     );
     let (get_result, put_result) = tokio::join!(get, put);
 
+    // A requested cancellation is observed authoritatively by the source GET.
+    // Ending that GET also terminates the request-body stream, so the parallel
+    // PUT may surface a transport ambiguity that is merely downstream of the
+    // cancellation. Preserve Interrupted here; the attempt-owned root cleanup
+    // in `copy_tree` restores destination certainty, and a cleanup failure is
+    // still upgraded to RecoveryRequired by the existing CleanupFailure path.
+    if matches!(
+        &get_result,
+        Err(error) if error.kind() == io::ErrorKind::Interrupted
+    ) && context.cancel.load(Ordering::Acquire)
+    {
+        return get_result;
+    }
+
     match put_result {
         Ok(()) => {}
         Err(StreamPutError::Definitive(error)) => return Err(error),
