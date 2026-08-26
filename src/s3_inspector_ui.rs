@@ -204,7 +204,9 @@ pub fn launch_s3_inspector(
                             &worker_events,
                             JobEvent::Cancelled {
                                 id: worker_id,
-                                result: JobResult::generic_message("S3 object inspection cancelled"),
+                                result: JobResult::generic_message(
+                                    "S3 object inspection cancelled",
+                                ),
                             },
                         );
                     }
@@ -224,23 +226,28 @@ pub fn launch_s3_inspector(
                 let progress_manager = worker_manager.clone();
                 let progress_events = worker_events.clone();
                 let progress_id = worker_id.clone();
-                match scan_scope(provider, scope, Arc::clone(&cancellation), move |progress| {
-                    let _ = progress_manager.publish_event(
-                        &progress_events,
-                        JobEvent::Progress {
-                            id: progress_id.clone(),
-                            progress: JobProgress::Generic(Progress::Phase {
-                                phase: format!(
-                                    "{} pages · {} objects · {} logical · total unknown",
-                                    progress.pages_seen,
-                                    progress.objects_seen,
-                                    format_bytes_u128(progress.logical_bytes_seen)
-                                ),
-                                percent: None,
-                            }),
-                        },
-                    );
-                })
+                match scan_scope(
+                    provider,
+                    scope,
+                    Arc::clone(&cancellation),
+                    move |progress| {
+                        let _ = progress_manager.publish_event(
+                            &progress_events,
+                            JobEvent::Progress {
+                                id: progress_id.clone(),
+                                progress: JobProgress::Generic(Progress::Phase {
+                                    phase: format!(
+                                        "{} pages · {} objects · {} logical · total unknown",
+                                        progress.pages_seen,
+                                        progress.objects_seen,
+                                        format_bytes_u128(progress.logical_bytes_seen)
+                                    ),
+                                    percent: None,
+                                }),
+                            },
+                        );
+                    },
+                )
                 .await
                 {
                     Ok(S3ScanOutcome::Complete(result)) => {
@@ -267,7 +274,10 @@ pub fn launch_s3_inspector(
                             },
                         );
                     }
-                    Ok(S3ScanOutcome::Partial { snapshot: result, error }) => {
+                    Ok(S3ScanOutcome::Partial {
+                        snapshot: result,
+                        error,
+                    }) => {
                         store_snapshot(&snapshot, S3InspectorSnapshot::Scan(result));
                         let _ = worker_manager.publish_event(
                             &worker_events,
@@ -302,9 +312,7 @@ fn store_snapshot(
     slot: &Arc<Mutex<Option<Arc<S3InspectorSnapshot>>>>,
     snapshot: S3InspectorSnapshot,
 ) {
-    *slot
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(snapshot));
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(snapshot));
 }
 
 pub fn handle_s3_inspector_key(state: &mut AppState, key: KeyEvent) {
@@ -410,10 +418,7 @@ fn inspector_lines(state: &AppState) -> Vec<Line<'static>> {
         return vec![Line::from("S3 Inspector state unavailable")];
     };
     let mut lines = vec![Line::from(vec![
-        Span::styled(
-            "status: ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("status: ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(job_status(state, &ui.job_id)),
     ])];
     lines.push(Line::from(format!(
@@ -530,10 +535,7 @@ fn inspector_lines(state: &AppState) -> Vec<Line<'static>> {
                 format_bytes_u128(scan.total_logical_bytes)
             )));
             if let Some(note) = &scan.terminal_note {
-                lines.push(Line::from(format!(
-                    "terminal note: {}",
-                    display_safe(note)
-                )));
+                lines.push(Line::from(format!("terminal note: {}", display_safe(note))));
             }
             lines.push(Line::from(""));
             lines.push(Line::from("largest objects (bounded top 20):"));
@@ -589,10 +591,7 @@ fn inspector_lines(state: &AppState) -> Vec<Line<'static>> {
                 lines.push(Line::from("  <none reported>"));
             } else {
                 for (class, count) in &scan.storage_classes {
-                    lines.push(Line::from(format!(
-                        "  {}: {count}",
-                        display_safe(class)
-                    )));
+                    lines.push(Line::from(format!("  {}: {count}", display_safe(class))));
                 }
             }
             if scan.objects_without_storage_class > 0 {

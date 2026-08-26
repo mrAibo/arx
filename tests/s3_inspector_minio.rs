@@ -123,9 +123,11 @@ async fn minio_object_and_prefix_inspector_are_live_bounded_and_exact() {
         .largest_prefixes
         .value
         .expect("bounded prefix analytics");
-    assert!(prefixes.iter().any(|prefix| {
-        prefix.prefix == format!("{root}child/") && prefix.logical_bytes == 12
-    }));
+    assert!(
+        prefixes.iter().any(|prefix| {
+            prefix.prefix == format!("{root}child/") && prefix.logical_bytes == 12
+        })
+    );
     assert!(!progress.is_empty());
     assert_eq!(progress.last().unwrap().objects_seen, 3);
     assert_eq!(progress.last().unwrap().logical_bytes_seen, 15);

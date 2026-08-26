@@ -14,10 +14,10 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use crate::app::{AppState, OverlayKind};
 use crate::jobs::{JobProgress, JobResult, JobStatus};
-use crate::vfs::ListedEntry;
 use crate::storage_inspector::{
     UsageKind, UsageRecord, UsageScanOptions, UsageScanOutcome, UsageScanResult,
 };
+use crate::vfs::ListedEntry;
 
 const TOP_FILES_LIMIT: usize = 20;
 

@@ -311,9 +311,7 @@ pub async fn inspect_object(
         last_modified_unix_ms,
         etag: head.e_tag().map(str::to_owned),
         content_type: head.content_type().map(str::to_owned),
-        storage_class: head
-            .storage_class()
-            .map(|value| value.as_str().to_string()),
+        storage_class: head.storage_class().map(|value| value.as_str().to_string()),
         metadata,
         version_id: head.version_id().map(str::to_owned),
     })
@@ -517,7 +515,9 @@ fn next_token(
             "S3 inspection pagination contradiction",
         )),
         Some(true) => match returned {
-            Some(token) if !token.is_empty() && Some(token) != consumed => Ok(Some(token.to_string())),
+            Some(token) if !token.is_empty() && Some(token) != consumed => {
+                Ok(Some(token.to_string()))
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "S3 inspection pagination token did not advance",
@@ -580,7 +580,11 @@ where
                 let snapshot = accumulator.finish(false, false, Some(error.clone()));
                 return Ok(S3ScanOutcome::Partial { snapshot, error });
             }
-            Err(_) => return Err(io::Error::other("S3 ListObjectsV2 inspection request failed")),
+            Err(_) => {
+                return Err(io::Error::other(
+                    "S3 ListObjectsV2 inspection request failed",
+                ));
+            }
         };
 
         accumulator.pages_seen = accumulator.pages_seen.saturating_add(1);
@@ -640,7 +644,9 @@ where
             }
         };
         if continuation.is_none() {
-            return Ok(S3ScanOutcome::Complete(accumulator.finish(true, false, None)));
+            return Ok(S3ScanOutcome::Complete(
+                accumulator.finish(true, false, None),
+            ));
         }
     }
 }
@@ -700,7 +706,10 @@ mod tests {
         let snapshot = accumulator.finish(true, false, None);
         assert_eq!(snapshot.object_count, PREFIX_CARDINALITY_LIMIT as u64 + 1);
         assert_eq!(snapshot.largest_objects.len(), TOP_OBJECTS_LIMIT);
-        assert_eq!(snapshot.largest_prefixes.source, S3EvidenceSource::Unavailable);
+        assert_eq!(
+            snapshot.largest_prefixes.source,
+            S3EvidenceSource::Unavailable
+        );
         assert!(snapshot.largest_prefixes.value.is_none());
     }
 
