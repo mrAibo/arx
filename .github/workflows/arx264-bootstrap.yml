@@ -24,7 +24,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Wire inspector into product paths
-        run: python3 scripts/arx264_integrate.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/arx264_integrate.py')
+          text = p.read_text()
+          marker = '\nrep(\n    ".github/workflows/ci.yml",'
+          if marker in text:
+              text = text.split(marker, 1)[0] + '\n'
+          p.write_text(text)
+          PY
+          python3 scripts/arx264_integrate.py
+          printf '\n          cargo test --locked --test s3_inspector_minio -- --nocapture\n' >> .github/workflows/ci.yml
 
       - name: Quality and MSRV gates
         shell: bash
