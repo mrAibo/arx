@@ -2,7 +2,7 @@
 
 GitHub state is authoritative over this document. Re-fetch current `main`, issues, PRs, tags, workflow state, and releases before acting on any recorded SHA or backlog item.
 
-## CURRENT — v0.23.0 published
+## CURRENT — v0.23.0 published / SFTP→SFTP accepted on main
 
 **Current public release:** `v0.23.0`  
 **Release tag target:** `f66a25f3f2b4fb66832ecc50d85f9f105ebba086`  
@@ -10,6 +10,7 @@ GitHub state is authoritative over this document. Re-fetch current `main`, issue
 **Platform:** Linux only; published target Linux x86_64  
 **MSRV:** Rust 1.88  
 **Previous immutable release:** `v0.22.0` → `8737bbd2afaf0d6e7146a5d8c59ee1a0606325bf`
+**Current main:** `fe413aecfdc3bf5685849e73b396800f7f3ab7e0` — accepted/unreleased SFTP→SFTP Workspace Sync (#269 / PR #270)
 
 v0.23.0 ships the read-only **S3 Object & Bucket Inspector** on top of the v0.22.0 WebDAV recursive-operation baseline.
 
@@ -41,7 +42,7 @@ Published SHA-256 values:
 ## CURRENT PRODUCT TRUTH
 
 - **Local / SFTP:** browsing, transactional copy, bounded preview, SFTP conflict-safe text Remote Edit, OpenSSH-backed host/session behavior.
-- **Remote Workspace:** Compare → Preview → Execute → Verify for Local→Local, Local→SFTP, and SFTP→Local. SFTP→SFTP workspace sync remains unsupported in v0.23.0.
+- **Remote Workspace:** published v0.23.0 provides Compare → Preview → Execute → Verify for Local→Local, Local→SFTP, and SFTP→Local; current `main` additionally contains accepted/unreleased SFTP→SFTP sync with same-host/cross-host bounded streaming and real two-endpoint OpenSSH acceptance.
 - **Transfer Queue:** one persistent bounded FIFO runtime, configurable concurrency `1..=8`, truthful progress/rate/ETA where known, cooperative Pause/Resume/Cancel, and bounded safe retry.
 - **Transfer Center v2:** Active / History / All views and controls routed to the existing `TransferQueueRuntime`.
 - **Storage Inspector (`Alt+U`):** Local read-only logical/allocated usage plus exact S3 object inspection and bounded paginated bucket/prefix LiveScan analytics.
@@ -128,27 +129,30 @@ Remaining enhancements under #13:
 
 These are enhancements, not regressions or current release blockers.
 
-## SELECTED NEXT PRODUCT DIRECTION — SFTP → SFTP WORKSPACE SYNC
+## ACCEPTED / UNRELEASED — SFTP → SFTP WORKSPACE SYNC
 
-The next major feature is **SFTP → SFTP workspace synchronization**. Freeze a dedicated issue/contract before implementation and extend the existing Compare → Preview → Execute → Verify model rather than creating a second synchronization engine.
+Issue #269 was completed by PR #270 and is now accepted on `main` at `fe413aecfdc3bf5685849e73b396800f7f3ab7e0`. It is **not part of published v0.23.0**.
 
-Required boundaries:
+Accepted truth:
 
 - exact source and destination SFTP host/path identities
-- explicit same-host vs cross-host execution truth
-- reuse of the existing workspace-sync controller, `ProviderRegistry`, Transfer Queue, `JobManager`, retry policy, and verification model
-- frozen Preview before destructive Mirror consequences
-- deterministic copy/mutation ordering
-- real destination verification after execution
-- cooperative cancellation and truthful partial completion
-- explicit ambiguity/recovery boundaries
-- never treat a cross-host transfer as server-side rename/move
-- do not bundle general cross-provider Move or WebDAV→WebDAV recursive copy into this slice
+- explicit same-host and cross-host execution truth
+- bounded remote → ARX → remote file streaming through the existing SFTP transfer authority
+- no server-side copy/rename fiction and no SFTP→SFTP Move expansion
+- existing workspace-sync controller, `ProviderRegistry`, Job lifecycle, retry/recovery model, journal, frozen Preview and post-execution verification retained
+- SFTP mkdir/delete routed through existing provider mutation seams
+- stale source/destination fail closed before mutation
+- cancellation and partial/recovery truth retained
+- permanent two-endpoint OpenSSH physical lane with strict host-key checking
+- exact feature head `9656102bc679b71ca49513b37735bc79a3874a91`; squash merge `fe413aecfdc3bf5685849e73b396800f7f3ab7e0`
+- exact-head CI / WebDAV interop / SFTP physical all success; post-merge CI run `33002995697` and post-merge SFTP physical run `33002995516` success
+
+The focused release package is tracked in #271 and targets **v0.24.0** without another major feature.
 
 ## RECOMMENDED FEATURE SEQUENCE
 
-1. **Next:** SFTP → SFTP workspace sync.
-2. **After that:** WebDAV → WebDAV recursive copy, only after exact source/target and recovery semantics are frozen.
+1. **Next:** publish focused v0.24.0 with the already accepted SFTP→SFTP Workspace Sync.
+2. **After v0.24.0:** WebDAV → WebDAV recursive copy, only after exact source/target and recovery semantics are frozen.
 3. **Later:** general safe cross-provider Move modeled as copy → verify → delete-source.
 4. Other candidates: binary remote editing, additional Linux architectures, signed repositories, provider-specific read-only analytics where evidence is truthful.
 
