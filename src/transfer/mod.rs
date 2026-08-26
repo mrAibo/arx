@@ -276,6 +276,16 @@ impl TransferPlanner {
             return Ok(TransferMethod::Native);
         }
 
+        // Remote-to-remote workspace sync is streamed through ARX's existing
+        // SFTP executor. It is deliberately never routed through rsync/native or
+        // represented as a server-side copy/rename.
+        if Self::is_sftp_remote_pair(request) {
+            return match request.intent {
+                TransferIntent::Copy if request.executors.sftp => Ok(TransferMethod::Sftp),
+                _ => Err(Self::unsupported(request)),
+            };
+        }
+
         if Self::is_local_remote_pair(request) {
             return match request.intent {
                 TransferIntent::Copy if request.executors.rsync => Ok(TransferMethod::Rsync),
@@ -298,6 +308,13 @@ impl TransferPlanner {
         }
 
         Err(Self::unsupported(request))
+    }
+
+    fn is_sftp_remote_pair(request: &TransferRequest) -> bool {
+        matches!(
+            (request.source_provider, request.destination_provider),
+            (ProviderId::Sftp, ProviderId::Sftp)
+        )
     }
 
     fn is_local_remote_pair(request: &TransferRequest) -> bool {
@@ -694,8 +711,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_to_remote_is_not_routed_through_rsync() {
-        let error = TransferPlanner::plan(TransferRequest {
+    fn remote_to_remote_uses_sftp_and_never_rsync() {
+        let plan = TransferPlanner::plan(TransferRequest {
             source: sftp("prod-a", "/src"),
             destination: sftp("prod-b", "/dst"),
             source_provider: ProviderId::Sftp,
@@ -714,6 +731,32 @@ mod tests {
             s3_spec: None,
             webdav_spec: None,
         })
+        .unwrap();
+
+        assert_eq!(plan.method, TransferMethod::Sftp);
+    }
+
+    #[test]
+    fn remote_to_remote_requires_sftp_executor() {
+        let error = TransferPlanner::plan(TransferRequest {
+            source: sftp("prod-a", "/src"),
+            destination: sftp("prod-b", "/dst"),
+            source_provider: ProviderId::Sftp,
+            destination_provider: ProviderId::Sftp,
+            source_capabilities: SFTP_CAPABILITIES,
+            destination_capabilities: SFTP_CAPABILITIES,
+            intent: TransferIntent::Copy,
+            executors: ExecutorAvailability {
+                native: false,
+                rsync: true,
+                sftp: false,
+                s3: false,
+                webdav: false,
+            },
+            delete_extraneous: false,
+            s3_spec: None,
+            webdav_spec: None,
+        })
         .unwrap_err();
 
         assert!(matches!(
@@ -722,6 +765,39 @@ mod tests {
                 source: ProviderId::Sftp,
                 destination: ProviderId::Sftp,
                 intent: TransferIntent::Copy
+            }
+        ));
+    }
+
+    #[test]
+    fn remote_to_remote_move_remains_unsupported() {
+        let error = TransferPlanner::plan(TransferRequest {
+            source: sftp("prod-a", "/src"),
+            destination: sftp("prod-b", "/dst"),
+            source_provider: ProviderId::Sftp,
+            destination_provider: ProviderId::Sftp,
+            source_capabilities: SFTP_CAPABILITIES,
+            destination_capabilities: SFTP_CAPABILITIES,
+            intent: TransferIntent::Move,
+            executors: ExecutorAvailability {
+                native: false,
+                rsync: false,
+                sftp: true,
+                s3: false,
+                webdav: false,
+            },
+            delete_extraneous: false,
+            s3_spec: None,
+            webdav_spec: None,
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TransferPlanError::Unsupported {
+                source: ProviderId::Sftp,
+                destination: ProviderId::Sftp,
+                intent: TransferIntent::Move
             }
         ));
     }

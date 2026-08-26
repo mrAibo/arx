@@ -30,6 +30,30 @@ pub(crate) async fn execute_sftp_copy(
         ));
     }
 
+    if let (
+        Location::Sftp {
+            host: source_host,
+            path: source_dir,
+        },
+        Location::Sftp {
+            host: destination_host,
+            path: destination_dir,
+        },
+    ) = (&plan.source, &plan.destination)
+    {
+        return execute_sftp_remote_copy(
+            source_host,
+            source_dir,
+            destination_host,
+            destination_dir,
+            names,
+            cancel,
+            pause,
+            on_progress,
+        )
+        .await;
+    }
+
     let (host, direction) = match (&plan.source, &plan.destination) {
         (Location::Local(src), Location::Sftp { host, path }) => (
             host.as_str(),
@@ -127,6 +151,308 @@ pub(crate) async fn execute_sftp_copy(
 enum Direction<'a> {
     Upload { src: &'a Path, remote_dir: &'a str },
     Download { remote_dir: &'a str, dst: &'a Path },
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_sftp_remote_copy(
+    source_host: &str,
+    source_dir: &str,
+    destination_host: &str,
+    destination_dir: &str,
+    names: &[String],
+    cancel: Arc<AtomicBool>,
+    pause: PauseGate,
+    on_progress: &mut impl FnMut(TypedTransferProgress),
+) -> Result<TransferOutcome, TransferExecutionError> {
+    let source = OpenSshSftpConnection::connect(source_host)
+        .await
+        .map_err(TransferExecutionError::safe_to_retry)?;
+    let destination = match OpenSshSftpConnection::connect(destination_host).await {
+        Ok(connection) => connection,
+        Err(error) => {
+            let _ = source.close().await;
+            return Err(TransferExecutionError::safe_to_retry(error));
+        }
+    };
+
+    let total = names.len();
+    let mut completed = 0usize;
+    let mut cumulative_written = 0u64;
+    let mut total_bytes = Some(0u64);
+
+    let result = async {
+        for name in names {
+            validate_name(name)?;
+            let path = remote_join(source_dir, name);
+            let metadata = source
+                .session()
+                .symlink_metadata(path)
+                .await
+                .map_err(|error| phase_sftp(name, error, RetryDisposition::SafeToRetry))?;
+            if !metadata.is_regular() {
+                return Err(invalid(
+                    "SFTP remote-to-remote copy supports regular files only",
+                ));
+            }
+            total_bytes = total_bytes.and_then(|total| total.checked_add(metadata.len()));
+        }
+
+        for name in names {
+            validate_name(name)?;
+            check_cancelled(&cancel, completed)?;
+            copy_remote_file(
+                &source,
+                source_dir,
+                &destination,
+                destination_dir,
+                name,
+                &cancel,
+                &pause,
+                completed,
+                &mut cumulative_written,
+                total_bytes,
+                on_progress,
+            )
+            .await?;
+            completed += 1;
+        }
+
+        Ok(TransferOutcome { completed, total })
+    }
+    .await;
+
+    let _ = source.close().await;
+    let _ = destination.close().await;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn copy_remote_file(
+    source_connection: &OpenSshSftpConnection,
+    source_dir: &str,
+    destination_connection: &OpenSshSftpConnection,
+    destination_dir: &str,
+    name: &str,
+    cancel: &AtomicBool,
+    pause: &PauseGate,
+    completed: usize,
+    cumulative_written: &mut u64,
+    total_bytes: Option<u64>,
+    on_progress: &mut impl FnMut(TypedTransferProgress),
+) -> Result<(), TransferExecutionError> {
+    let source_path = remote_join(source_dir, name);
+    let source_before = source_connection
+        .session()
+        .symlink_metadata(source_path.clone())
+        .await
+        .map_err(|error| phase_sftp(name, error, RetryDisposition::SafeToRetry))?;
+    if !source_before.is_regular() {
+        return Err(invalid(
+            "SFTP remote-to-remote copy supports regular files only",
+        ));
+    }
+
+    let target = remote_join(destination_dir, name);
+    let token = operation_token();
+    let temp = format!("{target}.arx-part-{token}");
+    let backup = format!("{target}.arx-bak-{token}");
+
+    let mut remote_source = source_connection
+        .session()
+        .open(source_path.clone())
+        .await
+        .map_err(|error| phase_sftp(name, error, RetryDisposition::SafeToRetry))?;
+    let mut remote_destination = match destination_connection.session().create(temp.clone()).await {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(clean_remote_stage(
+                destination_connection,
+                &temp,
+                phase_sftp(name, error, RetryDisposition::SafeToRetry),
+            )
+            .await);
+        }
+    };
+
+    if let Err(error) = copy_stream(
+        &mut remote_source,
+        &mut remote_destination,
+        cancel,
+        pause,
+        completed,
+        cumulative_written,
+        total_bytes,
+        on_progress,
+    )
+    .await
+    {
+        return Err(clean_remote_stage(destination_connection, &temp, error).await);
+    }
+    if let Err(error) = remote_destination.flush().await {
+        return Err(clean_remote_stage(
+            destination_connection,
+            &temp,
+            phase_err(error, RetryDisposition::SafeToRetry),
+        )
+        .await);
+    }
+    if let Err(error) = remote_destination.shutdown().await {
+        return Err(clean_remote_stage(
+            destination_connection,
+            &temp,
+            phase_err(error, RetryDisposition::SafeToRetry),
+        )
+        .await);
+    }
+
+    let source_after = match source_connection
+        .session()
+        .symlink_metadata(source_path)
+        .await
+    {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(clean_remote_stage(
+                destination_connection,
+                &temp,
+                phase_sftp(name, error, RetryDisposition::SafeToRetry),
+            )
+            .await);
+        }
+    };
+    if !source_after.is_regular()
+        || source_after.size != source_before.size
+        || source_after.mtime != source_before.mtime
+    {
+        return Err(clean_remote_stage(
+            destination_connection,
+            &temp,
+            phase_err(
+                io::Error::other("SFTP source changed during remote-to-remote copy"),
+                RetryDisposition::SafeToRetry,
+            ),
+        )
+        .await);
+    }
+
+    let staged = match destination_connection
+        .session()
+        .metadata(temp.clone())
+        .await
+    {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(clean_remote_stage(
+                destination_connection,
+                &temp,
+                phase_sftp(name, error, RetryDisposition::SafeToRetry),
+            )
+            .await);
+        }
+    };
+    if staged.len() != source_before.len() {
+        return Err(clean_remote_stage(
+            destination_connection,
+            &temp,
+            phase_err(
+                io::Error::other("SFTP remote-to-remote staged size differs"),
+                RetryDisposition::SafeToRetry,
+            ),
+        )
+        .await);
+    }
+    if let Err(cancelled) = check_cancelled(cancel, completed) {
+        return Err(clean_remote_stage(destination_connection, &temp, cancelled).await);
+    }
+
+    let had_target = match destination_connection
+        .session()
+        .symlink_metadata(target.clone())
+        .await
+    {
+        Ok(metadata) if metadata.is_regular() => true,
+        Ok(_) => {
+            return Err(clean_remote_stage(
+                destination_connection,
+                &temp,
+                invalid("SFTP remote-to-remote destination is not a regular file"),
+            )
+            .await);
+        }
+        Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => false,
+        Err(error) => {
+            return Err(clean_remote_stage(
+                destination_connection,
+                &temp,
+                phase_sftp(name, error, RetryDisposition::SafeToRetry),
+            )
+            .await);
+        }
+    };
+
+    if had_target
+        && let Err(error) = destination_connection
+            .session()
+            .rename(target.clone(), backup.clone())
+            .await
+    {
+        return Err(clean_remote_stage(
+            destination_connection,
+            &temp,
+            phase_sftp(name, error, RetryDisposition::SafeToRetry),
+        )
+        .await);
+    }
+
+    if let Err(cancelled) = check_cancelled(cancel, completed) {
+        if let Err(cleanup) = destination_connection
+            .session()
+            .remove_file(temp.clone())
+            .await
+        {
+            return Err(phase_sftp(
+                &temp,
+                cleanup,
+                RetryDisposition::RecoveryRequired,
+            ));
+        }
+        if had_target
+            && destination_connection
+                .session()
+                .rename(backup.clone(), target.clone())
+                .await
+                .is_err()
+        {
+            return Err(phase_err(
+                io::Error::other("SFTP remote-to-remote cancellation rollback failed"),
+                RetryDisposition::RecoveryRequired,
+            ));
+        }
+        return Err(cancelled);
+    }
+
+    if let Err(error) = destination_connection
+        .session()
+        .rename(temp.clone(), target.clone())
+        .await
+    {
+        let _ = destination_connection.session().remove_file(temp).await;
+        if had_target
+            && destination_connection
+                .session()
+                .rename(backup, target)
+                .await
+                .is_err()
+        {
+            return Err(phase_err(
+                io::Error::other("SFTP remote-to-remote commit failed and rollback failed"),
+                RetryDisposition::RecoveryRequired,
+            ));
+        }
+        return Err(phase_sftp(name, error, RetryDisposition::AmbiguousMutation));
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -600,6 +926,27 @@ mod tests {
                 disposition
             );
         }
+    }
+
+    #[test]
+    fn remote_to_remote_plan_shape_is_sftp_only() {
+        let plan = TransferPlan {
+            source: Location::Sftp {
+                host: "a".into(),
+                path: "/src".into(),
+            },
+            destination: Location::Sftp {
+                host: "b".into(),
+                path: "/dst".into(),
+            },
+            intent: TransferIntent::Copy,
+            method: TransferMethod::Sftp,
+            s3_spec: None,
+            webdav_spec: None,
+        };
+        assert!(matches!(plan.source, Location::Sftp { .. }));
+        assert!(matches!(plan.destination, Location::Sftp { .. }));
+        assert_eq!(plan.method, TransferMethod::Sftp);
     }
 
     #[test]

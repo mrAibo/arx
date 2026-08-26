@@ -1,0 +1,54 @@
+name: SFTP Workspace Sync Physical
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sftp-workspace-sync-physical:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Exact-SHA evidence (PR head)
+        run: |
+          set -euo pipefail
+          TESTED_SHA="$(git rev-parse HEAD)"
+          echo "TESTED_SHA=$TESTED_SHA"
+          EXPECTED="${{ github.event.pull_request.head.sha }}"
+          if [ -n "$EXPECTED" ] && [ "$EXPECTED" != "$TESTED_SHA" ]; then
+            echo "::error::checked-out SHA ($TESTED_SHA) != PR head ($EXPECTED)"
+            exit 1
+          fi
+
+      - name: Provision two OpenSSH endpoints + run workspace-sync matrix
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssh-server openssh-client
+          source ./scripts/setup_sftp_sync_acceptance.sh
+          cargo test --locked --test sftp_workspace_sync_physical \
+            physical_sftp_workspace_sync_matrix -- --ignored --nocapture --test-threads=1
+
+      - name: Retry-disposition regression evidence
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib transfer::sftp_copy::tests::phase_error_preserves_retry_disposition -- --nocapture
+          cargo test --locked --test transfer_queue_contracts ambiguous_and_recovery_dispositions_stop_after_one_attempt -- --nocapture
