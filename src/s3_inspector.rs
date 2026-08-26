@@ -732,13 +732,7 @@ mod tests {
         for index in 0..STORAGE_CLASS_CARDINALITY_LIMIT {
             let class = format!("CLASS-{index}");
             accumulator
-                .ingest(
-                    &format!("file-{index}"),
-                    Some(1),
-                    None,
-                    None,
-                    Some(&class),
-                )
+                .ingest(&format!("file-{index}"), Some(1), None, None, Some(&class))
                 .unwrap();
         }
         let error = accumulator
