@@ -10,8 +10,19 @@ def replace_exact(path: str, old: str, new: str, expected: int = 1) -> None:
     p.write_text(text.replace(old, new))
 
 
-# Restore the existing SFTP test annotation and keep exactly one attribute on
-# the new WebDAV planner test.
+def replace_after(path: str, marker: str, old: str, new: str) -> None:
+    p = Path(path)
+    text = p.read_text()
+    if text.count(marker) != 1:
+        raise SystemExit(f"{path}: marker count != 1: {marker!r}")
+    prefix, tail = text.split(marker, 1)
+    count = tail.count(old)
+    if count != 1:
+        raise SystemExit(f"{path}: after marker expected one anchor, found {count}: {old[:120]!r}")
+    p.write_text(prefix + marker + tail.replace(old, new, 1))
+
+
+# Restore test annotations exactly.
 replace_exact(
     "src/transfer/mod.rs",
     "    #[test]\n    #[test]\n    fn webdav_remote_copy_requires_frozen_copy_tree_and_rejects_move()",
@@ -23,7 +34,7 @@ replace_exact(
     "\n    #[test]\n    fn remote_to_remote_uses_sftp_and_never_rsync()",
 )
 
-# Load the shared physical fault proxy exactly once at the vfs parent level.
+# Shared physical proxy: compile exactly one module instance.
 replace_exact(
     "src/vfs/mod.rs",
     '#[cfg(all(test, feature = "physical-webdav"))]\nmod webdav_acceptance;\n',
@@ -46,8 +57,7 @@ replace_exact(
     'use super::webdav_acceptance_proxy::{ProxyMode, start_proxy};',
 )
 
-# Physical test polish: exact byte total, no unused secret copy/import, and a
-# synchronous registry constructor because it performs no async work.
+# Physical acceptance polish.
 replace_exact(
     "src/vfs/webdav_remote_copy_acceptance.rs",
     'use std::sync::atomic::{AtomicBool, Ordering};',
@@ -85,7 +95,7 @@ replace_exact(
     expected=2,
 )
 
-# Clippy: collapse factual size checks without changing semantics.
+# Clippy: collapse equivalent factual size checks.
 replace_exact(
     "src/transfer/webdav_transfer.rs",
     '''        if let Some(expected) = source_size {\n            if destination_files.get(&relative).copied().flatten() != Some(expected) {\n                return Err(io::Error::new(\n                    io::ErrorKind::InvalidData,\n                    format!(\n                        "WebDAV copy verification failed: size differs for {}",\n                        relative.display()\n                    ),\n                ));\n            }\n        }\n''',
@@ -97,8 +107,7 @@ replace_exact(
     '''    if let Some(expected) = file.advertised_size\n        && copied != expected\n    {\n        return Err(io::Error::new(\n            io::ErrorKind::InvalidData,\n            format!(\n                "WebDAV source size changed while streaming {}: expected {expected}, got {copied}",\n                file.relative.display()\n            ),\n        ));\n    }\n''',
 )
 
-# Keep the streaming helper small and coherent by carrying operation-scoped
-# immutable values in one context instead of suppressing too_many_arguments.
+# Reduce copy_tree_file_streamed argument count without suppressing lint.
 replace_exact(
     "src/transfer/webdav_transfer.rs",
     '''const WEBDAV_REMOTE_COPY_PIPE_BYTES: usize = 64 * 1024;\nconst MAX_WEBDAV_REMOTE_COPY_FILE_BYTES: usize = 16 * 1024 * 1024 * 1024;\n\nasync fn copy_tree_file_streamed(\n    source_provider: &WebDavProvider,\n    destination_provider: &WebDavProvider,\n    file: &TreeFile,\n    destination: &WebDavWriteTarget,\n    cancel: Arc<AtomicBool>,\n    pause: crate::transfer_queue::PauseGate,\n    base: u64,\n    total: Option<u64>,\n    on_progress: &mut impl FnMut(TypedTransferProgress),\n) -> io::Result<u64> {\n''',
@@ -114,8 +123,9 @@ replace_exact(
     '''    let put = destination_provider.put_logical_stream_with_policy(\n        &destination.logical_path,\n''',
     '''    let put = context.destination_provider.put_logical_stream_with_policy(\n        &destination.logical_path,\n''',
 )
-replace_exact(
+replace_after(
     "src/transfer/webdav_transfer.rs",
+    "pub(crate) async fn copy_tree(",
     '''        let mut completed_before = 0u64;\n        for file in &manifest.files {\n''',
     '''        let file_context = RemoteCopyFileContext {\n            source_provider,\n            destination_provider,\n            destination_root,\n            cancel: cancel.clone(),\n            pause: pause.clone(),\n            total: manifest.total_bytes,\n        };\n        let mut completed_before = 0u64;\n        for file in &manifest.files {\n''',
 )
