@@ -8,7 +8,7 @@
 use super::quick_actions;
 use arx::app::{Action, ActionId, AppState};
 use arx::effect_dispatcher::EffectDispatcher;
-use arx::vfs::Entry;
+use arx::vfs::{Entry, ListedEntry};
 
 /// Narrow context handed to registered action handlers.
 ///
@@ -18,6 +18,7 @@ use arx::vfs::Entry;
 pub(crate) struct FeatureActionContext<'a> {
     pub state: &'a mut AppState,
     pub focused: Option<&'a Entry>,
+    pub focused_listed: Option<&'a ListedEntry>,
     pub active_entries: &'a [&'a Entry],
     pub effect_dispatcher: &'a EffectDispatcher,
 }
@@ -35,6 +36,7 @@ fn quick_action_handler(ctx: &mut FeatureActionContext, action: &Action) -> bool
     let FeatureActionContext {
         state,
         focused,
+        focused_listed: _,
         active_entries,
         effect_dispatcher,
     } = ctx;
@@ -49,7 +51,7 @@ fn quick_action_handler(ctx: &mut FeatureActionContext, action: &Action) -> bool
 
 #[cfg(target_os = "linux")]
 fn storage_handler(ctx: &mut FeatureActionContext, _action: &Action) -> bool {
-    match arx::storage_inspector_ui::launch_storage_inspector(ctx.state) {
+    match arx::storage_inspector_ui::launch_storage_inspector(ctx.state, ctx.focused_listed) {
         Ok(id) => {
             ctx.state.message = Some(format!("Storage Inspector: {id}"));
         }
@@ -143,6 +145,7 @@ mod tests {
         let mut ctx = FeatureActionContext {
             state: &mut state,
             focused: None,
+            focused_listed: None,
             active_entries: &[],
             effect_dispatcher: &mut dispatcher_box,
         };
@@ -158,6 +161,7 @@ mod tests {
         let mut ctx = FeatureActionContext {
             state: &mut state,
             focused: None,
+            focused_listed: None,
             active_entries: &[],
             effect_dispatcher: &mut dispatcher_box,
         };

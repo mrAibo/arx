@@ -292,9 +292,13 @@ pub async fn inspect_object(
         .and_then(|value| (value >= 0).then_some(value as u64));
     let metadata = head
         .metadata()
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
+        .map(|metadata| {
+            metadata
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     Ok(S3ObjectSnapshot {
         evidence: S3EvidenceSource::LiveScan,
