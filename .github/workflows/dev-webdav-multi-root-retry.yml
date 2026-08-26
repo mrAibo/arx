@@ -1,4 +1,4 @@
-name: DEV WebDAV multi-root retry
+name: DEV WebDAV multi-root diagnostics
 
 on:
   push:
@@ -7,10 +7,10 @@ on:
       - '.github/workflows/dev-webdav-multi-root-retry.yml'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  patch-test-commit:
+  diagnose:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -61,25 +61,34 @@ jobs:
           Path('/tmp/arx-multi-root-patch.py').write_text(script)
           PY
           python3 /tmp/arx-multi-root-patch.py
-      - name: Format and standard gates
+      - name: Capture exact gate diagnostics
         shell: bash
         run: |
-          set -euo pipefail
+          set -u
           cargo fmt --all
-          cargo fmt --all -- --check
-          cargo check --locked --all-features
-          cargo clippy --locked --all-targets --all-features -- -D warnings
-          cargo test --locked --all-features
-          cargo +1.88 check --locked --all-features
-          git diff --check
-      - name: Commit implementation and remove helpers
-        shell: bash
-        run: |
-          set -euo pipefail
-          git rm .github/workflows/dev-webdav-multi-root-patch.yml
-          git rm .github/workflows/dev-webdav-multi-root-retry.yml
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add src/transfer/mod.rs src/transfer/webdav_batch.rs src/transfer/executor.rs src/tui/transfers.rs
-          git commit -m 'feat: wire WebDAV multi-root F5 copy'
-          git push origin HEAD:feature/webdav-multi-root-copy
+          : > /tmp/multi-root-diagnostics.txt
+          run_gate() {
+            printf '\n===== %s =====\n' "$1" >> /tmp/multi-root-diagnostics.txt
+            shift
+            "$@" >> /tmp/multi-root-diagnostics.txt 2>&1
+            rc=$?
+            printf '\nEXIT=%s\n' "$rc" >> /tmp/multi-root-diagnostics.txt
+            return 0
+          }
+          run_gate 'cargo fmt --check' cargo fmt --all -- --check
+          run_gate 'cargo check' cargo check --locked --all-features
+          run_gate 'cargo clippy' cargo clippy --locked --all-targets --all-features -- -D warnings
+          run_gate 'cargo test' cargo test --locked --all-features
+          run_gate 'cargo +1.88 check' cargo +1.88 check --locked --all-features
+          run_gate 'git diff --check' git diff --check
+          printf '\n===== git status --short =====\n' >> /tmp/multi-root-diagnostics.txt
+          git status --short >> /tmp/multi-root-diagnostics.txt 2>&1 || true
+          git diff -- src/transfer/mod.rs src/transfer/webdav_batch.rs src/transfer/executor.rs src/tui/transfers.rs > /tmp/multi-root.patch
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: multi-root-diagnostics
+          path: |
+            /tmp/multi-root-diagnostics.txt
+            /tmp/multi-root.patch
+          if-no-files-found: error
