@@ -53,7 +53,16 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Tests
-        run: cargo test --locked --all-features
+        shell: bash
+        run: |
+          set -o pipefail
+          if cargo test --locked --all-features > /tmp/arx264-tests.log 2>&1; then
+            tail -40 /tmp/arx264-tests.log
+          else
+            echo '=== ARX264 TEST FAILURE TAIL ==='
+            tail -220 /tmp/arx264-tests.log
+            exit 1
+          fi
 
       - name: MSRV
         run: |
