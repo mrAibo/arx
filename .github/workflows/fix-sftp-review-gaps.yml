@@ -27,38 +27,13 @@ jobs:
           from pathlib import Path
           p = Path('src/transfer/sftp_copy.rs')
           s = p.read_text()
-
-          old_connect = '    let source = OpenSshSftpConnection::connect(source_host).await?;\n'
-          new_connect = '''    let source = OpenSshSftpConnection::connect(source_host)
-        .await
-        .map_err(TransferExecutionError::safe_to_retry)?;
-'''
+          old_connect = "    let source = OpenSshSftpConnection::connect(source_host).await?;\n"
+          new_connect = "    let source = OpenSshSftpConnection::connect(source_host)\n        .await\n        .map_err(TransferExecutionError::safe_to_retry)?;\n"
           if s.count(old_connect) != 1:
               raise SystemExit(f'expected one source-connect anchor, got {s.count(old_connect)}')
           s = s.replace(old_connect, new_connect)
-
-          old_after = '''    let source_after = source_connection
-        .session()
-        .symlink_metadata(source_path)
-        .await
-        .map_err(|error| phase_sftp(name, error, RetryDisposition::SafeToRetry))?;
-'''
-          new_after = '''    let source_after = match source_connection
-        .session()
-        .symlink_metadata(source_path)
-        .await
-    {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            return Err(clean_remote_stage(
-                destination_connection,
-                &temp,
-                phase_sftp(name, error, RetryDisposition::SafeToRetry),
-            )
-            .await);
-        }
-    };
-'''
+          old_after = "    let source_after = source_connection\n        .session()\n        .symlink_metadata(source_path)\n        .await\n        .map_err(|error| phase_sftp(name, error, RetryDisposition::SafeToRetry))?;\n"
+          new_after = "    let source_after = match source_connection\n        .session()\n        .symlink_metadata(source_path)\n        .await\n    {\n        Ok(metadata) => metadata,\n        Err(error) => {\n            return Err(clean_remote_stage(\n                destination_connection,\n                &temp,\n                phase_sftp(name, error, RetryDisposition::SafeToRetry),\n            )\n            .await);\n        }\n    };\n"
           if s.count(old_after) != 1:
               raise SystemExit(f'expected one post-stream metadata anchor, got {s.count(old_after)}')
           s = s.replace(old_after, new_after)
