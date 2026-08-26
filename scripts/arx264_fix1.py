@@ -96,4 +96,15 @@ if text.count(needle) != 3:
     raise SystemExit(
         f"expected exactly 3 legacy local test calls in storage_inspector_ui.rs, found {text.count(needle)}"
     )
-p.write_text(text.replace(needle, "launch_storage_inspector(&mut state, None)"))
+text = text.replace(needle, "launch_storage_inspector(&mut state, None)")
+old_reason = '"Storage Inspector is available for local paths only"'
+if text.count(old_reason) != 1:
+    raise SystemExit(
+        f"expected exactly 1 legacy local-only assertion in storage_inspector_ui.rs, found {text.count(old_reason)}"
+    )
+text = text.replace(
+    old_reason,
+    '"Storage Inspector is available for Local and S3 paths"',
+    1,
+)
+p.write_text(text)
