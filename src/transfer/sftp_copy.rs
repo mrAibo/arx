@@ -164,7 +164,9 @@ async fn execute_sftp_remote_copy(
     pause: PauseGate,
     on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> Result<TransferOutcome, TransferExecutionError> {
-    let source = OpenSshSftpConnection::connect(source_host).await?;
+    let source = OpenSshSftpConnection::connect(source_host)
+        .await
+        .map_err(TransferExecutionError::safe_to_retry)?;
     let destination = match OpenSshSftpConnection::connect(destination_host).await {
         Ok(connection) => connection,
         Err(error) => {
@@ -303,11 +305,21 @@ async fn copy_remote_file(
         .await);
     }
 
-    let source_after = source_connection
+    let source_after = match source_connection
         .session()
         .symlink_metadata(source_path)
         .await
-        .map_err(|error| phase_sftp(name, error, RetryDisposition::SafeToRetry))?;
+    {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(clean_remote_stage(
+                destination_connection,
+                &temp,
+                phase_sftp(name, error, RetryDisposition::SafeToRetry),
+            )
+            .await);
+        }
+    };
     if !source_after.is_regular()
         || source_after.size != source_before.size
         || source_after.mtime != source_before.mtime
