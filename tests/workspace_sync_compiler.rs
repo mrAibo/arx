@@ -334,24 +334,29 @@ fn sftp_to_local_regular_file_compiles_when_sftp_executor_is_available() {
 }
 
 #[test]
-fn sftp_directory_creation_is_compile_time_gated() {
+fn sftp_directory_creation_compiles_through_provider_capability() {
     let diff = WorkspaceDiff::compare(
         local("/left"),
         sftp("prod", "/right"),
         vec![dir("new-dir")],
         Vec::<WorkspaceEntry>::new(),
     );
-    let error = SyncExecutionCompiler::compile(
+    let compiled = SyncExecutionCompiler::compile(
         executable(&diff, SyncPolicy::default(), false),
         &diff,
         &default_registry(),
         &remote_matrix("prod"),
     )
-    .unwrap_err();
+    .unwrap();
 
+    assert_eq!(compiled.steps().len(), 1);
     assert!(matches!(
-        error,
-        SyncCompileError::UnsupportedDirectoryMutation { ref path, .. } if path == "new-dir"
+        &compiled.steps()[0].step,
+        PhysicalSyncStep::EnsureDirectory {
+            relative_path,
+            target: Location::Sftp { host, path },
+            expected_target: None,
+        } if relative_path == "new-dir" && host == "prod" && path == "/right/new-dir"
     ));
 }
 
@@ -362,18 +367,24 @@ fn compiler_failure_creates_no_journal_record() {
     let diff = WorkspaceDiff::compare(
         local("/left"),
         sftp("prod", "/right"),
-        vec![dir("new-dir")],
+        vec![file("a.txt", 1)],
         Vec::<WorkspaceEntry>::new(),
     );
 
+    // A real compiler failure remains possible when the exact SFTP endpoint
+    // has no proven transfer executor. The compiler must still fail before any
+    // journal lifecycle exists.
     let result = SyncExecutionCompiler::compile(
         executable(&diff, SyncPolicy::default(), false),
         &diff,
         &default_registry(),
-        &remote_matrix("prod"),
+        &SyncExecutorMatrix::local_only(),
     );
 
-    assert!(result.is_err());
+    assert!(matches!(
+        result,
+        Err(SyncCompileError::MissingExecutorAvailability { ref host }) if host == "prod"
+    ));
     assert!(journal.read_all().unwrap().is_empty());
 }
 
