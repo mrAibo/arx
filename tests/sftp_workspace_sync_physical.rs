@@ -170,7 +170,7 @@ fn reset_root(host: &str, path: &Path) -> Result<(), AnyError> {
     ssh_run(
         host,
         &format!(
-            "set -eu; rm -rf -- {0}; mkdir -p -- {0}; chmod 700 -- {0}",
+            "set -eu; rm -rf -- {0}; mkdir -p -- {0}; chmod 755 -- {0}",
             sh_quote(&path)
         ),
     )?;
