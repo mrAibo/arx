@@ -116,7 +116,9 @@ fn fixture() -> Result<Fixture, AnyError> {
         "ARX_WEBDAV_COPY_B_PASS",
     )?;
     if a.url == b.url {
-        return Err(io::Error::other("physical copy requires two distinct WebDAV endpoints").into());
+        return Err(
+            io::Error::other("physical copy requires two distinct WebDAV endpoints").into(),
+        );
     }
     let registry = registry_for(&a, &b);
     // Production resolver/secret path must resolve both independently.
@@ -165,13 +167,18 @@ async fn replace(provider: &WebDavProvider, path: &str, bytes: &[u8]) -> Result<
 async fn read_exact(provider: &WebDavProvider, path: &str) -> Result<Vec<u8>, AnyError> {
     let read = provider.get_bounded(path, 512 * 1024 * 1024).await?;
     if read.truncated {
-        return Err(io::Error::other(format!("unexpected bounded-read truncation at {path}")).into());
+        return Err(
+            io::Error::other(format!("unexpected bounded-read truncation at {path}")).into(),
+        );
     }
     Ok(read.bytes)
 }
 
 async fn collection_exists(provider: &WebDavProvider, path: &str) -> bool {
-    provider.resolve_logical_collection_exact(path).await.is_ok()
+    provider
+        .resolve_logical_collection_exact(path)
+        .await
+        .is_ok()
 }
 
 async fn listed_named(
@@ -180,10 +187,16 @@ async fn listed_named(
     name: &str,
 ) -> Result<ListedEntry, AnyError> {
     let page = registry.list_page(location, None).await?;
-    let mut found = page.entries.into_iter().filter(|entry| entry.entry.name == name);
-    let first = found
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("missing listed root {name}")))?;
+    let mut found = page
+        .entries
+        .into_iter()
+        .filter(|entry| entry.entry.name == name);
+    let first = found.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("missing listed root {name}"),
+        )
+    })?;
     if found.next().is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -192,7 +205,9 @@ async fn listed_named(
         .into());
     }
     if first.entry.kind != EntryKind::Directory {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "copy root is not a collection").into());
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidData, "copy root is not a collection").into(),
+        );
     }
     Ok(first)
 }
@@ -270,7 +285,10 @@ async fn seed_tree(provider: &WebDavProvider, root: &str) -> Result<(), AnyError
 }
 
 async fn assert_seed_tree(provider: &WebDavProvider, root: &str) -> Result<(), AnyError> {
-    assert_eq!(read_exact(provider, &format!("/{root}/root.txt")).await?, b"root-bytes\n");
+    assert_eq!(
+        read_exact(provider, &format!("/{root}/root.txt")).await?,
+        b"root-bytes\n"
+    );
     assert_eq!(
         read_exact(provider, &format!("/{root}/nested/deep.bin")).await?,
         b"\x00\x01deep\xffbytes\n"
@@ -350,7 +368,10 @@ async fn case_preexisting_refusal(f: &Fixture) -> Result<(), AnyError> {
         .await
         .expect_err("pre-existing destination root must fail closed");
     assert_eq!(error.retry_disposition(), RetryDisposition::NeverRetry);
-    assert_eq!(read_exact(&f.b.provider, &format!("/{root}/keep.txt")).await?, b"keep");
+    assert_eq!(
+        read_exact(&f.b.provider, &format!("/{root}/keep.txt")).await?,
+        b"keep"
+    );
     assert!(
         f.b.provider
             .get_bounded(&format!("/{root}/source.txt"), 64)
@@ -365,11 +386,10 @@ async fn case_stale_manifest(f: &Fixture) -> Result<(), AnyError> {
     let root = token("stale");
     mkcol(&f.a.provider, &format!("/{root}")).await?;
     put(&f.a.provider, &format!("/{root}/file.txt"), b"old").await?;
-    let exact = f
-        .a
-        .provider
-        .resolve_logical_collection_exact(&format!("/{root}"))
-        .await?;
+    let exact =
+        f.a.provider
+            .resolve_logical_collection_exact(&format!("/{root}"))
+            .await?;
     let cancel = AtomicBool::new(false);
     let pause = PauseGate::disabled();
     let frozen = build_tree_manifest(&f.a.provider, &exact, &cancel, &pause).await?;
@@ -424,7 +444,12 @@ async fn case_source_get_failure_cleanup(f: &Fixture) -> Result<(), AnyError> {
 async fn case_ambiguous_put_recovery(f: &Fixture) -> Result<(), AnyError> {
     let root = token("ambiguous-put");
     mkcol(&f.a.provider, &format!("/{root}")).await?;
-    put(&f.a.provider, &format!("/{root}/file.bin"), b"ambiguous-put-bytes").await?;
+    put(
+        &f.a.provider,
+        &format!("/{root}/file.bin"),
+        b"ambiguous-put-bytes",
+    )
+    .await?;
     let proxy = start_proxy(&f.b.url, ProxyMode::AmbiguousPut).await?;
     let registry = registry_with_urls(f, f.a.url.clone(), proxy.listen_addr.clone()).await;
     let src = dav(f.a.id, "/");
@@ -433,10 +458,19 @@ async fn case_ambiguous_put_recovery(f: &Fixture) -> Result<(), AnyError> {
     let error = execute(&registry, &plan, &names)
         .await
         .expect_err("dropped PUT response must be recovery-required");
-    assert_eq!(error.retry_disposition(), RetryDisposition::RecoveryRequired);
+    assert_eq!(
+        error.retry_disposition(),
+        RetryDisposition::RecoveryRequired
+    );
     let record = proxy.record.lock().await;
-    assert_eq!(record.put_count, 1, "ambiguous mutation must not be replayed");
-    assert!(record.apache_response_seen, "proxy must prove Apache processed PUT");
+    assert_eq!(
+        record.put_count, 1,
+        "ambiguous mutation must not be replayed"
+    );
+    assert!(
+        record.apache_response_seen,
+        "proxy must prove Apache processed PUT"
+    );
     drop(record);
     assert!(!collection_exists(&f.b.provider, &format!("/{root}")).await);
     Ok(())
@@ -445,7 +479,12 @@ async fn case_ambiguous_put_recovery(f: &Fixture) -> Result<(), AnyError> {
 async fn case_cleanup_failure_recovery(f: &Fixture) -> Result<(), AnyError> {
     let root = token("cleanup-failure");
     mkcol(&f.a.provider, &format!("/{root}")).await?;
-    put(&f.a.provider, &format!("/{root}/file.bin"), b"cleanup-failure-bytes").await?;
+    put(
+        &f.a.provider,
+        &format!("/{root}/file.bin"),
+        b"cleanup-failure-bytes",
+    )
+    .await?;
     let proxy = start_proxy(&f.b.url, ProxyMode::AmbiguousPutDropDelete).await?;
     let registry = registry_with_urls(f, f.a.url.clone(), proxy.listen_addr.clone()).await;
     let src = dav(f.a.id, "/");
@@ -454,14 +493,19 @@ async fn case_cleanup_failure_recovery(f: &Fixture) -> Result<(), AnyError> {
     let error = execute(&registry, &plan, &names)
         .await
         .expect_err("failed cleanup must be recovery-required");
-    assert_eq!(error.retry_disposition(), RetryDisposition::RecoveryRequired);
+    assert_eq!(
+        error.retry_disposition(),
+        RetryDisposition::RecoveryRequired
+    );
     let record = proxy.record.lock().await;
     assert_eq!(record.put_count, 1);
     assert_eq!(record.delete_count, 1);
     drop(record);
     assert!(collection_exists(&f.b.provider, &format!("/{root}")).await);
     // Test-only recovery so the disposable fixture remains internally tidy.
-    f.b.provider.delete_logical_collection(&format!("/{root}")).await?;
+    f.b.provider
+        .delete_logical_collection(&format!("/{root}"))
+        .await?;
     Ok(())
 }
 
@@ -487,7 +531,10 @@ async fn case_runtime_cancellation(f: &Fixture) -> Result<(), AnyError> {
     let terminal = timeout(Duration::from_secs(45), async {
         let mut requested = false;
         loop {
-            let event = rx.recv().await.ok_or_else(|| io::Error::other("job event stream closed"))?;
+            let event = rx
+                .recv()
+                .await
+                .ok_or_else(|| io::Error::other("job event stream closed"))?;
             if event.id() != id {
                 continue;
             }
@@ -510,9 +557,19 @@ async fn case_runtime_cancellation(f: &Fixture) -> Result<(), AnyError> {
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "cancellation case timed out"))??;
-    assert!(terminal.1, "cancellation must be requested after streamed bytes were observed");
-    assert!(matches!(terminal.0, JobEvent::Cancelled { .. }), "terminal={:?}", terminal.0);
-    assert_eq!(jobs.get(&id).expect("cancel job").status, JobStatus::Cancelled);
+    assert!(
+        terminal.1,
+        "cancellation must be requested after streamed bytes were observed"
+    );
+    assert!(
+        matches!(terminal.0, JobEvent::Cancelled { .. }),
+        "terminal={:?}",
+        terminal.0
+    );
+    assert_eq!(
+        jobs.get(&id).expect("cancel job").status,
+        JobStatus::Cancelled
+    );
     runtime.shutdown().await;
     assert!(!collection_exists(&f.b.provider, &format!("/{root}")).await);
     Ok(())

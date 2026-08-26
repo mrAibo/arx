@@ -11,6 +11,8 @@
 //!   AmbiguousPut      — forward the complete PUT by Content-Length, observe
 //!                       Apache's response head (confirm server completed), then
 //!                       discard it and close the ARX side.
+//!   AmbiguousPutDropDelete — same ambiguous PUT, then drop the cleanup DELETE
+//!                       before it reaches Apache to prove RecoveryRequired.
 //!
 //! ponytail: test infra only, compiled under `physical-webdav`. Not a product.
 
@@ -26,6 +28,7 @@ pub enum ProxyMode {
     PassThroughRecord,
     DropGetBody,
     AmbiguousPut,
+    AmbiguousPutDropDelete,
 }
 
 pub struct ProxyRecord {
@@ -33,6 +36,7 @@ pub struct ProxyRecord {
     pub get_count: usize,
     pub head_count: usize,
     pub propfind_count: usize,
+    pub delete_count: usize,
     pub seen_if_none_match: bool,
     /// W18: proxy observed a complete Apache response head for the PUT.
     pub apache_response_seen: bool,
@@ -45,6 +49,7 @@ impl ProxyRecord {
             get_count: 0,
             head_count: 0,
             propfind_count: 0,
+            delete_count: 0,
             seen_if_none_match: false,
             apache_response_seen: false,
         }
@@ -176,6 +181,7 @@ async fn handle_conn(
             "GET" => r.get_count += 1,
             "HEAD" => r.head_count += 1,
             "PROPFIND" => r.propfind_count += 1,
+            "DELETE" => r.delete_count += 1,
             _ => {}
         }
         if seen_inm {
@@ -249,7 +255,12 @@ async fn handle_conn(
                 pipe(&mut client, &mut upstream).await;
             }
         }
-        ProxyMode::AmbiguousPut => {
+        ProxyMode::AmbiguousPut | ProxyMode::AmbiguousPutDropDelete => {
+            if mode == ProxyMode::AmbiguousPutDropDelete && method == "DELETE" {
+                // Cleanup transport ambiguity: do not forward the DELETE.
+                let _ = client.shutdown().await;
+                return;
+            }
             if method == "PUT" {
                 // reqwest sends this Vec-backed PUT with Content-Length. Forward
                 // exactly the remaining declared bytes; do not wait for EOF on

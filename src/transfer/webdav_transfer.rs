@@ -1115,7 +1115,7 @@ pub(crate) async fn download_tree(
     Ok(1 + manifest.descendant_count)
 }
 
-async fn revalidate_tree_manifest(
+pub(crate) async fn revalidate_tree_manifest(
     provider: &WebDavProvider,
     source: &WebDavCollectionRef,
     frozen: &WebDavTreeManifest,

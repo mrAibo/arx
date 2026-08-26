@@ -141,7 +141,10 @@ fn classify_webdav_copy_tree_error(error: io::Error) -> TransferExecutionError {
         }
         Some(CopyTreeFailure::AmbiguousMutation { .. }) => TransferExecutionError::Io {
             source: error,
-            disposition: crate::transfer_queue::RetryDisposition::AmbiguousMutation,
+            // #275: destination mutation certainty is lost even when best-effort
+            // owned-root cleanup succeeds. Require operator recovery evidence;
+            // never let the queue auto-replay this remote mutation.
+            disposition: crate::transfer_queue::RetryDisposition::RecoveryRequired,
         },
         None => TransferExecutionError::Io {
             source: error,
