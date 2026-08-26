@@ -1,0 +1,48 @@
+name: Apply v0.24.0 release prep
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/apply-v024-release-prep.yml'
+      - 'scripts/apply_v024_release_prep.py'
+      - 'docs/releases/v0.24.0.md'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'release/v0.24.0-prep'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Apply exact release-prep replacements
+        run: python3 scripts/apply_v024_release_prep.py
+      - name: Validate release metadata and diff
+        run: |
+          git diff --check
+          python3 - <<'PY'
+          import json, subprocess
+          data = json.loads(subprocess.check_output(['cargo','metadata','--locked','--no-deps','--format-version','1']))
+          versions = [p['version'] for p in data['packages'] if p['name'] == 'arx']
+          assert versions == ['0.24.0'], versions
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('Cargo.lock').read_text()
+          assert '[[package]]\nname = "arx"\nversion = "0.24.0"\ndependencies = [' in text
+          assert '[[package]]\nname = "arx"\nversion = "0.23.0"\ndependencies = [' not in text
+          PY
+      - name: Commit release prep and remove helper
+        run: |
+          rm -f scripts/apply_v024_release_prep.py .github/workflows/apply-v024-release-prep.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'release: prepare v0.24.0'
+          git push origin HEAD:release/v0.24.0-prep
