@@ -5,6 +5,7 @@ Terminal commander for local ↔ remote workspaces on Linux.
 ![ARX Remote Workspace — Compare, Preview, Sync, Verify](docs/assets/remote-workspace-update.gif)
 
 **Current release: [v0.23.0](https://github.com/mrAibo/arx/releases/tag/v0.23.0)**  
+**Release candidate in source:** `v0.24.0` — not published until the immutable tag and GitHub Release exist.
 Linux x86_64 · Rust MSRV 1.88 · MIT
 
 Compare before touching anything. Preview the exact consequences. Execute. Verify the real result.

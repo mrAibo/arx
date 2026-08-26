@@ -10,7 +10,8 @@ Repository: `mrAibo/arx`
 - v0.23.0 tag target: `f66a25f3f2b4fb66832ecc50d85f9f105ebba086`
 - Published: 2026-08-26
 - Previous immutable release: **v0.22.0** → `8737bbd2afaf0d6e7146a5d8c59ee1a0606325bf`
-- Current main: `fe413aecfdc3bf5685849e73b396800f7f3ab7e0` — accepted/unreleased SFTP→SFTP Workspace Sync (#269 / PR #270)
+- Current main: `cd5f1b147ac4ca78d7fdab134d548b97a7c20a00` — public-truth baseline after PR #272
+- Active release candidate: **v0.24.0** on `release/v0.24.0-prep` via #271; source version metadata is not publication
 - Rust MSRV: **1.88**
 - Product platform: **Linux only**
 - Published target: **Linux x86_64**
@@ -37,14 +38,14 @@ Published package SHA-256 values:
 
 ## 2. Current phase
 
-SFTP → SFTP Workspace Sync has completed its feature cycle and is accepted on `main`; it remains **unreleased relative to v0.23.0**. The active phase is the focused **v0.24.0 release package**, tracked in #271.
+SFTP → SFTP Workspace Sync has completed its feature cycle and is accepted on `main`; it remains **unreleased relative to v0.23.0**. Public-truth sync Task A is complete at `cd5f1b147ac4ca78d7fdab134d548b97a7c20a00`. The active phase is freezing the focused **v0.24.0 release candidate** on `release/v0.24.0-prep`, tracked in #271, with no new runtime feature.
 
 Current sequence:
 
 1. keep v0.23.0 and all older release tags immutable
-2. synchronize public truth: v0.23.0 is published; SFTP→SFTP is accepted/unreleased on current `main`
-3. prepare v0.24.0 as release-truth/version metadata only; add no new runtime feature
-4. require one exact release-candidate head to pass standard CI, Rust 1.88, SFTP physical, WebDAV interoperability and Release validation
+2. public-truth sync is complete: PR #272 → `cd5f1b147ac4ca78d7fdab134d548b97a7c20a00`, with post-merge CI and SFTP physical success
+3. freeze v0.24.0 release-truth/version metadata only; add no new runtime feature
+4. require the resulting exact release-candidate head to pass standard CI, Rust 1.88, SFTP physical, WebDAV interoperability and Release validation
 5. pinned squash merge using the reviewed head, then require post-merge CI and SFTP physical success
 6. create immutable v0.24.0 tag on the accepted release commit, publish through the existing Release workflow, and independently verify packages/checksums/binary truth
 7. close #271 only after canonical docs and cleanup reflect published v0.24.0
@@ -195,10 +196,13 @@ Accepted implementation truth:
 Evidence:
 
 - exact feature head: `9656102bc679b71ca49513b37735bc79a3874a91`
-- squash merge / current feature main: `fe413aecfdc3bf5685849e73b396800f7f3ab7e0`
-- accepted tree: `57463d53718fd1cdd2b838dbee5524d99a9de59c`
-- post-merge CI: run `33002995697` — success
-- post-merge SFTP physical: run `33002995516` — success
+- feature squash merge: `fe413aecfdc3bf5685849e73b396800f7f3ab7e0`
+- accepted feature tree: `57463d53718fd1cdd2b838dbee5524d99a9de59c`
+- feature post-merge CI: run `33002995697` — success
+- feature post-merge SFTP physical: run `33002995516` — success
+- public-truth baseline: `cd5f1b147ac4ca78d7fdab134d548b97a7c20a00`
+- public-truth post-merge CI: run `33007674598` — success
+- public-truth post-merge SFTP physical: run `33007674646` — success
 - issue #269: completed
 
 Release decision: publish this feature as focused **v0.24.0**, tracked in #271, before starting another major feature.
