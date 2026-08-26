@@ -1,0 +1,58 @@
+name: Correct WebDAV copy dependency lock
+
+on:
+  push:
+    branches:
+      - feature/webdav-webdav-recursive-copy
+    paths:
+      - '.github/workflows/fix-webdav-copy-lock.yml'
+      - 'scripts/fix_webdav_copy_lock.py'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - name: Restore dependency truth
+        run: |
+          set -euo pipefail
+          python3 scripts/fix_webdav_copy_lock.py
+          cargo check
+      - name: Prove lock drift is root dependency only
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+          base = subprocess.check_output([
+              'git','show','3d8050829bf57866dd494a69ac5b0f5ebc9496d9:Cargo.lock'
+          ], text=True)
+          anchor = ' "tokio",\n "toml",'
+          if base.count(anchor) != 1:
+              raise SystemExit('unexpected Cargo.lock root dependency anchor')
+          expected = base.replace(anchor, ' "tokio",\n "tokio-util",\n "toml",', 1)
+          current = Path('Cargo.lock').read_text()
+          if current != expected:
+              subprocess.run(['git','diff','3d8050829bf57866dd494a69ac5b0f5ebc9496d9','--','Cargo.lock'])
+              raise SystemExit('Cargo.lock contains dependency drift beyond direct tokio-util root edge')
+          PY
+          cargo test --locked webdav_remote_copy_requires_frozen_copy_tree_and_rejects_move
+          cargo test --locked webdav_to_webdav_freezes_exact_collection_and_new_destination
+          cargo test --locked webdav_to_webdav_rejects_file_and_multi_root
+      - name: Commit correction and remove helper
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/fix-webdav-copy-lock.yml scripts/fix_webdav_copy_lock.py
+          git add -A
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix: keep WebDAV copy dependency lock stable'
+          git push origin HEAD:feature/webdav-webdav-recursive-copy
