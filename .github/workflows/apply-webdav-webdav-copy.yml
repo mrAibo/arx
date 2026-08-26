@@ -22,6 +22,8 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt
 
       - name: Apply frozen #275 core
         run: python3 scripts/apply_webdav_webdav_copy.py
