@@ -27,14 +27,12 @@ jobs:
           cargo fmt --all
           cargo fmt --all -- --check
           git diff --check
-      - name: Commit acceptance and remove helpers
+      - name: Commit only physical acceptance source
         shell: bash
         run: |
           set -euo pipefail
-          git rm .github/workflows/dev-webdav-multi-root-physical-finalizer.yml
-          git rm tools/dev_webdav_multi_root_physical_finalizer.py
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -u
+          git add -u src/vfs/webdav_acceptance.rs src/vfs/webdav_interop_acceptance.rs
           git commit -m 'test: cover WebDAV multi-root F5 physically'
           git push origin HEAD:feature/webdav-multi-root-copy
