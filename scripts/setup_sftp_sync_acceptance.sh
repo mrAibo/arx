@@ -4,15 +4,34 @@ set -euo pipefail
 : "${RUNNER_TEMP:?RUNNER_TEMP must be set}"
 
 FIXTURE_ROOT="${RUNNER_TEMP}/arx-sftp-sync-physical"
+REMOTE_USER="arxsftp"
+REMOTE_HOME="/home/${REMOTE_USER}"
+REMOTE_ROOT_A="/tmp/arx-sftp-sync-physical-a-${GITHUB_RUN_ID:-$$}"
+REMOTE_ROOT_B="/tmp/arx-sftp-sync-physical-b-${GITHUB_RUN_ID:-$$}"
+
 rm -rf -- "$FIXTURE_ROOT"
-mkdir -p "$FIXTURE_ROOT" "$FIXTURE_ROOT/data-a" "$FIXTURE_ROOT/data-b"
-chmod 700 "$FIXTURE_ROOT" "$FIXTURE_ROOT/data-a" "$FIXTURE_ROOT/data-b"
+mkdir -p "$FIXTURE_ROOT"
+chmod 700 "$FIXTURE_ROOT"
 
 CLIENT_KEY="$FIXTURE_ROOT/client_ed25519"
-AUTHORIZED_KEYS="$FIXTURE_ROOT/authorized_keys"
 ssh-keygen -q -t ed25519 -N '' -f "$CLIENT_KEY"
-cp "$CLIENT_KEY.pub" "$AUTHORIZED_KEYS"
-chmod 600 "$AUTHORIZED_KEYS"
+chmod 600 "$CLIENT_KEY"
+
+# Use a dedicated disposable account rather than the hosted-runner account.
+# GitHub runner accounts may be locked in /etc/shadow even when pubkey auth is
+# configured, which causes sshd to reject them before authorized_keys is read.
+if id "$REMOTE_USER" >/dev/null 2>&1; then
+  sudo userdel -r "$REMOTE_USER" >/dev/null 2>&1 || true
+fi
+sudo useradd --create-home --shell /bin/bash "$REMOTE_USER"
+# An empty password field unlocks the account for public-key authentication;
+# password and keyboard-interactive authentication stay disabled in sshd.
+sudo passwd -d "$REMOTE_USER" >/dev/null
+sudo install -d -m 700 -o "$REMOTE_USER" -g "$REMOTE_USER" "$REMOTE_HOME/.ssh"
+sudo install -m 600 -o "$REMOTE_USER" -g "$REMOTE_USER" \
+  "$CLIENT_KEY.pub" "$REMOTE_HOME/.ssh/authorized_keys"
+sudo install -d -m 755 -o "$REMOTE_USER" -g "$REMOTE_USER" "$REMOTE_ROOT_A"
+sudo install -d -m 755 -o "$REMOTE_USER" -g "$REMOTE_USER" "$REMOTE_ROOT_B"
 
 PORT_A="$(python3 - <<'PY'
 import socket
@@ -35,7 +54,6 @@ if [ "$PORT_A" = "$PORT_B" ]; then
   exit 1
 fi
 
-USER_NAME="$(id -un)"
 SSH_DIR="$HOME/.ssh"
 SSH_CONFIG="$SSH_DIR/config"
 SSH_CONFIG_BACKUP="$FIXTURE_ROOT/ssh_config.backup"
@@ -61,6 +79,8 @@ cleanup_sftp_sync_fixture() {
   else
     rm -f "$SSH_CONFIG"
   fi
+  sudo rm -rf -- "$REMOTE_ROOT_A" "$REMOTE_ROOT_B" >/dev/null 2>&1 || true
+  sudo userdel -r "$REMOTE_USER" >/dev/null 2>&1 || true
 }
 trap cleanup_sftp_sync_fixture EXIT
 
@@ -75,15 +95,15 @@ Port $port
 ListenAddress 127.0.0.1
 HostKey $host_key
 PidFile $FIXTURE_ROOT/sshd-${name}.pid
-AuthorizedKeysFile $AUTHORIZED_KEYS
-StrictModes no
+AuthorizedKeysFile .ssh/authorized_keys
+StrictModes yes
 PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
 UsePAM no
 PermitRootLogin no
-AllowUsers $USER_NAME
+AllowUsers $REMOTE_USER
 Subsystem sftp internal-sftp
 LogLevel VERBOSE
 EOF
@@ -100,7 +120,7 @@ cat >> "$SSH_CONFIG" <<EOF
 Host arx-sftp-a
   HostName 127.0.0.1
   Port $PORT_A
-  User $USER_NAME
+  User $REMOTE_USER
   IdentityFile $CLIENT_KEY
   IdentitiesOnly yes
   BatchMode yes
@@ -111,7 +131,7 @@ Host arx-sftp-a
 Host arx-sftp-b
   HostName 127.0.0.1
   Port $PORT_B
-  User $USER_NAME
+  User $REMOTE_USER
   IdentityFile $CLIENT_KEY
   IdentitiesOnly yes
   BatchMode yes
@@ -132,8 +152,12 @@ for alias in arx-sftp-a arx-sftp-b; do
   done
   if [ "$ready" != 1 ]; then
     echo "SSH fixture $alias did not become ready" >&2
-    cat "$FIXTURE_ROOT/sshd-a.log" >&2 2>/dev/null || true
-    cat "$FIXTURE_ROOT/sshd-b.log" >&2 2>/dev/null || true
+    echo "--- ssh client diagnostics ($alias) ---" >&2
+    ssh -vvv "$alias" true >&2 || true
+    echo "--- sshd-a log ---" >&2
+    sudo cat "$FIXTURE_ROOT/sshd-a.log" >&2 2>/dev/null || true
+    echo "--- sshd-b log ---" >&2
+    sudo cat "$FIXTURE_ROOT/sshd-b.log" >&2 2>/dev/null || true
     exit 1
   fi
 done
@@ -141,9 +165,11 @@ done
 export ARX_SFTP_SYNC_PHYSICAL=1
 export ARX_SFTP_SYNC_HOST_A=arx-sftp-a
 export ARX_SFTP_SYNC_HOST_B=arx-sftp-b
-export ARX_SFTP_SYNC_ROOT_A="$FIXTURE_ROOT/data-a"
-export ARX_SFTP_SYNC_ROOT_B="$FIXTURE_ROOT/data-b"
+export ARX_SFTP_SYNC_ROOT_A="$REMOTE_ROOT_A"
+export ARX_SFTP_SYNC_ROOT_B="$REMOTE_ROOT_B"
 
 echo "SFTP_SYNC_FIXTURE_ROOT=$FIXTURE_ROOT"
 echo "SFTP_SYNC_ENDPOINT_A=arx-sftp-a:$PORT_A"
 echo "SFTP_SYNC_ENDPOINT_B=arx-sftp-b:$PORT_B"
+echo "SFTP_SYNC_REMOTE_ROOT_A=$REMOTE_ROOT_A"
+echo "SFTP_SYNC_REMOTE_ROOT_B=$REMOTE_ROOT_B"
