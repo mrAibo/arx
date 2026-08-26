@@ -24,7 +24,7 @@ jobs:
       - name: Apply strict source transformations
         run: |
           set -euo pipefail
-          python3 scripts/apply_sftp_sftp_sync_core.py
+          python3 scripts/run_sftp_sftp_sync_core_v2.py
           cargo fmt --all
           git diff --check
 
@@ -33,7 +33,7 @@ jobs:
           HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
-          git rm scripts/apply_sftp_sftp_sync_core.py .github/workflows/apply-sftp-sftp-sync-core.yml
+          git rm scripts/apply_sftp_sftp_sync_core.py scripts/run_sftp_sftp_sync_core_v2.py .github/workflows/apply-sftp-sftp-sync-core.yml
           git diff --check
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
