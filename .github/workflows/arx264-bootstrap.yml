@@ -33,7 +33,7 @@ jobs:
           text = p.read_text()
           marker = '\nrep(\n    ".github/workflows/ci.yml",'
           if marker in text:
-              text = text.split(marker, 1)[0] + '\n'
+              text = text.split(marker, 1)[0].rstrip('\n') + '\n'
           p.write_text(text)
           PY
           python3 scripts/arx264_integrate.py
