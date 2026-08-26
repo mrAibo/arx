@@ -196,3 +196,4 @@ jobs:
           export AWS_ACCESS_KEY_ID=minioadmin
           export AWS_SECRET_ACCESS_KEY=minioadmin
           cargo test --locked --test transfer_queue_s3_retry_physical -- --nocapture
+          cargo test --locked --test s3_inspector_minio -- --nocapture

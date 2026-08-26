@@ -183,8 +183,8 @@ pub fn action_availability(id: ActionId, ctx: &ActionContext) -> ActionAvailabil
     match registration.policy {
         super::registration::AvailabilityPolicy::Default => default_action_availability(id, ctx),
         super::registration::AvailabilityPolicy::Always => ActionAvailability::Available,
-        super::registration::AvailabilityPolicy::LocalOnly(reason) => {
-            if ctx.active_provider == ProviderId::Local {
+        super::registration::AvailabilityPolicy::LocalOrS3(reason) => {
+            if matches!(ctx.active_provider, ProviderId::Local | ProviderId::S3) {
                 ActionAvailability::Available
             } else {
                 ActionAvailability::Disabled {

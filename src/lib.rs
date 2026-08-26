@@ -13,6 +13,10 @@ pub mod journal;
 pub mod keyring;
 pub mod process;
 pub mod remote;
+#[cfg(target_os = "linux")]
+pub mod s3_inspector;
+#[cfg(target_os = "linux")]
+pub mod s3_inspector_ui;
 pub mod services;
 #[cfg(target_os = "linux")]
 pub mod storage_inspector;

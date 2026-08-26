@@ -1574,15 +1574,17 @@ async fn dispatch_ui_action(
     if embedded_terminal::handle_action(state, &action) {
         return Ok(());
     }
-    let focused = focused_row
-        .and_then(|row| row.listed())
-        .map(|listed| &listed.entry);
+    // Exact ListedEntry identity is frozen before feature dispatch so S3
+    // inspection never reconstructs remote identity from presentation names.
+    let focused_listed = focused_row.and_then(|row| row.listed());
+    let focused = focused_listed.map(|listed| &listed.entry);
     // PACK R: proof-feature activation through the registered controller seam.
     {
         let focused_ref = focused;
         let mut ctx = feature_registry::FeatureActionContext {
             state,
             focused: focused_ref,
+            focused_listed,
             active_entries,
             effect_dispatcher,
         };
@@ -1590,8 +1592,7 @@ async fn dispatch_ui_action(
             return Ok(());
         }
     }
-    // ponytail: keep the ListedEntry (exact identity) for preview, not &Entry
-    let focused_listed = focused_row.and_then(|row| row.listed());
+    // `focused_listed` above remains the exact identity authority for preview/transfers too.
     // ponytail: passive pane's focused entry — needed for cross-pane S3 transfer
     let other_listed = other_focused_row.and_then(|row| row.listed());
     if transfers::handle_action(

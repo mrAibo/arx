@@ -21,8 +21,8 @@ pub enum AvailabilityPolicy {
     Default,
     /// Unconditionally available.
     Always,
-    /// Local-pane-only with a truthful disabled reason.
-    LocalOnly(&'static str),
+    /// Read-only storage intelligence available on Local and S3 panes.
+    LocalOrS3(&'static str),
     /// Quick Action: local-only, then requires a focused/selected regular file.
     QuickSha256,
     /// Quick Action: local-only, otherwise available.
@@ -629,12 +629,12 @@ static REGISTRATIONS: &[Registration] = &[
         meta: ActionMeta {
             id: ActionId::OpenStorageInspector,
             label: "Storage Inspector",
-            description: "Read-only local disk usage analysis by JobManager scan",
+            description: "Read-only storage intelligence for Local and S3 locations",
             category: ActionCategory::Panels,
             destructive: false,
         },
-        policy: AvailabilityPolicy::LocalOnly(
-            "Storage Inspector is available for local paths only",
+        policy: AvailabilityPolicy::LocalOrS3(
+            "Storage Inspector is available for Local and S3 paths",
         ),
     },
 ];
@@ -839,7 +839,7 @@ mod tests {
         assert!(!r.meta.destructive);
         assert_eq!(
             r.policy,
-            AvailabilityPolicy::LocalOnly("Storage Inspector is available for local paths only")
+            AvailabilityPolicy::LocalOrS3("Storage Inspector is available for Local and S3 paths")
         );
     }
 

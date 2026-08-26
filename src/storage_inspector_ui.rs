@@ -17,6 +17,7 @@ use crate::jobs::{JobProgress, JobResult, JobStatus};
 use crate::storage_inspector::{
     UsageKind, UsageRecord, UsageScanOptions, UsageScanOutcome, UsageScanResult,
 };
+use crate::vfs::ListedEntry;
 
 const TOP_FILES_LIMIT: usize = 20;
 
@@ -108,6 +109,8 @@ pub struct StorageInspectorUiState {
     pub basis: StorageSizeBasis,
     pub sort: StorageSort,
     pub view: StorageView,
+    /// S3 shares the exclusive Storage Inspector overlay while keeping its own read-only state.
+    pub s3: Option<crate::s3_inspector_ui::S3InspectorUiState>,
 }
 
 impl StorageInspectorUiState {
@@ -119,6 +122,7 @@ impl StorageInspectorUiState {
         self.basis = StorageSizeBasis::Allocated;
         self.sort = StorageSort::Size;
         self.view = StorageView::Directory;
+        self.s3 = None;
     }
 
     fn reset_cursor(&mut self) {
@@ -151,10 +155,24 @@ impl StorageRow {
 /// Only one Storage Inspector scan is retained by the UI at a time. Starting a
 /// new scan drops the previous completed snapshot so repeated use in a long ARX
 /// session cannot grow snapshot memory without bound.
-pub fn launch_storage_inspector(state: &mut AppState) -> Result<String, String> {
+pub fn launch_storage_inspector(
+    state: &mut AppState,
+    focused_listed: Option<&ListedEntry>,
+) -> Result<String, String> {
+    match &state.active_pane().location {
+        crate::vfs::Location::S3 { .. } => {
+            return crate::s3_inspector_ui::launch_s3_inspector(state, focused_listed);
+        }
+        crate::vfs::Location::Local(_) => {}
+        _ => return Err("Storage Inspector is available for Local and S3 paths".into()),
+    }
+    launch_local_storage_inspector(state)
+}
+
+fn launch_local_storage_inspector(state: &mut AppState) -> Result<String, String> {
     let root = match &state.active_pane().location {
         crate::vfs::Location::Local(path) => path.clone(),
-        _ => return Err("Storage Inspector is available for local paths only".into()),
+        _ => return Err("Local Storage Inspector requires a local path".into()),
     };
 
     let manager = state
@@ -165,6 +183,14 @@ pub fn launch_storage_inspector(state: &mut AppState) -> Result<String, String> 
         .job_events
         .clone()
         .ok_or_else(|| "Storage Inspector: job event channel is not bound".to_string())?;
+
+    if let Some(s3) = state.storage_inspector.s3.take()
+        && manager
+            .get(&s3.job_id)
+            .is_some_and(|job| !job.status.is_terminal())
+    {
+        manager.cancel(&s3.job_id);
+    }
 
     if let Some(id) = state.storage_inspector.job_id.clone()
         && manager
@@ -195,6 +221,10 @@ pub fn launch_storage_inspector(state: &mut AppState) -> Result<String, String> 
 /// The overlay is exclusive: callers should consume the key regardless of
 /// whether this function changes state.
 pub fn handle_storage_inspector_key(state: &mut AppState, key: KeyEvent) {
+    if state.storage_inspector.s3.is_some() {
+        crate::s3_inspector_ui::handle_s3_inspector_key(state, key);
+        return;
+    }
     match key.code {
         KeyCode::Esc => state.close_overlay(OverlayKind::StorageInspector),
         KeyCode::Up | KeyCode::Char('k') => {
@@ -364,6 +394,10 @@ fn sort_rows(rows: &mut [StorageRow], sort: StorageSort) {
 }
 
 pub fn render_storage_inspector(frame: &mut ratatui::Frame, area: Rect, state: &mut AppState) {
+    if state.storage_inspector.s3.is_some() {
+        crate::s3_inspector_ui::render_s3_inspector(frame, area, state);
+        return;
+    }
     let popup = centered_rect(90, 86, area);
     frame.render_widget(Clear, popup);
 
@@ -797,7 +831,7 @@ mod tests {
         state.job_events = Some(tx);
         state.storage_scan_snapshots = StorageScanSnapshotStore::new();
 
-        let id = launch_storage_inspector(&mut state).expect("local launch");
+        let id = launch_storage_inspector(&mut state, None).expect("local launch");
         assert_eq!(state.active_overlay(), Some(OverlayKind::StorageInspector));
         let scans = manager
             .snapshot()
@@ -825,10 +859,10 @@ mod tests {
             path: "/".into(),
         };
         state.active = crate::app::Pane::Left;
-        let result = launch_storage_inspector(&mut state);
+        let result = launch_storage_inspector(&mut state, None);
         assert_eq!(
             result.unwrap_err(),
-            "Storage Inspector is available for local paths only"
+            "Storage Inspector is available for Local and S3 paths"
         );
         assert_eq!(state.active_overlay(), None);
     }
@@ -1063,7 +1097,7 @@ mod tests {
         state.left.location = Location::Local(temp.path().to_path_buf());
         state.active = crate::app::Pane::Left;
         state.job_events = Some(tx);
-        let new_id = launch_storage_inspector(&mut state).expect("next local launch");
+        let new_id = launch_storage_inspector(&mut state, None).expect("next local launch");
         assert_ne!(new_id, old_job.id);
         assert!(!state.storage_scan_snapshots.contains(&old_job.id));
         assert_eq!(state.storage_inspector.job_id, Some(new_id.clone()));
