@@ -57,6 +57,13 @@ rep(
         ),
 ''',
 )
+rep(
+    "src/app/registration.rs",
+    '''            AvailabilityPolicy::LocalOnly("Storage Inspector is available for local paths only")
+''',
+    '''            AvailabilityPolicy::LocalOrS3("Storage Inspector is available for Local and S3 paths")
+''',
+)
 
 rep(
     "src/app/availability.rs",
