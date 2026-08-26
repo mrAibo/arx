@@ -1172,16 +1172,16 @@ fn verified_manifest_shape(
         ));
     }
     for (relative, source_size) in source_files {
-        if let Some(expected) = source_size {
-            if destination_files.get(&relative).copied().flatten() != Some(expected) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "WebDAV copy verification failed: size differs for {}",
-                        relative.display()
-                    ),
-                ));
-            }
+        if let Some(expected) = source_size
+            && destination_files.get(&relative).copied().flatten() != Some(expected)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "WebDAV copy verification failed: size differs for {}",
+                    relative.display()
+                ),
+            ));
         }
     }
     Ok(())
@@ -1206,29 +1206,38 @@ async fn cleanup_copied_root(
 const WEBDAV_REMOTE_COPY_PIPE_BYTES: usize = 64 * 1024;
 const MAX_WEBDAV_REMOTE_COPY_FILE_BYTES: usize = 16 * 1024 * 1024 * 1024;
 
-async fn copy_tree_file_streamed(
-    source_provider: &WebDavProvider,
-    destination_provider: &WebDavProvider,
-    file: &TreeFile,
-    destination: &WebDavWriteTarget,
+struct RemoteCopyFileContext<'a> {
+    source_provider: &'a WebDavProvider,
+    destination_provider: &'a WebDavProvider,
+    destination_root: &'a WebDavWriteTarget,
     cancel: Arc<AtomicBool>,
     pause: crate::transfer_queue::PauseGate,
-    base: u64,
     total: Option<u64>,
+}
+
+async fn copy_tree_file_streamed(
+    context: &RemoteCopyFileContext<'_>,
+    file: &TreeFile,
+    base: u64,
     on_progress: &mut impl FnMut(TypedTransferProgress),
 ) -> io::Result<u64> {
+    let destination = upload_target_for_relative(context.destination_root, &file.relative)?;
     let (mut writer, reader) = tokio::io::duplex(WEBDAV_REMOTE_COPY_PIPE_BYTES);
     let get = async {
-        let result = source_provider
+        let result = context
+            .source_provider
             .get_stream(
                 &file.source.href,
                 MAX_WEBDAV_REMOTE_COPY_FILE_BYTES,
                 &mut writer,
-                Some(&cancel),
-                Some(&pause),
+                Some(&context.cancel),
+                Some(&context.pause),
                 |completed, _| {
                     if let Some(completed) = base.checked_add(completed) {
-                        on_progress(TypedTransferProgress::Bytes { completed, total });
+                        on_progress(TypedTransferProgress::Bytes {
+                            completed,
+                            total: context.total,
+                        });
                     }
                 },
             )
@@ -1236,7 +1245,7 @@ async fn copy_tree_file_streamed(
         drop(writer);
         result
     };
-    let put = destination_provider.put_logical_stream_with_policy(
+    let put = context.destination_provider.put_logical_stream_with_policy(
         &destination.logical_path,
         reader,
         file.advertised_size,
@@ -1256,16 +1265,16 @@ async fn copy_tree_file_streamed(
         }
     }
     let copied = get_result?;
-    if let Some(expected) = file.advertised_size {
-        if copied != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "WebDAV source size changed while streaming {}: expected {expected}, got {copied}",
-                    file.relative.display()
-                ),
-            ));
-        }
+    if let Some(expected) = file.advertised_size
+        && copied != expected
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "WebDAV source size changed while streaming {}: expected {expected}, got {copied}",
+                file.relative.display()
+            ),
+        ));
     }
     Ok(copied)
 }
@@ -1368,6 +1377,14 @@ pub(crate) async fn copy_tree(
                 })?;
         }
 
+        let file_context = RemoteCopyFileContext {
+            source_provider,
+            destination_provider,
+            destination_root,
+            cancel: cancel.clone(),
+            pause: pause.clone(),
+            total: manifest.total_bytes,
+        };
         let mut completed_before = 0u64;
         for file in &manifest.files {
             pause.checkpoint().await;
@@ -1377,19 +1394,8 @@ pub(crate) async fn copy_tree(
                     "WebDAV remote tree copy cancelled",
                 ));
             }
-            let target = upload_target_for_relative(destination_root, &file.relative)?;
-            let copied = copy_tree_file_streamed(
-                source_provider,
-                destination_provider,
-                file,
-                &target,
-                cancel.clone(),
-                pause.clone(),
-                completed_before,
-                manifest.total_bytes,
-                on_progress,
-            )
-            .await?;
+            let copied =
+                copy_tree_file_streamed(&file_context, file, completed_before, on_progress).await?;
             completed_before = completed_before.checked_add(copied).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,

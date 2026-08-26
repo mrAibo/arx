@@ -762,7 +762,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn webdav_remote_copy_requires_frozen_copy_tree_and_rejects_move() {
         let source = crate::vfs::WebDavCollectionRef {
             target: "dav-a".into(),
@@ -812,6 +811,7 @@ mod tests {
         assert!(TransferPlanner::plan(moved).is_err());
     }
 
+    #[test]
     fn remote_to_remote_uses_sftp_and_never_rsync() {
         let plan = TransferPlanner::plan(TransferRequest {
             source: sftp("prod-a", "/src"),

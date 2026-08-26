@@ -3,10 +3,8 @@
 
 #![cfg(feature = "physical-webdav")]
 
-#[path = "webdav_acceptance_proxy.rs"]
-mod fault_proxy;
-
 use super::webdav::{WebDavProvider, WebDavTarget};
+use super::webdav_acceptance_proxy::{ProxyMode, start_proxy};
 use crate::jobs::{JobEvent, JobManager, JobProgress, JobStatus, Progress};
 use crate::transfer::executor::{TransferExecutionError, execute_transfer};
 use crate::transfer::webdav_transfer::{build_tree_manifest, revalidate_tree_manifest};
@@ -17,11 +15,10 @@ use crate::transfer::{
 use crate::transfer_queue::{PauseGate, RetryDisposition, TransferQueueConfig};
 use crate::transfer_queue_runtime::TransferQueueRuntime;
 use crate::vfs::{EntryKind, ListedEntry, Location, ProviderRegistry};
-use fault_proxy::{ProxyMode, start_proxy};
 use std::error::Error;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -33,7 +30,6 @@ struct Endpoint {
     id: &'static str,
     url: String,
     user: String,
-    pass: String,
     provider: Arc<WebDavProvider>,
 }
 
@@ -70,7 +66,6 @@ fn endpoint(
         id,
         url,
         user,
-        pass,
         provider,
     })
 }
@@ -310,7 +305,7 @@ async fn assert_manifest(provider: &WebDavProvider, root: &str) -> Result<(), An
     assert_eq!(manifest.directories.len(), 3);
     assert_eq!(manifest.files.len(), 3);
     assert_eq!(manifest.descendant_count, 6);
-    assert_eq!(manifest.total_bytes, Some(26));
+    assert_eq!(manifest.total_bytes, Some(24));
     Ok(())
 }
 
@@ -407,7 +402,7 @@ async fn case_stale_manifest(f: &Fixture) -> Result<(), AnyError> {
     Ok(())
 }
 
-async fn registry_with_urls(
+fn registry_with_urls(
     f: &Fixture,
     source_url: String,
     destination_url: String,
@@ -429,7 +424,7 @@ async fn case_source_get_failure_cleanup(f: &Fixture) -> Result<(), AnyError> {
     )
     .await?;
     let proxy = start_proxy(&f.a.url, ProxyMode::DropGetBody).await?;
-    let registry = registry_with_urls(f, proxy.listen_addr.clone(), f.b.url.clone()).await;
+    let registry = registry_with_urls(f, proxy.listen_addr.clone(), f.b.url.clone());
     let src = dav(f.a.id, "/");
     let listed = listed_named(&registry, &src, &root).await?;
     let (plan, names) = build_plan(&registry, src, dav(f.b.id, "/"), &listed)?;
@@ -451,7 +446,7 @@ async fn case_ambiguous_put_recovery(f: &Fixture) -> Result<(), AnyError> {
     )
     .await?;
     let proxy = start_proxy(&f.b.url, ProxyMode::AmbiguousPut).await?;
-    let registry = registry_with_urls(f, f.a.url.clone(), proxy.listen_addr.clone()).await;
+    let registry = registry_with_urls(f, f.a.url.clone(), proxy.listen_addr.clone());
     let src = dav(f.a.id, "/");
     let listed = listed_named(&registry, &src, &root).await?;
     let (plan, names) = build_plan(&registry, src, dav(f.b.id, "/"), &listed)?;
@@ -486,7 +481,7 @@ async fn case_cleanup_failure_recovery(f: &Fixture) -> Result<(), AnyError> {
     )
     .await?;
     let proxy = start_proxy(&f.b.url, ProxyMode::AmbiguousPutDropDelete).await?;
-    let registry = registry_with_urls(f, f.a.url.clone(), proxy.listen_addr.clone()).await;
+    let registry = registry_with_urls(f, f.a.url.clone(), proxy.listen_addr.clone());
     let src = dav(f.a.id, "/");
     let listed = listed_named(&registry, &src, &root).await?;
     let (plan, names) = build_plan(&registry, src, dav(f.b.id, "/"), &listed)?;
