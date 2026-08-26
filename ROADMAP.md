@@ -2,7 +2,7 @@
 
 GitHub state is authoritative over this document. Re-fetch current `main`, issues, PRs, tags, workflow state, and releases before acting on any recorded SHA or backlog item.
 
-## CURRENT — v0.23.0 published / SFTP→SFTP accepted on main
+## CURRENT — v0.23.0 published / v0.24.0 release preparation
 
 **Current public release:** `v0.23.0`  
 **Release tag target:** `f66a25f3f2b4fb66832ecc50d85f9f105ebba086`  
@@ -10,7 +10,8 @@ GitHub state is authoritative over this document. Re-fetch current `main`, issue
 **Platform:** Linux only; published target Linux x86_64  
 **MSRV:** Rust 1.88  
 **Previous immutable release:** `v0.22.0` → `8737bbd2afaf0d6e7146a5d8c59ee1a0606325bf`
-**Current main:** `fe413aecfdc3bf5685849e73b396800f7f3ab7e0` — accepted/unreleased SFTP→SFTP Workspace Sync (#269 / PR #270)
+**Current main:** `cd5f1b147ac4ca78d7fdab134d548b97a7c20a00` — public-truth baseline after PR #272
+**Active release candidate:** `v0.24.0` via #271 / `release/v0.24.0-prep`; source version metadata does not imply publication
 
 v0.23.0 ships the read-only **S3 Object & Bucket Inspector** on top of the v0.22.0 WebDAV recursive-operation baseline.
 
@@ -42,7 +43,7 @@ Published SHA-256 values:
 ## CURRENT PRODUCT TRUTH
 
 - **Local / SFTP:** browsing, transactional copy, bounded preview, SFTP conflict-safe text Remote Edit, OpenSSH-backed host/session behavior.
-- **Remote Workspace:** published v0.23.0 provides Compare → Preview → Execute → Verify for Local→Local, Local→SFTP, and SFTP→Local; current `main` additionally contains accepted/unreleased SFTP→SFTP sync with same-host/cross-host bounded streaming and real two-endpoint OpenSSH acceptance.
+- **Remote Workspace:** published v0.23.0 provides Compare → Preview → Execute → Verify for Local→Local, Local→SFTP, and SFTP→Local; the v0.24.0 release candidate adds the already accepted SFTP→SFTP sync with same-host/cross-host bounded streaming and real two-endpoint OpenSSH acceptance.
 - **Transfer Queue:** one persistent bounded FIFO runtime, configurable concurrency `1..=8`, truthful progress/rate/ETA where known, cooperative Pause/Resume/Cancel, and bounded safe retry.
 - **Transfer Center v2:** Active / History / All views and controls routed to the existing `TransferQueueRuntime`.
 - **Storage Inspector (`Alt+U`):** Local read-only logical/allocated usage plus exact S3 object inspection and bounded paginated bucket/prefix LiveScan analytics.
@@ -131,7 +132,7 @@ These are enhancements, not regressions or current release blockers.
 
 ## ACCEPTED / UNRELEASED — SFTP → SFTP WORKSPACE SYNC
 
-Issue #269 was completed by PR #270 and is now accepted on `main` at `fe413aecfdc3bf5685849e73b396800f7f3ab7e0`. It is **not part of published v0.23.0**.
+Issue #269 was completed by PR #270 and feature-merged as `fe413aecfdc3bf5685849e73b396800f7f3ab7e0`. Public-truth baseline `cd5f1b147ac4ca78d7fdab134d548b97a7c20a00` retains the feature. It is **not part of published v0.23.0** and is the sole major feature targeted by the v0.24.0 release candidate.
 
 Accepted truth:
 
