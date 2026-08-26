@@ -603,7 +603,7 @@ async fn stale_launch_error(
 }
 
 async fn case_stale_preview_fails_closed(fixture: &Fixture) -> Result<(), AnyError> {
-    let (left, right, left_path, right_path) = cross_host_roots(fixture, "stale-source")?;
+    let (left, right, left_path, _right_path) = cross_host_roots(fixture, "stale-source")?;
     let source = left_path.join("stale.txt");
     ssh_write(&fixture.host_a, &source.to_string_lossy(), b"old\n")?;
     let reg = registry(fixture);
