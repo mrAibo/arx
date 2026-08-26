@@ -2,41 +2,47 @@
 
 This document is the canonical continuation point for active ARX development. It is intentionally compact: a new development session should be able to recover current product truth, frozen architecture rules, release state, and the next work sequence without reconstructing chat history.
 
-> **Authority rule:** live GitHub state wins over this file. Re-fetch current `main`, open issues/PRs, workflow state, and releases before acting on any SHA or backlog statement recorded here. Published tags are immutable evidence; current `main` may be ahead of the latest release.
+> **Authority rule:** live GitHub state wins over this file. Re-fetch current `main`, open issues/PRs, workflow state, tags, and releases before acting on any SHA or publication statement recorded here. Published tags are immutable evidence.
 
-## 1. Current release and main baseline
+## 1. Current release line and baseline
 
 Repository: `mrAibo/arx`
 
-- Current public release: **v0.22.0**
+- Release version in this source tree: **v0.23.0**
+- Previous immutable public release: **v0.22.0**
 - v0.22.0 tag target: `8737bbd2afaf0d6e7146a5d8c59ee1a0606325bf`
-- Published: 2026-08-26
-- Accepted post-release `main` after S3 Inspector merge: `d95f6183c93932fba7f5ac10f421ce6abbe1f044`
+- Accepted pre-release main baseline: `5078379d32dff352cce8478930fcbd023cb8951e`
 - Rust MSRV: **1.88**
 - Product platform: **Linux only**
 - Published target: **Linux x86_64**
 - Release assets: tar.gz, `.deb`, `.rpm`, and `SHA256SUMS`
 - Release publication uses one validated ELF and reuses the validated artifact bundle; do not rebuild between validation and publication.
 
-v0.22.0 remains the immutable published baseline. `main` is currently ahead of it because issue #264 / PR #265 added the read-only S3 Object & Bucket Inspector after the release.
+v0.23.0 packages the already accepted read-only S3 Object & Bucket Inspector on top of the v0.22.0 product baseline. The live GitHub tag, Release workflow, and Release object are authoritative for whether publication has completed; do not infer publication merely from the version in this source tree.
 
 ## 2. Current phase
 
-The immediate phase is **release preparation / public-truth synchronization**, not another architecture pack.
+The immediate phase is **v0.23.0 release execution**, not another architecture pack or feature expansion.
 
-Current direction:
+Release sequence:
 
-1. keep README, ROADMAP, this handoff, and live GitHub state synchronized
-2. keep the merged S3 Inspector runtime frozen unless a genuine correctness/safety blocker is discovered
-3. prefer a minimal **v0.23.0** release before starting another major feature
-4. after that release, the preferred next major feature is **SFTP → SFTP workspace synchronization**
-5. preserve exact-head CI and affected physical provider acceptance
+1. keep the release candidate limited to version/lockfile/release-note/public-truth changes
+2. keep the accepted S3 Inspector runtime frozen unless a genuine correctness/safety blocker is discovered
+3. require exact-head standard CI and Release PR validation
+4. merge only the reviewed exact PR head
+5. require post-merge CI before tagging
+6. create immutable `v0.23.0` on the accepted main commit
+7. let the existing tag-triggered Release workflow validate and publish the one-build artifact bundle
+8. independently verify tag target, Release state, assets, checksums, binary version, and v0.22.0 tag immutability
+9. only after release acceptance, freeze the next major feature: **SFTP → SFTP workspace synchronization**
 
-Do not begin SFTP→SFTP implementation by silently extending the S3 or release slice. Freeze a dedicated issue/contract first.
+Do not begin SFTP→SFTP implementation by silently extending the release slice. Freeze a dedicated issue/contract first.
 
-## 3. Current product truth
+## 3. v0.23.0 product truth
 
-### Published in v0.22.0
+v0.23.0 retains the v0.22.0 product surface and adds the accepted S3 Object & Bucket Inspector.
+
+Shipped product surface:
 
 - Local / SFTP browsing, transactional copy, bounded preview, and SFTP conflict-safe text Remote Edit
 - Remote Workspace Compare → Preview → Execute → Verify for Local→Local, Local→SFTP, and SFTP→Local
@@ -53,9 +59,9 @@ Do not begin SFTP→SFTP implementation by silently extending the S3 or release 
 - multi-root Local↔WebDAV F5 Copy as one queued job
 - Linux x86_64 tar.gz / DEB / RPM distribution from one validated ELF
 
-### Completed on current main after v0.22.0
+### S3 Object & Bucket Inspector included in v0.23.0
 
-Issue #264 / PR #265 added **S3 Object & Bucket Inspector**:
+Issue #264 / PR #265 added:
 
 - exact provider-native object identity
 - `HeadObject` facts only: size, last modified, ETag, content type, storage class, metadata, endpoint identity, version ID when returned
@@ -63,7 +69,7 @@ Issue #264 / PR #265 added **S3 Object & Bucket Inspector**:
 - observed object count and logical bytes
 - bounded largest-object ranking
 - bounded immediate-prefix ranking
-- bounded storage-class cardinality
+- bounded prefix and storage-class cardinality
 - age and storage-class distributions
 - progress, cancellation, and truthful partial-state handling
 - no S3 cleanup/mutation UI in this slice
@@ -72,9 +78,12 @@ Issue #264 / PR #265 added **S3 Object & Bucket Inspector**:
 - no second provider registry, S3 client cache, scheduler, or JobManager
 
 Accepted implementation head: `d0ceb64781777bd04fe51aeaff9b8d3dfa3c3343`  
-Squash merge on main: `d95f6183c93932fba7f5ac10f421ce6abbe1f044`
+Squash merge on main: `d95f6183c93932fba7f5ac10f421ce6abbe1f044`  
+Public-truth sync merge: `5078379d32dff352cce8478930fcbd023cb8951e`
 
-Final exact-head CI and post-merge push CI were green across Quality, Rust 1.88 MSRV, MinIO/S3 physical acceptance, Apache WebDAV physical regression, and real PTY multiplexer acceptance. The MinIO lane explicitly executed `tests/s3_inspector_minio.rs` and proved the real object + prefix inspector path.
+Final exact-head feature CI and post-merge push CI were green across Quality, Rust 1.88 MSRV, MinIO/S3 physical acceptance, Apache WebDAV physical regression, and real PTY multiplexer acceptance. The MinIO lane explicitly executed `tests/s3_inspector_minio.rs` and proved the real object + prefix inspector path.
+
+SFTP→SFTP workspace synchronization remains intentionally unsupported in v0.23.0.
 
 ## 4. Architecture status
 
@@ -140,22 +149,21 @@ Do not treat these as v0.23.0 release blockers unless live GitHub state explicit
 
 ## 6. Recommended next sequence
 
-### A. First — v0.23.0 release
+### A. Finish v0.23.0 release
 
-Recommended because the S3 Inspector is a complete user-visible feature already accepted on `main`.
+The candidate should remain minimal:
 
-Keep the release candidate minimal:
-
-- bump Cargo version and root Cargo.lock version to `0.23.0`
-- add `docs/releases/v0.23.0.md`
-- synchronize README/ROADMAP release truth
-- keep runtime code frozen unless a separately reviewed release blocker is found
-- run exact-head standard gates and affected physical lanes
-- run the existing one-build/no-rebuild release validation
-- merge with pinned expected head
-- tag the accepted main commit as immutable `v0.23.0`
-- allow the existing tag-triggered workflow to publish tar.gz / DEB / RPM / `SHA256SUMS`
-- independently verify tag target, release state, assets, checksums, packaged binary version, and v0.22.0 tag immutability
+- Cargo package and root Cargo.lock version `0.23.0`
+- `docs/releases/v0.23.0.md`
+- README / ROADMAP / canonical handoff release truth synchronized
+- no runtime, dependency, workflow, or package-logic changes unless a separately reviewed blocker appears
+- exact-head standard CI and Release PR validation green
+- independent exact-head diff review
+- pinned merge using the reviewed head SHA
+- post-merge push CI green
+- immutable `v0.23.0` tag on accepted main
+- existing tag-triggered workflow publishes tar.gz / DEB / RPM / `SHA256SUMS`
+- independent post-publish verification of tag target, Release state, assets, checksums, binary `arx 0.23.0`, and v0.22.0 immutability
 
 ### B. After v0.23.0 — SFTP → SFTP workspace sync
 
@@ -215,7 +223,7 @@ Additional rules:
 - never fabricate progress, rate, ETA, capacity, cost, or provider semantics
 - do not change runtime semantics merely to satisfy timing-sensitive tests
 - destructive/remote mutation paths require truthful transaction, cancellation, retry, and recovery behavior
-- `Cargo.lock` remains authoritative
+- `Cargo.lock` remains authoritative; release-only version bumps must not alter unrelated dependency checksums or resolution
 
 ## 9. Collaboration model
 
@@ -235,9 +243,10 @@ For feature releases:
 5. run exact-head standard + affected physical gates
 6. validate release packages from one release ELF
 7. merge with pinned expected head
-8. create a new immutable tag on the accepted main commit
-9. allow the existing tag-triggered Release workflow to publish validated artifacts
-10. independently verify tag target, release state, assets, checksums, packaged binary version, and prior-tag immutability
+8. require post-merge CI success
+9. create a new immutable tag on the accepted main commit
+10. allow the existing tag-triggered Release workflow to publish validated artifacts
+11. independently verify tag target, release state, assets, checksums, packaged binary version, and prior-tag immutability
 
 Never repurpose an already-published version identity.
 
@@ -256,4 +265,4 @@ Before changing code:
 
 Minimal continuation prompt:
 
-> Continue development of `github.com/mrAibo/arx`. Read `docs/DEVELOPMENT_HANDOFF.md`, `ROADMAP.md`, and `ARCHITECTURE.md`; treat live GitHub state as authoritative. Current public release is v0.22.0, while current main contains the accepted S3 Object & Bucket Inspector from #264/#265. Preserve the frozen architecture authorities. Prefer a minimal v0.23.0 release before beginning the next major feature, then freeze SFTP→SFTP workspace sync as a dedicated slice. Use Hermes only for deterministic Linux-local execution.
+> Continue development of `github.com/mrAibo/arx`. Read `docs/DEVELOPMENT_HANDOFF.md`, `ROADMAP.md`, and `ARCHITECTURE.md`; treat live GitHub state as authoritative. The source tree release line is v0.23.0 and includes the accepted S3 Object & Bucket Inspector from #264/#265; verify live GitHub state to determine whether publication is complete. Preserve the frozen architecture authorities. Finish any remaining v0.23.0 release gates before beginning the next major feature, then freeze SFTP→SFTP workspace sync as a dedicated slice. Use Hermes only for deterministic Linux-local execution.

@@ -1,32 +1,31 @@
 # ARX Roadmap
 
-GitHub state is authoritative over this document. Re-fetch current `main`, issues, PRs, and release state before acting on any SHA or backlog item recorded here.
+GitHub state is authoritative over this document. Re-fetch current `main`, issues, PRs, tags, workflow state, and releases before acting on any SHA or publication statement recorded here.
 
-## CURRENT — v0.22.0 release + post-release main truth
+## CURRENT — v0.23.0 release line
 
-**Current public release:** `v0.22.0`  
-**Release tag target:** `8737bbd2afaf0d6e7146a5d8c59ee1a0606325bf`  
-**Published:** 2026-08-26  
-**Current accepted main after #265:** `d95f6183c93932fba7f5ac10f421ce6abbe1f044`  
+**Release version in this source tree:** `v0.23.0`  
+**Previous immutable public release:** `v0.22.0`  
+**v0.22.0 tag target:** `8737bbd2afaf0d6e7146a5d8c59ee1a0606325bf`  
+**Accepted pre-release main baseline:** `5078379d32dff352cce8478930fcbd023cb8951e`  
+**Publication authority:** live GitHub tag / Release workflow / Release state  
 **Platform:** Linux only; published target Linux x86_64  
 **MSRV:** Rust 1.88
 
-v0.22.0 is the current stable 0.x release line. It keeps the one-build/no-rebuild release pipeline and expands the WebDAV recursive surface from one-way recursive download into recursive upload, safe recursive delete, and multi-root F5 Copy.
+The v0.23.0 release line packages the already accepted read-only S3 Object & Bucket Inspector on top of the v0.22.0 WebDAV release baseline. Runtime behavior is frozen for this release slice; the release branch changes version, lockfile version, release notes, and public release truth only.
 
-Current `main` is intentionally ahead of the published release: PR #265 merged the read-only S3 Object & Bucket Inspector from issue #264. This capability is accepted on `main` but is not yet present in the published v0.22.0 binaries.
-
-Current product truth:
+Current product truth for v0.23.0:
 
 - **Local / SFTP:** browsing, transactional copy, bounded preview, SFTP conflict-safe text Remote Edit, OpenSSH-backed host/session behavior.
 - **Remote Workspace:** compare → Preview → Execute → Verify for Local→Local, Local→SFTP, and SFTP→Local. SFTP→SFTP workspace sync remains unsupported.
 - **Transfer Queue:** one persistent bounded FIFO runtime, configurable concurrency `1..=8`, truthful progress/rate/ETA where known, cooperative Pause/Resume/Cancel, and bounded safe retry.
 - **Transfer Center v2:** Active / History / All views and controls routed to the existing `TransferQueueRuntime`.
-- **Storage Inspector (`Alt+U`):** Local read-only logical/allocated usage, drill-down/top-files, hard-link handling, partial/error/cancel truth; current `main` additionally provides exact S3 object inspection plus bounded paginated bucket/prefix LiveScan analytics.
+- **Storage Inspector (`Alt+U`):** Local read-only logical/allocated usage, drill-down/top-files, hard-link handling, partial/error/cancel truth; S3 adds exact object inspection plus bounded paginated bucket/prefix LiveScan analytics.
 - **Filesystems (`Alt+D`):** read-only Linux capacity/inode view with explicit unavailable/autofs truth. S3 does not receive fabricated filesystem capacity or `df` semantics.
 - **Effective keymap:** one conflict-safe effective runtime map with user overrides and `arx --print-keymap` discovery.
 - **Mouse / split panes / terminal:** visible-row-correct mouse behavior, vertical+horizontal split panes, typed tmux/GNU Screen lifecycle.
 - **Typed local Quick Actions:** SHA-256, Touch, Compress-to-tar.gz plus the existing mkdir/chmod/symlink surface.
-- **S3:** AWS S3 + MinIO physically accepted supported MVPs; current `main` adds exact object and bounded bucket/prefix inspection through the existing provider/registry/job authorities; Moto emulated; Cloudflare R2 / Wasabi remain unverified best-effort targets.
+- **S3:** AWS S3 + MinIO physically accepted supported paths; v0.23.0 includes exact object and bounded bucket/prefix inspection through the existing provider/registry/job authorities; Moto emulated; Cloudflare R2 / Wasabi remain unverified best-effort targets.
 - **WebDAV providers:** Apache mod_dav, Nextcloud 34.0.2-apache, and ownCloud 11.0.0 physically accepted through the Basic-auth path.
 - **WebDAV recursive download:** one exact selected collection → one new Local tree with exact href identity, bounded Depth:1 traversal, manifest-before-mutation, noclobber staging, and truthful cleanup/recovery.
 - **WebDAV recursive upload:** one Local directory → one new remote tree with complete Local pre-scan, shared 50,000/128 bounds, no-follow reads, root ownership, noclobber write semantics, and recovery truth.
@@ -54,13 +53,13 @@ Provider-native identity remains authoritative. Presentation/display names never
 
 There is **no GO** for an external Lua/WASM/`.so` plugin runtime. Re-evaluate only if real user/ecosystem demand appears and a truthful enforcement/security model can be defined. `arx.menu` remains the supported lightweight extension path.
 
-## COMPLETED ON MAIN — S3 Object & Bucket Inspector
+## INCLUDED IN v0.23.0 — S3 Object & Bucket Inspector
 
 Issue [#264](https://github.com/mrAibo/arx/issues/264) was completed by PR [#265](https://github.com/mrAibo/arx/pull/265).
 
 **Accepted implementation head:** `d0ceb64781777bd04fe51aeaff9b8d3dfa3c3343`  
 **Squash merge on main:** `d95f6183c93932fba7f5ac10f421ce6abbe1f044`  
-**State:** merged and post-merge CI accepted; not yet published in v0.22.0
+**Public-truth sync merge:** `5078379d32dff352cce8478930fcbd023cb8951e`
 
 The completed slice is deliberately read-only:
 
@@ -76,13 +75,13 @@ The completed slice is deliberately read-only:
 - reuse of the existing `ProviderRegistry`, per-target `S3Provider`/AWS client, `JobManager`, and UI architecture
 - no S3 mutation/cleanup UI, no fake capacity/free-space/`df` data, no invented billing/cost data
 
-Acceptance evidence for the final exact PR head included Format, Clippy, full tests, Rust 1.88 MSRV, real PTY multiplexer acceptance, Apache WebDAV regression acceptance, and the existing S3/MinIO physical lane. The MinIO lane explicitly executed `tests/s3_inspector_minio.rs` and proved the real object + prefix inspector path. The post-merge push CI on `d95f6183...` also completed successfully.
+Acceptance evidence for the final exact feature PR head included Format, Clippy, full tests, Rust 1.88 MSRV, real PTY multiplexer acceptance, Apache WebDAV regression acceptance, and the existing S3/MinIO physical lane. The MinIO lane explicitly executed `tests/s3_inspector_minio.rs` and proved the real object + prefix inspector path. The post-merge push CI also completed successfully.
 
-Cloudflare R2 / Wasabi remain best-effort/unverified; this slice does not claim physical certification for them.
+Cloudflare R2 / Wasabi remain best-effort/unverified; v0.23.0 does not claim physical certification for them.
 
 ## RELEASED WEBDAV WORK
 
-The #13 post-MVP umbrella now includes these shipped capabilities:
+The #13 post-MVP umbrella includes these shipped capabilities from v0.22.0 and retained in v0.23.0:
 
 - core WebDAV provider semantics
 - Apache mod_dav W1–W18 physical acceptance
@@ -94,7 +93,7 @@ The #13 post-MVP umbrella now includes these shipped capabilities:
 - safe bounded recursive WebDAV delete (#255 / PR #256)
 - one-job multi-root Local↔WebDAV F5 Copy (#257 / PR #258)
 
-Remaining #13 items are enhancements, not release blockers:
+Remaining #13 items are enhancements, not v0.23.0 release blockers:
 
 - [ ] multi-root recursive WebDAV delete
 - [ ] WebDAV → WebDAV recursive/cross-target copy or move with truthful target/recovery semantics
@@ -103,7 +102,7 @@ Remaining #13 items are enhancements, not release blockers:
 
 ## SELECTED NEXT PRODUCT DIRECTION
 
-The next major feature direction after the completed S3 Inspector should be **SFTP → SFTP workspace synchronization**.
+After v0.23.0, the next major feature direction is **SFTP → SFTP workspace synchronization**.
 
 Before implementation, freeze a dedicated issue around the existing Compare → Preview → Execute → Verify model. The slice must reuse the existing workspace-sync controller, provider authority, transfer queue, job lifecycle, retry policy, and verification model rather than introducing a second synchronization engine.
 
@@ -118,19 +117,22 @@ Required boundaries before implementation:
 - do not silently reinterpret SFTP→SFTP as server-side rename/move when a cross-host transfer is actually required
 - do not combine this automatically with general cross-provider Move or WebDAV→WebDAV recursive copy
 
-## RELEASE DECISION
+## v0.23.0 RELEASE CONTRACT
 
-**Recommendation: cut v0.23.0 before beginning the SFTP → SFTP implementation.**
+v0.23.0 is deliberately a minimal release slice around an already accepted user-visible feature:
 
-Reasoning:
+- Cargo package version and root lockfile version are `0.23.0`
+- `docs/releases/v0.23.0.md` is the release-note source
+- README and canonical public truth describe the same S3 Inspector scope
+- runtime code, dependencies, workflows, package logic, and provider semantics remain unchanged unless a genuine separately reviewed blocker appears
+- exact-head standard CI and Release PR validation must pass before merge
+- the merge must be pinned to the reviewed PR head
+- post-merge CI must pass before tagging
+- immutable `v0.23.0` must target the accepted main commit
+- the existing tag-triggered Release workflow must validate and publish the one-build artifact bundle
+- final acceptance must independently verify tag target, Release state, assets, checksums, binary version, and v0.22.0 tag immutability
 
-- #264/#265 is a complete, user-visible capability rather than an internal cleanup.
-- Exact-head and post-merge CI are green, including the affected physical MinIO path.
-- The completed S3 Inspector is cleanly separable from the next synchronization feature.
-- Shipping it now keeps `main` and public binaries from drifting through another major feature block.
-- A v0.23.0 release can remain a minimal release-truth slice: version/lockfile, release notes/public docs, release validation, tag, and publication; runtime behavior should remain frozen unless a genuine release blocker is discovered.
-
-This is a release recommendation, not an already-created release. Until that release process is explicitly executed, v0.22.0 remains the current published version.
+Live GitHub state is the authority for whether these publication gates have completed.
 
 ## RECOMMENDED FEATURE SEQUENCE
 
@@ -159,7 +161,7 @@ Items not currently represented by active GitHub issues should be promoted to de
 
 Native Windows support remains out of scope. Windows SSH clients may interoperate with an ARX process running on Linux; that does not change the Linux-only product policy.
 
-## RELEASED — v0.22.0 (2026-08-26)
+## PREVIOUS RELEASE — v0.22.0 (2026-08-26)
 
 Release target: `8737bbd2afaf0d6e7146a5d8c59ee1a0606325bf`.
 
@@ -184,6 +186,24 @@ The official Release run validated tag/version truth, release notes/hero asset, 
 Independent post-publish verification rechecked all three package hashes against `SHA256SUMS`; the tarball binary reports `arx 0.22.0` and `--help` exits successfully.
 
 ## RELEASE HISTORY
+
+### v0.23.0
+
+- read-only S3 Object & Bucket Inspector
+- exact provider-native `HeadObject` facts
+- bounded paginated `ListObjectsV2` bucket/prefix LiveScan
+- progress, cancellation, partial truth, bounded prefix and storage-class cardinality
+- existing ProviderRegistry/S3Provider/JobManager authorities retained
+- AWS S3 + real MinIO acceptance; R2/Wasabi remain best-effort/unverified
+
+Publication evidence for v0.23.0 is intentionally not hard-coded here; verify the live immutable tag and GitHub Release state.
+
+### v0.22.0
+
+- recursive Local → WebDAV upload
+- safe bounded recursive WebDAV delete
+- multi-root Local↔WebDAV F5 Copy
+- Apache / Nextcloud / ownCloud physical acceptance retained
 
 ### v0.21.0
 
