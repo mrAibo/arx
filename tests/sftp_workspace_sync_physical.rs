@@ -13,9 +13,7 @@ use arx::services::{
 };
 use arx::vfs::sftp::SftpProvider;
 use arx::vfs::{Location, ProviderRegistry, capabilities};
-use arx::workspace_sync::{
-    ConflictPolicy, SyncMode, SyncPolicy, WorkspaceDiff, WorkspaceSyncPlan,
-};
+use arx::workspace_sync::{ConflictPolicy, SyncMode, SyncPolicy, WorkspaceDiff, WorkspaceSyncPlan};
 use arx::workspace_sync_execution::{SyncPlanValidator, SyncValidationError};
 use arx::workspace_sync_executor::SyncTerminalState;
 use arx::workspace_sync_verification::{
@@ -217,20 +215,10 @@ async fn fresh_diff(
     right: &Location,
 ) -> Result<WorkspaceDiff, AnyError> {
     let cancel = AtomicBool::new(false);
-    let left_entries = scan_workspace(
-        registry,
-        left,
-        WorkspaceScanOptions::default(),
-        &cancel,
-    )
-    .await?;
-    let right_entries = scan_workspace(
-        registry,
-        right,
-        WorkspaceScanOptions::default(),
-        &cancel,
-    )
-    .await?;
+    let left_entries =
+        scan_workspace(registry, left, WorkspaceScanOptions::default(), &cancel).await?;
+    let right_entries =
+        scan_workspace(registry, right, WorkspaceScanOptions::default(), &cancel).await?;
     Ok(WorkspaceDiff::compare(
         left.clone(),
         right.clone(),
@@ -256,10 +244,8 @@ async fn start_sync(
     policy: SyncPolicy,
     confirmed: bool,
 ) -> Result<StartedSync, AnyError> {
-    let controller = WorkspaceSyncController::with_journal(
-        registry,
-        OperationJournal::open(journal_path())?,
-    );
+    let controller =
+        WorkspaceSyncController::with_journal(registry, OperationJournal::open(journal_path())?);
     let logical = WorkspaceSyncPlan::build(&diff, policy);
     let frozen = controller.freeze(&logical, &diff)?;
     let jobs = JobManager::new();
@@ -332,10 +318,9 @@ fn finished_verification(
 ) -> Result<&SyncVerificationResult, AnyError> {
     match &snapshot.status {
         SyncVerificationStatus::Finished(result) => Ok(result.as_ref()),
-        other => Err(io::Error::other(format!(
-            "expected finished verification, got {other:?}"
-        ))
-        .into()),
+        other => {
+            Err(io::Error::other(format!("expected finished verification, got {other:?}")).into())
+        }
     }
 }
 
@@ -360,7 +345,10 @@ fn assert_observed_destination(
         .find(|entry| entry.relative_path == relative_path)
         .unwrap_or_else(|| panic!("verification did not observe {relative_path}"));
     assert_eq!(
-        entry.right.as_ref().and_then(|fingerprint| fingerprint.size),
+        entry
+            .right
+            .as_ref()
+            .and_then(|fingerprint| fingerprint.size),
         Some(expected_size),
         "verification={verification:?}"
     );
@@ -402,11 +390,17 @@ async fn case_cross_host_replacement(fixture: &Fixture) -> Result<(), AnyError> 
     ssh_write(&fixture.host_b, &target_path.to_string_lossy(), b"old\n")?;
     ssh_run(
         &fixture.host_a,
-        &format!("touch -m -d @1700000100 -- {}", sh_quote(&source_path.to_string_lossy())),
+        &format!(
+            "touch -m -d @1700000100 -- {}",
+            sh_quote(&source_path.to_string_lossy())
+        ),
     )?;
     ssh_run(
         &fixture.host_b,
-        &format!("touch -m -d @1700000000 -- {}", sh_quote(&target_path.to_string_lossy())),
+        &format!(
+            "touch -m -d @1700000000 -- {}",
+            sh_quote(&target_path.to_string_lossy())
+        ),
     )?;
 
     let reg = registry(fixture);
@@ -424,7 +418,10 @@ async fn case_cross_host_replacement(fixture: &Fixture) -> Result<(), AnyError> 
         "replace.txt",
         source.len() as u64,
     );
-    assert_eq!(ssh_read(&fixture.host_b, &target_path.to_string_lossy())?, source);
+    assert_eq!(
+        ssh_read(&fixture.host_b, &target_path.to_string_lossy())?,
+        source
+    );
     assert!(!ssh_has_part_artifact(
         &fixture.host_b,
         &right_path.to_string_lossy()
@@ -611,13 +608,15 @@ async fn case_stale_preview_fails_closed(fixture: &Fixture) -> Result<(), AnyErr
     ssh_write(&fixture.host_a, &source.to_string_lossy(), b"old\n")?;
     let reg = registry(fixture);
     let original = fresh_diff(&reg, &left, &right).await?;
-    let controller = WorkspaceSyncController::with_journal(
-        reg,
-        OperationJournal::open(journal_path())?,
-    );
+    let controller =
+        WorkspaceSyncController::with_journal(reg, OperationJournal::open(journal_path())?);
     let logical = WorkspaceSyncPlan::build(&original, SyncPolicy::default());
     let frozen = SyncPlanValidator::freeze(&logical, &original, &registry(fixture))?;
-    ssh_write(&fixture.host_a, &source.to_string_lossy(), b"source changed\n")?;
+    ssh_write(
+        &fixture.host_a,
+        &source.to_string_lossy(),
+        b"source changed\n",
+    )?;
     let (error, jobs) = stale_launch_error(&controller, frozen, original).await?;
     assert!(matches!(
         error,
@@ -631,10 +630,8 @@ async fn case_stale_preview_fails_closed(fixture: &Fixture) -> Result<(), AnyErr
     ssh_write(&fixture.host_a, &source.to_string_lossy(), b"source\n")?;
     let reg = registry(fixture);
     let original = fresh_diff(&reg, &left, &right).await?;
-    let controller = WorkspaceSyncController::with_journal(
-        reg,
-        OperationJournal::open(journal_path())?,
-    );
+    let controller =
+        WorkspaceSyncController::with_journal(reg, OperationJournal::open(journal_path())?);
     let logical = WorkspaceSyncPlan::build(&original, SyncPolicy::default());
     let frozen = SyncPlanValidator::freeze(&logical, &original, &registry(fixture))?;
     ssh_write(&fixture.host_b, &target.to_string_lossy(), b"appeared\n")?;
