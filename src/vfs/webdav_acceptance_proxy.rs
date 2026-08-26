@@ -226,6 +226,14 @@ async fn handle_conn(
         }
     }
 
+    // A cleanup-failure fault must not reach the real server at all. Do this
+    // before opening or writing the upstream connection so the test cannot
+    // accidentally prove RecoveryRequired after Apache already deleted root.
+    if mode == ProxyMode::AmbiguousPutDropDelete && method == "DELETE" {
+        let _ = client.shutdown().await;
+        return;
+    }
+
     // Connect to real Apache.
     let mut upstream = match TcpStream::connect((upstream_host.as_str(), upstream_port)).await {
         Ok(u) => u,
@@ -299,11 +307,6 @@ async fn handle_conn(
             }
         }
         ProxyMode::AmbiguousPut | ProxyMode::AmbiguousPutDropDelete => {
-            if mode == ProxyMode::AmbiguousPutDropDelete && method == "DELETE" {
-                // Cleanup transport ambiguity: do not forward the DELETE.
-                let _ = client.shutdown().await;
-                return;
-            }
             if method == "PUT" {
                 // Forward exactly the remaining declared bytes; do not wait for
                 // EOF on the client connection.
