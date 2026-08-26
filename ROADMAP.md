@@ -2,74 +2,39 @@
 
 GitHub state is authoritative over this document. Re-fetch current `main`, issues, PRs, and release state before acting on any SHA or backlog item recorded here.
 
-## CURRENT — v0.21.0 product truth
+## CURRENT — v0.22.0 product truth
 
-**Current public release:** `v0.21.0`  
-**Release tag target:** `3427cd085740d2c3f8a4bffbbf55b34ba3d9bb85`  
-**Published:** 2026-08-25  
+**Current public release:** `v0.22.0`  
+**Release tag target:** `8737bbd2afaf0d6e7146a5d8c59ee1a0606325bf`  
+**Published:** 2026-08-26  
 **Platform:** Linux only; published target Linux x86_64  
 **MSRV:** Rust 1.88
 
-v0.21.0 is the current stable 0.x release line. It keeps the established one-build/no-rebuild release pipeline and adds the first recursive WebDAV capability on top of the v0.20.0 storage, transfer-control, and native-packaging baseline.
+v0.22.0 is the current stable 0.x release line. It keeps the one-build/no-rebuild release pipeline and expands the WebDAV recursive surface from one-way recursive download into recursive upload, safe recursive delete, and multi-root F5 Copy.
 
 Current product truth:
 
 - **Local / SFTP:** browsing, transactional copy, bounded preview, SFTP conflict-safe text Remote Edit, OpenSSH-backed host/session behavior.
 - **Remote Workspace:** compare → Preview → Execute → Verify for Local→Local, Local→SFTP, and SFTP→Local. SFTP→SFTP workspace sync remains unsupported.
 - **Transfer Queue:** one persistent bounded FIFO runtime, configurable concurrency `1..=8`, truthful progress/rate/ETA where known, cooperative Pause/Resume/Cancel, and bounded safe retry.
-- **Transfer Center v2:** Active / History / All views and controls routed to the existing TransferQueueRuntime.
-- **Storage Inspector (`Alt+U`):** Linux-local, read-only `du++`-style logical/allocated usage, drill-down/top-files, hard-link handling, partial/error/cancel truth.
-- **Filesystems (`Alt+D`):** Linux-local, read-only `df++`-style capacity/inode view with explicit unavailable/autofs truth.
+- **Transfer Center v2:** Active / History / All views and controls routed to the existing `TransferQueueRuntime`.
+- **Local Storage Inspector (`Alt+U`):** read-only logical/allocated usage, drill-down/top-files, hard-link handling, partial/error/cancel truth.
+- **Filesystems (`Alt+D`):** read-only Linux capacity/inode view with explicit unavailable/autofs truth.
 - **Effective keymap:** one conflict-safe effective runtime map with user overrides and `arx --print-keymap` discovery.
-- **Mouse:** visible-row-correct clicks, active-pane wheel, Shift+Click ranges, drag-selection safety, provider-aware typed context menu.
-- **Split panes:** vertical + horizontal orientation, explicit close, keyboard ratio resize `20..=80` step 5, section-aware same-location mouse behavior. No independent split Location and no nested pane tree.
-- **tmux / GNU Screen:** typed discovery and terminal mode release/reacquire around interactive attach.
-- **Typed local Quick Actions:** SHA-256, Touch, Compress-to-tar.gz, with the pre-existing mkdir/chmod/symlink surface retained. No shell-string interpolation for the new actions.
+- **Mouse / split panes / terminal:** visible-row-correct mouse behavior, vertical+horizontal split panes, typed tmux/GNU Screen lifecycle.
+- **Typed local Quick Actions:** SHA-256, Touch, Compress-to-tar.gz plus the existing mkdir/chmod/symlink surface.
 - **S3:** AWS S3 + MinIO physically accepted supported MVPs; Moto emulated; Cloudflare R2 / Wasabi remain unverified best-effort targets.
-- **WebDAV:** Apache mod_dav, Nextcloud 34.0.2-apache, and ownCloud 11.0.0 physically accepted through the supported Basic-auth path.
-- **WebDAV recursive download:** one exact selected WebDAV collection → one new Local tree, using provider-native href identities, bounded authenticated `PROPFIND Depth: 1`, manifest-before-Local-mutation, noclobber staging, cleanup/recovery truth, and checked cumulative byte progress.
-- **Distribution:** GitHub Release is the publication path; Linux x86_64 ships tar.gz, `.deb`, `.rpm`, and one `SHA256SUMS`, all produced from one validated ELF.
-- **Extension surface:** `arx.menu` is the supported lightweight admin extension mechanism. There is no embedded Lua/WASM/native plugin runtime.
-
-## STABILIZATION — v0.21.x
-
-The immediate phase after v0.21.0 is stabilization, not another architecture sequence.
-
-Priorities:
-
-1. Keep README / ROADMAP / development handoff / current status synchronized with released product truth.
-2. Treat real user bug reports and regressions as higher priority than speculative feature work.
-3. Keep runtime architecture frozen unless a demonstrated correctness/safety blocker requires a reviewed change.
-4. Preserve exact-head CI and physical provider acceptance when affected code changes.
-5. Clean obsolete GitHub PR/branch/status clutter after verifying that no unique unfinished work remains.
-
-The first stabilization pass is complete: the public truth documents were refreshed for v0.21.0 and obsolete historical draft PRs were closed without deleting their history.
-
-### Development cadence after stabilization
-
-ARX should now progress in **large, coherent user-visible vertical slices**, not long chains of micro-tasks or stacked micro-PRs.
-
-- Freeze the complete behavioral/safety contract before implementation.
-- Implement the selected feature as one coherent branch / macro-batch.
-- Include its unit/contract tests, physical acceptance changes, and necessary documentation in the same slice.
-- Collect related review findings and correct them coherently on the same branch instead of bouncing between tiny implementation prompts.
-- Accept only one exact final head SHA after independent full-diff review and required CI/physical evidence.
-- Prefer completing one useful capability and moving toward the next release over speculative architecture work.
-
-The selected next major slice is **#253 — Local directory → WebDAV recursive upload**.
-
-Patch releases in the v0.21.x line should normally contain bug fixes, compatibility corrections, documentation truth, or release/distribution fixes — not large new feature surfaces. #253 is therefore the leading candidate for the next feature release rather than a v0.21.x patch.
+- **WebDAV providers:** Apache mod_dav, Nextcloud 34.0.2-apache, and ownCloud 11.0.0 physically accepted through the Basic-auth path.
+- **WebDAV recursive download:** one exact selected collection → one new Local tree with exact href identity, bounded Depth:1 traversal, manifest-before-mutation, noclobber staging, and truthful cleanup/recovery.
+- **WebDAV recursive upload:** one Local directory → one new remote tree with complete Local pre-scan, shared 50,000/128 bounds, no-follow reads, root ownership, noclobber write semantics, and recovery truth.
+- **WebDAV recursive delete:** one exact selected collection with complete+revalidated manifest, deepest-first/root-last execution, fresh empty proof before each collection DELETE, and no blind retry of ambiguity.
+- **WebDAV multi-root F5:** multiple selected current sibling roots in Local↔WebDAV as one queued sequential job, with root-level Items progress and truthful partial completion.
+- **Distribution:** GitHub Releases is the sole binary/package publication path. Linux x86_64 ships tar.gz, `.deb`, `.rpm`, and one `SHA256SUMS`, all produced from one validated ELF. The source tree intentionally does not track a current `bin/arx` copy.
+- **Extension surface:** `arx.menu` remains the supported lightweight admin extension mechanism; there is no embedded Lua/WASM/native plugin runtime.
 
 ## COMPLETED FOUNDATION
 
 The architecture sequence **O → P → Q → R is complete**.
-
-- **PACK O:** typed local Quick Actions — complete.
-- **PACK P:** TUI decomposition — complete.
-- **PACK Q:** VFS convergence — complete.
-- **PACK R:** internal feature/command registration — complete.
-
-Frozen architecture truths:
 
 ```text
 Location          = typed identity / address / navigation
@@ -78,84 +43,71 @@ CapabilitySet     = exact-location / concrete-instance capability truth
 VfsProvider       = backend provider interface
 ```
 
-Do not add a second ProviderRegistry, TransferQueueRuntime, JobManager, EffectDispatcher, scheduler, retry authority, or secret store.
+Do not add a second `ProviderRegistry`, `TransferQueueRuntime`, `JobManager`, `EffectDispatcher`, scheduler, retry authority, or secret store.
 
-Provider-native identity remains authoritative. Presentation/display names never reconstruct remote addresses.
+Provider-native identity remains authoritative. Presentation/display names never reconstruct existing remote addresses.
 
 ### External plugins
 
 There is **no GO** for an external Lua/WASM/`.so` plugin runtime. Re-evaluate only if real user/ecosystem demand appears and a truthful enforcement/security model can be defined. `arx.menu` remains the supported lightweight extension path.
 
-## ACTIVE GITHUB BACKLOG
+## RELEASED WEBdav WORK
 
-**#13 — WebDAV post-MVP** remains the product umbrella.  
-**#253 — WebDAV recursive upload** is the selected active implementation slice under that umbrella.
-
-Already shipped under #13:
+The #13 post-MVP umbrella now includes these shipped capabilities:
 
 - core WebDAV provider semantics
 - Apache mod_dav W1–W18 physical acceptance
 - Nextcloud 34.0.2 and ownCloud 11.0.0 I1–I12 physical certification
 - WebDAV F5 source/selection truth hardening
 - RFC-compatible MOVE Depth behavior
-- exact recursive WebDAV collection download to Local
+- exact recursive WebDAV collection download to Local (#248 / PR #250)
+- recursive Local → WebDAV upload (#253 / PR #254)
+- safe bounded recursive WebDAV delete (#255 / PR #256)
+- one-job multi-root Local↔WebDAV F5 Copy (#257 / PR #258)
 
-Selected now:
+Remaining #13 items are enhancements, not release blockers:
 
-- [ ] **#253 Local directory → WebDAV recursive upload** — one selected Local directory to one new remote tree through the existing F5/planner/queue/executor authority, with full Local pre-scan, bounded tree limits, symlink/special-file rejection, destination-root noclobber, owned-root cleanup/recovery truth, whole-attempt byte progress, and Apache/Nextcloud/ownCloud physical acceptance.
+- [ ] multi-root recursive WebDAV delete
+- [ ] WebDAV → WebDAV recursive/cross-target copy or move with truthful target/recovery semantics
+- [ ] optional metadata/property mutation only for a demonstrated admin use case
+- [ ] Digest/Bearer auth only if interoperability evidence requires it
 
-Remaining #13 roadmap after #253:
+## SELECTED NEXT PRODUCT DIRECTION
 
-- [ ] **Recursive WebDAV delete** — only with explicit bounded traversal/identity and recovery semantics.
-- [ ] **WebDAV → WebDAV recursive/cross-target copy or move** — only with a truthful execution model; never pretend server-side MOVE spans unrelated targets.
-- [ ] **Multiple-root recursive selection** — only after one stable planning/progress contract exists.
-- [ ] **Metadata/property mutation** — optional, only if a real admin use case justifies it.
-- [ ] **Digest/Bearer auth** — only if future interoperability evidence demonstrates that the shipped Basic-auth/app-password path is insufficient.
+The next major usefulness direction should move beyond continued WebDAV breadth and add **read-only S3 storage intelligence**.
 
-The remaining #13 items are enhancements, not regressions or release blockers.
+Before implementation, create/freeze a dedicated issue for an **S3 Object Inspector + Bucket Inspector** slice with these boundaries:
 
-## RECOMMENDED NEXT FEATURE SEQUENCE
+- read-only only; no cleanup/mutation surface
+- reuse the existing S3 provider/registry/job authorities
+- object details: key, size, last modified, ETag, content type, storage class, metadata, version information where the provider can prove it
+- bucket/prefix view: object count, logical bytes, largest objects/prefixes, age distribution, storage-class distribution where derivable
+- pagination/streaming and cancellation for large buckets
+- explicit evidence/freshness source for aggregate analytics (`LiveScan`, `StorageLens`, `Inventory`, `OtherProvider`, `Unavailable`)
+- AWS S3 + MinIO physical acceptance; R2/Wasabi remain best-effort until separately evidenced
+- **never fabricate POSIX `df`/filesystem-capacity semantics for S3**
+
+Do not combine the S3 Inspector automatically with WebDAV→WebDAV transfer, SFTP→SFTP workspace sync, or general cross-provider Move.
+
+## RECOMMENDED FEATURE SEQUENCE
 
 This is prioritization guidance, not a promise that each item must ship in the named version.
 
-### Candidate v0.22.0 — WebDAV write-side recursion
+### Next — S3 Object/Bucket Inspector
 
-**Chosen implementation slice: #253.**
+Read-only storage intelligence using truthful provider evidence, bounded/paginated scans, cancellation, and no POSIX-capacity fiction.
 
-- One selected Local directory → one new WebDAV directory tree.
-- Existing one-file upload remains supported.
-- No merging into an existing remote root.
-- No multiple roots, recursive delete, WebDAV↔WebDAV recursion, cross-backend Move, or speculative auth expansion in this slice.
+### After that — SFTP → SFTP workspace sync
 
-Acceptance must include Apache mod_dav, Nextcloud, and ownCloud through the same real F5 → preparation → planner → Transfer Queue → executor product path, with explicit partial-remote-tree cleanup/recovery semantics and no blind retry of ambiguous mutations.
+Extend existing Compare → Preview → Execute → Verify only if both source and destination identities, mutation ordering, verification, and recovery remain truthful. Reuse the existing workspace-sync controller and transfer authority.
 
-### Candidate v0.23.0 — Remote tree operations
+### Later — WebDAV → WebDAV recursive copy
 
-Potential scope after upload is stable:
+Only after exact target/source identity and cross-target execution semantics are frozen. Do not pretend server-side MOVE spans unrelated targets.
 
-- recursive WebDAV delete
-- multiple-root recursive planning if one coherent contract is proven
+### Later still — general safe cross-provider Move
 
-Do not combine these merely to fill a release; each mutation surface must have its own safety proof.
-
-### Candidate v0.24.0 — Cross-provider transfer evolution
-
-Potential work:
-
-- WebDAV↔WebDAV transfer under explicit target truth
-- SFTP→SFTP workspace sync
-- safe cross-backend Move based on copy → verify → delete-source, never optimistic rename semantics across providers
-- broader recursive remote operations only where transaction/recovery truth exists
-
-### Candidate v0.25.0 — Storage intelligence
-
-S3 post-MVP direction:
-
-- read-only Object Inspector
-- read-only Bucket Inspector
-- usage analytics with explicit evidence source and freshness (`LiveScan`, `StorageLens`, `Inventory`, `OtherProvider`, `Unavailable`)
-
-S3 must remain an object-storage model. Never fabricate POSIX `df`/filesystem-capacity semantics when the provider cannot prove them.
+Model as copy → verify → delete source with explicit ambiguity/recovery boundaries. Never treat cross-provider Move as an optimistic rename.
 
 ## OTHER PRODUCT BACKLOG
 
@@ -164,73 +116,64 @@ Items not currently represented by active GitHub issues should be promoted to de
 - binary remote editing
 - additional Linux architectures, especially ARM64 if user demand justifies it
 - signed package-repository distribution if operationally worthwhile
-- broader cross-backend Move
-- SFTP→SFTP workspace sync
-- provider-specific read-only inspection/analytics where evidence is truthful
+- provider-specific read-only analytics where evidence is truthful
 
 Native Windows support remains out of scope. Windows SSH clients may interoperate with an ARX process running on Linux; that does not change the Linux-only product policy.
 
-## RELEASED — v0.21.0 (2026-08-25)
+## RELEASED — v0.22.0 (2026-08-26)
 
-Release target: `3427cd085740d2c3f8a4bffbbf55b34ba3d9bb85`.
+Release target: `8737bbd2afaf0d6e7146a5d8c59ee1a0606325bf`.
 
 Highlights:
 
-- exact one-root WebDAV recursive download to a new Local tree
-- Nextcloud 34.0.2 and ownCloud 11.0.0 physical WebDAV certification
-- WebDAV F5 target/source truth and MOVE interoperability fixes
-- horizontal/resizable split panes and section-aware mouse behavior
-- conflict-safe configurable effective keymap + `arx --print-keymap`
-- tmux/GNU Screen lifecycle hardening
-- mouse follow-up and typed context menu
-- deterministic transfer-pause acceptance
-- typed local SHA-256 / Touch / Compress Quick Actions
+- recursive Local → WebDAV upload
+- safe bounded recursive WebDAV delete with destructive ambiguity/LOCK/cancellation physical proof
+- multi-root Local↔WebDAV F5 Copy as one queued job
+- recursive WebDAV download retained from v0.21.0
+- Apache mod_dav, Nextcloud 34.0.2, and ownCloud 11.0.0 physical acceptance
+- existing MinIO retry and real tmux/GNU Screen PTY lanes remained green
 
 Published artifacts:
 
-- `arx-v0.21.0-x86_64-unknown-linux-gnu.tar.gz`
-- `arx_0.21.0_amd64.deb`
-- `arx-0.21.0-1.x86_64.rpm`
+- `arx-v0.22.0-x86_64-unknown-linux-gnu.tar.gz`
+- `arx_0.22.0_amd64.deb`
+- `arx-0.22.0-1.x86_64.rpm`
 - `SHA256SUMS`
 
-The tag-triggered Release workflow validated version/tag truth, format, Clippy, full tests, Rust 1.88, one release build, third-party licenses, TAR/DEB/RPM payload and metadata, packaged-binary identity, checksums, and publication from the validated artifact bundle.
+The official Release run validated tag/version truth, release notes/hero asset, format, Clippy, full tests, Rust 1.88, one release build, third-party licenses, TAR/DEB/RPM exact payloads and metadata, packaged-binary identity, checksums, and publication from the validated artifact bundle.
+
+Independent post-publish verification rechecked all three package hashes against `SHA256SUMS`; the tarball binary reports `arx 0.22.0` and `--help` exits successfully.
 
 ## RELEASE HISTORY
 
-### v0.20.0
+### v0.21.0
 
-Storage/operations release:
+- exact recursive WebDAV collection download to a new Local tree
+- Nextcloud 34.0.2 and ownCloud 11.0.0 certification
+- WebDAV target/source truth and MOVE interoperability fixes
+- split-pane, effective-keymap, tmux/screen, mouse, pause-acceptance, and local Quick Action improvements
+
+### v0.20.0
 
 - Local Storage Inspector / Filesystems
 - Transfer Center v2
 - native Linux tar.gz / DEB / RPM publication contract
-- typed local Quick Actions and lean extension/runtime cleanup landed in the post-v0.20 development range and are represented accurately in v0.21.0 notes
 
 ### v0.19.0
 
-Transfer Queue release:
-
-- one persistent bounded FIFO `TransferQueueRuntime`
-- configurable concurrency
-- truthful progress/rate/ETA
-- cooperative Pause/Resume/Cancel
-- bounded safe retry and recovery/ambiguity classification
+- persistent bounded FIFO Transfer Queue
+- configurable concurrency, progress/rate/ETA, Pause/Resume/Cancel
+- bounded safe retry and ambiguity/recovery classification
 
 ### v0.18.0
 
-WebDAV MVP:
-
-- PROPFIND / GET / PUT / DELETE / MKCOL / COPY / MOVE
+- WebDAV MVP with PROPFIND / GET / PUT / DELETE / MKCOL / COPY / MOVE
 - Basic auth through keyring/environment secret resolution
-- bounded F3 preview and one-file Local↔WebDAV F5 copy
-- raw-href authority and noclobber safety
-- Apache mod_dav W1–W18 physical acceptance
+- raw-href authority and Apache W1–W18 physical acceptance
 
 ### v0.17.x
 
-Linux publication and SFTP Remote Edit reliability baseline.
-
-Historical implementation detail remains available through Git history, closed issues/PRs, and per-release notes; the roadmap intentionally emphasizes current truth over chronology.
+Historical Linux publication/SFTP Remote Edit baseline. Any old tracked `bin/arx` copy from that era is obsolete and is not a current distribution channel.
 
 ## RELEASE PROCESS POLICY
 
@@ -239,7 +182,7 @@ A release candidate should keep runtime code frozen and change only release trut
 Before tagging:
 
 - Cargo version and root Cargo.lock version match the intended tag.
-- README, ROADMAP, handoff, and `docs/releases/vX.Y.Z.md` describe the same product truth.
+- public docs and `docs/releases/vX.Y.Z.md` describe the same product truth.
 - exact-head quality / Rust 1.88 MSRV / affected physical provider gates are green.
 - Release validation builds once and validates notices, tar/deb/rpm exact payloads, package metadata, ELF identity, checksums, and artifact upload.
 - the tag targets the accepted merge SHA.
@@ -250,7 +193,7 @@ Before tagging:
 - Prefer user-visible vertical slices over new architecture packs.
 - Implement one selected feature as a coherent macro-batch instead of a chain of micro-tasks.
 - Collect related findings and fix them coherently on the same implementation branch.
-- Keep product/runtime/documentation/physical acceptance changes for one capability in the same slice when they are logically required.
+- Keep product/runtime/documentation/physical acceptance changes for one capability in the same slice when logically required.
 - Use exact-head CI and physical evidence as acceptance gates.
 - Do not weaken production semantics to satisfy timing-sensitive tests.
 - Move toward a usable release once the frozen slice is complete; do not extend scope merely because adjacent ideas are available.
