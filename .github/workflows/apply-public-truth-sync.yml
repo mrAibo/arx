@@ -1,0 +1,34 @@
+name: Apply public truth sync
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/apply-public-truth-sync.yml'
+      - 'scripts/apply_public_truth_sync.py'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'docs/sync-sftp-workspace-truth'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Apply exact public-truth replacements
+        run: python3 scripts/apply_public_truth_sync.py
+      - name: Validate docs diff
+        run: git diff --check
+      - name: Commit docs and remove helper
+        run: |
+          rm -f scripts/apply_public_truth_sync.py .github/workflows/apply-public-truth-sync.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'docs: record accepted SFTP workspace sync'
+          git push origin HEAD:docs/sync-sftp-workspace-truth
