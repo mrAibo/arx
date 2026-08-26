@@ -372,7 +372,8 @@ impl SyncPlanValidator {
         match (source, destination) {
             (ProviderId::Local, ProviderId::Local)
             | (ProviderId::Local, ProviderId::Sftp)
-            | (ProviderId::Sftp, ProviderId::Local) => Ok(()),
+            | (ProviderId::Sftp, ProviderId::Local)
+            | (ProviderId::Sftp, ProviderId::Sftp) => Ok(()),
             (ProviderId::Archive, _) => Err(SyncValidationError::UnsupportedSourceCapability {
                 provider: source,
                 capability: Capability::Read,
@@ -938,8 +939,8 @@ mod tests {
 
     #[test]
     fn sftp_mirror_passes_validator_now_that_delete_capability_exists() {
-        // SFTP_CAPABILITIES now includes Delete, so the validator accepts SFTP
-        // deletes. The compiler still requires Local (`require_local_file_mutation`).
+        // SFTP_CAPABILITIES includes Delete, so the frozen plan can retain exact
+        // SFTP delete preconditions for the compiler/runtime mutation authority.
         let preview = WorkspaceDiff::compare(
             local("/left"),
             sftp("prod", "/srv/app"),
@@ -955,6 +956,33 @@ mod tests {
         );
 
         assert!(SyncPlanValidator::freeze(&plan, &preview, &default_registry()).is_ok());
+    }
+
+    #[test]
+    fn sftp_to_sftp_copy_freezes_exact_roots() {
+        let preview = WorkspaceDiff::compare(
+            sftp("source", "/srv/source"),
+            sftp("destination", "/srv/destination"),
+            vec![entry("nested/a.txt", fp(10, 20))],
+            Vec::<WorkspaceEntry>::new(),
+        );
+        let plan = WorkspaceSyncPlan::build(&preview, SyncPolicy::default());
+        let frozen = SyncPlanValidator::freeze(&plan, &preview, &default_registry()).unwrap();
+
+        assert_eq!(frozen.left_root(), &sftp("source", "/srv/source"));
+        assert_eq!(
+            frozen.right_root(),
+            &sftp("destination", "/srv/destination")
+        );
+        assert!(matches!(
+            &frozen.operations()[0],
+            FrozenSyncOperation::Copy {
+                relative_path,
+                from: WorkspaceSide::Left,
+                to: WorkspaceSide::Right,
+                ..
+            } if relative_path == "nested/a.txt"
+        ));
     }
 
     #[test]

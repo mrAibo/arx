@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::transfer::{
     ExecutorAvailability, TransferIntent, TransferPlan, TransferPlanner, TransferRequest,
 };
-use crate::vfs::{CapabilitySet, EntryKind, Location, ProviderId, ProviderRegistry};
+use crate::vfs::{Capability, CapabilitySet, EntryKind, Location, ProviderId, ProviderRegistry};
 use crate::workspace_sync::{
     WorkspaceDiff, WorkspaceDiffEntry, WorkspaceFingerprint, WorkspaceSide,
 };
@@ -50,10 +50,28 @@ impl SyncExecutorMatrix {
                     SyncCompileError::MissingExecutorAvailability { host: host.clone() }
                 })
             }
-            (Location::Sftp { .. }, Location::Sftp { .. }) => {
-                Err(SyncCompileError::RemoteToRemoteUnsupported {
-                    source_location: Box::new(source.clone()),
-                    destination_location: Box::new(destination.clone()),
+            (
+                Location::Sftp {
+                    host: source_host, ..
+                },
+                Location::Sftp {
+                    host: destination_host,
+                    ..
+                },
+            ) => {
+                let source = self.remote.get(source_host).copied().ok_or_else(|| {
+                    SyncCompileError::MissingExecutorAvailability {
+                        host: source_host.clone(),
+                    }
+                })?;
+                let destination = self.remote.get(destination_host).copied().ok_or_else(|| {
+                    SyncCompileError::MissingExecutorAvailability {
+                        host: destination_host.clone(),
+                    }
+                })?;
+                Ok(ExecutorAvailability {
+                    sftp: source.sftp && destination.sftp,
+                    ..ExecutorAvailability::NONE
                 })
             }
             _ => Err(SyncCompileError::UnsupportedTransferPair {
@@ -187,6 +205,7 @@ impl SyncExecutionCompiler {
             {
                 compile_delete(
                     executable.plan(),
+                    registry,
                     &mut staged,
                     path,
                     *from,
@@ -283,7 +302,7 @@ fn compile_copy(
             kind: expected_source.kind,
         }),
         EntryKind::Directory => {
-            compile_directory_copy(executable, staged, path, to, expected_destination)
+            compile_directory_copy(executable, registry, staged, path, to, expected_destination)
         }
         EntryKind::File => compile_file_copy(
             executable,
@@ -305,6 +324,7 @@ fn compile_copy(
 
 fn compile_directory_copy(
     executable: &ExecutableSyncPlan,
+    registry: &ProviderRegistry,
     staged: &mut Vec<StagedStep>,
     path: &str,
     to: WorkspaceSide,
@@ -316,7 +336,7 @@ fn compile_directory_copy(
             EntryKind::Directory => Ok(()),
             EntryKind::File => {
                 require_structural_confirmation(executable, path)?;
-                require_local_file_mutation(&target, path)?;
+                require_file_mutation(registry, &target, path)?;
                 staged.push(staged_step(
                     StepPhase::BlockingFileDelete,
                     path,
@@ -344,7 +364,7 @@ fn compile_directory_copy(
         };
     }
 
-    require_local_directory_mutation(&target, path)?;
+    require_directory_mutation(registry, &target, path, Capability::Mkdir)?;
     staged.push(staged_step(
         StepPhase::EnsureDirectory,
         path,
@@ -397,7 +417,7 @@ fn compile_file_copy(
                 }
                 blocking_delete_paths.extend(descendants);
                 let target = resolve_relative(root_for_side(executable.plan(), to), path);
-                require_local_directory_mutation(&target, path)?;
+                require_directory_mutation(registry, &target, path, Capability::Delete)?;
                 staged.push(staged_step(
                     StepPhase::BlockingDirectoryRemove,
                     path,
@@ -458,6 +478,7 @@ fn compile_file_copy(
 
 fn compile_delete(
     plan: &FrozenWorkspaceSyncPlan,
+    registry: &ProviderRegistry,
     staged: &mut Vec<StagedStep>,
     path: &str,
     from: WorkspaceSide,
@@ -467,7 +488,7 @@ fn compile_delete(
     let target = resolve_relative(root_for_side(plan, from), path);
     match expected_target.kind {
         EntryKind::File => {
-            require_local_file_mutation(&target, path)?;
+            require_file_mutation(registry, &target, path)?;
             staged.push(staged_step(
                 if blocking {
                     StepPhase::BlockingFileDelete
@@ -484,7 +505,7 @@ fn compile_delete(
             Ok(())
         }
         EntryKind::Directory => {
-            require_local_directory_mutation(&target, path)?;
+            require_directory_mutation(registry, &target, path, Capability::Delete)?;
             staged.push(staged_step(
                 if blocking {
                     StepPhase::BlockingDirectoryRemove
@@ -558,23 +579,38 @@ fn require_structural_confirmation(
     }
 }
 
-fn require_local_directory_mutation(target: &Location, path: &str) -> Result<(), SyncCompileError> {
-    if target.provider_id() == ProviderId::Local {
+fn require_directory_mutation(
+    registry: &ProviderRegistry,
+    target: &Location,
+    path: &str,
+    capability: Capability,
+) -> Result<(), SyncCompileError> {
+    let provider = target.provider_id();
+    if matches!(provider, ProviderId::Local | ProviderId::Sftp)
+        && registry.supports_at(target, capability)
+    {
         Ok(())
     } else {
         Err(SyncCompileError::UnsupportedDirectoryMutation {
-            provider: target.provider_id(),
+            provider,
             path: path.to_string(),
         })
     }
 }
 
-fn require_local_file_mutation(target: &Location, path: &str) -> Result<(), SyncCompileError> {
-    if target.provider_id() == ProviderId::Local {
+fn require_file_mutation(
+    registry: &ProviderRegistry,
+    target: &Location,
+    path: &str,
+) -> Result<(), SyncCompileError> {
+    let provider = target.provider_id();
+    if matches!(provider, ProviderId::Local | ProviderId::Sftp)
+        && registry.supports_at(target, Capability::Delete)
+    {
         Ok(())
     } else {
         Err(SyncCompileError::UnsupportedFileMutation {
-            provider: target.provider_id(),
+            provider,
             path: path.to_string(),
         })
     }
@@ -753,8 +789,18 @@ mod tests {
         ));
     }
 
+    fn sftp_executor() -> ExecutorAvailability {
+        ExecutorAvailability {
+            native: false,
+            rsync: true,
+            sftp: true,
+            s3: false,
+            webdav: false,
+        }
+    }
+
     #[test]
-    fn remote_to_remote_is_explicitly_gated() {
+    fn remote_to_remote_requires_both_sftp_executor_endpoints() {
         let source = Location::Sftp {
             host: "a".into(),
             path: "/src".into(),
@@ -763,29 +809,47 @@ mod tests {
             host: "b".into(),
             path: "/dst".into(),
         };
+        let matrix = SyncExecutorMatrix::default()
+            .with_remote("a", sftp_executor())
+            .with_remote("b", sftp_executor());
+        let availability = matrix.for_transfer(&source, &destination).unwrap();
+        assert!(availability.sftp);
+        assert!(!availability.rsync);
+
+        let missing_destination = SyncExecutorMatrix::default().with_remote("a", sftp_executor());
         assert!(matches!(
-            SyncExecutorMatrix::default().for_transfer(&source, &destination),
-            Err(SyncCompileError::RemoteToRemoteUnsupported { .. })
+            missing_destination.for_transfer(&source, &destination),
+            Err(SyncCompileError::MissingExecutorAvailability { host }) if host == "b"
         ));
     }
 
-    // ── REMOTE-09: SFTP delete never reaches sync execution ──
+    #[test]
+    fn same_host_remote_to_remote_uses_sftp_executor() {
+        let source = Location::Sftp {
+            host: "prod".into(),
+            path: "/src".into(),
+        };
+        let destination = Location::Sftp {
+            host: "prod".into(),
+            path: "/dst".into(),
+        };
+        let matrix = SyncExecutorMatrix::default().with_remote("prod", sftp_executor());
+        assert!(matrix.for_transfer(&source, &destination).unwrap().sftp);
+    }
 
     #[test]
-    fn sftp_delete_never_reaches_sync_execution() {
-        // require_local_file_mutation() rejects any non-Local provider.
-        // This is the exact gate that prevents SFTP file mutations from
-        // being compiled into executable sync steps. The validator (in
-        // workspace_sync_execution.rs) now passes SFTP deletes because
-        // SFTP_CAPABILITIES includes Delete — the compiler is the
-        // definitive blocker.
-        let sftp_target = Location::Sftp {
+    fn sftp_delete_and_directory_mutation_use_declared_capabilities() {
+        let registry = crate::vfs::default_registry();
+        let file = Location::Sftp {
             host: "prod".into(),
             path: "/srv/data.txt".into(),
         };
-        let result = require_local_file_mutation(&sftp_target, "data.txt");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("Sftp") || msg.contains("cannot safely delete"));
+        let dir = Location::Sftp {
+            host: "prod".into(),
+            path: "/srv/new-dir".into(),
+        };
+        assert!(require_file_mutation(&registry, &file, "data.txt").is_ok());
+        assert!(require_directory_mutation(&registry, &dir, "new-dir", Capability::Mkdir).is_ok());
+        assert!(require_directory_mutation(&registry, &dir, "new-dir", Capability::Delete).is_ok());
     }
 }

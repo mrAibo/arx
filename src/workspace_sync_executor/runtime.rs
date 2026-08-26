@@ -429,17 +429,28 @@ impl WorkspaceSyncExecutor {
                 relative_path,
                 target,
                 ..
-            } => {
-                let Location::Local(path) = target else {
-                    return Err(failed_mutation(
-                        relative_path,
-                        "compiled directory creation is not local",
-                    ));
-                };
-                tokio::fs::create_dir(path)
+            } => match target {
+                Location::Local(path) => tokio::fs::create_dir(path)
                     .await
-                    .map_err(|error| failed_mutation(relative_path, error))
-            }
+                    .map_err(|error| failed_mutation(relative_path, error)),
+                Location::Sftp { .. } => {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(StepExecutionResult::Cancelled);
+                    }
+                    let (provider, exact_path) = self
+                        .registry
+                        .provider_for_location(target)
+                        .map_err(|error| failed_mutation(relative_path, error))?;
+                    provider
+                        .mkdir(&exact_path)
+                        .await
+                        .map_err(|error| failed_mutation(relative_path, error))
+                }
+                _ => Err(failed_mutation(
+                    relative_path,
+                    "compiled directory creation provider is unsupported",
+                )),
+            },
             PhysicalSyncStep::TransferFile {
                 relative_path,
                 transfer,
@@ -466,20 +477,39 @@ impl WorkspaceSyncExecutor {
                 relative_path,
                 target,
                 ..
-            } => {
-                let (parent, name) = local_parent_name(target).ok_or_else(|| {
-                    failed_mutation(relative_path, "compiled file deletion is not local")
-                })?;
-                MutationService::trash_local(parent, vec![name], cancel, |_| {})
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| match error {
-                        crate::services::MutationError::Cancelled { .. } => {
-                            StepExecutionResult::Cancelled
-                        }
-                        other => failed_mutation(relative_path, other),
-                    })
-            }
+            } => match target {
+                Location::Local(_) => {
+                    let (parent, name) = local_parent_name(target).ok_or_else(|| {
+                        failed_mutation(relative_path, "invalid local file deletion target")
+                    })?;
+                    MutationService::trash_local(parent, vec![name], cancel, |_| {})
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| match error {
+                            crate::services::MutationError::Cancelled { .. } => {
+                                StepExecutionResult::Cancelled
+                            }
+                            other => failed_mutation(relative_path, other),
+                        })
+                }
+                Location::Sftp { .. } => {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(StepExecutionResult::Cancelled);
+                    }
+                    let (provider, exact_path) = self
+                        .registry
+                        .provider_for_location(target)
+                        .map_err(|error| failed_mutation(relative_path, error))?;
+                    provider
+                        .remove_file(&exact_path)
+                        .await
+                        .map_err(|error| failed_mutation(relative_path, error))
+                }
+                _ => Err(failed_mutation(
+                    relative_path,
+                    "compiled file deletion provider is unsupported",
+                )),
+            },
             PhysicalSyncStep::RemoveDirectory {
                 relative_path,
                 target,
@@ -488,15 +518,25 @@ impl WorkspaceSyncExecutor {
                 if cancel.load(Ordering::Relaxed) {
                     return Err(StepExecutionResult::Cancelled);
                 }
-                let Location::Local(path) = target else {
-                    return Err(failed_mutation(
+                match target {
+                    Location::Local(path) => tokio::fs::remove_dir(path)
+                        .await
+                        .map_err(|error| failed_mutation(relative_path, error)),
+                    Location::Sftp { .. } => {
+                        let (provider, exact_path) = self
+                            .registry
+                            .provider_for_location(target)
+                            .map_err(|error| failed_mutation(relative_path, error))?;
+                        provider
+                            .remove_dir(&exact_path)
+                            .await
+                            .map_err(|error| failed_mutation(relative_path, error))
+                    }
+                    _ => Err(failed_mutation(
                         relative_path,
-                        "compiled directory removal is not local",
-                    ));
-                };
-                tokio::fs::remove_dir(path)
-                    .await
-                    .map_err(|error| failed_mutation(relative_path, error))
+                        "compiled directory removal provider is unsupported",
+                    )),
+                }
             }
         }
     }
@@ -626,6 +666,24 @@ fn local_parent_name(location: &Location) -> Option<(PathBuf, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn location_parent_name_preserves_sftp_host_and_parent() {
+        let loc = Location::Sftp {
+            host: "prod-a".into(),
+            path: "/srv/app/config.toml".into(),
+        };
+        assert_eq!(
+            location_parent_name(&loc),
+            Some((
+                Location::Sftp {
+                    host: "prod-a".into(),
+                    path: "/srv/app".into(),
+                },
+                "config.toml".into(),
+            ))
+        );
+    }
 
     #[test]
     fn location_parent_name_rejects_s3() {
