@@ -17,9 +17,11 @@ Compare before touching anything. Preview the exact consequences. Execute. Verif
 - **Truthful background work.** Queue, pause-pending, paused, retry-waiting, cancelled, failed, completed, and verification remain distinct states.
 - **Safe remote semantics.** ARX prefers noclobber/staged operations and never blindly replays ambiguous remote mutations.
 - **Provider-native identity.** Existing remote resources are addressed by provider truth, not reconstructed display names.
-- **Read-only storage visibility.** Local usage/capacity inspection stays separate from mutation and cleanup.
+- **Read-only storage intelligence.** `Alt+U` provides truthful Local usage analysis and, on current `main`, exact S3 object plus bounded bucket/prefix inspection without inventing filesystem-capacity semantics.
 
 Remote Workspace synchronization currently supports Local → Local, Local → SFTP, and SFTP → Local. SFTP → SFTP workspace synchronization remains intentionally unsupported.
+
+**Current `main` is ahead of v0.22.0.** It includes the read-only S3 Object & Bucket Inspector from [#264](https://github.com/mrAibo/arx/issues/264) / [#265](https://github.com/mrAibo/arx/pull/265). The latest published binaries remain v0.22.0 until a new release is cut.
 
 ## Platform support
 
@@ -96,12 +98,12 @@ arx
 | Transfer Queue | Bounded FIFO, concurrency 1..=8, progress/rate/ETA where known, Pause/Resume/Cancel, safe retry ≤3 attempts |
 | Transfer Center | Active / History / All views with runtime-owned controls |
 | Workspace Sync | Compare → Preview → Execute → Verify for supported Local/SFTP directions |
-| Local Storage Inspector | Read-only `du++`-style logical/allocated usage, drill-down, top files, cancellation |
-| Filesystems | Read-only Linux `df++`-style capacity/inode view |
+| Storage Inspector (`Alt+U`) | Local: read-only `du++`-style logical/allocated usage, drill-down/top files/cancellation. S3 on current `main`: exact object inspection plus bounded paginated bucket/prefix LiveScan analytics |
+| Filesystems | Read-only Linux `df++`-style capacity/inode view; S3 never receives fake `df` semantics |
 | Effective keymap | Conflict-safe user overrides + `arx --print-keymap` |
 | Quick Actions | Typed local SHA-256, Touch, Compress to tar.gz; existing mkdir/chmod/symlink surface retained |
 | Embedded terminal | Built-in terminal plus hardened tmux / GNU Screen lifecycle |
-| S3 | AWS S3 + MinIO physically accepted; Moto emulated; R2/Wasabi best-effort/unverified |
+| S3 | AWS S3 + MinIO physically accepted; current `main` adds exact Object & Bucket/Prefix Inspector; Moto emulated; R2/Wasabi best-effort/unverified |
 | WebDAV | Apache mod_dav + Nextcloud 34.0.2 + ownCloud 11.0.0 physically accepted with Basic auth |
 | Packages | tar.gz + `.deb` + `.rpm` + one `SHA256SUMS`, all published from one validated ELF |
 | Extension surface | `arx.menu`; no embedded Lua/WASM/native plugin runtime |
@@ -120,6 +122,22 @@ arx
 | Ctrl+U | Swap panes |
 | Ctrl+X C / L / O / S | chmod / hardlink / chown / symlink |
 | Ctrl+\\ | Toggle split pane |
+
+## S3 Object & Bucket Inspector on current main
+
+The post-v0.22.0 `main` adds read-only S3 storage intelligence without treating object storage like a POSIX filesystem.
+
+### Exact object inspection
+
+For one exact provider-native S3 object, ARX uses `HeadObject` and shows only facts the backend actually returns: target/bucket/key identity, size, last modified, ETag, content type, storage class, metadata, endpoint override, and version ID when available. Missing values remain unavailable rather than being synthesized.
+
+### Bounded bucket / prefix inspection
+
+Bucket and prefix inspection uses paginated `ListObjectsV2` LiveScan evidence with progress and cooperative cancellation. It reports observed object count, logical bytes, bounded largest-object ranking, bounded immediate-prefix ranking, age distribution, and storage-class distribution. Prefix and storage-class cardinality are explicitly bounded so large or unusual S3-compatible backends cannot turn the inspector into an unbounded in-memory inventory.
+
+The implementation reuses the existing `ProviderRegistry`, per-target `S3Provider`/AWS client, `JobManager`, and UI authority. It does not create a second scheduler, registry, client cache, or mutation path.
+
+Physical acceptance on the merged implementation includes a real MinIO path proving exact object inspection and prefix inspection. AWS S3 remains the supported product path; Cloudflare R2 and Wasabi remain best-effort/unverified until separately evidenced.
 
 ## WebDAV in v0.22.0
 
@@ -168,7 +186,7 @@ Still intentionally unsupported: multi-root recursive WebDAV delete, WebDAV→We
 | Ctrl+P | Command Center |
 | Ctrl+J | Jobs |
 | Ctrl+Y | Transfer Center |
-| Alt+U | Local Storage Inspector |
+| Alt+U | Storage Inspector — Local usage or S3 object/bucket/prefix inspection |
 | Alt+D | Filesystems |
 | Ctrl+X T | Embedded Terminal |
 | ? | Help |
