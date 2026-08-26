@@ -17,6 +17,7 @@ const INSPECT_PAGE_SIZE: i32 = 1000;
 const TOP_OBJECTS_LIMIT: usize = 20;
 const TOP_PREFIXES_LIMIT: usize = 20;
 const PREFIX_CARDINALITY_LIMIT: usize = 2048;
+const STORAGE_CLASS_CARDINALITY_LIMIT: usize = 64;
 const DAY_MS: u64 = 86_400_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,6 +446,14 @@ impl ScanAccumulator {
 
         match storage_class {
             Some(class) => {
+                if !self.storage_classes.contains_key(class)
+                    && self.storage_classes.len() >= STORAGE_CLASS_CARDINALITY_LIMIT
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "S3 storage-class cardinality exceeds bounded inspector limit",
+                    ));
+                }
                 *self.storage_classes.entry(class.to_string()).or_insert(0) += 1;
             }
             None => self.objects_without_storage_class += 1,
@@ -711,6 +720,36 @@ mod tests {
             S3EvidenceSource::Unavailable
         );
         assert!(snapshot.largest_prefixes.value.is_none());
+    }
+
+    #[test]
+    fn accumulator_fails_closed_when_storage_class_cardinality_exceeds_cap() {
+        let scope = S3InspectionScope::Bucket(S3BucketRef {
+            target: "t".into(),
+            bucket: "b".into(),
+        });
+        let mut accumulator = ScanAccumulator::new(scope, 400 * DAY_MS);
+        for index in 0..STORAGE_CLASS_CARDINALITY_LIMIT {
+            let class = format!("CLASS-{index}");
+            accumulator
+                .ingest(
+                    &format!("file-{index}"),
+                    Some(1),
+                    None,
+                    None,
+                    Some(&class),
+                )
+                .unwrap();
+        }
+        let error = accumulator
+            .ingest("overflow", Some(1), None, None, Some("CLASS-overflow"))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("storage-class cardinality"));
+        assert_eq!(
+            accumulator.storage_classes.len(),
+            STORAGE_CLASS_CARDINALITY_LIMIT
+        );
     }
 
     #[test]
