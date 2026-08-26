@@ -25,7 +25,7 @@ replace_once(
 replace_once(
     "README.md",
     "**Current release: [v0.23.0](https://github.com/mrAibo/arx/releases/tag/v0.23.0)**  \nLinux x86_64 · Rust MSRV 1.88 · MIT",
-    "**Current release: [v0.23.0](https://github.com/mrAibo/arx/releases/tag/v0.23.0)**  \n**Release candidate in source:** `v0.24.0` — not published until the immutable tag and GitHub Release exist.  \nLinux x86_64 · Rust MSRV 1.88 · MIT",
+    "**Current release: [v0.23.0](https://github.com/mrAibo/arx/releases/tag/v0.23.0)**  \n**Release candidate in source:** `v0.24.0` — not published until the immutable tag and GitHub Release exist.\nLinux x86_64 · Rust MSRV 1.88 · MIT",
 )
 
 replace_once(
@@ -36,7 +36,7 @@ replace_once(
 replace_once(
     "ROADMAP.md",
     "**Current main:** `fe413aecfdc3bf5685849e73b396800f7f3ab7e0` — accepted/unreleased SFTP→SFTP Workspace Sync (#269 / PR #270)",
-    "**Current main:** `cd5f1b147ac4ca78d7fdab134d548b97a7c20a00` — public-truth baseline after PR #272  \n**Active release candidate:** `v0.24.0` via #271 / `release/v0.24.0-prep`; source version metadata does not imply publication",
+    "**Current main:** `cd5f1b147ac4ca78d7fdab134d548b97a7c20a00` — public-truth baseline after PR #272\n**Active release candidate:** `v0.24.0` via #271 / `release/v0.24.0-prep`; source version metadata does not imply publication",
 )
 replace_once(
     "ROADMAP.md",
