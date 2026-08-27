@@ -101,12 +101,7 @@ async fn seed(provider: &WebDavProvider, root: &str) -> Result<(), AnyError> {
         b"\x00\x01portable\xffmove\n",
     )
     .await?;
-    put(
-        provider,
-        &format!("/{root}/unicodé space/zero.bin"),
-        b"",
-    )
-    .await?;
+    put(provider, &format!("/{root}/unicodé space/zero.bin"), b"").await?;
     Ok(())
 }
 
