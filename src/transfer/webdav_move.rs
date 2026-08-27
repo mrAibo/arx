@@ -34,7 +34,9 @@ pub(crate) enum MoveTreeFailure {
         original: String,
         cleanup: String,
     },
-    #[error("WebDAV Move cancelled before source commit after {completed} of {total} transaction items")]
+    #[error(
+        "WebDAV Move cancelled before source commit after {completed} of {total} transaction items"
+    )]
     CancelledBeforeSourceDelete { completed: usize, total: usize },
     #[error("WebDAV Move source is partially deleted after {completed} of {total}: {reason}")]
     PartialSourceDelete {
@@ -119,12 +121,9 @@ pub fn prepare_webdav_move_tree(
         ));
     }
 
-    let destination_root = webdav_write_child_target(
-        destination_target,
-        destination_path,
-        &source.entry.name,
-    )
-    .map_err(|error| error.to_string())?;
+    let destination_root =
+        webdav_write_child_target(destination_target, destination_path, &source.entry.name)
+            .map_err(|error| error.to_string())?;
 
     Ok((
         WebDavTransferSpec::MoveTree {
@@ -204,10 +203,8 @@ fn delete_snapshot_matches_tree(
     }
     let mut expected = BTreeMap::new();
     for directory in &tree.directories {
-        let canonical = provider.canonical_exact_href_identity(
-            &directory.source.target,
-            &directory.source.href,
-        )?;
+        let canonical = provider
+            .canonical_exact_href_identity(&directory.source.target, &directory.source.href)?;
         expected.insert(canonical, directory.relative.components().count());
     }
     for file in &tree.files {
@@ -221,10 +218,12 @@ fn delete_snapshot_matches_tree(
         .iter()
         .map(|node| {
             let expected_identity = match &node.identity {
-                WebDavDeleteIdentity::Object(object) => provider
-                    .canonical_exact_href_identity(&object.target, &object.href),
-                WebDavDeleteIdentity::Collection(collection) => provider
-                    .canonical_exact_href_identity(&collection.target, &collection.href),
+                WebDavDeleteIdentity::Object(object) => {
+                    provider.canonical_exact_href_identity(&object.target, &object.href)
+                }
+                WebDavDeleteIdentity::Collection(collection) => {
+                    provider.canonical_exact_href_identity(&collection.target, &collection.href)
+                }
             }?;
             if expected_identity != node.canonical_identity {
                 return Err(io::Error::new(
@@ -370,14 +369,7 @@ pub(crate) async fn move_tree(
             "WebDAV Move cancelled before copy",
         ));
     }
-    revalidate_tree_manifest(
-        &source_provider,
-        source,
-        &source_manifest,
-        &cancel,
-        &pause,
-    )
-    .await?;
+    revalidate_tree_manifest(&source_provider, source, &source_manifest, &cancel, &pause).await?;
 
     let copy_spec = WebDavTransferSpec::CopyTree {
         source: source.clone(),
@@ -455,14 +447,8 @@ pub(crate) async fn move_tree(
     }
 
     // The copied source snapshot must still be current before destructive commit.
-    if let Err(error) = revalidate_tree_manifest(
-        &source_provider,
-        source,
-        &source_manifest,
-        &cancel,
-        &pause,
-    )
-    .await
+    if let Err(error) =
+        revalidate_tree_manifest(&source_provider, source, &source_manifest, &cancel, &pause).await
     {
         return Err(cleanup_on_predelete(error).await);
     }

@@ -957,13 +957,12 @@ mod tests {
             crate::transfer_queue::RetryDisposition::NeverRetry
         );
 
-        let recovery = classify_webdav_move_tree_error(io::Error::other(
-            MoveTreeFailure::RecoveryRequired {
+        let recovery =
+            classify_webdav_move_tree_error(io::Error::other(MoveTreeFailure::RecoveryRequired {
                 completed: 2,
                 total: 7,
                 reason: "ambiguous delete".into(),
-            },
-        ));
+            }));
         assert_eq!(
             recovery.retry_disposition(),
             crate::transfer_queue::RetryDisposition::RecoveryRequired

@@ -369,7 +369,10 @@ impl TransferPlanner {
                 matches!(
                     (request.source_provider, request.destination_provider),
                     (ProviderId::WebDAV, ProviderId::WebDAV)
-                ) && matches!(request.webdav_spec, Some(WebDavTransferSpec::MoveTree { .. }))
+                ) && matches!(
+                    request.webdav_spec,
+                    Some(WebDavTransferSpec::MoveTree { .. })
+                )
             }
             TransferIntent::Synchronize => false,
         }
