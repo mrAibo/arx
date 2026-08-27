@@ -132,6 +132,62 @@ struct WebDavDeleteBatchManifest {
     total: usize,
 }
 
+struct WebDavDeleteBatchAccumulator {
+    manifests: Vec<WebDavDeleteManifest>,
+    all_seen: HashSet<String>,
+    total: usize,
+}
+
+impl WebDavDeleteBatchAccumulator {
+    fn new(root_capacity: usize) -> Self {
+        Self {
+            manifests: Vec::with_capacity(root_capacity),
+            all_seen: HashSet::new(),
+            total: 0,
+        }
+    }
+
+    fn push(
+        &mut self,
+        root_identity: String,
+        manifest: WebDavDeleteManifest,
+    ) -> Result<(), WebDavDeleteError> {
+        if !self.all_seen.insert(root_identity) {
+            return Err(WebDavDeleteError::PreMutation {
+                reason: "duplicate/cyclic WebDAV identity across delete roots".into(),
+            });
+        }
+        for node in &manifest.nodes {
+            if !self.all_seen.insert(node.canonical_identity.clone()) {
+                return Err(WebDavDeleteError::PreMutation {
+                    reason: "duplicate/cyclic WebDAV identity across delete roots".into(),
+                });
+            }
+        }
+
+        self.total = self
+            .total
+            .checked_add(1 + manifest.nodes.len())
+            .ok_or_else(|| WebDavDeleteError::PreMutation {
+                reason: "WebDAV delete batch item count overflow".into(),
+            })?;
+        if self.total > MAX_WEBDAV_TREE_DESCENDANTS {
+            return Err(WebDavDeleteError::PreMutation {
+                reason: "WebDAV multi-root delete exceeds 50000 planned items".into(),
+            });
+        }
+        self.manifests.push(manifest);
+        Ok(())
+    }
+
+    fn finish(self) -> WebDavDeleteBatchManifest {
+        WebDavDeleteBatchManifest {
+            manifests: self.manifests,
+            total: self.total,
+        }
+    }
+}
+
 impl MutationService {
     /// Delete multiple exact WebDAV collection roots as one truthful mutation
     /// job. The existing single-root implementation remains authoritative when
@@ -284,53 +340,23 @@ impl MutationService {
         }
         ordered_roots.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-        let mut manifests = Vec::with_capacity(ordered_roots.len());
+        let mut batch = WebDavDeleteBatchAccumulator::new(ordered_roots.len());
         for (root_identity, root) in ordered_roots {
             let manifest = Self::build_webdav_delete_manifest(provider, &root).await?;
-            manifests.push((root_identity, manifest));
+            batch.push(root_identity, manifest)?;
         }
-        validate_webdav_delete_batch_manifests(manifests)
+        Ok(batch.finish())
     }
 }
 
 fn validate_webdav_delete_batch_manifests(
     manifests: Vec<(String, WebDavDeleteManifest)>,
 ) -> Result<WebDavDeleteBatchManifest, WebDavDeleteError> {
-    let mut accepted = Vec::with_capacity(manifests.len());
-    let mut all_seen = HashSet::new();
-    let mut total = 0usize;
-
+    let mut batch = WebDavDeleteBatchAccumulator::new(manifests.len());
     for (root_identity, manifest) in manifests {
-        if !all_seen.insert(root_identity) {
-            return Err(WebDavDeleteError::PreMutation {
-                reason: "duplicate/cyclic WebDAV identity across delete roots".into(),
-            });
-        }
-        for node in &manifest.nodes {
-            if !all_seen.insert(node.canonical_identity.clone()) {
-                return Err(WebDavDeleteError::PreMutation {
-                    reason: "duplicate/cyclic WebDAV identity across delete roots".into(),
-                });
-            }
-        }
-
-        total = total.checked_add(1 + manifest.nodes.len()).ok_or_else(|| {
-            WebDavDeleteError::PreMutation {
-                reason: "WebDAV delete batch item count overflow".into(),
-            }
-        })?;
-        if total > MAX_WEBDAV_TREE_DESCENDANTS {
-            return Err(WebDavDeleteError::PreMutation {
-                reason: "WebDAV multi-root delete exceeds 50000 planned items".into(),
-            });
-        }
-        accepted.push(manifest);
+        batch.push(root_identity, manifest)?;
     }
-
-    Ok(WebDavDeleteBatchManifest {
-        manifests: accepted,
-        total,
-    })
+    Ok(batch.finish())
 }
 
 fn batch_definitive_failure(
