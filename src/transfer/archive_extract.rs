@@ -56,7 +56,7 @@ fn command(archive: &Path, member: &str, metadata: bool) -> tokio::process::Comm
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     command
 }
@@ -94,7 +94,13 @@ async fn stream_child(
     }
     let status = child.wait().await?;
     if !status.success() {
-        return Err(io::Error::other("archive member extraction failed"));
+        let mut err = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut err).await;
+        }
+        return Err(io::Error::other(format!(
+            "archive member extraction failed: {err}"
+        )));
     }
     Ok(total)
 }

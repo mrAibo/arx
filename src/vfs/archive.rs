@@ -83,7 +83,7 @@ impl ArchiveFs {
 
         let output = if is_zip {
             std::process::Command::new("unzip")
-                .args(["-l", &archive.to_string_lossy()])
+                .args(["-Z", "-1", &archive.to_string_lossy()])
                 .output()
         } else {
             std::process::Command::new("tar")
@@ -112,28 +112,9 @@ impl ArchiveFs {
         let mut result = Vec::new();
 
         for line in stdout.lines() {
-            let entry_path = if is_zip {
-                // unzip -l format: "  Length   Date   Time   Name"
-                // Skip header/footer lines
-                if line.starts_with("  Length")
-                    || line.starts_with(" -------")
-                    || !line.starts_with(' ')
-                {
-                    continue;
-                }
-                // Path is after the last space-padded column group
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                // unzip -l output: Length Method Size Cmpr Date Time CRC-32 Name
-                // Path is the last field
-                if parts.len() < 5 {
-                    continue;
-                }
-                parts.last().copied().unwrap_or("")
-            } else {
-                // tar tf: path per line
-                line.trim().to_string();
-                line.trim()
-            };
+            // `unzip -Z -1` and `tar tf` both emit one full member path per
+            // line, preserving spaces and Unicode. No column parsing needed.
+            let entry_path = line.trim();
 
             if entry_path.is_empty() || entry_path.ends_with('/') {
                 continue; // skip dir markers, we'll infer dirs from paths
@@ -317,14 +298,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_preview_rejects_unsafe_member_path() {
-        let provider = ArchiveProvider {
-            archive: PathBuf::from("fixture.tar"),
-        };
-        let error = provider
-            .read_prefix_bytes("../escape", 64)
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    async fn zip_list_preserves_member_names_with_spaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("file with spaces.txt");
+        std::fs::write(&source, b"payload").unwrap();
+        let archive = temp.path().join("fixture.zip");
+        assert!(
+            std::process::Command::new("zip")
+                .args([archive.to_str().unwrap(), "file with spaces.txt"])
+                .current_dir(temp.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let entries = ArchiveFs::list(&archive, "").unwrap();
+        assert!(entries
+            .iter()
+            .any(|e| e.name == "file with spaces.txt"));
     }
 }

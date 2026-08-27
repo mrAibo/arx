@@ -154,9 +154,10 @@ fn require_active_capability(
 }
 
 /// Exact set of provider pairs `TransferPlanner` can actually execute for
-/// Copy. Local↔Local, Local↔SFTP, Local↔S3, and Local↔WebDAV are the implemented
-/// directions; every other pair remains disabled until its planner/executor path
-/// exists with the same safety guarantees.
+/// Copy. Local↔Local, Local↔SFTP, Local↔S3, Local↔WebDAV, and Archive→Local
+/// (single-member extraction) are the implemented directions; every other
+/// pair remains disabled until its planner/executor path exists with the same
+/// safety guarantees.
 fn copy_pair_supported(active: ProviderId, passive: ProviderId) -> bool {
     matches!(
         (active, passive),
@@ -167,6 +168,7 @@ fn copy_pair_supported(active: ProviderId, passive: ProviderId) -> bool {
             | (ProviderId::Local, ProviderId::S3)
             | (ProviderId::WebDAV, ProviderId::Local)
             | (ProviderId::Local, ProviderId::WebDAV)
+            | (ProviderId::Archive, ProviderId::Local)
     )
 }
 
@@ -342,8 +344,9 @@ pub(crate) fn default_action_availability(id: ActionId, ctx: &ActionContext) -> 
                 }
             } else if copy_pair_supported(ctx.active_provider, ctx.passive_provider) {
                 // copy_pair_supported is the exact executable Copy surface:
-                // Local↔Local, Local↔SFTP, Local↔S3 and Local↔WebDAV. Other
-                // provider pairs remain disabled until implemented safely.
+                // Local↔Local, Local↔SFTP, Local↔S3, Local↔WebDAV, and
+                // Archive→Local single-member extraction. Other provider
+                // pairs remain disabled until implemented safely.
                 ActionAvailability::Available
             } else {
                 ActionAvailability::Disabled {
@@ -1192,14 +1195,14 @@ mod tests {
     }
 
     #[test]
-    fn copy_archive_local_disabled() {
+    fn copy_archive_local_available() {
         let mut ctx = context(ProviderId::Archive, ARCHIVE_CAPABILITIES);
         ctx.passive_provider = ProviderId::Local;
         ctx.focused_kind = Some(EntryKind::File);
-        assert!(matches!(
+        assert_eq!(
             action_availability(ActionId::Copy, &ctx),
-            ActionAvailability::Disabled { .. }
-        ));
+            ActionAvailability::Available
+        );
     }
 
     #[test]
