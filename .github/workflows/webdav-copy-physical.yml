@@ -36,13 +36,15 @@ jobs:
             exit 1
           fi
 
-      - name: Provision two Apache mod_dav endpoints and run #275 matrix
+      - name: Provision two Apache mod_dav endpoints and run #275 copy + #279 Move matrices
         working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
           source ./scripts/setup_webdav_copy_acceptance.sh
           cargo test --locked --lib --features physical-webdav \
             physical_webdav_remote_recursive_copy -- --nocapture --test-threads=1
+          cargo test --locked --test webdav_move_physical --features physical-webdav \
+            physical_webdav_verified_move_transaction -- --nocapture --test-threads=1
 
       - name: Retry-disposition regression evidence
         run: |
