@@ -2,16 +2,17 @@
 
 GitHub state is authoritative over this document. Re-fetch current `main`, issues, PRs, tags, workflow state, and releases before acting on any recorded SHA or backlog item.
 
-## CURRENT — v0.25.0 release candidate / v0.24.0 published
+## CURRENT — v0.25.0 published
 
-**Current public release until the new tag is published:** `v0.24.0`  
-**Immutable v0.24.0 tag target:** `6d413fac5d5b493859bfadfbedbeb436b1140e0b`  
-**v0.25.0 release issue:** #281  
+**Current public release:** `v0.25.0`  
+**Immutable v0.25.0 tag target:** `068d360abed853f1c6b05d8bf7a529c6b8cdfdb5`  
+**Previous immutable release:** `v0.24.0` → `6d413fac5d5b493859bfadfbedbeb436b1140e0b`  
+**v0.25.0 release issue:** #281 — completed  
 **v0.25.0 feature baseline before release preparation:** `main` → `d603281aca350749e3e195752c17295ab1638bc6`  
 **Platform:** Linux only; published target Linux x86_64  
 **MSRV:** Rust 1.88
 
-The v0.25.0 release candidate is a **release/public-truth slice only**. It publishes three WebDAV capabilities that were already independently frozen, implemented, physically accepted, merged, and post-merge accepted after v0.24.0:
+v0.25.0 is the current public release. It publishes three WebDAV capabilities that were independently frozen, implemented, physically accepted, merged, and post-merge accepted after v0.24.0:
 
 1. WebDAV → WebDAV recursive/cross-target Copy — #275 / PR #276.
 2. Multi-root recursive WebDAV Delete — #277 / PR #278.
@@ -19,12 +20,12 @@ The v0.25.0 release candidate is a **release/public-truth slice only**. It publi
 
 The release does not introduce a new provider/runtime/retry/scheduler/secret authority, dependency change, MSRV change, or unrelated feature.
 
-Publication truth remains separate from source-tree version metadata. Until an immutable `v0.25.0` tag is created on an accepted release commit and the tag-triggered Release workflow publishes successfully, `v0.24.0` remains the current public release.
+Publication truth is proven by immutable tag `v0.25.0` → `068d360abed853f1c6b05d8bf7a529c6b8cdfdb5` and Release workflow `33060354545`, which completed `validate=success` and `publish=success`. The GitHub Release is latest, non-draft and non-prerelease with exactly tar.gz, DEB, RPM and `SHA256SUMS`.
 
 ## CURRENT PRODUCT TRUTH
 
 - **Local / SFTP:** browsing, transactional copy, bounded preview, SFTP conflict-safe text Remote Edit, OpenSSH-backed host/session behavior.
-- **Remote Workspace:** v0.24.0 provides Compare → Preview → Execute → Verify for Local→Local, Local→SFTP, SFTP→Local, and same-host/cross-host SFTP→SFTP sync with bounded remote → ARX → remote streaming and real two-endpoint OpenSSH acceptance.
+- **Remote Workspace:** v0.25.0 retains Compare → Preview → Execute → Verify for Local→Local, Local→SFTP, SFTP→Local, and same-host/cross-host SFTP→SFTP sync, and publishes the verified WebDAV same/cross-target transaction surface described below.
 - **Transfer Queue:** one persistent bounded FIFO runtime, configurable concurrency `1..=8`, truthful progress/rate/ETA where known, cooperative Pause/Resume/Cancel, and bounded safe retry.
 - **Transfer Center v2:** Active / History / All views and controls routed to the existing `TransferQueueRuntime`.
 - **Storage Inspector (`Alt+U`):** Local read-only logical/allocated usage plus exact S3 object inspection and bounded paginated bucket/prefix LiveScan analytics.
@@ -35,7 +36,7 @@ Publication truth remains separate from source-tree version metadata. Until an i
 - **S3:** AWS S3 + MinIO supported paths; Moto emulated; exact object and bounded bucket/prefix inspector shipped in v0.23.0; Cloudflare R2 / Wasabi remain unverified best-effort targets.
 - **WebDAV interoperability:** Apache mod_dav, Nextcloud 34.0.2-apache, and ownCloud 11.0.0 physically accepted through Basic auth.
 - **WebDAV Local↔remote recursive operations:** recursive WebDAV→Local download, Local→WebDAV upload, safe bounded recursive delete foundation, and one-job multi-root Local↔WebDAV F5 Copy.
-- **Accepted post-v0.24 WebDAV transaction surface:** one-root recursive same/cross-target WebDAV→WebDAV Copy; multi-root recursive WebDAV Delete; one-root verified same/cross-target WebDAV→WebDAV Move through copy → verify → frozen-source delete.
+- **Released v0.25.0 WebDAV transaction surface:** one-root recursive same/cross-target WebDAV→WebDAV Copy; multi-root recursive WebDAV Delete; one-root verified same/cross-target WebDAV→WebDAV Move through copy → verify → frozen-source delete.
 - **Distribution:** GitHub Releases is the binary/package publication path; Linux x86_64 ships tar.gz, DEB, RPM, and one `SHA256SUMS`, all produced from one validated ELF.
 - **Extension surface:** `arx.menu` remains the supported lightweight extension mechanism; there is no embedded Lua/WASM/native plugin runtime.
 
@@ -64,7 +65,7 @@ Do not introduce a second:
 
 External plugins remain **no GO**. Re-evaluate Lua/WASM/native plugins only if real user/ecosystem demand appears and a truthful enforcement/security model exists. `arx.menu` remains the supported lightweight admin extension path.
 
-## ACCEPTED — WEBDAV TRANSACTION SURFACE FOR v0.25.0
+## RELEASED — WEBDAV TRANSACTION SURFACE IN v0.25.0
 
 ### Recursive WebDAV → WebDAV Copy — #275 / PR #276
 
@@ -138,7 +139,7 @@ Released and retained before v0.25.0:
 - safe bounded recursive WebDAV delete foundation (#255 / PR #256);
 - one-job multi-root Local↔WebDAV F5 Copy (#257 / PR #258).
 
-Completed on current main and selected for v0.25.0 publication:
+Published in v0.25.0:
 
 - [x] WebDAV→WebDAV recursive/cross-target Copy — #275 / PR #276;
 - [x] multi-root recursive WebDAV Delete — #277 / PR #278;
@@ -198,7 +199,7 @@ Native Windows support remains out of scope. Windows SSH clients may interoperat
 
 ## RELEASE HISTORY
 
-### v0.25.0 — release candidate
+### v0.25.0 — 2026-08-27
 
 - recursive same-target/cross-target WebDAV → WebDAV Copy;
 - multi-root recursive WebDAV Delete;
@@ -206,7 +207,7 @@ Native Windows support remains out of scope. Windows SSH clients may interoperat
 - percent-escape hex-case canonical matching correction without percent-decoding;
 - no dependency/MSRV/configuration migration change.
 
-Publication is not claimed until the immutable tag and GitHub Release are verified.
+Published from immutable tag `v0.25.0` on `068d360abed853f1c6b05d8bf7a529c6b8cdfdb5`; Release workflow `33060354545` validated one locked release build, exact tar/DEB/RPM payloads, checksums and then published the verified artifact bundle.
 
 ### v0.24.0 — 2026-08-26
 
