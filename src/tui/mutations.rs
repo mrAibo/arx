@@ -265,13 +265,15 @@ pub(super) fn handle_action(
                         plan.sources,
                         cancel,
                         move |progress| {
-                            let percent =
-                                progress.completed.saturating_mul(100) / progress.total.max(1);
                             let _ = progress_jobs.publish_event(
                                 &progress_tx,
                                 arx::jobs::JobEvent::Progress {
                                     id: progress_id.clone(),
-                                    progress: arx::jobs::Progress::Percent(percent as u8).into(),
+                                    progress: arx::jobs::Progress::Items {
+                                        done: progress.completed,
+                                        total: progress.total,
+                                    }
+                                    .into(),
                                 },
                             );
                         },
