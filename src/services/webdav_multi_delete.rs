@@ -28,11 +28,9 @@ pub struct WebDavRecursiveDeletePlan {
     pub created_at: Instant,
 }
 
-/// Compatibility entry point for the already-shipped single-root F8 path.
-///
-/// Keep rejecting multi-selection until the TUI is switched atomically to the
-/// batch executor; this prevents an intermediate branch state from accepting a
-/// multi-selection and then deleting only the first root.
+/// Compatibility entry point for callers that intentionally support only the
+/// already-shipped single-root recursive-delete contract. The TUI multi-root
+/// path uses `prepare_webdav_recursive_delete_batch` directly.
 pub fn prepare_webdav_recursive_delete(
     location: &Location,
     selected_names: &[String],
@@ -287,39 +285,52 @@ impl MutationService {
         ordered_roots.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         let mut manifests = Vec::with_capacity(ordered_roots.len());
-        let mut all_seen = HashSet::new();
-        let mut total = 0usize;
         for (root_identity, root) in ordered_roots {
             let manifest = Self::build_webdav_delete_manifest(provider, &root).await?;
+            manifests.push((root_identity, manifest));
+        }
+        validate_webdav_delete_batch_manifests(manifests)
+    }
+}
 
-            if !all_seen.insert(root_identity) {
+fn validate_webdav_delete_batch_manifests(
+    manifests: Vec<(String, WebDavDeleteManifest)>,
+) -> Result<WebDavDeleteBatchManifest, WebDavDeleteError> {
+    let mut accepted = Vec::with_capacity(manifests.len());
+    let mut all_seen = HashSet::new();
+    let mut total = 0usize;
+
+    for (root_identity, manifest) in manifests {
+        if !all_seen.insert(root_identity) {
+            return Err(WebDavDeleteError::PreMutation {
+                reason: "duplicate/cyclic WebDAV identity across delete roots".into(),
+            });
+        }
+        for node in &manifest.nodes {
+            if !all_seen.insert(node.canonical_identity.clone()) {
                 return Err(WebDavDeleteError::PreMutation {
                     reason: "duplicate/cyclic WebDAV identity across delete roots".into(),
                 });
             }
-            for node in &manifest.nodes {
-                if !all_seen.insert(node.canonical_identity.clone()) {
-                    return Err(WebDavDeleteError::PreMutation {
-                        reason: "duplicate/cyclic WebDAV identity across delete roots".into(),
-                    });
-                }
-            }
-
-            total = total.checked_add(1 + manifest.nodes.len()).ok_or_else(|| {
-                WebDavDeleteError::PreMutation {
-                    reason: "WebDAV delete batch item count overflow".into(),
-                }
-            })?;
-            if total > MAX_WEBDAV_TREE_DESCENDANTS {
-                return Err(WebDavDeleteError::PreMutation {
-                    reason: "WebDAV multi-root delete exceeds 50000 planned items".into(),
-                });
-            }
-            manifests.push(manifest);
         }
 
-        Ok(WebDavDeleteBatchManifest { manifests, total })
+        total = total.checked_add(1 + manifest.nodes.len()).ok_or_else(|| {
+            WebDavDeleteError::PreMutation {
+                reason: "WebDAV delete batch item count overflow".into(),
+            }
+        })?;
+        if total > MAX_WEBDAV_TREE_DESCENDANTS {
+            return Err(WebDavDeleteError::PreMutation {
+                reason: "WebDAV multi-root delete exceeds 50000 planned items".into(),
+            });
+        }
+        accepted.push(manifest);
     }
+
+    Ok(WebDavDeleteBatchManifest {
+        manifests: accepted,
+        total,
+    })
 }
 
 fn batch_definitive_failure(
@@ -358,6 +369,34 @@ mod tests {
                 href: href.into(),
             }),
         }
+    }
+
+    fn synthetic_manifest(
+        root_name: &str,
+        first_node: usize,
+        node_count: usize,
+    ) -> (String, WebDavDeleteManifest) {
+        let root_href = format!("/dav/{root_name}/");
+        let nodes = (first_node..first_node + node_count)
+            .map(|index| WebDavDeleteNode {
+                canonical_identity: format!("node-{index}"),
+                identity: WebDavDeleteIdentity::Object(WebDavObjectRef {
+                    target: "t".into(),
+                    href: format!("/dav/object-{index}"),
+                }),
+                depth: 1,
+            })
+            .collect();
+        (
+            format!("root-{root_name}"),
+            WebDavDeleteManifest {
+                root: WebDavCollectionRef {
+                    target: "t".into(),
+                    href: root_href,
+                },
+                nodes,
+            },
+        )
     }
 
     #[test]
@@ -454,6 +493,39 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn batch_manifest_accepts_50000_items_and_rejects_50001() {
+        let accepted = validate_webdav_delete_batch_manifests(vec![
+            synthetic_manifest("a", 0, 24_999),
+            synthetic_manifest("b", 24_999, 24_999),
+        ])
+        .unwrap();
+        assert_eq!(accepted.total, 50_000);
+
+        let rejected = validate_webdav_delete_batch_manifests(vec![
+            synthetic_manifest("a", 0, 24_999),
+            synthetic_manifest("b", 24_999, 25_000),
+        ]);
+        assert!(matches!(
+            rejected,
+            Err(WebDavDeleteError::PreMutation { reason })
+                if reason.contains("50000 planned items")
+        ));
+    }
+
+    #[test]
+    fn batch_manifest_rejects_cross_root_exact_identity_overlap() {
+        let first = synthetic_manifest("a", 0, 1);
+        let mut second = synthetic_manifest("b", 1, 1);
+        second.0 = first.1.nodes[0].canonical_identity.clone();
+
+        assert!(matches!(
+            validate_webdav_delete_batch_manifests(vec![first, second]),
+            Err(WebDavDeleteError::PreMutation { reason })
+                if reason.contains("duplicate/cyclic WebDAV identity")
+        ));
     }
 
     #[test]
