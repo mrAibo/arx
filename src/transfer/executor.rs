@@ -9,6 +9,7 @@ use crate::vfs::{Location, ProviderRegistry, local::LocalFs, webdav::WebDavProvi
 
 use super::s3_download;
 use super::s3_upload;
+use super::webdav_move::{MoveTreeFailure, move_tree as webdav_move_tree};
 use super::webdav_transfer::{
     CopyTreeFailure, TreeCleanupFailure, UploadTreeCleanupFailure, UploadTreeRootAmbiguous,
     WebDavOverwritePolicy, copy_tree as webdav_copy_tree, download_one as webdav_download_one,
@@ -153,6 +154,50 @@ fn classify_webdav_copy_tree_error(error: io::Error) -> TransferExecutionError {
     }
 }
 
+fn classify_webdav_move_tree_error(error: io::Error) -> TransferExecutionError {
+    if error.kind() == io::ErrorKind::Interrupted {
+        return TransferExecutionError::Cancelled { completed: 0 };
+    }
+
+    if let Some(failure) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<MoveTreeFailure>())
+    {
+        return match failure {
+            MoveTreeFailure::CancelledBeforeSourceDelete { completed, .. } => {
+                TransferExecutionError::Cancelled {
+                    completed: *completed,
+                }
+            }
+            MoveTreeFailure::DestinationChanged { .. }
+            | MoveTreeFailure::CleanupFailure { .. }
+            | MoveTreeFailure::RecoveryRequired { .. } => TransferExecutionError::Io {
+                source: error,
+                disposition: crate::transfer_queue::RetryDisposition::RecoveryRequired,
+            },
+            MoveTreeFailure::PartialSourceDelete { .. } => TransferExecutionError::Io {
+                source: error,
+                disposition: crate::transfer_queue::RetryDisposition::NeverRetry,
+            },
+        };
+    }
+
+    // The Move copy phase deliberately reuses the already accepted CopyTree
+    // executor. Preserve its typed ambiguity/recovery semantics verbatim.
+    if error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<CopyTreeFailure>())
+        .is_some()
+    {
+        return classify_webdav_copy_tree_error(error);
+    }
+
+    TransferExecutionError::Io {
+        source: error,
+        disposition: crate::transfer_queue::RetryDisposition::NeverRetry,
+    }
+}
+
 fn classify_webdav_tree_error(error: io::Error) -> TransferExecutionError {
     if error.kind() == io::ErrorKind::Interrupted {
         TransferExecutionError::Cancelled { completed: 0 }
@@ -248,10 +293,10 @@ async fn execute_webdav_batch_item(
                 .await
                 .map_err(classify_webdav_tree_error)?;
         }
-        WebDavTransferSpec::CopyTree { .. } => {
+        WebDavTransferSpec::CopyTree { .. } | WebDavTransferSpec::MoveTree { .. } => {
             return Err(TransferExecutionError::InvalidPlan {
                 method: TransferMethod::WebDav,
-                reason: "WebDAV remote CopyTree cannot be nested in a batch".into(),
+                reason: "WebDAV remote tree transaction cannot be nested in a batch".into(),
             });
         }
         WebDavTransferSpec::Batch { .. } => {
@@ -279,13 +324,17 @@ async fn execute_webdav_batch(
             reason: "WebDAV batch requires matching root specs and names".into(),
         });
     }
-    if items
-        .iter()
-        .any(|item| matches!(item, WebDavTransferSpec::Batch { .. }) || item.target() != target)
-    {
+    if items.iter().any(|item| {
+        matches!(
+            item,
+            WebDavTransferSpec::Batch { .. }
+                | WebDavTransferSpec::CopyTree { .. }
+                | WebDavTransferSpec::MoveTree { .. }
+        ) || item.target() != target
+    }) {
         return Err(TransferExecutionError::InvalidPlan {
             method: TransferMethod::WebDav,
-            reason: "WebDAV batch contains a nested or mixed-target root".into(),
+            reason: "WebDAV batch contains a nested/remote transaction or mixed-target root".into(),
         });
     }
 
@@ -465,6 +514,44 @@ pub async fn execute_transfer(
                     total: items,
                 });
             }
+            if let WebDavTransferSpec::MoveTree {
+                source,
+                destination_root,
+            } = spec
+            {
+                if plan.intent != TransferIntent::Move {
+                    return Err(TransferExecutionError::InvalidPlan {
+                        method: TransferMethod::WebDav,
+                        reason: "WebDAV MoveTree requires TransferIntent::Move".into(),
+                    });
+                }
+                let source_provider = registry
+                    .webdav_provider_for_transfer(&source.target)
+                    .map_err(|error| TransferExecutionError::InvalidPlan {
+                        method: TransferMethod::WebDav,
+                        reason: error.to_string(),
+                    })?;
+                let destination_provider = registry
+                    .webdav_provider_for_transfer(&destination_root.target)
+                    .map_err(|error| TransferExecutionError::InvalidPlan {
+                        method: TransferMethod::WebDav,
+                        reason: error.to_string(),
+                    })?;
+                let items = webdav_move_tree(
+                    source_provider,
+                    destination_provider,
+                    spec,
+                    cancel.clone(),
+                    pause,
+                    &mut on_progress,
+                )
+                .await
+                .map_err(classify_webdav_move_tree_error)?;
+                return Ok(TransferOutcome {
+                    completed: items,
+                    total: items,
+                });
+            }
 
             let target = spec.target();
             let provider = registry.webdav_provider_for_transfer(target).map_err(|e| {
@@ -551,8 +638,10 @@ pub async fn execute_transfer(
                         total: items,
                     });
                 }
-                WebDavTransferSpec::CopyTree { .. } => {
-                    unreachable!("CopyTree is handled before the single-provider WebDAV executor")
+                WebDavTransferSpec::CopyTree { .. } | WebDavTransferSpec::MoveTree { .. } => {
+                    unreachable!(
+                        "remote tree transactions are handled before the single-provider WebDAV executor"
+                    )
                 }
                 WebDavTransferSpec::Batch { target, items } => {
                     return execute_webdav_batch(
@@ -841,6 +930,44 @@ mod tests {
             )),
             TransferExecutionError::Cancelled { completed: 0 }
         ));
+    }
+
+    #[test]
+    fn webdav_move_terminal_states_are_never_blindly_retried() {
+        let cancelled = classify_webdav_move_tree_error(io::Error::other(
+            MoveTreeFailure::CancelledBeforeSourceDelete {
+                completed: 7,
+                total: 14,
+            },
+        ));
+        assert!(matches!(
+            cancelled,
+            TransferExecutionError::Cancelled { completed: 7 }
+        ));
+
+        let partial = classify_webdav_move_tree_error(io::Error::other(
+            MoveTreeFailure::PartialSourceDelete {
+                completed: 2,
+                total: 7,
+                reason: "locked".into(),
+            },
+        ));
+        assert_eq!(
+            partial.retry_disposition(),
+            crate::transfer_queue::RetryDisposition::NeverRetry
+        );
+
+        let recovery = classify_webdav_move_tree_error(io::Error::other(
+            MoveTreeFailure::RecoveryRequired {
+                completed: 2,
+                total: 7,
+                reason: "ambiguous delete".into(),
+            },
+        ));
+        assert_eq!(
+            recovery.retry_disposition(),
+            crate::transfer_queue::RetryDisposition::RecoveryRequired
+        );
     }
 
     #[test]
