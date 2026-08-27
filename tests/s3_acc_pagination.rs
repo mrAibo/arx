@@ -38,6 +38,7 @@ async fn upload(reg: &ProviderRegistry, target: &str, key: &str, data: &[u8]) {
         destination: root(target),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(S3TransferSpec::UploadOne {
             local_source: tmp.clone(),
             destination: S3ObjectRef {

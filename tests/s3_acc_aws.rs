@@ -101,6 +101,7 @@ async fn upload_bytes(registry: &ProviderRegistry, key: &str, data: &[u8]) {
         destination: aws_root(),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(spec),
         webdav_spec: None,
     };
@@ -137,6 +138,7 @@ async fn download_bytes(registry: &ProviderRegistry, key: &str) -> Vec<u8> {
         destination: Location::Local(std::env::temp_dir()),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(spec),
         webdav_spec: None,
     };
@@ -351,6 +353,7 @@ async fn aws_multipart_upload_roundtrip() {
         destination: aws_root(),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(S3TransferSpec::UploadOne {
             local_source: tmp.clone(),
             destination: S3ObjectRef {
@@ -383,6 +386,7 @@ async fn aws_multipart_upload_roundtrip() {
         destination: Location::Local(std::env::temp_dir()),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(S3TransferSpec::DownloadOne {
             source: S3ObjectRef {
                 target: "aws".to_string(),
@@ -451,6 +455,7 @@ async fn aws_multipart_cancel_aborts_without_completed_object() {
         destination: aws_root(),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(S3TransferSpec::UploadOne {
             local_source: tmp.clone(),
             destination: S3ObjectRef {
@@ -507,6 +512,7 @@ async fn aws_multipart_cancel_after_first_part_aborts() {
         destination: aws_root(),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(S3TransferSpec::UploadOne {
             local_source: tmp.clone(),
             destination: S3ObjectRef {
@@ -601,6 +607,7 @@ async fn aws_denial_put_object() {
         },
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(S3TransferSpec::UploadOne {
             local_source: tmp.clone(),
             destination: S3ObjectRef {
@@ -761,6 +768,7 @@ async fn aws_bucket_bound_target_works_without_list_all_my_buckets() {
         destination: root.clone(),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(S3TransferSpec::UploadOne {
             local_source: tmp.clone(),
             destination: S3ObjectRef {
@@ -817,6 +825,7 @@ async fn download_bytes_in(registry: &ProviderRegistry, target: &str, key: &str)
         destination: Location::Local(std::env::temp_dir()),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(spec),
         webdav_spec: None,
     };
@@ -905,6 +914,7 @@ async fn aws_denial_get_object() {
         destination: Location::Local(std::env::temp_dir()),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(spec),
         webdav_spec: None,
     };
@@ -1025,6 +1035,7 @@ async fn aws_object_disappears_mid_op() {
         destination: Location::Local(std::env::temp_dir()),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(spec),
         webdav_spec: None,
     };

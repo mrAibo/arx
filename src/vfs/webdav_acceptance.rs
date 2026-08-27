@@ -159,6 +159,7 @@ async fn run_f5_controlled(
         intent: TransferIntent::Copy,
         executors,
         delete_extraneous: false,
+        archive_spec: None,
         s3_spec: None,
         webdav_spec: Some(webdav_spec),
     })
@@ -211,6 +212,7 @@ async fn run_f5_batch_runtime(
         intent: TransferIntent::Copy,
         executors,
         delete_extraneous: false,
+        archive_spec: None,
         s3_spec: None,
         webdav_spec: Some(webdav_spec),
     })
@@ -1590,6 +1592,7 @@ async fn physical_webdav_multi_root_copy() {
         intent: TransferIntent::Copy,
         executors,
         delete_extraneous: false,
+        archive_spec: None,
         s3_spec: None,
         webdav_spec: Some(cancel_spec),
     })

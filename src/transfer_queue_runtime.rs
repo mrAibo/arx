@@ -678,6 +678,7 @@ mod tests {
             destination: Location::Local(PathBuf::from("/enqueue-race-destination")),
             intent: TransferIntent::Copy,
             method: TransferMethod::Native,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: None,
         }

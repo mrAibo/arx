@@ -77,6 +77,7 @@ async fn run_multipart_roundtrip(reg: &ProviderRegistry, target: &str) {
         destination: root(target),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(S3TransferSpec::UploadOne {
             local_source: tmp.clone(),
             destination: S3ObjectRef {
@@ -106,6 +107,7 @@ async fn run_multipart_roundtrip(reg: &ProviderRegistry, target: &str) {
         destination: Location::Local(std::env::temp_dir()),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(S3TransferSpec::DownloadOne {
             source: S3ObjectRef {
                 target: target.to_string(),
@@ -166,6 +168,7 @@ async fn run_multipart_cancel_before(reg: &ProviderRegistry, target: &str) {
         destination: root(target),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(S3TransferSpec::UploadOne {
             local_source: tmp.clone(),
             destination: S3ObjectRef {

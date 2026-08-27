@@ -1,3 +1,4 @@
+pub mod archive_extract;
 pub mod executor;
 pub mod integrity;
 pub mod probe;
@@ -16,7 +17,7 @@ pub use self::webdav_transfer::WebDavOverwritePolicy;
 
 use crate::vfs::{
     Capability, CapabilitySet, EntryIdentity, EntryKind, ListedEntry, Location, ProviderId,
-    S3ObjectRef, WebDavObjectRef, validate_child_name,
+    S3ObjectRef, WebDavObjectRef, archive::ArchiveMemberRef, validate_child_name,
 };
 use std::path::PathBuf;
 
@@ -36,6 +37,11 @@ pub enum TransferMethod {
     /// GET/PUT address the exact raw href from the listing identity — never a
     /// reconstructed path. Executor is live (B1/B2).
     WebDav,
+    /// Archive extraction: one exact member streamed to one new Local file.
+    /// Selected only for an Archive→Local `Copy` with a frozen
+    /// `ArchiveTransferSpec`; the executor refuses it without that spec.
+    // ponytail: extraction-only, no archive mutation (issue #285)
+    Archive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +63,8 @@ pub struct TransferPlan {
     /// Frozen WebDAV payload for this plan, carried verbatim from the request.
     /// None for non-WebDAV transfers.
     pub webdav_spec: Option<WebDavTransferSpec>,
+    /// Frozen exact archive member and Local output path. None otherwise.
+    pub archive_spec: Option<ArchiveTransferSpec>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +118,8 @@ pub struct TransferRequest {
     /// Frozen WebDAV payload for this request, built by the caller.
     /// The planner never reconstructs it. None for non-WebDAV transfers.
     pub webdav_spec: Option<WebDavTransferSpec>,
+    /// Frozen Archive → Local payload built from one exact listed identity.
+    pub archive_spec: Option<ArchiveTransferSpec>,
 }
 
 /// Frozen, transferred S3 identity/payload. The `S3ObjectRef` is the sole
@@ -125,6 +135,12 @@ pub enum S3TransferSpec {
         source: S3ObjectRef,
         local_destination: PathBuf,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveTransferSpec {
+    pub source: ArchiveMemberRef,
+    pub local_destination: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,10 +265,27 @@ impl TransferPlanner {
             method,
             s3_spec: request.s3_spec,
             webdav_spec: request.webdav_spec,
+            archive_spec: request.archive_spec,
         })
     }
 
     fn choose_method(request: &TransferRequest) -> Result<TransferMethod, TransferPlanError> {
+        // Archive extraction is one-way, one-member Copy only. Never fall
+        // through to native same-provider behavior or infer member identity.
+        if request.source_provider == ProviderId::Archive
+            || request.destination_provider == ProviderId::Archive
+        {
+            return if request.source_provider == ProviderId::Archive
+                && request.destination_provider == ProviderId::Local
+                && request.intent == TransferIntent::Copy
+                && request.archive_spec.is_some()
+            {
+                Ok(TransferMethod::Archive)
+            } else {
+                Err(Self::unsupported(request))
+            };
+        }
+
         // Every S3-touching plan is decided here and never falls through to the
         // legacy Local/Local, Local<->Sftp or same-provider native branches.
         if request.source_provider == ProviderId::S3
@@ -703,6 +736,7 @@ mod tests {
             intent: TransferIntent::Copy,
             executors: ExecutorAvailability::local(),
             delete_extraneous: false,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: None,
         })
@@ -728,6 +762,7 @@ mod tests {
                 webdav: false,
             },
             delete_extraneous: false,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: None,
         };
@@ -763,6 +798,7 @@ mod tests {
                 webdav: false,
             },
             delete_extraneous: false,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: None,
         };
@@ -809,6 +845,7 @@ mod tests {
                 webdav: true,
             },
             delete_extraneous: false,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: Some(WebDavTransferSpec::CopyTree {
                 source: source.clone(),
@@ -859,6 +896,7 @@ mod tests {
                 webdav: false,
             },
             delete_extraneous: false,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: None,
         })
@@ -885,6 +923,7 @@ mod tests {
                 webdav: false,
             },
             delete_extraneous: false,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: None,
         })
@@ -918,6 +957,7 @@ mod tests {
                 webdav: false,
             },
             delete_extraneous: false,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: None,
         })
@@ -951,6 +991,7 @@ mod tests {
                 webdav: false,
             },
             delete_extraneous: true,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: None,
         })
@@ -970,6 +1011,7 @@ mod tests {
             intent: TransferIntent::Copy,
             executors: ExecutorAvailability::NONE,
             delete_extraneous: false,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: None,
         })
@@ -1048,6 +1090,7 @@ mod tests {
             },
             delete_extraneous: false,
             s3_spec,
+            archive_spec: None,
             webdav_spec: None,
         }
     }
@@ -1274,6 +1317,7 @@ mod tests {
             executors: ExecutorAvailability::local(),
             delete_extraneous: false,
             s3_spec,
+            archive_spec: None,
             webdav_spec: None,
         };
         // Some: copied into the plan by the planner.

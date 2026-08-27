@@ -161,6 +161,7 @@ async fn upload_object(registry: &ProviderRegistry, key: &str, payload: &[u8]) {
         },
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(spec),
         webdav_spec: None,
     };
@@ -225,6 +226,7 @@ async fn p8_s3_safe_read_retry_through_runtime() {
         destination: Location::Local(dest_dir.clone()),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(spec),
         webdav_spec: None,
     };

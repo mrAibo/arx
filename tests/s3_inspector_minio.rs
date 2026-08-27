@@ -35,6 +35,7 @@ async fn upload_bytes(registry: &ProviderRegistry, key: &str, data: &[u8]) {
         destination: minio_root(),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(S3TransferSpec::UploadOne {
             local_source: tmp.clone(),
             destination: S3ObjectRef {

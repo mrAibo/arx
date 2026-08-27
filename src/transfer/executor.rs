@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::vfs::{Location, ProviderRegistry, local::LocalFs, webdav::WebDavProvider};
 
+use super::archive_extract;
 use super::s3_download;
 use super::s3_upload;
 use super::webdav_move::{MoveTreeFailure, move_tree as webdav_move_tree};
@@ -403,6 +404,40 @@ pub async fn execute_transfer(
             method: plan.method,
             reason: "SCP executor is not implemented".into(),
         }),
+        TransferMethod::Archive => {
+            let spec =
+                plan.archive_spec
+                    .as_ref()
+                    .ok_or_else(|| TransferExecutionError::InvalidPlan {
+                        method: plan.method,
+                        reason: "archive transfer plan missing frozen spec".into(),
+                    })?;
+            let (Location::Archive { archive, .. }, Location::Local(destination_root)) =
+                (&plan.source, &plan.destination)
+            else {
+                return Err(TransferExecutionError::InvalidPlan {
+                    method: plan.method,
+                    reason: "archive extraction requires Archive source and Local destination"
+                        .into(),
+                });
+            };
+            if plan.intent != TransferIntent::Copy
+                || names.len() != 1
+                || spec.local_destination.parent() != Some(destination_root.as_path())
+            {
+                return Err(TransferExecutionError::InvalidPlan {
+                    method: plan.method,
+                    reason:
+                        "archive extraction requires one frozen member in the Local destination"
+                            .into(),
+                });
+            }
+            archive_extract::extract_one(archive, spec, cancel, pause, &mut on_progress).await?;
+            Ok(TransferOutcome {
+                completed: 1,
+                total: 1,
+            })
+        }
         TransferMethod::S3 => {
             let spec =
                 plan.s3_spec
@@ -1011,6 +1046,7 @@ mod tests {
             destination: local(dst.path().to_path_buf()),
             intent: TransferIntent::Copy,
             method: TransferMethod::Native,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: None,
         };
@@ -1044,6 +1080,7 @@ mod tests {
             destination: local(dst.path().to_path_buf()),
             intent: TransferIntent::Move,
             method: TransferMethod::Native,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: None,
         };
@@ -1074,6 +1111,7 @@ mod tests {
             destination: sftp("prod", "/dst"),
             intent: TransferIntent::Copy,
             method: TransferMethod::Rsync,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: None,
         };
@@ -1110,6 +1148,7 @@ mod tests {
             destination: sftp("b", "/dst"),
             intent: TransferIntent::Copy,
             method: TransferMethod::Rsync,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: None,
         };
@@ -1136,6 +1175,7 @@ mod tests {
             destination: sftp("prod", "/dst"),
             intent: TransferIntent::Move,
             method: TransferMethod::Rsync,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: None,
         };
@@ -1181,6 +1221,7 @@ mod tests {
             intent: TransferIntent::Copy,
             method,
             s3_spec,
+            archive_spec: None,
             webdav_spec: None,
         }
     }

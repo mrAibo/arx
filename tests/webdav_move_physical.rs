@@ -279,6 +279,7 @@ async fn build_move_plan(
         intent: TransferIntent::Move,
         executors,
         delete_extraneous: false,
+        archive_spec: None,
         s3_spec: None,
         webdav_spec: Some(webdav_spec),
     })?;
