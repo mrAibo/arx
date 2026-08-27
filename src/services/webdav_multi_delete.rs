@@ -349,6 +349,7 @@ impl MutationService {
     }
 }
 
+#[cfg(test)]
 fn validate_webdav_delete_batch_manifests(
     manifests: Vec<(String, WebDavDeleteManifest)>,
 ) -> Result<WebDavDeleteBatchManifest, WebDavDeleteError> {
