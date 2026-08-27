@@ -497,11 +497,7 @@ async fn physical_webdav_recursive_delete_safety() {
     .await;
     provider.mkdir(&format!("/{positive_b}")).await.unwrap();
     put(&provider, &format!("/{positive_b}/file.txt"), b"b").await;
-    let positive_plan = plan_for_roots(
-        &provider,
-        &[positive_b.clone(), positive_a.clone()],
-    )
-    .await;
+    let positive_plan = plan_for_roots(&provider, &[positive_b.clone(), positive_a.clone()]).await;
     let positive_result = MutationService::delete_webdav_trees(
         provider.clone(),
         positive_plan.sources,
@@ -519,19 +515,10 @@ async fn physical_webdav_recursive_delete_safety() {
     let batch_cancel_id = physical_run_id();
     let batch_cancel_a = format!("{batch_cancel_id}-a-cancel");
     let batch_cancel_b = format!("{batch_cancel_id}-b-cancel");
-    provider
-        .mkdir(&format!("/{batch_cancel_a}"))
-        .await
-        .unwrap();
-    provider
-        .mkdir(&format!("/{batch_cancel_b}"))
-        .await
-        .unwrap();
-    let batch_cancel_plan = plan_for_roots(
-        &provider,
-        &[batch_cancel_b.clone(), batch_cancel_a.clone()],
-    )
-    .await;
+    provider.mkdir(&format!("/{batch_cancel_a}")).await.unwrap();
+    provider.mkdir(&format!("/{batch_cancel_b}")).await.unwrap();
+    let batch_cancel_plan =
+        plan_for_roots(&provider, &[batch_cancel_b.clone(), batch_cancel_a.clone()]).await;
     let batch_cancel = Arc::new(AtomicBool::new(false));
     let set_batch_cancel = batch_cancel.clone();
     let batch_cancel_result = MutationService::delete_webdav_trees(
@@ -562,14 +549,8 @@ async fn physical_webdav_recursive_delete_safety() {
     let batch_locked_id = physical_run_id();
     let batch_locked_a = format!("{batch_locked_id}-a-first");
     let batch_locked_b = format!("{batch_locked_id}-b-locked");
-    provider
-        .mkdir(&format!("/{batch_locked_a}"))
-        .await
-        .unwrap();
-    provider
-        .mkdir(&format!("/{batch_locked_b}"))
-        .await
-        .unwrap();
+    provider.mkdir(&format!("/{batch_locked_a}")).await.unwrap();
+    provider.mkdir(&format!("/{batch_locked_b}")).await.unwrap();
     put(
         &provider,
         &format!("/{batch_locked_b}/a-locked.txt"),
@@ -586,11 +567,8 @@ async fn physical_webdav_recursive_delete_safety() {
     let batch_token = lock_resource(&upstream, &batch_locked_path, &user, &pass)
         .await
         .unwrap();
-    let batch_locked_plan = plan_for_roots(
-        &provider,
-        &[batch_locked_b.clone(), batch_locked_a.clone()],
-    )
-    .await;
+    let batch_locked_plan =
+        plan_for_roots(&provider, &[batch_locked_b.clone(), batch_locked_a.clone()]).await;
     let batch_locked_result = MutationService::delete_webdav_trees(
         provider.clone(),
         batch_locked_plan.sources,
@@ -611,15 +589,9 @@ async fn physical_webdav_recursive_delete_safety() {
     let batch_locked_names = list_root_names(&provider, &batch_locked_b).await;
     assert!(batch_locked_names.iter().any(|name| name == "a-locked.txt"));
     assert!(batch_locked_names.iter().any(|name| name == "z-later.txt"));
-    unlock_resource(
-        &upstream,
-        &batch_locked_path,
-        &batch_token,
-        &user,
-        &pass,
-    )
-    .await
-    .unwrap();
+    unlock_resource(&upstream, &batch_locked_path, &batch_token, &user, &pass)
+        .await
+        .unwrap();
     cleanup_tree(&provider, &batch_locked_b).await;
 
     // Ambiguity in root B: DELETE #1 (root A) is passed through normally;
