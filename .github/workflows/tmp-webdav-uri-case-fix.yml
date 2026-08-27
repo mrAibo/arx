@@ -27,12 +27,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Apply percent-escape case normalization and regression test
+      - name: Apply URI equivalence fix and strengthen drift acceptance
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
+
           p = Path('src/vfs/webdav.rs')
           s = p.read_text()
           old = '''fn canonical_url_identity(url: &url::Url) -> String {
@@ -101,20 +102,43 @@ jobs:
           '''
           if s.count(anchor) != 1:
               raise SystemExit(f'test anchor match count={s.count(anchor)}')
-          s = s.replace(anchor, test + anchor)
-          p.write_text(s)
+          p.write_text(s.replace(anchor, test + anchor))
+
+          p = Path('tests/webdav_move_physical.rs')
+          s = p.read_text()
+          old = '''    assert_eq!(error.retry_disposition(), RetryDisposition::NeverRetry);
+              assert!(error.to_string().contains("source changed"));
+              assert!(file_exists(&f.a.provider, &format!("/{root}/late.txt")).await);
+              assert!(!collection_exists(&f.b.provider, f.b.id, &format!("/{root}")).await);
+          '''
+          new = '''    assert_eq!(error.retry_disposition(), RetryDisposition::NeverRetry);
+              assert!(
+                  error.to_string().contains("source tree changed"),
+                  "source drift must be reported factually: {error}"
+              );
+              assert!(
+                  file_exists(&f.a.provider, &format!("/{root}/a.txt")).await,
+                  "original source child must remain: source DELETE must not start"
+              );
+              assert!(file_exists(&f.a.provider, &format!("/{root}/late.txt")).await);
+              assert!(!collection_exists(&f.b.provider, f.b.id, &format!("/{root}")).await);
+          '''
+          if s.count(old) != 1:
+              raise SystemExit(f'source drift assertion match count={s.count(old)}')
+          p.write_text(s.replace(old, new))
           PY
           cargo fmt
           git diff --check
-          CHANGED="$(git diff --name-only)"
-          test "$CHANGED" = "src/vfs/webdav.rs"
+          CHANGED="$(git diff --name-only | sort)"
+          EXPECTED="$(printf '%s\n' src/vfs/webdav.rs tests/webdav_move_physical.rs | sort)"
+          test "$CHANGED" = "$EXPECTED"
 
       - name: Unit and compile proof
         run: |
           set -euo pipefail
           cargo fmt --check
           cargo test --locked --lib canonical_url_identity_normalizes_only_percent_escape_hex_case -- --nocapture
-          cargo clippy --locked --lib --features physical-webdav -- -D warnings
+          cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --test webdav_move_physical --features physical-webdav --no-run
 
       - name: Apache physical Move proof
@@ -125,17 +149,17 @@ jobs:
           cargo test --locked --test webdav_move_physical --features physical-webdav \
             physical_webdav_verified_move_transaction -- --nocapture --test-threads=1
 
-      - name: Commit proven fix and self-remove
+      - name: Commit only fully proven changes and self-remove
         shell: bash
         run: |
           set -euo pipefail
           rm .github/workflows/tmp-webdav-uri-case-fix.yml
           git diff --check
           CHANGED="$(git status --short | awk '{print $2}' | sort)"
-          EXPECTED="$(printf '%s\n' src/vfs/webdav.rs .github/workflows/tmp-webdav-uri-case-fix.yml | sort)"
+          EXPECTED="$(printf '%s\n' src/vfs/webdav.rs tests/webdav_move_physical.rs .github/workflows/tmp-webdav-uri-case-fix.yml | sort)"
           test "$CHANGED" = "$EXPECTED"
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/vfs/webdav.rs .github/workflows/tmp-webdav-uri-case-fix.yml
-          git commit -m "fix: normalize WebDAV percent-escape hex case"
+          git add src/vfs/webdav.rs tests/webdav_move_physical.rs .github/workflows/tmp-webdav-uri-case-fix.yml
+          git commit -m "fix: canonicalize WebDAV percent-escape case"
           git push origin HEAD:feature/webdav-verified-move
