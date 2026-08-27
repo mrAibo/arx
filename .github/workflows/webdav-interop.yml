@@ -17,6 +17,7 @@ on:
       - "src/services/**"
       - "src/transfer/**"
       - "tests/webdav_multi_delete_interop.rs"
+      - "tests/webdav_move_interop.rs"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -82,6 +83,8 @@ jobs:
             physical_webdav_interop_multi_root_copy -- --nocapture
           cargo test --locked --test webdav_multi_delete_interop --features physical-webdav \
             physical_webdav_interop_multi_root_recursive_delete -- --nocapture --test-threads=1
+          cargo test --locked --test webdav_move_interop --features physical-webdav \
+            physical_webdav_interop_verified_move_same_target -- --nocapture --test-threads=1
 
       - name: Cleanup fixture
         if: always()
