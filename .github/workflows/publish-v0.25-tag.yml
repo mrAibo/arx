@@ -1,4 +1,4 @@
-name: Publish v0.25.0 tag (temporary)
+name: Dispatch v0.25.0 release (temporary)
 
 on:
   push:
@@ -8,10 +8,11 @@ on:
       - '.github/workflows/publish-v0.25-tag.yml'
 
 permissions:
-  contents: write
+  contents: read
+  actions: write
 
 jobs:
-  tag:
+  dispatch:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
@@ -19,7 +20,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify immutable release target
+      - name: Verify immutable release identity
         env:
           EXPECTED_SHA: 068d360abed853f1c6b05d8bf7a529c6b8cdfdb5
           TAG: v0.25.0
@@ -27,17 +28,16 @@ jobs:
           set -euo pipefail
           git fetch origin main --tags
           test "$(git rev-parse origin/main)" = "$EXPECTED_SHA"
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG already exists; refusing to retarget or replace it." >&2
-            exit 1
-          fi
-          git cat-file -e "$EXPECTED_SHA^{commit}"
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$EXPECTED_SHA"
+          test "$(git ls-remote origin "refs/tags/$TAG" | awk '{print $1}')" = "$EXPECTED_SHA"
 
-      - name: Create immutable lightweight tag
+      - name: Dispatch existing Release workflow on immutable tag
         env:
-          EXPECTED_SHA: 068d360abed853f1c6b05d8bf7a529c6b8cdfdb5
+          GH_TOKEN: ${{ github.token }}
           TAG: v0.25.0
         run: |
           set -euo pipefail
-          git tag "$TAG" "$EXPECTED_SHA"
-          git push origin "refs/tags/$TAG:refs/tags/$TAG"
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/dispatches" \
+            -f ref="$TAG" \
+            -f 'inputs[version]=0.25.0'
