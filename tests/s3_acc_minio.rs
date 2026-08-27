@@ -68,6 +68,7 @@ async fn upload_bytes(registry: &ProviderRegistry, key: &str, data: &[u8]) {
         destination: minio_root(),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(spec),
         webdav_spec: None,
     };
@@ -102,6 +103,7 @@ async fn download_bytes(registry: &ProviderRegistry, key: &str) -> Vec<u8> {
         destination: Location::Local(std::env::temp_dir()),
         intent: TransferIntent::Copy,
         method: TransferMethod::S3,
+        archive_spec: None,
         s3_spec: Some(spec),
         webdav_spec: None,
     };

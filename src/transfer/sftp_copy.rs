@@ -941,6 +941,7 @@ mod tests {
             },
             intent: TransferIntent::Copy,
             method: TransferMethod::Sftp,
+            archive_spec: None,
             s3_spec: None,
             webdav_spec: None,
         };

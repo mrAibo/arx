@@ -241,6 +241,7 @@ fn build_plan(
         intent: TransferIntent::Copy,
         executors,
         delete_extraneous: false,
+        archive_spec: None,
         s3_spec: None,
         webdav_spec: Some(webdav_spec),
     })?;

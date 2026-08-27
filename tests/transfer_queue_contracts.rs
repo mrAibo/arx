@@ -37,6 +37,7 @@ fn local_copy_plan(src: &std::path::Path, dst: &std::path::Path) -> TransferPlan
         destination: Location::Local(dst.to_path_buf()),
         intent: TransferIntent::Copy,
         method: TransferMethod::Native,
+        archive_spec: None,
         s3_spec: None,
         webdav_spec: None,
     }

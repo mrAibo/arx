@@ -44,6 +44,28 @@ fn build_s3_copy_spec(
     }
 }
 
+fn build_archive_copy_spec(
+    src_loc: &Location,
+    dst_loc: &Location,
+    focused: &ListedEntry,
+) -> Result<arx::transfer::ArchiveTransferSpec, String> {
+    let (Location::Archive { .. }, Location::Local(destination)) = (src_loc, dst_loc) else {
+        return Err("Archive copy requires an Archive source and Local destination".into());
+    };
+    let EntryIdentity::ArchiveMember(source) = &focused.identity else {
+        return Err("Archive copy requires an exact focused member identity".into());
+    };
+    if focused.entry.kind != EntryKind::File {
+        return Err("Archive copy supports one regular file only".into());
+    }
+    arx::vfs::validate_child_name(&focused.entry.name)
+        .map_err(|_| "Archive member cannot be represented as one safe local filename")?;
+    Ok(arx::transfer::ArchiveTransferSpec {
+        source: source.clone(),
+        local_destination: destination.join(&focused.entry.name),
+    })
+}
+
 pub(super) fn handle_action(
     state: &mut AppState,
     action: &Action,
@@ -83,6 +105,31 @@ pub(super) fn handle_action(
                 .registry
                 .capabilities_for_location(&dst_loc)
                 .unwrap_or_default();
+            // Archive -> Local extraction: one exact focused member only.
+            let archive_spec: Option<arx::transfer::ArchiveTransferSpec> =
+                if src_provider == ProviderId::Archive || dst_provider == ProviderId::Archive {
+                    if !selected_names.is_empty() {
+                        state.message = Some("Archive copy supports the focused file only".into());
+                        return true;
+                    }
+                    let Some(source) = focused_listed else {
+                        state.message = Some("Focus an archive file to copy".into());
+                        return true;
+                    };
+                    match build_archive_copy_spec(&src_loc, &dst_loc, source) {
+                        Ok(spec) => {
+                            names = vec![source.entry.name.clone()];
+                            Some(spec)
+                        }
+                        Err(message) => {
+                            state.message = Some(message);
+                            return true;
+                        }
+                    }
+                } else {
+                    None
+                };
+
             // S3 basic transfer: a single S3 object paired with a Local pane.
             let s3_spec: Option<arx::transfer::S3TransferSpec> =
                 if src_provider == ProviderId::S3 || dst_provider == ProviderId::S3 {
@@ -172,6 +219,7 @@ pub(super) fn handle_action(
                 delete_extraneous: false,
                 s3_spec,
                 webdav_spec,
+                archive_spec,
             };
             let plan = match arx::transfer::TransferPlanner::plan(request) {
                 Ok(p) => p,
@@ -276,6 +324,7 @@ pub(super) fn handle_action(
                 intent: arx::transfer::TransferIntent::Move,
                 executors,
                 delete_extraneous: false,
+                archive_spec: None,
                 s3_spec: None,
                 webdav_spec,
             };
@@ -434,6 +483,7 @@ mod tests {
                 webdav: false,
             },
             delete_extraneous: false,
+            archive_spec: None,
             s3_spec: Some(spec),
             webdav_spec: None,
         };

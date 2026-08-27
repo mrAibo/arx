@@ -188,6 +188,7 @@ async fn physical_webdav_interop_verified_move_same_target() -> Result<(), AnyEr
         intent: TransferIntent::Move,
         executors,
         delete_extraneous: false,
+        archive_spec: None,
         s3_spec: None,
         webdav_spec: Some(webdav_spec),
     })?;

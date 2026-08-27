@@ -154,9 +154,10 @@ fn require_active_capability(
 }
 
 /// Exact set of provider pairs `TransferPlanner` can actually execute for
-/// Copy. Local↔Local, Local↔SFTP, Local↔S3, and Local↔WebDAV are the implemented
-/// directions; every other pair remains disabled until its planner/executor path
-/// exists with the same safety guarantees.
+/// Copy. Local↔Local, Local↔SFTP, Local↔S3, Local↔WebDAV, and Archive→Local
+/// (single-member extraction) are the implemented directions; every other
+/// pair remains disabled until its planner/executor path exists with the same
+/// safety guarantees.
 fn copy_pair_supported(active: ProviderId, passive: ProviderId) -> bool {
     matches!(
         (active, passive),
@@ -167,6 +168,7 @@ fn copy_pair_supported(active: ProviderId, passive: ProviderId) -> bool {
             | (ProviderId::Local, ProviderId::S3)
             | (ProviderId::WebDAV, ProviderId::Local)
             | (ProviderId::Local, ProviderId::WebDAV)
+            | (ProviderId::Archive, ProviderId::Local)
     )
 }
 
@@ -270,13 +272,14 @@ pub(crate) fn default_action_availability(id: ActionId, ctx: &ActionContext) -> 
         ActionId::BeginChmod => {
             require_active_capability(ctx, Capability::Chmod, "Permission changes")
         }
-        // ViewFile (F3) supports exactly Local, Sftp, and S3. The provider
-        // allow-list is explicit: WebDAV/Archive are never enabled merely
+        // ViewFile (F3) supports Local, Sftp, S3, and bounded archive preview. The provider
+        // allow-list is explicit: WebDAV is never enabled merely
         // because their capability sets happen to contain Read.
         ActionId::ViewFile
             if ctx.active_provider != ProviderId::Local
                 && ctx.active_provider != ProviderId::Sftp
-                && ctx.active_provider != ProviderId::S3 =>
+                && ctx.active_provider != ProviderId::S3
+                && ctx.active_provider != ProviderId::Archive =>
         {
             ActionAvailability::Disabled {
                 reason: "Remote viewing is not supported yet".into(),
@@ -294,6 +297,11 @@ pub(crate) fn default_action_availability(id: ActionId, ctx: &ActionContext) -> 
         ActionId::ViewFile if ctx.focused_kind != Some(EntryKind::File) => {
             ActionAvailability::Disabled {
                 reason: "Select a regular file to view".into(),
+            }
+        }
+        ActionId::EditFile if ctx.active_provider == ProviderId::Archive => {
+            ActionAvailability::Disabled {
+                reason: "Archive editing is not supported; extract the file first".into(),
             }
         }
         ActionId::EditFile if ctx.active_provider == ProviderId::S3 => {
@@ -336,8 +344,9 @@ pub(crate) fn default_action_availability(id: ActionId, ctx: &ActionContext) -> 
                 }
             } else if copy_pair_supported(ctx.active_provider, ctx.passive_provider) {
                 // copy_pair_supported is the exact executable Copy surface:
-                // Local↔Local, Local↔SFTP, Local↔S3 and Local↔WebDAV. Other
-                // provider pairs remain disabled until implemented safely.
+                // Local↔Local, Local↔SFTP, Local↔S3, Local↔WebDAV, and
+                // Archive→Local single-member extraction. Other provider
+                // pairs remain disabled until implemented safely.
                 ActionAvailability::Available
             } else {
                 ActionAvailability::Disabled {
@@ -632,6 +641,19 @@ mod tests {
         assert!(
             matches!(availability, ActionAvailability::Available),
             "SFTP F3 should be Available when Capability::Read is present; got {availability:?}"
+        );
+    }
+
+    #[test]
+    fn archive_view_is_available_but_edit_explains_extract_first() {
+        let ctx = context(ProviderId::Archive, ARCHIVE_CAPABILITIES);
+        assert_eq!(
+            action_availability(ActionId::ViewFile, &ctx),
+            ActionAvailability::Available
+        );
+        assert_eq!(
+            action_availability(ActionId::EditFile, &ctx).reason(),
+            Some("Archive editing is not supported; extract the file first")
         );
     }
 
@@ -1173,14 +1195,14 @@ mod tests {
     }
 
     #[test]
-    fn copy_archive_local_disabled() {
+    fn copy_archive_local_available() {
         let mut ctx = context(ProviderId::Archive, ARCHIVE_CAPABILITIES);
         ctx.passive_provider = ProviderId::Local;
         ctx.focused_kind = Some(EntryKind::File);
-        assert!(matches!(
+        assert_eq!(
             action_availability(ActionId::Copy, &ctx),
-            ActionAvailability::Disabled { .. }
-        ));
+            ActionAvailability::Available
+        );
     }
 
     #[test]

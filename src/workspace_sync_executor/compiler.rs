@@ -555,6 +555,7 @@ fn compile_transfer_plan(
         intent: TransferIntent::Copy,
         executors: availability,
         delete_extraneous: false,
+        archive_spec: None,
         s3_spec: None,
         webdav_spec: None,
     })

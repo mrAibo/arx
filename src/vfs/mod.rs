@@ -1728,6 +1728,7 @@ pub struct ListedEntry {
 // ponytail: S3 identity derived from exact *Ref; Other keeps non-S3 compat
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryIdentity {
+    ArchiveMember(archive::ArchiveMemberRef),
     S3Object(s3::S3ObjectRef),
     S3Prefix(s3::S3PrefixRef),
     S3Bucket(s3::S3BucketRef),
