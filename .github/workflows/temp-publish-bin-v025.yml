@@ -68,8 +68,8 @@ jobs:
         run: |
           set -euo pipefail
           rm .github/workflows/temp-publish-bin-v025.yml
-          git status --short
-          changed="$(git status --short | awk '{print $2}' | sort)"
+          git status --short --untracked-files=all
+          changed="$(git status --short --untracked-files=all | awk '{print $2}' | sort)"
           expected="$(printf '%s\n' .gitignore .github/workflows/temp-publish-bin-v025.yml bin/arx | sort)"
           test "$changed" = "$expected"
           git config user.name "github-actions[bot]"
