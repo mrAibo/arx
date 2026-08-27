@@ -209,8 +209,6 @@ async fn event_loop(
                 &runtime.sync,
             )
         })?;
-        state.message = None; // one-shot clear after render
-
         // Drain terminal output if active
         if let Some(ref mut term) = state.term {
             term.drain();
@@ -306,6 +304,9 @@ async fn event_loop(
         };
         mouse_ui.frame_area = Some(Rect::from(terminal.size()?));
         if let Some(event) = next_input {
+            // Keep feedback visible across runtime ticks; dismiss it only when
+            // the user performs the next input action (which may replace it).
+            state.message = None;
             let outcome = input_dispatch::handle_event(
                 event,
                 &mut state,
