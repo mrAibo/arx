@@ -89,7 +89,7 @@ jobs:
           path.write_text(text)
           PY
 
-          git diff --check
+          test "$(git diff --name-only)" = "ROADMAP.md"
           git diff -- ROADMAP.md
 
       - name: Commit roadmap publication truth
