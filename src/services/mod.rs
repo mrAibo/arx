@@ -3,7 +3,7 @@ mod diff;
 mod file_info;
 mod git;
 mod infrastructure;
-mod mutation;
+pub(crate) mod mutation;
 mod pane_loader;
 pub mod preview;
 mod quick_actions;
