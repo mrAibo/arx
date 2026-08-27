@@ -270,13 +270,14 @@ pub(crate) fn default_action_availability(id: ActionId, ctx: &ActionContext) -> 
         ActionId::BeginChmod => {
             require_active_capability(ctx, Capability::Chmod, "Permission changes")
         }
-        // ViewFile (F3) supports exactly Local, Sftp, and S3. The provider
-        // allow-list is explicit: WebDAV/Archive are never enabled merely
+        // ViewFile (F3) supports Local, Sftp, S3, and bounded archive preview. The provider
+        // allow-list is explicit: WebDAV is never enabled merely
         // because their capability sets happen to contain Read.
         ActionId::ViewFile
             if ctx.active_provider != ProviderId::Local
                 && ctx.active_provider != ProviderId::Sftp
-                && ctx.active_provider != ProviderId::S3 =>
+                && ctx.active_provider != ProviderId::S3
+                && ctx.active_provider != ProviderId::Archive =>
         {
             ActionAvailability::Disabled {
                 reason: "Remote viewing is not supported yet".into(),
@@ -294,6 +295,11 @@ pub(crate) fn default_action_availability(id: ActionId, ctx: &ActionContext) -> 
         ActionId::ViewFile if ctx.focused_kind != Some(EntryKind::File) => {
             ActionAvailability::Disabled {
                 reason: "Select a regular file to view".into(),
+            }
+        }
+        ActionId::EditFile if ctx.active_provider == ProviderId::Archive => {
+            ActionAvailability::Disabled {
+                reason: "Archive editing is not supported; extract the file first".into(),
             }
         }
         ActionId::EditFile if ctx.active_provider == ProviderId::S3 => {
@@ -632,6 +638,19 @@ mod tests {
         assert!(
             matches!(availability, ActionAvailability::Available),
             "SFTP F3 should be Available when Capability::Read is present; got {availability:?}"
+        );
+    }
+
+    #[test]
+    fn archive_view_is_available_but_edit_explains_extract_first() {
+        let ctx = context(ProviderId::Archive, ARCHIVE_CAPABILITIES);
+        assert_eq!(
+            action_availability(ActionId::ViewFile, &ctx),
+            ActionAvailability::Available
+        );
+        assert_eq!(
+            action_availability(ActionId::EditFile, &ctx).reason(),
+            Some("Archive editing is not supported; extract the file first")
         );
     }
 

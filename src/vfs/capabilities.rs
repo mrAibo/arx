@@ -64,9 +64,11 @@ pub const SFTP_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
     .with(Capability::Mkdir)
     .with(Capability::Delete);
 
-/// Archive browsing currently supports listing only. Extraction/mutation stay
-/// outside the provider contract until they have transactional semantics.
-pub const ARCHIVE_CAPABILITIES: CapabilitySet = CapabilitySet::NONE.with(Capability::List);
+/// Archive browsing supports listing and bounded read-only preview. Extraction
+/// remains transfer-layer work; archive mutation stays unsupported.
+pub const ARCHIVE_CAPABILITIES: CapabilitySet = CapabilitySet::NONE
+    .with(Capability::List)
+    .with(Capability::Read);
 
 /// WebDAV MVP (PACK E): PROPFIND listing, bounded GET preview, MKCOL, DELETE,
 /// same-target COPY/MOVE (server-side), and one-file PUT via Local↔WebDAV F5.
@@ -106,8 +108,7 @@ pub const fn builtin_capabilities(provider: ProviderId) -> CapabilitySet {
         ProviderId::Sftp => SFTP_CAPABILITIES,
         ProviderId::S3 => S3_CAPABILITIES,
         ProviderId::WebDAV => WEBDAV_CAPABILITIES,
-        // Archive capabilities are not yet declared as a stable contract.
-        ProviderId::Archive => CapabilitySet::NONE,
+        ProviderId::Archive => ARCHIVE_CAPABILITIES,
     }
 }
 

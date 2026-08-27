@@ -224,6 +224,18 @@ pub fn listed_entry_navigation_target(
     listed: &crate::vfs::ListedEntry,
 ) -> Option<crate::vfs::Location> {
     match &listed.identity {
+        crate::vfs::EntryIdentity::ArchiveMember(reference)
+            if listed.entry.kind == crate::vfs::EntryKind::Directory =>
+        {
+            let crate::vfs::Location::Archive { archive, .. } = current else {
+                return None;
+            };
+            Some(crate::vfs::Location::Archive {
+                archive: archive.clone(),
+                inner_path: reference.member_path.clone(),
+            })
+        }
+        crate::vfs::EntryIdentity::ArchiveMember(_) => None,
         crate::vfs::EntryIdentity::S3Bucket(reference) => Some(crate::vfs::Location::S3 {
             target: reference.target.clone(),
             bucket: Some(reference.bucket.clone()),

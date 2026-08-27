@@ -686,10 +686,13 @@ fn is_archive(name: &str) -> bool {
 }
 
 /// S3-30R: S3 regular objects now route through the identity-aware
-/// `Effect::PreviewLocation` lane (alongside SFTP). Local/Archive fall through
-/// to their own preview paths. This is the S3 F3 dispatch decision.
+/// `Effect::PreviewLocation` lane (alongside SFTP and Archive). Local falls
+/// through to its own preview path. This is the non-local F3 dispatch decision.
 fn s3_f3_routes_to_preview(location: &Location) -> bool {
-    matches!(location.provider_id(), ProviderId::Sftp | ProviderId::S3)
+    matches!(
+        location.provider_id(),
+        ProviderId::Sftp | ProviderId::S3 | ProviderId::Archive
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
