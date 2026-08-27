@@ -82,9 +82,7 @@ fn endpoint(
 
 fn fixture() -> Result<Option<Fixture>, AnyError> {
     if std::env::var("ARX_WEBDAV_COPY_PHYSICAL").as_deref() != Ok("1") {
-        eprintln!(
-            "skipping WebDAV Move physical matrix: ARX_WEBDAV_COPY_PHYSICAL=1 not set"
-        );
+        eprintln!("skipping WebDAV Move physical matrix: ARX_WEBDAV_COPY_PHYSICAL=1 not set");
         return Ok(None);
     }
     Ok(Some(Fixture {
@@ -183,7 +181,11 @@ async fn seed_one(provider: &WebDavProvider, root: &str) -> Result<(), AnyError>
     Ok(())
 }
 
-async fn seed_two(provider: &WebDavProvider, root: &str, locked_name: bool) -> Result<(), AnyError> {
+async fn seed_two(
+    provider: &WebDavProvider,
+    root: &str,
+    locked_name: bool,
+) -> Result<(), AnyError> {
     provider.mkdir(&format!("/{root}")).await?;
     put_new(provider, &format!("/{root}/a.txt"), b"a").await?;
     let second = if locked_name { "z-locked.txt" } else { "z.txt" };
@@ -200,10 +202,7 @@ async fn read_exact(provider: &WebDavProvider, path: &str) -> Result<Vec<u8>, An
 }
 
 async fn collection_exists(provider: &WebDavProvider, target: &str, path: &str) -> bool {
-    provider
-        .list_page(&dav(target, path), None)
-        .await
-        .is_ok()
+    provider.list_page(&dav(target, path), None).await.is_ok()
 }
 
 async fn file_exists(provider: &WebDavProvider, path: &str) -> bool {
@@ -220,9 +219,15 @@ async fn listed_named(
     name: &str,
 ) -> Result<ListedEntry, AnyError> {
     let page = registry.list_page(location, None).await?;
-    let mut found = page.entries.into_iter().filter(|row| row.entry.name == name);
+    let mut found = page
+        .entries
+        .into_iter()
+        .filter(|row| row.entry.name == name);
     let first = found.next().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, format!("missing listed root {name}"))
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("missing listed root {name}"),
+        )
     })?;
     if found.next().is_some() {
         return Err(io::Error::new(
@@ -232,7 +237,9 @@ async fn listed_named(
         .into());
     }
     if first.entry.kind != EntryKind::Directory {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Move root is not a directory").into());
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidData, "Move root is not a directory").into(),
+        );
     }
     Ok(first)
 }
@@ -290,7 +297,10 @@ async fn execute(
 }
 
 async fn assert_full_tree(provider: &WebDavProvider, root: &str) -> Result<(), AnyError> {
-    assert_eq!(read_exact(provider, &format!("/{root}/root.txt")).await?, b"root-bytes\n");
+    assert_eq!(
+        read_exact(provider, &format!("/{root}/root.txt")).await?,
+        b"root-bytes\n"
+    );
     assert_eq!(
         read_exact(provider, &format!("/{root}/nested/deep.bin")).await?,
         b"\x00\x01deep\xffbytes\n"
@@ -299,7 +309,14 @@ async fn assert_full_tree(provider: &WebDavProvider, root: &str) -> Result<(), A
         read_exact(provider, &format!("/{root}/unicodé space/zero.bin")).await?,
         b""
     );
-    assert!(collection_exists(provider, provider.target().id.as_str(), &format!("/{root}/empty")).await);
+    assert!(
+        collection_exists(
+            provider,
+            provider.target().id.as_str(),
+            &format!("/{root}/empty")
+        )
+        .await
+    );
     Ok(())
 }
 
@@ -307,9 +324,12 @@ async fn case_cross_target_success(f: &Fixture) -> Result<(), AnyError> {
     let root = format!("{} unicodé", token("cross"));
     seed_full(&f.a.provider, &root).await?;
     let registry = registry_for(&f.a, &f.b);
-    let (plan, names) = build_move_plan(&registry, dav(f.a.id, "/"), dav(f.b.id, "/"), &root).await?;
-    let WebDavTransferSpec::MoveTree { source, destination_root } =
-        plan.webdav_spec.as_ref().expect("MoveTree spec")
+    let (plan, names) =
+        build_move_plan(&registry, dav(f.a.id, "/"), dav(f.b.id, "/"), &root).await?;
+    let WebDavTransferSpec::MoveTree {
+        source,
+        destination_root,
+    } = plan.webdav_spec.as_ref().expect("MoveTree spec")
     else {
         unreachable!();
     };
@@ -334,7 +354,11 @@ async fn case_cross_target_success(f: &Fixture) -> Result<(), AnyError> {
     .await?;
     assert_eq!(outcome.completed, 14);
     assert_eq!(outcome.total, 14);
-    assert!(progress.iter().all(|sample| matches!(sample, TypedTransferProgress::Items { .. })));
+    assert!(
+        progress
+            .iter()
+            .all(|sample| matches!(sample, TypedTransferProgress::Items { .. }))
+    );
     assert_eq!(progress.last().map(|sample| sample.completed()), Some(14));
     assert!(!collection_exists(&f.a.provider, f.a.id, &format!("/{root}")).await);
     assert_full_tree(&f.b.provider, &root).await?;
@@ -374,7 +398,8 @@ async fn case_cancel_after_verified_copy(f: &Fixture) -> Result<(), AnyError> {
     let root = token("cancel-precommit");
     seed_one(&f.a.provider, &root).await?;
     let registry = registry_for(&f.a, &f.b);
-    let (plan, names) = build_move_plan(&registry, dav(f.a.id, "/"), dav(f.b.id, "/"), &root).await?;
+    let (plan, names) =
+        build_move_plan(&registry, dav(f.a.id, "/"), dav(f.b.id, "/"), &root).await?;
     let cancel = Arc::new(AtomicBool::new(false));
     let set_cancel = cancel.clone();
     let error = execute(
@@ -384,14 +409,23 @@ async fn case_cancel_after_verified_copy(f: &Fixture) -> Result<(), AnyError> {
         cancel,
         PauseGate::disabled(),
         move |progress| {
-            if matches!(progress, TypedTransferProgress::Items { completed: 2, total: Some(4) }) {
+            if matches!(
+                progress,
+                TypedTransferProgress::Items {
+                    completed: 2,
+                    total: Some(4)
+                }
+            ) {
                 set_cancel.store(true, Ordering::Release);
             }
         },
     )
     .await
     .expect_err("cancel after verified copy must not commit source delete");
-    assert!(matches!(error, TransferExecutionError::Cancelled { completed: 2 }));
+    assert!(matches!(
+        error,
+        TransferExecutionError::Cancelled { completed: 2 }
+    ));
     assert!(collection_exists(&f.a.provider, f.a.id, &format!("/{root}")).await);
     assert!(!collection_exists(&f.b.provider, f.b.id, &format!("/{root}")).await);
     cleanup(&f.a.provider, &format!("/{root}")).await;
@@ -439,13 +473,17 @@ async fn case_source_drift_before_delete(f: &Fixture) -> Result<(), AnyError> {
     let root = token("source-drift");
     seed_one(&f.a.provider, &root).await?;
     let registry = registry_for(&f.a, &f.b);
-    let (plan, names) = build_move_plan(&registry, dav(f.a.id, "/"), dav(f.b.id, "/"), &root).await?;
+    let (plan, names) =
+        build_move_plan(&registry, dav(f.a.id, "/"), dav(f.b.id, "/"), &root).await?;
     let (gate, signal, handle) = run_paused_after_verified_copy(registry, plan, names, 2).await;
-    signal.await.map_err(|_| io::Error::other("copy verification signal dropped"))?;
+    signal
+        .await
+        .map_err(|_| io::Error::other("copy verification signal dropped"))?;
     gate.wait_checkpoint().await;
     put_new(&f.a.provider, &format!("/{root}/late.txt"), b"late").await?;
     gate.resume();
-    let error = handle.await??.expect_err("source drift must abort before source DELETE");
+    let result = handle.await?;
+    let error = result.expect_err("source drift must abort before source DELETE");
     assert_eq!(error.retry_disposition(), RetryDisposition::NeverRetry);
     assert!(error.to_string().contains("source changed"));
     assert!(file_exists(&f.a.provider, &format!("/{root}/late.txt")).await);
@@ -458,14 +496,21 @@ async fn case_destination_drift_requires_recovery(f: &Fixture) -> Result<(), Any
     let root = token("destination-drift");
     seed_one(&f.a.provider, &root).await?;
     let registry = registry_for(&f.a, &f.b);
-    let (plan, names) = build_move_plan(&registry, dav(f.a.id, "/"), dav(f.b.id, "/"), &root).await?;
+    let (plan, names) =
+        build_move_plan(&registry, dav(f.a.id, "/"), dav(f.b.id, "/"), &root).await?;
     let (gate, signal, handle) = run_paused_after_verified_copy(registry, plan, names, 2).await;
-    signal.await.map_err(|_| io::Error::other("copy verification signal dropped"))?;
+    signal
+        .await
+        .map_err(|_| io::Error::other("copy verification signal dropped"))?;
     gate.wait_checkpoint().await;
     put_new(&f.b.provider, &format!("/{root}/intruder.txt"), b"intruder").await?;
     gate.resume();
-    let error = handle.await??.expect_err("destination drift must require recovery");
-    assert_eq!(error.retry_disposition(), RetryDisposition::RecoveryRequired);
+    let result = handle.await?;
+    let error = result.expect_err("destination drift must require recovery");
+    assert_eq!(
+        error.retry_disposition(),
+        RetryDisposition::RecoveryRequired
+    );
     assert!(collection_exists(&f.a.provider, f.a.id, &format!("/{root}")).await);
     assert!(file_exists(&f.b.provider, &format!("/{root}/intruder.txt")).await);
     cleanup(&f.a.provider, &format!("/{root}")).await;
@@ -501,7 +546,9 @@ async fn lock_resource(endpoint: &Endpoint, path: &str) -> Result<String, AnyErr
         .send()
         .await?;
     if response.status() != reqwest::StatusCode::OK {
-        return Err(io::Error::other(format!("LOCK expected 200, got {}", response.status())).into());
+        return Err(
+            io::Error::other(format!("LOCK expected 200, got {}", response.status())).into(),
+        );
     }
     Ok(response
         .headers()
@@ -522,7 +569,9 @@ async fn unlock_resource(endpoint: &Endpoint, path: &str, token: &str) -> Result
         .send()
         .await?;
     if response.status() != reqwest::StatusCode::NO_CONTENT {
-        return Err(io::Error::other(format!("UNLOCK expected 204, got {}", response.status())).into());
+        return Err(
+            io::Error::other(format!("UNLOCK expected 204, got {}", response.status())).into(),
+        );
     }
     Ok(())
 }
@@ -533,7 +582,8 @@ async fn case_definitive_late_delete_failure(f: &Fixture) -> Result<(), AnyError
     let locked_path = format!("/{root}/z-locked.txt");
     let lock_token = lock_resource(&f.a, &locked_path).await?;
     let registry = registry_for(&f.a, &f.b);
-    let (plan, names) = build_move_plan(&registry, dav(f.a.id, "/"), dav(f.b.id, "/"), &root).await?;
+    let (plan, names) =
+        build_move_plan(&registry, dav(f.a.id, "/"), dav(f.b.id, "/"), &root).await?;
     let error = execute(
         &registry,
         &plan,
@@ -676,7 +726,8 @@ async fn case_ambiguous_late_delete_recovery(f: &Fixture) -> Result<(), AnyError
     seed_two(&f.a.provider, &root, false).await?;
     let proxy = start_ambiguous_second_delete_proxy(&f.a.url).await?;
     let registry = registry_for_urls(&f.a, proxy.listen_addr.clone(), &f.b, f.b.url.clone());
-    let (plan, names) = build_move_plan(&registry, dav(f.a.id, "/"), dav(f.b.id, "/"), &root).await?;
+    let (plan, names) =
+        build_move_plan(&registry, dav(f.a.id, "/"), dav(f.b.id, "/"), &root).await?;
     let error = execute(
         &registry,
         &plan,
@@ -687,10 +738,19 @@ async fn case_ambiguous_late_delete_recovery(f: &Fixture) -> Result<(), AnyError
     )
     .await
     .expect_err("lost second DELETE response must require recovery");
-    assert_eq!(error.retry_disposition(), RetryDisposition::RecoveryRequired);
+    assert_eq!(
+        error.retry_disposition(),
+        RetryDisposition::RecoveryRequired
+    );
     let record = proxy.record.lock().await;
-    assert_eq!(record.delete_count, 2, "ambiguous DELETE must not replay or continue to root");
-    assert!(record.apache_response_seen, "real Apache must have processed the ambiguous DELETE");
+    assert_eq!(
+        record.delete_count, 2,
+        "ambiguous DELETE must not replay or continue to root"
+    );
+    assert!(
+        record.apache_response_seen,
+        "real Apache must have processed the ambiguous DELETE"
+    );
     drop(record);
     assert!(collection_exists(&f.a.provider, f.a.id, &format!("/{root}")).await);
     assert!(file_exists(&f.b.provider, &format!("/{root}/a.txt")).await);
@@ -704,7 +764,8 @@ async fn case_cancel_after_source_commit_starts(f: &Fixture) -> Result<(), AnyEr
     let root = token("cancel-partial");
     seed_two(&f.a.provider, &root, false).await?;
     let registry = registry_for(&f.a, &f.b);
-    let (plan, names) = build_move_plan(&registry, dav(f.a.id, "/"), dav(f.b.id, "/"), &root).await?;
+    let (plan, names) =
+        build_move_plan(&registry, dav(f.a.id, "/"), dav(f.b.id, "/"), &root).await?;
     let cancel = Arc::new(AtomicBool::new(false));
     let set_cancel = cancel.clone();
     let error = execute(
@@ -714,7 +775,13 @@ async fn case_cancel_after_source_commit_starts(f: &Fixture) -> Result<(), AnyEr
         cancel,
         PauseGate::disabled(),
         move |progress| {
-            if matches!(progress, TypedTransferProgress::Items { completed: 4, total: Some(6) }) {
+            if matches!(
+                progress,
+                TypedTransferProgress::Items {
+                    completed: 4,
+                    total: Some(6)
+                }
+            ) {
                 set_cancel.store(true, Ordering::Release);
             }
         },
@@ -726,7 +793,10 @@ async fn case_cancel_after_source_commit_starts(f: &Fixture) -> Result<(), AnyEr
     assert!(collection_exists(&f.a.provider, f.a.id, &format!("/{root}")).await);
     let remaining = file_exists(&f.a.provider, &format!("/{root}/a.txt")).await as usize
         + file_exists(&f.a.provider, &format!("/{root}/z.txt")).await as usize;
-    assert_eq!(remaining, 1, "exactly one source child must remain after cancel");
+    assert_eq!(
+        remaining, 1,
+        "exactly one source child must remain after cancel"
+    );
     assert!(file_exists(&f.b.provider, &format!("/{root}/a.txt")).await);
     assert!(file_exists(&f.b.provider, &format!("/{root}/z.txt")).await);
     cleanup(&f.a.provider, &format!("/{root}")).await;
