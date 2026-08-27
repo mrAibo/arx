@@ -485,7 +485,14 @@ async fn case_source_drift_before_delete(f: &Fixture) -> Result<(), AnyError> {
     let result = handle.await?;
     let error = result.expect_err("source drift must abort before source DELETE");
     assert_eq!(error.retry_disposition(), RetryDisposition::NeverRetry);
-    assert!(error.to_string().contains("source changed"));
+    assert!(
+        error.to_string().contains("source tree changed"),
+        "source drift must be reported factually: {error}"
+    );
+    assert!(
+        file_exists(&f.a.provider, &format!("/{root}/a.txt")).await,
+        "original source child must remain: source DELETE must not start"
+    );
     assert!(file_exists(&f.a.provider, &format!("/{root}/late.txt")).await);
     assert!(!collection_exists(&f.b.provider, f.b.id, &format!("/{root}")).await);
     cleanup(&f.a.provider, &format!("/{root}")).await;

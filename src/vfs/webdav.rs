@@ -1309,11 +1309,28 @@ fn raw_path_from_absolute_href(href: &str) -> io::Result<&str> {
 fn canonical_url_identity(url: &url::Url) -> String {
     let mut canonical = url.clone();
     canonical.set_fragment(None);
-    // A collection trailing slash is presentation-equivalent for cycle/self
-    // detection, while a legitimate query remains part of remote identity.
-    let path = canonical.path().trim_end_matches('/').to_string();
+    // URI percent-escape hex digits are case-insensitive. Servers such as
+    // Apache mod_dav may return `%c3%a9` for a request sent as `%C3%A9`.
+    // Normalize ONLY valid escape hex case: never percent-decode path bytes,
+    // never collapse separators, and keep the query as remote identity.
+    let path = normalize_percent_escape_hex_case(canonical.path().trim_end_matches('/'));
     canonical.set_path(&path);
     canonical.to_string()
+}
+
+fn normalize_percent_escape_hex_case(path: &str) -> String {
+    let mut bytes = path.as_bytes().to_vec();
+    let mut index = 0usize;
+    while index + 2 < bytes.len() {
+        if bytes[index] == b'%' && is_hex(bytes[index + 1]) && is_hex(bytes[index + 2]) {
+            bytes[index + 1].make_ascii_uppercase();
+            bytes[index + 2].make_ascii_uppercase();
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    String::from_utf8(bytes).expect("normalizing ASCII percent-escape digits preserves UTF-8")
 }
 
 /// Prove a Depth:1 result is one direct child by canonical WIRE URL path.
@@ -2007,6 +2024,31 @@ mod tests {
         assert_eq!(
             bare.write_logical_url("/f.txt").unwrap(),
             "http://host/f.txt"
+        );
+    }
+
+    #[test]
+    fn canonical_url_identity_normalizes_only_percent_escape_hex_case() {
+        let upper = url::Url::parse("http://example/dav/unicod%C3%A9/").unwrap();
+        let lower = url::Url::parse("http://example/dav/unicod%c3%a9/").unwrap();
+        assert_eq!(
+            canonical_url_identity(&upper),
+            canonical_url_identity(&lower)
+        );
+
+        let encoded_a = url::Url::parse("http://example/dav/%41").unwrap();
+        let literal_a = url::Url::parse("http://example/dav/A").unwrap();
+        assert_ne!(
+            canonical_url_identity(&encoded_a),
+            canonical_url_identity(&literal_a),
+            "canonical matching must not percent-decode path bytes"
+        );
+
+        let query_one = url::Url::parse("http://example/dav/a%20b?version=1").unwrap();
+        let query_two = url::Url::parse("http://example/dav/a%20b?version=2").unwrap();
+        assert_ne!(
+            canonical_url_identity(&query_one),
+            canonical_url_identity(&query_two)
         );
     }
 
