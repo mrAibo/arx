@@ -313,8 +313,6 @@ mod tests {
         );
 
         let entries = ArchiveFs::list(&archive, "").unwrap();
-        assert!(entries
-            .iter()
-            .any(|e| e.name == "file with spaces.txt"));
+        assert!(entries.iter().any(|e| e.name == "file with spaces.txt"));
     }
 }
