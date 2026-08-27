@@ -1,0 +1,80 @@
+name: Temporary publish v0.25.0 binary mirror
+
+on:
+  push:
+    branches:
+      - chore/publish-bin-v0.25.0
+    paths:
+      - '.github/workflows/temp-publish-bin-v025.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  publish-bin:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify immutable release and main baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main --tags
+          test "$(git rev-parse origin/main)" = "c73dc0bab192503b7e9e21805209409586a29664"
+          test "$(git rev-list -n1 v0.25.0)" = "068d360abed853f1c6b05d8bf7a529c6b8cdfdb5"
+
+      - name: Download and verify published v0.25.0 binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          curl -fsSL -o "$work/arx.tar.gz" \
+            https://github.com/mrAibo/arx/releases/download/v0.25.0/arx-v0.25.0-x86_64-unknown-linux-gnu.tar.gz
+          curl -fsSL -o "$work/SHA256SUMS" \
+            https://github.com/mrAibo/arx/releases/download/v0.25.0/SHA256SUMS
+          expected="$(awk '$2=="arx-v0.25.0-x86_64-unknown-linux-gnu.tar.gz" {print $1}' "$work/SHA256SUMS")"
+          test -n "$expected"
+          actual="$(sha256sum "$work/arx.tar.gz" | awk '{print $1}')"
+          test "$actual" = "$expected"
+          tar -xzf "$work/arx.tar.gz" -C "$work"
+          src="$work/arx-v0.25.0-x86_64-unknown-linux-gnu/arx"
+          test -x "$src"
+          test "$($src --version)" = "arx 0.25.0"
+          mkdir -p bin
+          install -m 0755 "$src" bin/arx
+          test "$(bin/arx --version)" = "arx 0.25.0"
+
+      - name: Allow only the published binary under bin
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.gitignore')
+          s = p.read_text()
+          old = '/bin/\n'
+          new = '/bin/*\n!/bin/arx\n'
+          if s.count(old) != 1:
+              raise SystemExit(f'expected exactly one {old!r}, found {s.count(old)}')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+      - name: Commit only final binary mirror changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/temp-publish-bin-v025.yml
+          git status --short
+          changed="$(git status --short | awk '{print $2}' | sort)"
+          expected="$(printf '%s\n' .gitignore .github/workflows/temp-publish-bin-v025.yml bin/arx | sort)"
+          test "$changed" = "$expected"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .gitignore bin/arx
+          git add -u .github/workflows/temp-publish-bin-v025.yml
+          git commit -m "chore: mirror v0.25.0 release binary"
+          git push origin HEAD:chore/publish-bin-v0.25.0
