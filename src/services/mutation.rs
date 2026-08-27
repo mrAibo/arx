@@ -1,3 +1,4 @@
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -5,10 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::vfs::local::LocalFs;
 use crate::vfs::webdav::{ExactDeleteError, WebDavProvider};
 use crate::vfs::{
-    EntryIdentity, EntryKind, ListedEntry, Location, MAX_WEBDAV_TREE_DEPTH,
-    MAX_WEBDAV_TREE_DESCENDANTS, WebDavCollectionRef, WebDavObjectRef,
+    EntryIdentity, MAX_WEBDAV_TREE_DEPTH, MAX_WEBDAV_TREE_DESCENDANTS, WebDavCollectionRef,
+    WebDavObjectRef,
 };
-use std::collections::{HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MutationProgress {
@@ -30,54 +30,6 @@ pub enum MutationError {
     Worker(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WebDavRecursiveDeletePlan {
-    pub source: WebDavCollectionRef,
-    pub presentation_name: String,
-    pub created_at: std::time::Instant,
-}
-
-pub fn prepare_webdav_recursive_delete(
-    location: &Location,
-    selected_names: &[String],
-    focused: Option<&ListedEntry>,
-    active: &[&ListedEntry],
-) -> Result<WebDavRecursiveDeletePlan, String> {
-    let Location::WebDav { target, .. } = location else {
-        return Err("WebDAV recursive delete requires an active WebDAV location".into());
-    };
-    if selected_names.len() > 1 {
-        return Err("WebDAV recursive delete supports exactly one collection".into());
-    }
-    let listed = if let Some(name) = selected_names.first() {
-        let matches: Vec<_> = active
-            .iter()
-            .filter(|entry| entry.entry.name == *name)
-            .copied()
-            .collect();
-        if matches.len() != 1 {
-            return Err("Selection is stale or ambiguous".into());
-        }
-        matches[0]
-    } else {
-        focused.ok_or_else(|| "Focus a WebDAV collection to delete".to_string())?
-    };
-    if listed.entry.kind != EntryKind::Directory {
-        return Err("WebDAV recursive delete requires a collection".into());
-    }
-    let EntryIdentity::WebDavCollection(source) = &listed.identity else {
-        return Err("Focused row has no exact WebDAV collection identity".into());
-    };
-    if source.target != *target {
-        return Err("WebDAV collection target does not match active target".into());
-    }
-    Ok(WebDavRecursiveDeletePlan {
-        source: source.clone(),
-        presentation_name: listed.entry.name.clone(),
-        created_at: std::time::Instant::now(),
-    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,85 +315,6 @@ impl MutationService {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn webdav_delete_selection_is_exact_and_fail_closed() {
-        let loc = Location::WebDav {
-            target: "t".into(),
-            path: "/".into(),
-        };
-        let row = ListedEntry {
-            entry: crate::vfs::Entry {
-                name: "dir".into(),
-                kind: EntryKind::Directory,
-                size: None,
-                modified_unix_ms: None,
-            },
-            identity: EntryIdentity::WebDavCollection(WebDavCollectionRef {
-                target: "t".into(),
-                href: "/dav/raw%20dir/?v=1".into(),
-            }),
-        };
-        let other = ListedEntry {
-            entry: crate::vfs::Entry {
-                name: "other".into(),
-                kind: EntryKind::Directory,
-                size: None,
-                modified_unix_ms: None,
-            },
-            identity: EntryIdentity::WebDavCollection(WebDavCollectionRef {
-                target: "t".into(),
-                href: "/dav/other/".into(),
-            }),
-        };
-        let plan = prepare_webdav_recursive_delete(&loc, &[], Some(&row), &[&row, &other]).unwrap();
-        assert_eq!(plan.source.href, "/dav/raw%20dir/?v=1");
-        let selected = vec!["other".to_string()];
-        assert_eq!(
-            prepare_webdav_recursive_delete(&loc, &selected, Some(&row), &[&row, &other])
-                .unwrap()
-                .source
-                .href,
-            "/dav/other/"
-        );
-        assert!(
-            prepare_webdav_recursive_delete(&loc, &["stale".into()], Some(&row), &[&row]).is_err()
-        );
-        assert!(
-            prepare_webdav_recursive_delete(&loc, &["dir".into()], Some(&row), &[&row, &row])
-                .is_err()
-        );
-        assert!(
-            prepare_webdav_recursive_delete(
-                &loc,
-                &["dir".into(), "other".into()],
-                Some(&row),
-                &[&row, &other]
-            )
-            .is_err()
-        );
-        let file = ListedEntry {
-            entry: crate::vfs::Entry {
-                name: "f".into(),
-                kind: EntryKind::File,
-                size: None,
-                modified_unix_ms: None,
-            },
-            identity: EntryIdentity::WebDavObject(WebDavObjectRef {
-                target: "t".into(),
-                href: "/dav/f".into(),
-            }),
-        };
-        assert!(prepare_webdav_recursive_delete(&loc, &[], Some(&file), &[&file]).is_err());
-        let mismatch = ListedEntry {
-            identity: EntryIdentity::WebDavCollection(WebDavCollectionRef {
-                target: "x".into(),
-                href: "/dav/x/".into(),
-            }),
-            ..row.clone()
-        };
-        assert!(prepare_webdav_recursive_delete(&loc, &[], Some(&mismatch), &[&mismatch]).is_err());
-    }
 
     #[tokio::test]
     async fn pre_cancelled_trash_preserves_source() {
