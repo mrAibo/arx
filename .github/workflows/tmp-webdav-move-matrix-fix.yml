@@ -1,0 +1,63 @@
+name: TEMP WebDAV Move Matrix Fix
+
+on:
+  push:
+    branches:
+      - feature/webdav-verified-move
+    paths:
+      - '.github/workflows/tmp-webdav-move-matrix-fix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix-format-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Apply narrow compile fix and format
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tests/webdav_move_physical.rs')
+          s = p.read_text()
+          old1 = 'let error = handle.await??.expect_err("source drift must abort before source DELETE");'
+          new1 = 'let result = handle.await?;\n    let error = result.expect_err("source drift must abort before source DELETE");'
+          old2 = 'let error = handle.await??.expect_err("destination drift must require recovery");'
+          new2 = 'let result = handle.await?;\n    let error = result.expect_err("destination drift must require recovery");'
+          if s.count(old1) != 1 or s.count(old2) != 1:
+              raise SystemExit('expected JoinHandle error sites not found exactly once')
+          p.write_text(s.replace(old1, new1).replace(old2, new2))
+          PY
+          cargo fmt
+          unexpected="$(git diff --name-only | grep -vE '^tests/webdav_move_physical\.rs$' || true)"
+          if [[ -n "$unexpected" ]]; then
+            echo "unexpected changed paths:" >&2
+            echo "$unexpected" >&2
+            exit 1
+          fi
+          git diff --check
+      - name: Compile targeted physical test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --test webdav_move_physical --features physical-webdav -- -D warnings
+          cargo test --locked --test webdav_move_physical --features physical-webdav --no-run
+      - name: Commit only the matrix fix and self-remove
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tests/webdav_move_physical.rs
+          git rm .github/workflows/tmp-webdav-move-matrix-fix.yml
+          git commit -m 'test: format and compile WebDAV move matrix'
+          git push origin HEAD:refs/heads/feature/webdav-verified-move
