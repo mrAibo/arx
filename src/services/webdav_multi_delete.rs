@@ -211,15 +211,18 @@ impl MutationService {
                         provider.delete_object_exact(object).await
                     }
                     WebDavDeleteIdentity::Collection(collection) => {
-                        let children = provider
-                            .list_collection_exact(collection)
-                            .await
-                            .map_err(|error| batch_definitive_failure(
-                                completed,
-                                total,
-                                &exact_identity,
-                                &error.to_string(),
-                            ))?;
+                        let children =
+                            provider
+                                .list_collection_exact(collection)
+                                .await
+                                .map_err(|error| {
+                                    batch_definitive_failure(
+                                        completed,
+                                        total,
+                                        &exact_identity,
+                                        &error.to_string(),
+                                    )
+                                })?;
                         if !children.is_empty() {
                             return Err(batch_definitive_failure(
                                 completed,
@@ -302,11 +305,11 @@ impl MutationService {
                 }
             }
 
-            total = total
-                .checked_add(1 + manifest.nodes.len())
-                .ok_or_else(|| WebDavDeleteError::PreMutation {
+            total = total.checked_add(1 + manifest.nodes.len()).ok_or_else(|| {
+                WebDavDeleteError::PreMutation {
                     reason: "WebDAV delete batch item count overflow".into(),
-                })?;
+                }
+            })?;
             if total > MAX_WEBDAV_TREE_DESCENDANTS {
                 return Err(WebDavDeleteError::PreMutation {
                     reason: "WebDAV multi-root delete exceeds 50000 planned items".into(),
@@ -415,34 +418,42 @@ mod tests {
         .unwrap();
         assert_eq!(plan.sources.len(), 2);
 
-        assert!(prepare_webdav_recursive_delete_batch(
-            &location,
-            &["missing".into()],
-            Some(&alpha),
-            &[&alpha, &beta],
-        )
-        .is_err());
-        assert!(prepare_webdav_recursive_delete_batch(
-            &location,
-            &["beta".into()],
-            Some(&alpha),
-            &[&beta, &duplicate_beta],
-        )
-        .is_err());
-        assert!(prepare_webdav_recursive_delete_batch(
-            &location,
-            &["alpha".into(), "file".into()],
-            Some(&alpha),
-            &[&alpha, &file],
-        )
-        .is_err());
-        assert!(prepare_webdav_recursive_delete_batch(
-            &location,
-            &["alpha".into(), "wrong".into()],
-            Some(&alpha),
-            &[&alpha, &wrong_target],
-        )
-        .is_err());
+        assert!(
+            prepare_webdav_recursive_delete_batch(
+                &location,
+                &["missing".into()],
+                Some(&alpha),
+                &[&alpha, &beta],
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_webdav_recursive_delete_batch(
+                &location,
+                &["beta".into()],
+                Some(&alpha),
+                &[&beta, &duplicate_beta],
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_webdav_recursive_delete_batch(
+                &location,
+                &["alpha".into(), "file".into()],
+                Some(&alpha),
+                &[&alpha, &file],
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_webdav_recursive_delete_batch(
+                &location,
+                &["alpha".into(), "wrong".into()],
+                Some(&alpha),
+                &[&alpha, &wrong_target],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -453,12 +464,14 @@ mod tests {
         };
         let alpha = collection("alpha", "t", "/dav/alpha/");
         let beta = collection("beta", "t", "/dav/beta/");
-        assert!(prepare_webdav_recursive_delete(
-            &location,
-            &["alpha".into(), "beta".into()],
-            Some(&alpha),
-            &[&alpha, &beta],
-        )
-        .is_err());
+        assert!(
+            prepare_webdav_recursive_delete(
+                &location,
+                &["alpha".into(), "beta".into()],
+                Some(&alpha),
+                &[&alpha, &beta],
+            )
+            .is_err()
+        );
     }
 }
