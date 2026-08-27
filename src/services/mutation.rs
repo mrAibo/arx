@@ -178,26 +178,40 @@ impl MutationService {
         })
     }
 
-    pub async fn delete_webdav_tree(
+    /// Delete exactly a previously frozen WebDAV tree snapshot.
+    ///
+    /// The current tree is rebuilt immediately before the first DELETE and must
+    /// still equal `frozen`. This seam is intentionally public so a higher-level
+    /// transaction (for example copy -> verify -> delete-source Move) can commit
+    /// the exact snapshot it copied instead of silently freezing newer content.
+    pub async fn delete_webdav_tree_from_frozen_manifest(
         provider: Arc<WebDavProvider>,
-        root: WebDavCollectionRef,
+        frozen: WebDavDeleteManifest,
         cancel: Arc<AtomicBool>,
         mut on_progress: impl FnMut(MutationProgress),
     ) -> Result<WebDavDeleteOutcome, WebDavDeleteError> {
-        let frozen = Self::build_webdav_delete_manifest(&provider, &root).await?;
+        let total = 1 + frozen.nodes.len();
         if cancel.load(Ordering::Acquire) {
             return Err(WebDavDeleteError::Cancelled {
                 completed: 0,
-                total: 1 + frozen.nodes.len(),
+                total,
             });
         }
+
+        let root = frozen.root.clone();
         let fresh = Self::build_webdav_delete_manifest(&provider, &root).await?;
         if fresh != frozen {
             return Err(WebDavDeleteError::PreMutation {
-                reason: "WebDAV tree changed after confirmation".into(),
+                reason: "WebDAV tree changed after manifest freeze".into(),
             });
         }
-        let total = 1 + frozen.nodes.len();
+        if cancel.load(Ordering::Acquire) {
+            return Err(WebDavDeleteError::Cancelled {
+                completed: 0,
+                total,
+            });
+        }
+
         let mut completed = 0usize;
         let mut ordered = frozen.nodes;
         ordered.push(WebDavDeleteNode {
@@ -280,6 +294,16 @@ impl MutationService {
             }
         }
         Ok(WebDavDeleteOutcome { completed, total })
+    }
+
+    pub async fn delete_webdav_tree(
+        provider: Arc<WebDavProvider>,
+        root: WebDavCollectionRef,
+        cancel: Arc<AtomicBool>,
+        on_progress: impl FnMut(MutationProgress),
+    ) -> Result<WebDavDeleteOutcome, WebDavDeleteError> {
+        let frozen = Self::build_webdav_delete_manifest(&provider, &root).await?;
+        Self::delete_webdav_tree_from_frozen_manifest(provider, frozen, cancel, on_progress).await
     }
 
     /// Move local items to Trash without blocking the TUI.
