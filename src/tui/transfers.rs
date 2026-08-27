@@ -193,26 +193,65 @@ pub(super) fn handle_action(
             true
         }
         Action::Move => {
-            let names: Vec<String> = state
+            let selected_names: Vec<String> = state
                 .selection_names(state.active, &state.active_pane().location)
                 .map(|names| names.iter().cloned().collect())
-                .or_else(|| focused.map(|entry| vec![entry.name.clone()]))
                 .unwrap_or_default();
+            let mut names: Vec<String> = if selected_names.is_empty() {
+                focused
+                    .map(|entry| vec![entry.name.clone()])
+                    .unwrap_or_default()
+            } else {
+                selected_names.clone()
+            };
             if names.is_empty() {
                 state.message = Some("Select a file or directory to move".into());
                 return true;
             }
-            // S3 move not supported — no destructive S3 move.
-            if state.active_pane().location.provider_id() == ProviderId::S3
-                || state.other_pane().location.provider_id() == ProviderId::S3
-            {
-                state.message = Some("S3 move not supported (use copy)".into());
-                return true;
-            }
+
             let src_loc = state.active_pane().location.clone();
             let dst_loc = state.other_pane().location.clone();
             let src_provider = src_loc.provider_id();
             let dst_provider = dst_loc.provider_id();
+
+            // S3 move remains unsupported — no destructive S3 transaction.
+            if src_provider == ProviderId::S3 || dst_provider == ProviderId::S3 {
+                state.message = Some("S3 move not supported (use copy)".into());
+                return true;
+            }
+
+            // F6 WebDAV Move freezes source identity ONLY from current ACTIVE
+            // listed rows. The passive pane contributes Location only. Any mixed
+            // Local/WebDAV shape remains fail-closed in this slice.
+            let webdav_spec: Option<arx::transfer::WebDavTransferSpec> =
+                if src_provider == ProviderId::WebDAV || dst_provider == ProviderId::WebDAV {
+                    if src_provider != ProviderId::WebDAV || dst_provider != ProviderId::WebDAV {
+                        state.message = Some(
+                            "WebDAV move currently requires WebDAV source and destination panes"
+                                .into(),
+                        );
+                        return true;
+                    }
+                    match arx::transfer::webdav_move::prepare_webdav_move_tree(
+                        &src_loc,
+                        &dst_loc,
+                        &selected_names,
+                        focused_listed,
+                        active_listed,
+                    ) {
+                        Ok((spec, queue_name)) => {
+                            names = vec![queue_name];
+                            Some(spec)
+                        }
+                        Err(msg) => {
+                            state.message = Some(msg);
+                            return true;
+                        }
+                    }
+                } else {
+                    None
+                };
+
             // PACK Q1: capability truth from the exact Locations.
             let src_caps = state
                 .registry
@@ -222,8 +261,11 @@ pub(super) fn handle_action(
                 .registry
                 .capabilities_for_location(&dst_loc)
                 .unwrap_or_default();
-            let executors =
+            let mut executors =
                 arx::transfer::probe::local_executors(arx::transfer::probe::detect_local_tools());
+            if webdav_spec.is_some() {
+                executors.webdav = true;
+            }
             let request = arx::transfer::TransferRequest {
                 source: src_loc.clone(),
                 destination: dst_loc.clone(),
@@ -235,7 +277,7 @@ pub(super) fn handle_action(
                 executors,
                 delete_extraneous: false,
                 s3_spec: None,
-                webdav_spec: None,
+                webdav_spec,
             };
             let plan = match arx::transfer::TransferPlanner::plan(request) {
                 Ok(p) => p,
@@ -486,6 +528,53 @@ mod tests {
             1,
             "one batch selection = one job"
         );
+    }
+
+    #[tokio::test]
+    async fn webdav_move_dispatch_queues_one_transaction_job() {
+        let registry = ProviderRegistry::new();
+        let sync = sync_runtime(registry.clone());
+        let mut state = AppState {
+            registry,
+            ..AppState::default()
+        };
+        state.left.location = Location::WebDav {
+            target: "src".into(),
+            path: "/active/".into(),
+        };
+        state.right.location = Location::WebDav {
+            target: "dst".into(),
+            path: "/archive/".into(),
+        };
+        state.active = Pane::Left;
+        let source = ListedEntry {
+            entry: Entry {
+                name: "tree".into(),
+                kind: EntryKind::Directory,
+                size: None,
+                modified_unix_ms: None,
+            },
+            identity: EntryIdentity::WebDavCollection(arx::vfs::WebDavCollectionRef {
+                target: "src".into(),
+                href: "/native/tree%20exact/?rev=4".into(),
+            }),
+        };
+
+        assert!(handle_action(
+            &mut state,
+            &Action::Move,
+            Some(&source.entry),
+            Some(&source),
+            None,
+            &[&source],
+            &sync,
+        ));
+        let message = state.message.as_deref().expect("queue confirmation");
+        assert!(
+            message.starts_with("Move queued ("),
+            "unexpected message: {message}"
+        );
+        assert_eq!(sync.jobs.snapshot().len(), 1, "one MoveTree = one job");
     }
 
     fn sync_runtime(registry: ProviderRegistry) -> SyncUiRuntime {
