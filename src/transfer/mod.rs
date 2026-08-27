@@ -8,6 +8,7 @@ pub mod s3_download;
 pub mod s3_multipart;
 pub mod s3_upload;
 pub mod webdav_batch;
+pub mod webdav_move;
 pub mod webdav_transfer;
 
 pub use self::executor::TransferOutcome;
@@ -163,6 +164,13 @@ pub enum WebDavTransferSpec {
         source: crate::vfs::WebDavCollectionRef,
         destination_root: WebDavWriteTarget,
     },
+    /// One exact WebDAV collection moved through the explicit
+    /// copy -> verify -> delete-frozen-source transaction. This is never a
+    /// server-side recursive MOVE alias.
+    MoveTree {
+        source: crate::vfs::WebDavCollectionRef,
+        destination_root: WebDavWriteTarget,
+    },
     /// Two or more frozen sibling roots executed sequentially through the
     /// existing WebDAV executor and one concrete provider authority.
     Batch {
@@ -181,7 +189,7 @@ impl WebDavTransferSpec {
             } => &destination_root.target,
             Self::DownloadOne { source, .. } => &source.target,
             Self::DownloadTree { source, .. } => &source.target,
-            Self::CopyTree { source, .. } => &source.target,
+            Self::CopyTree { source, .. } | Self::MoveTree { source, .. } => &source.target,
             Self::Batch { target, .. } => target,
         }
     }
@@ -343,22 +351,27 @@ impl TransferPlanner {
             )
     }
 
-    /// WebDAV Copy supports the existing Local<->WebDAV shapes plus one
-    /// frozen WebDAV->WebDAV recursive collection spec. Move/Synchronize stay
-    /// fail-closed.
+    /// WebDAV supports the existing Local<->WebDAV Copy shapes, exact
+    /// WebDAV->WebDAV CopyTree, and exact WebDAV->WebDAV MoveTree. Destructive
+    /// Move never falls back to CopyTree or generic provider-native Move.
     fn is_webdav_pair(request: &TransferRequest) -> bool {
-        if request.intent != TransferIntent::Copy {
-            return false;
-        }
-        match (request.source_provider, request.destination_provider) {
-            (ProviderId::Local, ProviderId::WebDAV) | (ProviderId::WebDAV, ProviderId::Local) => {
-                true
+        match request.intent {
+            TransferIntent::Copy => match (request.source_provider, request.destination_provider) {
+                (ProviderId::Local, ProviderId::WebDAV)
+                | (ProviderId::WebDAV, ProviderId::Local) => true,
+                (ProviderId::WebDAV, ProviderId::WebDAV) => matches!(
+                    request.webdav_spec,
+                    Some(WebDavTransferSpec::CopyTree { .. })
+                ),
+                _ => false,
+            },
+            TransferIntent::Move => {
+                matches!(
+                    (request.source_provider, request.destination_provider),
+                    (ProviderId::WebDAV, ProviderId::WebDAV)
+                ) && matches!(request.webdav_spec, Some(WebDavTransferSpec::MoveTree { .. }))
             }
-            (ProviderId::WebDAV, ProviderId::WebDAV) => matches!(
-                request.webdav_spec,
-                Some(WebDavTransferSpec::CopyTree { .. })
-            ),
-            _ => false,
+            TransferIntent::Synchronize => false,
         }
     }
 
@@ -762,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn webdav_remote_copy_requires_frozen_copy_tree_and_rejects_move() {
+    fn webdav_remote_copy_and_move_require_matching_frozen_specs() {
         let source = crate::vfs::WebDavCollectionRef {
             target: "dav-a".into(),
             href: "/dav/source/".into(),
@@ -795,8 +808,8 @@ mod tests {
             delete_extraneous: false,
             s3_spec: None,
             webdav_spec: Some(WebDavTransferSpec::CopyTree {
-                source,
-                destination_root,
+                source: source.clone(),
+                destination_root: destination_root.clone(),
             }),
         };
         assert_eq!(
@@ -806,9 +819,23 @@ mod tests {
         let mut without_spec = base.clone();
         without_spec.webdav_spec = None;
         assert!(TransferPlanner::plan(without_spec).is_err());
-        let mut moved = base;
-        moved.intent = TransferIntent::Move;
-        assert!(TransferPlanner::plan(moved).is_err());
+
+        let mut moved_with_copy = base.clone();
+        moved_with_copy.intent = TransferIntent::Move;
+        assert!(TransferPlanner::plan(moved_with_copy).is_err());
+
+        let mut move_request = base.clone();
+        move_request.intent = TransferIntent::Move;
+        move_request.webdav_spec = Some(WebDavTransferSpec::MoveTree {
+            source,
+            destination_root,
+        });
+        assert_eq!(
+            TransferPlanner::plan(move_request.clone()).unwrap().method,
+            TransferMethod::WebDav
+        );
+        move_request.intent = TransferIntent::Copy;
+        assert!(TransferPlanner::plan(move_request).is_err());
     }
 
     #[test]
