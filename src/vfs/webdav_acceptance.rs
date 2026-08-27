@@ -31,9 +31,8 @@
 
 #![cfg(feature = "physical-webdav")]
 
-// Test-only TCP proxy for W15/W17/W18 (fault injection front of real Apache).
-#[path = "webdav_acceptance_proxy.rs"]
-mod webdav_acceptance_proxy;
+// Test-only TCP proxy for W15/W17/W18 is shared from the parent vfs test module.
+use super::webdav_acceptance_proxy;
 
 use super::webdav::{WebDavProvider, WebDavTarget};
 use crate::transfer::{ExecutorAvailability, TransferIntent, TransferPlanner, TransferRequest};

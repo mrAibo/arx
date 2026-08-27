@@ -11,6 +11,8 @@
 //!   AmbiguousPut      — forward the complete PUT by Content-Length, observe
 //!                       Apache's response head (confirm server completed), then
 //!                       discard it and close the ARX side.
+//!   AmbiguousPutDropDelete — same ambiguous PUT, then drop the cleanup DELETE
+//!                       before it reaches Apache to prove RecoveryRequired.
 //!
 //! ponytail: test infra only, compiled under `physical-webdav`. Not a product.
 
@@ -26,6 +28,7 @@ pub enum ProxyMode {
     PassThroughRecord,
     DropGetBody,
     AmbiguousPut,
+    AmbiguousPutDropDelete,
 }
 
 pub struct ProxyRecord {
@@ -33,6 +36,7 @@ pub struct ProxyRecord {
     pub get_count: usize,
     pub head_count: usize,
     pub propfind_count: usize,
+    pub delete_count: usize,
     pub seen_if_none_match: bool,
     /// W18: proxy observed a complete Apache response head for the PUT.
     pub apache_response_seen: bool,
@@ -45,6 +49,7 @@ impl ProxyRecord {
             get_count: 0,
             head_count: 0,
             propfind_count: 0,
+            delete_count: 0,
             seen_if_none_match: false,
             apache_response_seen: false,
         }
@@ -116,6 +121,43 @@ fn content_length(headers: &[u8]) -> Option<usize> {
     })
 }
 
+/// Fault modes must observe every HTTP request separately. reqwest otherwise
+/// reuses the connection opened by a preparatory PROPFIND and later GET/PUT can
+/// bypass this per-connection parser inside the transparent pipe. Preserve the
+/// captured request verbatim except for replacing any Connection header with
+/// `Connection: close`, forcing the next request onto a fresh parsed connection.
+fn request_with_connection_close(request: &[u8], head_end: usize) -> Vec<u8> {
+    let head_without_terminator = &request[..head_end - 4];
+    let mut out = Vec::with_capacity(request.len() + 32);
+    let mut start = 0usize;
+    let mut line_index = 0usize;
+    while start <= head_without_terminator.len() {
+        let remaining = &head_without_terminator[start..];
+        let line_end = remaining
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|offset| start + offset)
+            .unwrap_or(head_without_terminator.len());
+        let line = &head_without_terminator[start..line_end];
+        let is_connection = line_index > 0
+            && line
+                .get(.."Connection:".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"Connection:"));
+        if !is_connection {
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+        }
+        line_index += 1;
+        if line_end == head_without_terminator.len() {
+            break;
+        }
+        start = line_end + 2;
+    }
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    out.extend_from_slice(&request[head_end..]);
+    out
+}
+
 async fn handle_conn(
     mut client: TcpStream,
     upstream_host: String,
@@ -176,11 +218,20 @@ async fn handle_conn(
             "GET" => r.get_count += 1,
             "HEAD" => r.head_count += 1,
             "PROPFIND" => r.propfind_count += 1,
+            "DELETE" => r.delete_count += 1,
             _ => {}
         }
         if seen_inm {
             r.seen_if_none_match = true;
         }
+    }
+
+    // A cleanup-failure fault must not reach the real server at all. Do this
+    // before opening or writing the upstream connection so the test cannot
+    // accidentally prove RecoveryRequired after Apache already deleted root.
+    if mode == ProxyMode::AmbiguousPutDropDelete && method == "DELETE" {
+        let _ = client.shutdown().await;
+        return;
     }
 
     // Connect to real Apache.
@@ -189,9 +240,15 @@ async fn handle_conn(
         Err(_) => return,
     };
 
-    // Forward everything already captured (headers plus any body bytes that
-    // arrived in the same read).
-    if upstream.write_all(&buf[..filled]).await.is_err() {
+    // Fault modes need one parsed request per TCP connection; otherwise a
+    // keep-alive request can disappear into `pipe` and bypass the selected
+    // fault. Pass-through recording retains ordinary keep-alive behavior.
+    let forwarded = if mode == ProxyMode::PassThroughRecord {
+        buf[..filled].to_vec()
+    } else {
+        request_with_connection_close(&buf[..filled], request_head_end)
+    };
+    if upstream.write_all(&forwarded).await.is_err() {
         return;
     }
 
@@ -249,11 +306,10 @@ async fn handle_conn(
                 pipe(&mut client, &mut upstream).await;
             }
         }
-        ProxyMode::AmbiguousPut => {
+        ProxyMode::AmbiguousPut | ProxyMode::AmbiguousPutDropDelete => {
             if method == "PUT" {
-                // reqwest sends this Vec-backed PUT with Content-Length. Forward
-                // exactly the remaining declared bytes; do not wait for EOF on
-                // the keep-alive client connection.
+                // Forward exactly the remaining declared bytes; do not wait for
+                // EOF on the client connection.
                 let declared = match request_content_length {
                     Some(n) => n,
                     None => return,

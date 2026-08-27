@@ -24,7 +24,8 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio_util::io::ReaderStream;
 
 /// Hard caps for multistatus parsing (quick-xml security boundary).
 const MAX_PROPFIND_BYTES: usize = 16 * 1024 * 1024;
@@ -105,6 +106,14 @@ pub(crate) enum NewCollectionError {
     #[error("definitive MKCOL failure: {0}")]
     Definitive(#[source] io::Error),
     #[error("ambiguous MKCOL outcome: {0}")]
+    Ambiguous(#[source] io::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StreamPutError {
+    #[error("definitive streaming PUT failure: {0}")]
+    Definitive(#[source] io::Error),
+    #[error("ambiguous streaming PUT outcome: {0}")]
     Ambiguous(#[source] io::Error),
 }
 
@@ -646,6 +655,138 @@ impl WebDavProvider {
         }
         on_progress(written, total);
         Ok(written)
+    }
+
+    /// Resolve one ARX-created logical collection path back to the exact raw
+    /// href returned by the server. This is the identity handoff from a NEW
+    /// write target to an EXISTING provider-native collection; callers must not
+    /// fabricate the href from the logical path.
+    pub(crate) async fn resolve_logical_collection_exact(
+        &self,
+        logical_path: &str,
+    ) -> io::Result<WebDavCollectionRef> {
+        let mut requested = self.write_logical_url(logical_path)?;
+        if !requested.ends_with('/') {
+            requested.push('/');
+        }
+        let requested_url = url::Url::parse(&requested).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bad logical collection url: {error}"),
+            )
+        })?;
+        let requested_identity = canonical_url_identity(&requested_url);
+        let mut exact = None;
+        for entry in self.propfind_url(&requested, "0").await? {
+            if !entry.is_collection {
+                continue;
+            }
+            let wire = self.wire_url_for_href(&entry.raw_href)?;
+            let parsed = url::Url::parse(&wire).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad returned collection href: {error}"),
+                )
+            })?;
+            if canonical_url_identity(&parsed) != requested_identity {
+                continue;
+            }
+            if exact.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PROPFIND returned duplicate identities for created collection",
+                ));
+            }
+            exact = Some(WebDavCollectionRef {
+                target: self.target.id.clone(),
+                href: entry.raw_href,
+            });
+        }
+        exact.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "created WebDAV collection could not be resolved to exact server href",
+            )
+        })
+    }
+
+    /// Fail closed when a same-target destination overlaps the exact source
+    /// collection. Copying a collection into itself/its descendant would mutate
+    /// the frozen source tree while it is being read.
+    pub(crate) fn ensure_logical_destination_disjoint(
+        &self,
+        source: &WebDavCollectionRef,
+        destination_logical_path: &str,
+    ) -> io::Result<()> {
+        let source_url = url::Url::parse(&self.collection_wire_url(source)?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let destination_url =
+            url::Url::parse(&self.write_logical_url(destination_logical_path)?)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let source_path = source_url.path().trim_end_matches('/');
+        let destination_path = destination_url.path().trim_end_matches('/');
+        let source_prefix = format!("{source_path}/");
+        let destination_prefix = format!("{destination_path}/");
+        if source_path == destination_path
+            || destination_path.starts_with(&source_prefix)
+            || source_path.starts_with(&destination_prefix)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WebDAV copy source and destination roots overlap",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Streaming logical PUT. The request body owns an AsyncRead-backed stream,
+    /// so remote-to-remote copy stays bounded by the caller's pipe capacity.
+    /// No HTTP mutation retry is enabled. Transport/5xx outcomes are ambiguous.
+    pub(crate) async fn put_logical_stream_with_policy<R>(
+        &self,
+        logical_path: &str,
+        reader: R,
+        content_length: Option<u64>,
+        policy: WebDavOverwritePolicy,
+    ) -> Result<(), StreamPutError>
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+    {
+        let url = self
+            .write_logical_url(logical_path)
+            .map_err(StreamPutError::Definitive)?;
+        let stream = ReaderStream::new(reader);
+        let body = reqwest::Body::wrap_stream(stream);
+        let mut builder = self.client.put(&url).body(body);
+        if let Some(length) = content_length {
+            builder = builder.header(reqwest::header::CONTENT_LENGTH, length.to_string());
+        }
+        if matches!(policy, WebDavOverwritePolicy::Forbid) {
+            builder = builder.header("If-None-Match", "*");
+        }
+        let request = self.auth_req(builder).map_err(StreamPutError::Definitive)?;
+        let response = request.send().await.map_err(|error| {
+            StreamPutError::Ambiguous(io::Error::other(format!(
+                "streaming PUT transport: {error}"
+            )))
+        })?;
+        let status = response.status();
+        if matches!(status.as_u16(), 200 | 201 | 204) {
+            return Ok(());
+        }
+        if status == reqwest::StatusCode::PRECONDITION_FAILED {
+            return Err(StreamPutError::Definitive(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "refusing to overwrite existing resource (policy Forbid)",
+            )));
+        }
+        let text = read_fixed_text(response).await;
+        let error = self.status_error("PUT", status, &text);
+        if status.is_client_error() {
+            Err(StreamPutError::Definitive(error))
+        } else {
+            Err(StreamPutError::Ambiguous(error))
+        }
     }
 
     /// PUT with the overwrite policy enforced at the HTTP layer (no
