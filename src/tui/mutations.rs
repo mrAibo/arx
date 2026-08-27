@@ -49,18 +49,23 @@ pub(super) fn handle_action(
                     .selection_names(state.active, &state.active_pane().location)
                     .map(|names| names.iter().cloned().collect())
                     .unwrap_or_default();
-                match arx::services::prepare_webdav_recursive_delete(
+                match arx::services::prepare_webdav_recursive_delete_batch(
                     &state.active_pane().location,
                     &selected_names,
                     focused_listed,
                     active_listed,
                 ) {
                     Ok(plan) => {
+                        let root_count = plan.sources.len();
                         state.pending_webdav_delete = Some(plan);
-                        state.message = Some(
+                        state.message = Some(if root_count == 1 {
                             "Permanently delete this WebDAV directory tree? Enter to confirm, Escape to cancel"
-                                .into(),
-                        );
+                                .into()
+                        } else {
+                            format!(
+                                "Permanently delete {root_count} WebDAV directory trees? Enter to confirm, Escape to cancel"
+                            )
+                        });
                     }
                     Err(error) => state.message = Some(error),
                 }
@@ -233,10 +238,16 @@ pub(super) fn handle_action(
                 let loader = pane_loader.clone();
                 let jobs = sync.jobs.clone();
                 let tx = sync.job_events.clone();
+                let root_count = plan.sources.len();
+                let job_description = if root_count == 1 {
+                    format!("Delete WebDAV tree {}", plan.presentation_name)
+                } else {
+                    format!("Delete {root_count} WebDAV trees")
+                };
                 let job = jobs.create_job(
                     "webdav-recursive-delete",
                     arx::jobs::JobKind::Delete,
-                    format!("Delete WebDAV tree {}", plan.presentation_name),
+                    job_description,
                     Some(location.clone()),
                     None,
                 );
@@ -249,9 +260,9 @@ pub(super) fn handle_action(
                     let progress_jobs = jobs.clone();
                     let progress_tx = tx.clone();
                     let progress_id = id.clone();
-                    let result = MutationService::delete_webdav_tree(
+                    let result = MutationService::delete_webdav_trees(
                         provider,
-                        plan.source,
+                        plan.sources,
                         cancel,
                         move |progress| {
                             let percent =
@@ -683,11 +694,30 @@ pub(super) fn submit_mkdir(
 
 pub(super) fn render_confirmation(frame: &mut Frame, area: Rect, state: &AppState) {
     if let Some(plan) = &state.pending_webdav_delete {
-        let body = format!(
-            "PERMANENT WEBDAV TREE DELETE\n\n{}\n\nPermanently delete this WebDAV directory tree?\nNo Trash / Undo  Enter=Confirm  Esc=Cancel",
-            plan.presentation_name
-        );
-        let popup = centered_rect_lines(60, 9, area);
+        let root_count = plan.sources.len();
+        let body = if root_count == 1 {
+            format!(
+                "PERMANENT WEBDAV TREE DELETE\n\n{}\n\nPermanently delete this WebDAV directory tree?\nNo Trash / Undo  Enter=Confirm  Esc=Cancel",
+                plan.presentation_name
+            )
+        } else {
+            let max_show = 10;
+            let mut names: Vec<String> = plan
+                .presentation_names
+                .iter()
+                .take(max_show)
+                .map(|name| format!("  {name}"))
+                .collect();
+            if root_count > max_show {
+                names.push(format!("  ...and {} more", root_count - max_show));
+            }
+            format!(
+                "PERMANENT WEBDAV TREE DELETE\n\n{root_count} WebDAV directory trees\n{}\n\nPermanently delete {root_count} WebDAV directory trees?\nNo Trash / Undo  Enter=Confirm  Esc=Cancel",
+                names.join("\n")
+            )
+        };
+        let height = (body.lines().count() + 2).min(area.height as usize) as u16;
+        let popup = centered_rect_lines(60, height.max(9), area);
         frame.render_widget(Clear, popup);
         frame.render_widget(
             ratatui::widgets::Paragraph::new(body).block(
