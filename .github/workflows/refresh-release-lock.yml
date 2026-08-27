@@ -1,0 +1,55 @@
+name: Refresh release lock (temporary)
+
+on:
+  push:
+    branches:
+      - 'release/v0.25.0'
+    paths:
+      - '.github/workflows/refresh-release-lock.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: release/v0.25.0
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Build exact expected lock
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          cargo = Path("Cargo.toml").read_text()
+          assert 'version = "0.25.0"' in cargo
+          path = Path("Cargo.lock")
+          before = path.read_text()
+          needle = '[[package]]\nname = "arx"\nversion = "0.24.0"\n'
+          replacement = '[[package]]\nname = "arx"\nversion = "0.25.0"\n'
+          assert before.count(needle) == 1
+          Path("/tmp/Cargo.lock.expected").write_text(before.replace(needle, replacement, 1))
+          PY
+
+      - name: Let Cargo refresh root package metadata
+        run: cargo check --all-features
+
+      - name: Prove no dependency lock drift
+        run: |
+          set -euo pipefail
+          cmp /tmp/Cargo.lock.expected Cargo.lock
+          test "$(git status --short -- Cargo.lock)" = " M Cargo.lock"
+          test "$(git status --short --untracked-files=no | wc -l)" -eq 1
+
+      - name: Commit exact lock update
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore(release): refresh lock for 0.25.0"
+          git push origin HEAD:release/v0.25.0
