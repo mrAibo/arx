@@ -2,6 +2,7 @@
 
 use arx::services::{
     MutationService, WebDavDeleteError, WebDavRecursiveDeletePlan, prepare_webdav_recursive_delete,
+    prepare_webdav_recursive_delete_batch,
 };
 use arx::vfs::webdav::{WebDavProvider, WebDavTarget};
 use arx::vfs::{CancellationFlag, Location, RemoteEditRevision, VfsProvider};
@@ -81,6 +82,19 @@ async fn plan_for_root(provider: &WebDavProvider, root_name: &str) -> WebDavRecu
         .expect("root must be listed");
     let active = rows.iter().collect::<Vec<_>>();
     prepare_webdav_recursive_delete(&location, &[], Some(selected), &active).unwrap()
+}
+
+async fn plan_for_roots(
+    provider: &WebDavProvider,
+    root_names: &[String],
+) -> WebDavRecursiveDeletePlan {
+    let location = Location::WebDav {
+        target: provider.target().id.clone(),
+        path: "/".into(),
+    };
+    let rows = provider.list_page(&location, None).await.unwrap().entries;
+    let active = rows.iter().collect::<Vec<_>>();
+    prepare_webdav_recursive_delete_batch(&location, root_names, None, &active).unwrap()
 }
 
 async fn list_root_names(provider: &WebDavProvider, root_name: &str) -> Vec<String> {
@@ -193,7 +207,16 @@ fn header_end(bytes: &[u8]) -> Option<usize> {
         .map(|index| index + 4)
 }
 
-async fn start_ambiguous_delete_proxy(upstream_url: &str) -> io::Result<TestProxy> {
+async fn start_ambiguous_delete_proxy(
+    upstream_url: &str,
+    ambiguous_delete_number: usize,
+) -> io::Result<TestProxy> {
+    if ambiguous_delete_number == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ambiguous DELETE number must be >= 1",
+        ));
+    }
     let upstream = url::Url::parse(upstream_url)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     let host = upstream.host_str().unwrap_or("127.0.0.1").to_string();
@@ -211,7 +234,13 @@ async fn start_ambiguous_delete_proxy(upstream_url: &str) -> io::Result<TestProx
             };
             let record = shared_record.clone();
             let host = host.clone();
-            tokio::spawn(handle_proxy_connection(client, host, port, record));
+            tokio::spawn(handle_proxy_connection(
+                client,
+                host,
+                port,
+                record,
+                ambiguous_delete_number,
+            ));
         }
     });
 
@@ -226,6 +255,7 @@ async fn handle_proxy_connection(
     upstream_host: String,
     upstream_port: u16,
     record: Arc<Mutex<ProxyRecord>>,
+    ambiguous_delete_number: usize,
 ) {
     let mut request = vec![0u8; 64 * 1024];
     let mut filled = 0usize;
@@ -250,17 +280,21 @@ async fn handle_proxy_connection(
         .unwrap_or("")
         .to_ascii_uppercase();
 
-    if method == "DELETE" {
-        record.lock().await.delete_count += 1;
-    }
+    let delete_number = if method == "DELETE" {
+        let mut record = record.lock().await;
+        record.delete_count += 1;
+        Some(record.delete_count)
+    } else {
+        None
+    };
 
     let mut upstream = match TcpStream::connect((upstream_host.as_str(), upstream_port)).await {
         Ok(stream) => stream,
         Err(_) => return,
     };
 
-    // Force one HTTP request per client connection so reqwest cannot reuse a
-    // prior PROPFIND tunnel for the DELETE that must be fault-injected.
+    // Force one HTTP request per client connection so every DELETE crosses the
+    // parser and the requested ordinal can be fault-injected deterministically.
     let mut forwarded = Vec::with_capacity(filled + 24);
     forwarded.extend_from_slice(&request[..request_head_end - 2]);
     forwarded.extend_from_slice(b"Connection: close\r\n\r\n");
@@ -269,7 +303,7 @@ async fn handle_proxy_connection(
         return;
     }
 
-    if method != "DELETE" {
+    if delete_number != Some(ambiguous_delete_number) {
         pipe(&mut client, &mut upstream).await;
         return;
     }
@@ -403,7 +437,7 @@ async fn physical_webdav_recursive_delete_safety() {
     )
     .await;
 
-    let proxy = start_ambiguous_delete_proxy(&upstream).await.unwrap();
+    let proxy = start_ambiguous_delete_proxy(&upstream, 1).await.unwrap();
     let proxy_provider = provider_for(proxy.listen_addr.clone(), &user, &pass);
     let ambiguous_plan = plan_for_root(&proxy_provider, &ambiguous_root).await;
     let ambiguous_result = MutationService::delete_webdav_tree(
@@ -438,4 +472,227 @@ async fn physical_webdav_recursive_delete_safety() {
         "no later manifest node may be deleted after ambiguity"
     );
     cleanup_tree(&provider, &ambiguous_root).await;
+
+    // Multi-root positive path: two selected sibling trees are completely
+    // frozen/revalidated before deletion, then each executes child-first and
+    // root-last. Include empty/nested collections, zero-byte and Unicode names.
+    let positive_id = physical_run_id();
+    let positive_a = format!("{positive_id}-a-positive");
+    let positive_b = format!("{positive_id}-b-positive");
+    provider.mkdir(&format!("/{positive_a}")).await.unwrap();
+    provider
+        .mkdir(&format!("/{positive_a}/empty"))
+        .await
+        .unwrap();
+    provider
+        .mkdir(&format!("/{positive_a}/nested"))
+        .await
+        .unwrap();
+    put(&provider, &format!("/{positive_a}/zero.bin"), b"").await;
+    put(
+        &provider,
+        &format!("/{positive_a}/nested/unicodé spáces.txt"),
+        b"unicode",
+    )
+    .await;
+    provider.mkdir(&format!("/{positive_b}")).await.unwrap();
+    put(&provider, &format!("/{positive_b}/file.txt"), b"b").await;
+    let positive_plan = plan_for_roots(
+        &provider,
+        &[positive_b.clone(), positive_a.clone()],
+    )
+    .await;
+    let positive_result = MutationService::delete_webdav_trees(
+        provider.clone(),
+        positive_plan.sources,
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(positive_result.completed, positive_result.total);
+    assert!(!root_exists(&provider, &positive_a).await);
+    assert!(!root_exists(&provider, &positive_b).await);
+
+    // Cancellation between roots preserves the exact global count and never
+    // starts the later root. Empty roots make each definitive success one item.
+    let batch_cancel_id = physical_run_id();
+    let batch_cancel_a = format!("{batch_cancel_id}-a-cancel");
+    let batch_cancel_b = format!("{batch_cancel_id}-b-cancel");
+    provider
+        .mkdir(&format!("/{batch_cancel_a}"))
+        .await
+        .unwrap();
+    provider
+        .mkdir(&format!("/{batch_cancel_b}"))
+        .await
+        .unwrap();
+    let batch_cancel_plan = plan_for_roots(
+        &provider,
+        &[batch_cancel_b.clone(), batch_cancel_a.clone()],
+    )
+    .await;
+    let batch_cancel = Arc::new(AtomicBool::new(false));
+    let set_batch_cancel = batch_cancel.clone();
+    let batch_cancel_result = MutationService::delete_webdav_trees(
+        provider.clone(),
+        batch_cancel_plan.sources,
+        batch_cancel,
+        move |progress| {
+            if progress.completed == 1 {
+                set_batch_cancel.store(true, Ordering::Release);
+            }
+        },
+    )
+    .await;
+    assert!(matches!(
+        batch_cancel_result,
+        Err(WebDavDeleteError::Cancelled {
+            completed: 1,
+            total: 2
+        })
+    ));
+    assert!(!root_exists(&provider, &batch_cancel_a).await);
+    assert!(root_exists(&provider, &batch_cancel_b).await);
+    cleanup_tree(&provider, &batch_cancel_b).await;
+
+    // A deterministic failure in root B occurs only after root A has been
+    // definitively deleted. Report global partial truth and stop before B's
+    // later peer/root.
+    let batch_locked_id = physical_run_id();
+    let batch_locked_a = format!("{batch_locked_id}-a-first");
+    let batch_locked_b = format!("{batch_locked_id}-b-locked");
+    provider
+        .mkdir(&format!("/{batch_locked_a}"))
+        .await
+        .unwrap();
+    provider
+        .mkdir(&format!("/{batch_locked_b}"))
+        .await
+        .unwrap();
+    put(
+        &provider,
+        &format!("/{batch_locked_b}/a-locked.txt"),
+        b"locked",
+    )
+    .await;
+    put(
+        &provider,
+        &format!("/{batch_locked_b}/z-later.txt"),
+        b"later",
+    )
+    .await;
+    let batch_locked_path = format!("/{batch_locked_b}/a-locked.txt");
+    let batch_token = lock_resource(&upstream, &batch_locked_path, &user, &pass)
+        .await
+        .unwrap();
+    let batch_locked_plan = plan_for_roots(
+        &provider,
+        &[batch_locked_b.clone(), batch_locked_a.clone()],
+    )
+    .await;
+    let batch_locked_result = MutationService::delete_webdav_trees(
+        provider.clone(),
+        batch_locked_plan.sources,
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .await;
+    assert!(matches!(
+        batch_locked_result,
+        Err(WebDavDeleteError::Partial {
+            completed: 1,
+            total: 4,
+            ..
+        })
+    ));
+    assert!(!root_exists(&provider, &batch_locked_a).await);
+    assert!(root_exists(&provider, &batch_locked_b).await);
+    let batch_locked_names = list_root_names(&provider, &batch_locked_b).await;
+    assert!(batch_locked_names.iter().any(|name| name == "a-locked.txt"));
+    assert!(batch_locked_names.iter().any(|name| name == "z-later.txt"));
+    unlock_resource(
+        &upstream,
+        &batch_locked_path,
+        &batch_token,
+        &user,
+        &pass,
+    )
+    .await
+    .unwrap();
+    cleanup_tree(&provider, &batch_locked_b).await;
+
+    // Ambiguity in root B: DELETE #1 (root A) is passed through normally;
+    // DELETE #2 is processed by Apache but its response is withheld. ARX must
+    // return RecoveryRequired at global completed=1 and issue no DELETE #3.
+    let batch_ambiguous_id = physical_run_id();
+    let batch_ambiguous_a = format!("{batch_ambiguous_id}-a-first");
+    let batch_ambiguous_b = format!("{batch_ambiguous_id}-b-ambiguous");
+    provider
+        .mkdir(&format!("/{batch_ambiguous_a}"))
+        .await
+        .unwrap();
+    provider
+        .mkdir(&format!("/{batch_ambiguous_b}"))
+        .await
+        .unwrap();
+    put(
+        &provider,
+        &format!("/{batch_ambiguous_b}/a-first.txt"),
+        b"first",
+    )
+    .await;
+    put(
+        &provider,
+        &format!("/{batch_ambiguous_b}/z-later.txt"),
+        b"later",
+    )
+    .await;
+
+    let batch_proxy = start_ambiguous_delete_proxy(&upstream, 2).await.unwrap();
+    let batch_proxy_provider = provider_for(batch_proxy.listen_addr.clone(), &user, &pass);
+    let batch_ambiguous_plan = plan_for_roots(
+        &batch_proxy_provider,
+        &[batch_ambiguous_b.clone(), batch_ambiguous_a.clone()],
+    )
+    .await;
+    let batch_ambiguous_result = MutationService::delete_webdav_trees(
+        batch_proxy_provider,
+        batch_ambiguous_plan.sources,
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .await;
+    assert!(matches!(
+        batch_ambiguous_result,
+        Err(WebDavDeleteError::RecoveryRequired {
+            completed: 1,
+            total: 4,
+            ..
+        })
+    ));
+    let batch_record = batch_proxy.record.lock().await;
+    assert_eq!(
+        batch_record.delete_count, 2,
+        "later ambiguous DELETE must never replay or advance to DELETE #3"
+    );
+    assert!(
+        batch_record.apache_response_seen,
+        "proxy must prove Apache processed the second uncertain DELETE"
+    );
+    drop(batch_record);
+    assert!(!root_exists(&provider, &batch_ambiguous_a).await);
+    assert!(root_exists(&provider, &batch_ambiguous_b).await);
+    let batch_ambiguous_names = list_root_names(&provider, &batch_ambiguous_b).await;
+    let remaining_batch_children = batch_ambiguous_names
+        .iter()
+        .any(|name| name == "a-first.txt") as usize
+        + batch_ambiguous_names
+            .iter()
+            .any(|name| name == "z-later.txt") as usize;
+    assert_eq!(
+        remaining_batch_children, 1,
+        "no later node may be deleted after the second DELETE becomes ambiguous"
+    );
+    cleanup_tree(&provider, &batch_ambiguous_b).await;
 }
