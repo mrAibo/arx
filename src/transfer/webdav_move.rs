@@ -1,6 +1,56 @@
-use crate::vfs::{EntryIdentity, EntryKind, ListedEntry, Location};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::{WebDavTransferSpec, webdav_write_child_target};
+use crate::services::mutation::{MutationService, WebDavDeleteError};
+use crate::transfer_queue::{PauseGate, TypedTransferProgress};
+use crate::vfs::webdav::WebDavProvider;
+use crate::vfs::{EntryIdentity, EntryKind, ListedEntry, Location, WebDavCollectionRef};
+
+use super::webdav_transfer::{
+    WebDavTreeManifest, build_tree_manifest, copy_tree, revalidate_tree_manifest,
+};
+use super::{WebDavTransferSpec, WebDavWriteTarget, webdav_write_child_target};
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MoveTreeFailure {
+    #[error(
+        "WebDAV Move destination changed after verification at {target}:{logical_path}: {reason}"
+    )]
+    DestinationChanged {
+        target: String,
+        logical_path: String,
+        reason: String,
+    },
+    #[error(
+        "WebDAV Move could not clean verified attempt-owned destination {target}:{logical_path}: original={original}; cleanup={cleanup}"
+    )]
+    CleanupFailure {
+        target: String,
+        logical_path: String,
+        original: String,
+        cleanup: String,
+    },
+    #[error("WebDAV Move source is partially deleted after {completed} of {total}: {reason}")]
+    PartialSourceDelete {
+        completed: usize,
+        total: usize,
+        reason: String,
+    },
+    #[error("WebDAV Move requires recovery after {completed} of {total} source deletes: {reason}")]
+    RecoveryRequired {
+        completed: usize,
+        total: usize,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedDestination {
+    root: WebDavCollectionRef,
+    manifest: WebDavTreeManifest,
+}
 
 fn resolve_move_source<'a>(
     selected_names: &[String],
@@ -79,6 +129,351 @@ pub fn prepare_webdav_move_tree(
         },
         source.entry.name.clone(),
     ))
+}
+
+fn verify_manifest_shape(
+    source: &WebDavTreeManifest,
+    destination: &WebDavTreeManifest,
+) -> io::Result<()> {
+    let source_dirs = source
+        .directories
+        .iter()
+        .map(|entry| entry.relative.clone())
+        .collect::<BTreeSet<_>>();
+    let destination_dirs = destination
+        .directories
+        .iter()
+        .map(|entry| entry.relative.clone())
+        .collect::<BTreeSet<_>>();
+    if source_dirs != destination_dirs {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WebDAV Move verification failed: directory manifest differs",
+        ));
+    }
+
+    let source_files = source
+        .files
+        .iter()
+        .map(|entry| (entry.relative.clone(), entry.advertised_size))
+        .collect::<BTreeMap<_, _>>();
+    let destination_files = destination
+        .files
+        .iter()
+        .map(|entry| (entry.relative.clone(), entry.advertised_size))
+        .collect::<BTreeMap<_, _>>();
+    if source_files.len() != destination_files.len()
+        || source_files.keys().ne(destination_files.keys())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WebDAV Move verification failed: file manifest differs",
+        ));
+    }
+    for (relative, source_size) in source_files {
+        if let Some(expected) = source_size
+            && destination_files.get(&relative).copied().flatten() != Some(expected)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "WebDAV Move verification failed: size differs for {}",
+                    relative.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn destination_snapshot_uninterruptible(
+    provider: &WebDavProvider,
+    destination_root: &WebDavWriteTarget,
+) -> io::Result<VerifiedDestination> {
+    let root = provider
+        .resolve_logical_collection_exact(&destination_root.logical_path)
+        .await?;
+    let never_cancel = AtomicBool::new(false);
+    let pause = PauseGate::disabled();
+    let manifest = build_tree_manifest(provider, &root, &never_cancel, &pause).await?;
+    Ok(VerifiedDestination { root, manifest })
+}
+
+async fn cleanup_verified_destination(
+    provider: &WebDavProvider,
+    destination_root: &WebDavWriteTarget,
+    verified: &VerifiedDestination,
+    original: io::Error,
+) -> io::Error {
+    let current = match destination_snapshot_uninterruptible(provider, destination_root).await {
+        Ok(current) => current,
+        Err(error) => {
+            return io::Error::other(MoveTreeFailure::DestinationChanged {
+                target: destination_root.target.clone(),
+                logical_path: destination_root.logical_path.clone(),
+                reason: format!(
+                    "cannot prove destination is still attempt-owned before cleanup: {error}; original={original}"
+                ),
+            });
+        }
+    };
+    if &current != verified {
+        return io::Error::other(MoveTreeFailure::DestinationChanged {
+            target: destination_root.target.clone(),
+            logical_path: destination_root.logical_path.clone(),
+            reason: format!("destination no longer matches verified snapshot; original={original}"),
+        });
+    }
+    match provider
+        .delete_logical_collection(&destination_root.logical_path)
+        .await
+    {
+        Ok(()) => original,
+        Err(cleanup) => io::Error::other(MoveTreeFailure::CleanupFailure {
+            target: destination_root.target.clone(),
+            logical_path: destination_root.logical_path.clone(),
+            original: original.to_string(),
+            cleanup: cleanup.to_string(),
+        }),
+    }
+}
+
+fn delete_preflight_error(error: WebDavDeleteError) -> io::Error {
+    match error {
+        WebDavDeleteError::PreMutation { reason } => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("WebDAV Move source delete preflight failed: {reason}"),
+        ),
+        other => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected WebDAV Move source delete preflight state: {other}"),
+        ),
+    }
+}
+
+/// Execute one WebDAV -> WebDAV Move as the explicit transaction
+/// copy -> independent destination verification -> frozen-source delete.
+///
+/// The destination stays attempt-owned until the source delete commit boundary.
+/// Once any source DELETE succeeds it is never rolled back.
+pub(crate) async fn move_tree(
+    source_provider: Arc<WebDavProvider>,
+    destination_provider: Arc<WebDavProvider>,
+    spec: &WebDavTransferSpec,
+    cancel: Arc<AtomicBool>,
+    pause: PauseGate,
+    on_progress: &mut impl FnMut(TypedTransferProgress),
+) -> io::Result<usize> {
+    let (source, destination_root) = match spec {
+        WebDavTransferSpec::MoveTree {
+            source,
+            destination_root,
+        } => (source, destination_root),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "move_tree requires WebDavTransferSpec::MoveTree",
+            ));
+        }
+    };
+
+    // Freeze both the copy-visible tree and the exact destructive delete plan
+    // before any destination mutation. The frozen delete plan is later consumed
+    // verbatim; newly appeared source children can never be absorbed silently.
+    let source_manifest = build_tree_manifest(&source_provider, source, &cancel, &pause).await?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "WebDAV Move cancelled before copy",
+        ));
+    }
+    let frozen_delete = MutationService::build_webdav_delete_manifest(&source_provider, source)
+        .await
+        .map_err(delete_preflight_error)?;
+    pause.checkpoint().await;
+    if cancel.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "WebDAV Move cancelled before copy",
+        ));
+    }
+    revalidate_tree_manifest(
+        &source_provider,
+        source,
+        &source_manifest,
+        &cancel,
+        &pause,
+    )
+    .await?;
+
+    let copy_spec = WebDavTransferSpec::CopyTree {
+        source: source.clone(),
+        destination_root: destination_root.clone(),
+    };
+    copy_tree(
+        &source_provider,
+        &destination_provider,
+        &copy_spec,
+        cancel.clone(),
+        pause.clone(),
+        on_progress,
+    )
+    .await?;
+
+    // copy_tree already performs its accepted independent destination verify.
+    // Re-read the destination without honoring user cancellation so Move owns a
+    // concrete verified snapshot that can later gate cleanup and source commit.
+    let verified_destination =
+        destination_snapshot_uninterruptible(&destination_provider, destination_root)
+            .await
+            .map_err(|error| {
+                io::Error::other(MoveTreeFailure::DestinationChanged {
+                    target: destination_root.target.clone(),
+                    logical_path: destination_root.logical_path.clone(),
+                    reason: format!(
+                        "cannot establish post-copy destination snapshot for Move: {error}"
+                    ),
+                })
+            })?;
+    if let Err(error) = verify_manifest_shape(&source_manifest, &verified_destination.manifest) {
+        return Err(io::Error::other(MoveTreeFailure::DestinationChanged {
+            target: destination_root.target.clone(),
+            logical_path: destination_root.logical_path.clone(),
+            reason: error.to_string(),
+        }));
+    }
+
+    let cleanup_on_predelete = |reason: io::Error| async {
+        cleanup_verified_destination(
+            &destination_provider,
+            destination_root,
+            &verified_destination,
+            reason,
+        )
+        .await
+    };
+
+    if cancel.load(Ordering::Acquire) {
+        return Err(cleanup_on_predelete(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "WebDAV Move cancelled before source delete",
+        ))
+        .await);
+    }
+    pause.checkpoint().await;
+    if cancel.load(Ordering::Acquire) {
+        return Err(cleanup_on_predelete(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "WebDAV Move cancelled before source delete",
+        ))
+        .await);
+    }
+
+    // The copied source snapshot must still be current before destructive commit.
+    if let Err(error) = revalidate_tree_manifest(
+        &source_provider,
+        source,
+        &source_manifest,
+        &cancel,
+        &pause,
+    )
+    .await
+    {
+        return Err(cleanup_on_predelete(error).await);
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err(cleanup_on_predelete(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "WebDAV Move cancelled before source delete",
+        ))
+        .await);
+    }
+
+    // Final destination proof immediately before handing control to the exact
+    // frozen-source delete authority. Any destination drift is RecoveryRequired;
+    // never remove an unproven tree and never touch source in that state.
+    let current_destination =
+        match destination_snapshot_uninterruptible(&destination_provider, destination_root).await {
+            Ok(current) => current,
+            Err(error) => {
+                return Err(io::Error::other(MoveTreeFailure::DestinationChanged {
+                    target: destination_root.target.clone(),
+                    logical_path: destination_root.logical_path.clone(),
+                    reason: format!("cannot revalidate destination before source delete: {error}"),
+                }));
+            }
+        };
+    if current_destination != verified_destination {
+        return Err(io::Error::other(MoveTreeFailure::DestinationChanged {
+            target: destination_root.target.clone(),
+            logical_path: destination_root.logical_path.clone(),
+            reason: "destination changed after verification".into(),
+        }));
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err(cleanup_on_predelete(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "WebDAV Move cancelled before source delete",
+        ))
+        .await);
+    }
+
+    let delete_result = MutationService::delete_webdav_tree_from_frozen_manifest(
+        source_provider,
+        frozen_delete,
+        cancel,
+        |progress| {
+            on_progress(TypedTransferProgress::Items {
+                completed: progress.completed as u64,
+                total: Some(progress.total as u64),
+            });
+        },
+    )
+    .await;
+
+    match delete_result {
+        Ok(outcome) => Ok(outcome.total),
+        Err(WebDavDeleteError::PreMutation { reason }) => {
+            Err(cleanup_on_predelete(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("WebDAV Move source changed before first DELETE: {reason}"),
+            ))
+            .await)
+        }
+        Err(WebDavDeleteError::Cancelled {
+            completed: 0,
+            total: _,
+        }) => Err(cleanup_on_predelete(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "WebDAV Move cancelled before first source DELETE",
+        ))
+        .await),
+        Err(WebDavDeleteError::Cancelled { completed, total }) => {
+            Err(io::Error::other(MoveTreeFailure::PartialSourceDelete {
+                completed,
+                total,
+                reason: "cancelled after source deletion started".into(),
+            }))
+        }
+        Err(WebDavDeleteError::Partial {
+            completed,
+            total,
+            reason,
+        }) => Err(io::Error::other(MoveTreeFailure::PartialSourceDelete {
+            completed,
+            total,
+            reason,
+        })),
+        Err(WebDavDeleteError::RecoveryRequired {
+            completed,
+            total,
+            reason,
+        }) => Err(io::Error::other(MoveTreeFailure::RecoveryRequired {
+            completed,
+            total,
+            reason,
+        })),
+    }
 }
 
 #[cfg(test)]
@@ -233,5 +628,16 @@ mod tests {
             .unwrap_err()
             .contains("does not match")
         );
+    }
+
+    #[test]
+    fn manifest_shape_matches_copy_verification_semantics() {
+        let source = WebDavTreeManifest {
+            directories: vec![],
+            files: vec![],
+            descendant_count: 0,
+            total_bytes: Some(0),
+        };
+        assert!(verify_manifest_shape(&source, &source).is_ok());
     }
 }
