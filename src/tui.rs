@@ -5838,11 +5838,12 @@ mod tests {
             s3_f3_routes_to_preview(&s3_location()),
             "S3 must route F3 through the identity-aware preview lane"
         );
-        // Local/Archive must NOT take that lane (they keep their own paths).
+        // Local must NOT take that lane (it keeps the local-only fallthrough);
+        // Archive does, now that F3 previews archive members (package A).
         assert!(!s3_f3_routes_to_preview(&Location::Local(
             "/tmp/work".into()
         )));
-        assert!(!s3_f3_routes_to_preview(&archive_location()));
+        assert!(s3_f3_routes_to_preview(&archive_location()));
 
         // The exact S3ObjectRef identity survives the dispatch intact:
         // dispatch passes `listed.clone()` (EntryIdentity::S3Object), never
