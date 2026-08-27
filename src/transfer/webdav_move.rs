@@ -3,7 +3,9 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::services::mutation::{MutationService, WebDavDeleteError};
+use crate::services::mutation::{
+    MutationService, WebDavDeleteError, WebDavDeleteIdentity, WebDavDeleteManifest,
+};
 use crate::transfer_queue::{PauseGate, TypedTransferProgress};
 use crate::vfs::webdav::WebDavProvider;
 use crate::vfs::{EntryIdentity, EntryKind, ListedEntry, Location, WebDavCollectionRef};
@@ -32,6 +34,8 @@ pub(crate) enum MoveTreeFailure {
         original: String,
         cleanup: String,
     },
+    #[error("WebDAV Move cancelled before source commit after {completed} of {total} transaction items")]
+    CancelledBeforeSourceDelete { completed: usize, total: usize },
     #[error("WebDAV Move source is partially deleted after {completed} of {total}: {reason}")]
     PartialSourceDelete {
         completed: usize,
@@ -186,6 +190,61 @@ fn verify_manifest_shape(
     Ok(())
 }
 
+fn delete_snapshot_matches_tree(
+    provider: &WebDavProvider,
+    source: &WebDavCollectionRef,
+    tree: &WebDavTreeManifest,
+    delete: &WebDavDeleteManifest,
+) -> io::Result<()> {
+    if &delete.root != source {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WebDAV Move delete snapshot root differs from copied source root",
+        ));
+    }
+    let mut expected = BTreeMap::new();
+    for directory in &tree.directories {
+        let canonical = provider.canonical_exact_href_identity(
+            &directory.source.target,
+            &directory.source.href,
+        )?;
+        expected.insert(canonical, directory.relative.components().count());
+    }
+    for file in &tree.files {
+        let canonical =
+            provider.canonical_exact_href_identity(&file.source.target, &file.source.href)?;
+        expected.insert(canonical, file.relative.components().count());
+    }
+
+    let actual = delete
+        .nodes
+        .iter()
+        .map(|node| {
+            let expected_identity = match &node.identity {
+                WebDavDeleteIdentity::Object(object) => provider
+                    .canonical_exact_href_identity(&object.target, &object.href),
+                WebDavDeleteIdentity::Collection(collection) => provider
+                    .canonical_exact_href_identity(&collection.target, &collection.href),
+            }?;
+            if expected_identity != node.canonical_identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WebDAV Move delete snapshot canonical identity mismatch",
+                ));
+            }
+            Ok((node.canonical_identity.clone(), node.depth))
+        })
+        .collect::<io::Result<BTreeMap<_, _>>>()?;
+
+    if expected != actual {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WebDAV Move copy/delete snapshots differ before destination mutation",
+        ));
+    }
+    Ok(())
+}
+
 async fn destination_snapshot_uninterruptible(
     provider: &WebDavProvider,
     destination_root: &WebDavWriteTarget,
@@ -254,6 +313,12 @@ fn delete_preflight_error(error: WebDavDeleteError) -> io::Error {
 /// Execute one WebDAV -> WebDAV Move as the explicit transaction
 /// copy -> independent destination verification -> frozen-source delete.
 ///
+/// Progress uses one stable item unit for the whole attempt: `2 * N` total,
+/// where the first N means copied+verified destination items and the second N
+/// means definitive source deletes. Byte callbacks from the inner CopyTree are
+/// intentionally not published to the queue because the queue correctly rejects
+/// unit changes within one attempt.
+///
 /// The destination stays attempt-owned until the source delete commit boundary.
 /// Once any source DELETE succeeds it is never rolled back.
 pub(crate) async fn move_tree(
@@ -278,8 +343,8 @@ pub(crate) async fn move_tree(
     };
 
     // Freeze both the copy-visible tree and the exact destructive delete plan
-    // before any destination mutation. The frozen delete plan is later consumed
-    // verbatim; newly appeared source children can never be absorbed silently.
+    // before any destination mutation. They must describe the same exact source
+    // identity set and depths before the copy can start.
     let source_manifest = build_tree_manifest(&source_provider, source, &cancel, &pause).await?;
     if cancel.load(Ordering::Acquire) {
         return Err(io::Error::new(
@@ -290,6 +355,14 @@ pub(crate) async fn move_tree(
     let frozen_delete = MutationService::build_webdav_delete_manifest(&source_provider, source)
         .await
         .map_err(delete_preflight_error)?;
+    delete_snapshot_matches_tree(&source_provider, source, &source_manifest, &frozen_delete)?;
+    let source_items = 1usize
+        .checked_add(source_manifest.descendant_count)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WebDAV Move item overflow"))?;
+    let transaction_total = source_items
+        .checked_mul(2)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "WebDAV Move item overflow"))?;
+
     pause.checkpoint().await;
     if cancel.load(Ordering::Acquire) {
         return Err(io::Error::new(
@@ -310,13 +383,13 @@ pub(crate) async fn move_tree(
         source: source.clone(),
         destination_root: destination_root.clone(),
     };
-    copy_tree(
+    let copied_items = copy_tree(
         &source_provider,
         &destination_provider,
         &copy_spec,
         cancel.clone(),
         pause.clone(),
-        on_progress,
+        &mut |_| {},
     )
     .await?;
 
@@ -335,6 +408,15 @@ pub(crate) async fn move_tree(
                     ),
                 })
             })?;
+    if copied_items != source_items {
+        return Err(io::Error::other(MoveTreeFailure::DestinationChanged {
+            target: destination_root.target.clone(),
+            logical_path: destination_root.logical_path.clone(),
+            reason: format!(
+                "copy completed {copied_items} items but frozen Move snapshot contains {source_items}"
+            ),
+        }));
+    }
     if let Err(error) = verify_manifest_shape(&source_manifest, &verified_destination.manifest) {
         return Err(io::Error::other(MoveTreeFailure::DestinationChanged {
             target: destination_root.target.clone(),
@@ -343,6 +425,17 @@ pub(crate) async fn move_tree(
         }));
     }
 
+    on_progress(TypedTransferProgress::Items {
+        completed: source_items as u64,
+        total: Some(transaction_total as u64),
+    });
+
+    let cancelled_before_commit = || {
+        io::Error::other(MoveTreeFailure::CancelledBeforeSourceDelete {
+            completed: source_items,
+            total: transaction_total,
+        })
+    };
     let cleanup_on_predelete = |reason: io::Error| async {
         cleanup_verified_destination(
             &destination_provider,
@@ -354,19 +447,11 @@ pub(crate) async fn move_tree(
     };
 
     if cancel.load(Ordering::Acquire) {
-        return Err(cleanup_on_predelete(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "WebDAV Move cancelled before source delete",
-        ))
-        .await);
+        return Err(cleanup_on_predelete(cancelled_before_commit()).await);
     }
     pause.checkpoint().await;
     if cancel.load(Ordering::Acquire) {
-        return Err(cleanup_on_predelete(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "WebDAV Move cancelled before source delete",
-        ))
-        .await);
+        return Err(cleanup_on_predelete(cancelled_before_commit()).await);
     }
 
     // The copied source snapshot must still be current before destructive commit.
@@ -382,11 +467,7 @@ pub(crate) async fn move_tree(
         return Err(cleanup_on_predelete(error).await);
     }
     if cancel.load(Ordering::Acquire) {
-        return Err(cleanup_on_predelete(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "WebDAV Move cancelled before source delete",
-        ))
-        .await);
+        return Err(cleanup_on_predelete(cancelled_before_commit()).await);
     }
 
     // Final destination proof immediately before handing control to the exact
@@ -411,11 +492,7 @@ pub(crate) async fn move_tree(
         }));
     }
     if cancel.load(Ordering::Acquire) {
-        return Err(cleanup_on_predelete(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "WebDAV Move cancelled before source delete",
-        ))
-        .await);
+        return Err(cleanup_on_predelete(cancelled_before_commit()).await);
     }
 
     let delete_result = MutationService::delete_webdav_tree_from_frozen_manifest(
@@ -424,15 +501,18 @@ pub(crate) async fn move_tree(
         cancel,
         |progress| {
             on_progress(TypedTransferProgress::Items {
-                completed: progress.completed as u64,
-                total: Some(progress.total as u64),
+                completed: (source_items + progress.completed) as u64,
+                total: Some(transaction_total as u64),
             });
         },
     )
     .await;
 
     match delete_result {
-        Ok(outcome) => Ok(outcome.total),
+        Ok(outcome) => {
+            debug_assert_eq!(outcome.total, source_items);
+            Ok(transaction_total)
+        }
         Err(WebDavDeleteError::PreMutation { reason }) => {
             Err(cleanup_on_predelete(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -443,11 +523,7 @@ pub(crate) async fn move_tree(
         Err(WebDavDeleteError::Cancelled {
             completed: 0,
             total: _,
-        }) => Err(cleanup_on_predelete(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "WebDAV Move cancelled before first source DELETE",
-        ))
-        .await),
+        }) => Err(cleanup_on_predelete(cancelled_before_commit()).await),
         Err(WebDavDeleteError::Cancelled { completed, total }) => {
             Err(io::Error::other(MoveTreeFailure::PartialSourceDelete {
                 completed,
