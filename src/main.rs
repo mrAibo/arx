@@ -106,7 +106,8 @@ async fn main() {
     // X11 forwarding is session-owned. If the SSH client/server established
     // forwarding, DISPLAY is already present and is inherited unchanged by ARX and
     // child processes. If it is absent, ARX must not invent a display endpoint.
-    tui::run(config, keymap)
-        .await
-        .expect("TUI exited with error");
+    if let Err(error) = tui::run(config, keymap).await {
+        eprintln!("arx: TUI error: {error}");
+        std::process::exit(1);
+    }
 }
