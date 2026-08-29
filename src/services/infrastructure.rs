@@ -28,7 +28,7 @@ impl InfrastructureService {
                     .unwrap_or(false);
                 format!(
                     "{} {} ({})",
-                    if reachable { "✓" } else { "✗" },
+                    if reachable { "OK" } else { "X" },
                     alias,
                     hostname
                 )
