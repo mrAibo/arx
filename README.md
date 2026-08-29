@@ -4,7 +4,7 @@ Terminal commander for local ↔ remote workspaces on Linux.
 
 ![ARX Remote Workspace — Compare, Preview, Sync, Verify](docs/assets/remote-workspace-update.gif)
 
-**Current release: [v0.25.0](https://github.com/mrAibo/arx/releases/tag/v0.25.0)**
+**Current release: [v0.25.1](https://github.com/mrAibo/arx/releases/tag/v0.25.1)**
 
 Linux x86_64 · Rust MSRV 1.88 · MIT
 
@@ -22,7 +22,7 @@ Compare before touching anything. Preview the exact consequences. Execute. Verif
 
 Published **v0.25.0** adds the accepted WebDAV transaction surface from [#275](https://github.com/mrAibo/arx/issues/275) / [#276](https://github.com/mrAibo/arx/pull/276), [#277](https://github.com/mrAibo/arx/issues/277) / [#278](https://github.com/mrAibo/arx/pull/278), and [#279](https://github.com/mrAibo/arx/issues/279) / [#280](https://github.com/mrAibo/arx/pull/280): recursive same-target/cross-target WebDAV Copy to a new root, multi-root recursive WebDAV Delete, and verified WebDAV → WebDAV Move through copy → verify → frozen-source delete semantics.
 
-**v0.25.0 retains SFTP → SFTP Workspace Sync from v0.24.0** and the read-only S3 Object & Bucket Inspector shipped in v0.23.0. The same singular `ProviderRegistry`, Transfer Queue / Job lifecycle, retry/recovery authority, and provider-native identity model remain authoritative.
+**v0.25.1 retains the v0.25.0 WebDAV transaction surface** and adds bounded archive preview/extraction plus terminal UX and error-reporting fixes. The same singular `ProviderRegistry`, Transfer Queue / Job lifecycle, retry/recovery authority, and provider-native identity model remain authoritative.
 
 ## Platform support
 
@@ -30,11 +30,11 @@ ARX is intentionally a **Linux application**. The published release target is **
 
 When ARX runs inside SSH, the established session environment is authoritative. ARX preserves an existing `DISPLAY` but never invents one; X11 forwarding must already be provided by the SSH client/session.
 
-## Install v0.25.0
+## Install v0.25.1
 
-Published binaries and packages live under **GitHub Releases**, not in the source tree. The repository intentionally does not track a current `bin/arx` copy.
+Published binaries and packages live under **GitHub Releases**. The tracked `bin/arx` mirrors the validated Linux x86_64 release binary for repository-local use.
 
-Download your preferred artifact and `SHA256SUMS` from the [v0.25.0 release](https://github.com/mrAibo/arx/releases/tag/v0.25.0).
+Download your preferred artifact and `SHA256SUMS` from the [v0.25.1 release](https://github.com/mrAibo/arx/releases/tag/v0.25.1).
 
 Verify downloaded artifacts:
 
@@ -45,34 +45,34 @@ sha256sum --ignore-missing -c SHA256SUMS
 ### Debian / Ubuntu
 
 ```bash
-sudo apt install ./arx_0.25.0_amd64.deb
+sudo apt install ./arx_0.25.1_amd64.deb
 ```
 
 ### Fedora / RHEL family
 
 ```bash
-sudo dnf install ./arx-0.25.0-1.x86_64.rpm
+sudo dnf install ./arx-0.25.1-1.x86_64.rpm
 ```
 
 ### Portable tarball
 
 ```bash
-tar xzf arx-v0.25.0-x86_64-unknown-linux-gnu.tar.gz
-sudo install -m 755 arx-v0.25.0-x86_64-unknown-linux-gnu/arx /usr/local/bin/arx
+tar xzf arx-v0.25.1-x86_64-unknown-linux-gnu.tar.gz
+sudo install -m 755 arx-v0.25.1-x86_64-unknown-linux-gnu/arx /usr/local/bin/arx
 arx --version
 ```
 
 Expected output:
 
 ```text
-arx 0.25.0
+arx 0.25.1
 ```
 
 Release bundles include the MIT license and generated third-party license notices. Native packages install documentation under `/usr/share/doc/arx`.
 
 ### From source
 
-Rust 1.88+ and system OpenSSH are required. The built-in **Compress to tar.gz** Quick Action additionally requires a system `tar` executable.
+Rust 1.88+ and system OpenSSH are required. **Compress to tar.gz** requires `tar`; archive preview and extraction require `tar` for tar-family archives and `unzip` for ZIP archives.
 
 ```bash
 cargo install --git https://github.com/mrAibo/arx
@@ -93,7 +93,8 @@ arx
 
 | Area | Current product truth |
 |---|---|
-| Dual-pane TUI | Tabs, history, swap, mouse, split panes |
+| Dual-pane TUI | Tabs, history, swap, mouse, split panes, responsive queued input, persistent action feedback, visible-only hitboxes, high-contrast controls, ASCII status markers |
+| Archives | Nested tar-family/ZIP browsing; bounded exact-member F3 preview; one focused regular member can be extracted safely to Local with F5 |
 | Split panes | Vertical + horizontal, explicit close, keyboard ratio resize (20–80), section-aware same-location mouse behavior |
 | Local / SFTP | Browsing, transactional file copy, SFTP bounded preview, conflict-safe text Remote Edit |
 | Transfer Queue | Bounded FIFO, concurrency 1..=8, progress/rate/ETA where known, Pause/Resume/Cancel, safe retry ≤3 attempts |
@@ -113,9 +114,9 @@ arx
 
 | Key | Action |
 |---|---|
-| **F3** | View — Local full preview; SFTP bounded text; S3 bounded object preview; WebDAV bounded one-file preview |
-| **F4** | Edit — Local editor; SFTP conflict-safe text edit; S3/WebDAV disabled |
-| **F5** | Copy — Local↔Local, Local↔SFTP, Local↔S3 single object, Local↔WebDAV file/tree copy; WebDAV↔Local supports multiple selected sibling roots; WebDAV→WebDAV supports one exact recursive collection copied to one new same-target/cross-target root |
+| **F3** | View — Local full preview; bounded SFTP/S3/WebDAV preview; bounded archive-member preview |
+| **F4** | Edit — Local editor; SFTP conflict-safe text edit; Archive/S3/WebDAV disabled |
+| **F5** | Copy/extract — Local↔Local, Local↔SFTP, Local↔S3 single object, Local↔WebDAV file/tree copy; one focused regular archive member extracts safely to Local; WebDAV↔Local supports multiple selected sibling roots; WebDAV→WebDAV supports one exact recursive collection copied to one new same-target/cross-target root |
 | **F6** | Move — Local↔Local product path; S3 disabled; WebDAV→WebDAV supports one exact collection through verified copy → revalidate → frozen-source delete, same-target or cross-target |
 | **F7** | Create directory — Local/SFTP, S3 prefix marker, WebDAV MKCOL |
 | **F8** | Delete — Local trash; confirmed SFTP delete; exact S3 object / proven-empty marker delete; WebDAV supports safe bounded recursive delete for one or more exact selected collection roots |

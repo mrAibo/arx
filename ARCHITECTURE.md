@@ -142,7 +142,7 @@ current architecture.
 - **Local** — native filesystem operations.
 - **SFTP** — SSH/SFTP browsing and mutation semantics, including transactional copy
   and conflict-safe text Remote Edit.
-- **Archive** — archive browsing/preview semantics.
+- **Archive** — archive browsing, bounded member preview, and one exact regular-member extraction to Local through the transfer runtime.
 - **S3** — AWS-shaped object-storage provider with provider-native bucket/prefix/object
   identity.
 - **WebDAV** — HTTP/WebDAV provider using real DAV methods and href identity.
@@ -279,8 +279,8 @@ Key boundaries:
 - automatic HTTP mutation retry is disabled so ambiguous mutations are not replayed
   blindly.
 
-Apache `mod_dav` is the physically accepted MVP target. Nextcloud/ownCloud remain
-unverified and Digest/Bearer authentication is deferred.
+Apache `mod_dav`, Nextcloud 34.0.2, and ownCloud 11.0.0 are physically accepted
+through Basic authentication. Digest/Bearer authentication remains deferred.
 
 ## Release and packaging architecture
 
