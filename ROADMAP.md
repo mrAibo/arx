@@ -2,29 +2,15 @@
 
 GitHub state is authoritative over this document. Re-fetch current `main`, issues, PRs, tags, workflow state, and releases before acting on any recorded SHA or backlog item.
 
-## CURRENT — v0.25.0 published
+## CURRENT — v0.25.1 published
 
-**Current public release:** `v0.25.0`  
-**Immutable v0.25.0 tag target:** `068d360abed853f1c6b05d8bf7a529c6b8cdfdb5`  
-**Previous immutable release:** `v0.24.0` → `6d413fac5d5b493859bfadfbedbeb436b1140e0b`  
-**v0.25.0 release issue:** #281 — completed  
-**v0.25.0 feature baseline before release preparation:** `main` → `d603281aca350749e3e195752c17295ab1638bc6`  
+**Current public release:** `v0.25.1`  
+**Immutable v0.25.1 tag target:** `a0cb5452f307ef5d05d4c6b7701d95047c663a6f`  
+**Previous immutable release:** `v0.25.0` → `068d360abed853f1c6b05d8bf7a529c6b8cdfdb5`  
 **Platform:** Linux only; published target Linux x86_64  
 **MSRV:** Rust 1.88
 
-v0.25.0 is the current public release. It publishes three WebDAV capabilities that were independently frozen, implemented, physically accepted, merged, and post-merge accepted after v0.24.0:
-
-1. WebDAV → WebDAV recursive/cross-target Copy — #275 / PR #276.
-2. Multi-root recursive WebDAV Delete — #277 / PR #278.
-3. Verified WebDAV → WebDAV Move — #279 / PR #280.
-
-The release does not introduce a new provider/runtime/retry/scheduler/secret authority, dependency change, MSRV change, or unrelated feature.
-
-Publication truth is proven by immutable tag `v0.25.0` → `068d360abed853f1c6b05d8bf7a529c6b8cdfdb5` and Release workflow `33060354545`, which completed `validate=success` and `publish=success`. The GitHub Release is latest, non-draft and non-prerelease with exactly tar.gz, DEB, RPM and `SHA256SUMS`.
-
-## NEXT — v0.25.1 release candidate
-
-v0.25.1 is a usability and reliability patch over v0.25.0. It keeps the Linux x86_64 target, Rust 1.88 MSRV, dependencies, configuration, and existing provider/runtime authorities.
+v0.25.1 is a usability and reliability patch over v0.25.0. It keeps the Linux x86_64 target, Rust 1.88 MSRV, dependencies, configuration, and existing provider/runtime authorities:
 
 - bounded F3 preview for exact archive members;
 - safe Archive → Local F5 extraction for one focused regular member;
@@ -34,7 +20,7 @@ v0.25.1 is a usability and reliability patch over v0.25.0. It keeps the Linux x8
 - terminal-portable ASCII file and status markers;
 - concise fatal TUI error reporting with exit status 1.
 
-Publication is not claimed until the immutable tag and GitHub Release are verified.
+Release workflow `33273698175` validated and published the tar.gz, DEB, RPM, and `SHA256SUMS` from one ELF. The tracked `bin/arx` is byte-identical to that published ELF.
 
 ## CURRENT PRODUCT TRUTH
 
@@ -198,9 +184,9 @@ The inspector remains deliberately read-only:
 
 Real MinIO acceptance exercises `tests/s3_inspector_minio.rs`. AWS S3 remains the supported product path. Cloudflare R2 / Wasabi remain best-effort/unverified.
 
-## NEXT DECISION AFTER v0.25.0
+## NEXT DECISION AFTER v0.25.1
 
-Do not infer a next feature automatically. After v0.25.0 publication, choose the next user-visible slice from fresh evidence rather than extending provider surfaces speculatively.
+Do not infer a next feature automatically. Choose the next user-visible slice from fresh evidence rather than extending provider surfaces speculatively.
 
 Evidence-driven candidates include:
 
@@ -214,7 +200,7 @@ Native Windows support remains out of scope. Windows SSH clients may interoperat
 
 ## RELEASE HISTORY
 
-### v0.25.1 — release candidate
+### v0.25.1 — 2026-08-29
 
 - bounded exact-member archive preview;
 - safe one-focused-regular-member Archive → Local extraction;
@@ -223,7 +209,7 @@ Native Windows support remains out of scope. Windows SSH clients may interoperat
 - concise fatal TUI error reporting with exit status 1;
 - no dependency, MSRV, configuration, provider-authority, or scheduler change.
 
-Publication is not claimed until the immutable tag and GitHub Release are verified.
+Published from immutable tag `v0.25.1` on `a0cb5452f307ef5d05d4c6b7701d95047c663a6f`; Release workflow `33273698175` validated and published all four assets.
 
 ### v0.25.0 — 2026-08-27
 
