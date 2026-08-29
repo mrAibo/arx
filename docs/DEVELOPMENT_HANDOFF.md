@@ -1,5 +1,7 @@
 # ARX Development Handoff
 
+> Historical v0.24.0 handoff. Use `ROADMAP.md` and GitHub Releases for current release, product, and backlog truth.
+
 This is the canonical continuation point for active ARX development. Live GitHub state is authoritative over this file: re-fetch current `main`, open issues/PRs, workflow state, tags, and releases before acting on recorded SHAs.
 
 ## 1. Current release baseline

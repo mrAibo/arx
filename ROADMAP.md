@@ -22,6 +22,20 @@ The release does not introduce a new provider/runtime/retry/scheduler/secret aut
 
 Publication truth is proven by immutable tag `v0.25.0` → `068d360abed853f1c6b05d8bf7a529c6b8cdfdb5` and Release workflow `33060354545`, which completed `validate=success` and `publish=success`. The GitHub Release is latest, non-draft and non-prerelease with exactly tar.gz, DEB, RPM and `SHA256SUMS`.
 
+## NEXT — v0.25.1 release candidate
+
+v0.25.1 is a usability and reliability patch over v0.25.0. It keeps the Linux x86_64 target, Rust 1.88 MSRV, dependencies, configuration, and existing provider/runtime authorities.
+
+- bounded F3 preview for exact archive members;
+- safe Archive → Local F5 extraction for one focused regular member;
+- ZIP names with spaces or Unicode preserved;
+- persistent action feedback and responsive queued-input handling;
+- visible-only high-contrast command controls and readable pane selection;
+- terminal-portable ASCII file and status markers;
+- concise fatal TUI error reporting with exit status 1.
+
+Publication is not claimed until the immutable tag and GitHub Release are verified.
+
 ## CURRENT PRODUCT TRUTH
 
 - **Local / SFTP:** browsing, transactional copy, bounded preview, SFTP conflict-safe text Remote Edit, OpenSSH-backed host/session behavior.
@@ -33,11 +47,12 @@ Publication truth is proven by immutable tag `v0.25.0` → `068d360abed853f1c6b0
 - **Effective keymap:** one conflict-safe effective runtime map with user overrides and `arx --print-keymap` discovery.
 - **Mouse / split panes / terminal:** visible-row-correct mouse behavior, vertical+horizontal split panes, typed tmux/GNU Screen lifecycle.
 - **Typed local Quick Actions:** SHA-256, Touch, Compress-to-tar.gz plus mkdir/chmod/symlink surface.
+- **Archives:** nested archive browsing, bounded exact-member F3 preview, and safe one-focused-regular-member Archive → Local F5 extraction. Archive editing and archive mutation remain unsupported.
 - **S3:** AWS S3 + MinIO supported paths; Moto emulated; exact object and bounded bucket/prefix inspector shipped in v0.23.0; Cloudflare R2 / Wasabi remain unverified best-effort targets.
 - **WebDAV interoperability:** Apache mod_dav, Nextcloud 34.0.2-apache, and ownCloud 11.0.0 physically accepted through Basic auth.
 - **WebDAV Local↔remote recursive operations:** recursive WebDAV→Local download, Local→WebDAV upload, safe bounded recursive delete foundation, and one-job multi-root Local↔WebDAV F5 Copy.
 - **Released v0.25.0 WebDAV transaction surface:** one-root recursive same/cross-target WebDAV→WebDAV Copy; multi-root recursive WebDAV Delete; one-root verified same/cross-target WebDAV→WebDAV Move through copy → verify → frozen-source delete.
-- **Distribution:** GitHub Releases is the binary/package publication path; Linux x86_64 ships tar.gz, DEB, RPM, and one `SHA256SUMS`, all produced from one validated ELF.
+- **Distribution:** GitHub Releases is the publication path; Linux x86_64 ships tar.gz, DEB, RPM, and one `SHA256SUMS`, all produced from one validated ELF. Tracked `bin/arx` is a repository-local mirror, not a second publication authority.
 - **Extension surface:** `arx.menu` remains the supported lightweight extension mechanism; there is no embedded Lua/WASM/native plugin runtime.
 
 ## FROZEN ARCHITECTURE
@@ -198,6 +213,17 @@ Evidence-driven candidates include:
 Native Windows support remains out of scope. Windows SSH clients may interoperate with ARX running on Linux; that does not change the Linux-only product policy.
 
 ## RELEASE HISTORY
+
+### v0.25.1 — release candidate
+
+- bounded exact-member archive preview;
+- safe one-focused-regular-member Archive → Local extraction;
+- persistent action feedback and responsive terminal controls;
+- terminal-portable ASCII file/status markers;
+- concise fatal TUI error reporting with exit status 1;
+- no dependency, MSRV, configuration, provider-authority, or scheduler change.
+
+Publication is not claimed until the immutable tag and GitHub Release are verified.
 
 ### v0.25.0 — 2026-08-27
 
