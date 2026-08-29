@@ -5153,7 +5153,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
-                render_session_callout(f, f.area(), "✓ characterization");
+                render_session_callout(f, f.area(), "OK characterization");
             })
             .unwrap();
         let buf = terminal.backend().buffer();
@@ -5163,7 +5163,7 @@ mod tests {
             .map(|c| c.symbol().to_owned())
             .collect::<Vec<_>>()
             .join("");
-        assert!(text.contains("✓ characterization"));
+        assert!(text.contains("OK characterization"));
     }
 
     #[test]
@@ -5288,7 +5288,7 @@ mod tests {
                 synchronized_result(plan_id),
             )),
         ));
-        assert!(workspace_ribbon_text(&state).ends_with("✓ SYNCHRONIZED"));
+        assert!(workspace_ribbon_text(&state).ends_with("OK SYNCHRONIZED"));
 
         state.remote_workspace.verification = Some(verification_snapshot(
             plan_id,
@@ -5296,7 +5296,7 @@ mod tests {
                 differences_result(plan_id),
             )),
         ));
-        assert!(workspace_ribbon_text(&state).ends_with("⚠ DIFFERENCES REMAIN"));
+        assert!(workspace_ribbon_text(&state).ends_with("! DIFFERENCES REMAIN"));
 
         state.remote_workspace.verification = Some(verification_snapshot(
             plan_id,

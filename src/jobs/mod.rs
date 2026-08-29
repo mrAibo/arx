@@ -407,16 +407,18 @@ impl Job {
     }
 
     pub fn status_icon(&self) -> &str {
+        // ponytail: ASCII-only markers so statuses render in non-GUI terminals
+        // (PuTTY, bare ttys) where color emoji are dropped.
         match self.status {
-            JobStatus::Pending => "⏳",
-            JobStatus::Running => "⚡",
-            JobStatus::PausePending => "⏸",
-            JobStatus::Cancelling => "⏹",
-            JobStatus::Paused => "⏸",
-            JobStatus::RetryWaiting => "⟳",
-            JobStatus::Completed => "✅",
-            JobStatus::Failed => "❌",
-            JobStatus::Cancelled => "🚫",
+            JobStatus::Pending => ".",
+            JobStatus::Running => ">",
+            JobStatus::PausePending => "p",
+            JobStatus::Cancelling => "#",
+            JobStatus::Paused => "P",
+            JobStatus::RetryWaiting => "~",
+            JobStatus::Completed => "*",
+            JobStatus::Failed => "X",
+            JobStatus::Cancelled => "-",
         }
     }
 
@@ -1954,5 +1956,31 @@ mod tests {
         assert!(job.status.is_terminal());
         assert_ne!(job.status, JobStatus::Running);
         assert_ne!(job.status, JobStatus::Pending);
+    }
+
+    #[test]
+    fn status_icon_is_ascii_and_terminal_portable() {
+        // ponytail: every job status renders as a single ASCII cell so it
+        // shows in PuTTY/bare ttys where color emoji are dropped.
+        let cases = [
+            (JobStatus::Pending, "."),
+            (JobStatus::Running, ">"),
+            (JobStatus::PausePending, "p"),
+            (JobStatus::Cancelling, "#"),
+            (JobStatus::Paused, "P"),
+            (JobStatus::RetryWaiting, "~"),
+            (JobStatus::Completed, "*"),
+            (JobStatus::Failed, "X"),
+            (JobStatus::Cancelled, "-"),
+        ];
+        for (status, expected) in cases {
+            let mut job = Job::new("probe".to_string(), "probe".to_string(), JobKind::Copy, None, None);
+            job.status = status;
+            assert_eq!(job.status_icon(), expected, "status {status:?}");
+            assert!(
+                job.status_icon().is_ascii(),
+                "status {status:?} marker must be ASCII"
+            );
+        }
     }
 }

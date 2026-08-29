@@ -515,7 +515,7 @@ fn render_sync_job_lines(
             match &outcome.terminal {
                 arx::workspace_sync_executor::SyncTerminalState::Completed => {
                     lines.push(Line::from(Span::styled(
-                        "✓ Execution completed",
+                        "OK Execution completed",
                         Style::default().fg(Color::Green),
                     )));
                 }
@@ -525,7 +525,7 @@ fn render_sync_job_lines(
                         Style::default().fg(Color::Yellow),
                     )));
                     lines.push(Line::from(format!(
-                        "✓ {} physical step(s) completed",
+                        "OK {} physical step(s) completed",
                         outcome.completed.len()
                     )));
                     lines.push(Line::from(format!(
@@ -541,14 +541,14 @@ fn render_sync_job_lines(
                 }
                 arx::workspace_sync_executor::SyncTerminalState::Failed { step, error } => {
                     lines.push(Line::from(Span::styled(
-                        "✗ Sync partially completed",
+                        "X Sync partially completed",
                         Style::default().fg(Color::Red),
                     )));
                     lines.push(Line::from(format!(
-                        "✓ {} physical step(s) completed",
+                        "OK {} physical step(s) completed",
                         outcome.completed.len()
                     )));
-                    lines.push(Line::from(format!("✗ Step {} failed: {error}", step.0)));
+                    lines.push(Line::from(format!("X Step {} failed: {error}", step.0)));
                     lines.push(Line::from(format!(
                         "○ {} physical step(s) not started",
                         outcome.remaining.len()
@@ -565,7 +565,7 @@ fn render_sync_job_lines(
             {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    "⚠ Audit record finalization failed",
+                    "! Audit record finalization failed",
                     Style::default().fg(Color::Yellow),
                 )));
                 lines.push(Line::from(error.to_string()));
@@ -605,7 +605,7 @@ fn render_sync_job_lines(
             lines.push(Line::from(""));
             lines.push(sync_heading("FIRST SUCCESS THIS SESSION", Color::Green));
             lines.push(Line::from(Span::styled(
-                "✓ Remote Workspace workflow completed end-to-end.",
+                "OK Remote Workspace workflow completed end-to-end.",
                 Style::default().fg(Color::Green),
             )));
             lines.push(Line::from(Span::styled(
@@ -689,7 +689,7 @@ fn render_verification_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>
         SyncVerificationStatus::Finished(result) => match &result.verdict {
             SyncVerificationVerdict::Synchronized => {
                 lines.push(Line::from(Span::styled(
-                    "✓ VERIFIED",
+                    "OK VERIFIED",
                     Style::default().fg(Color::Green),
                 )));
                 lines.push(Line::from("Both workspace roots are synchronized."));
@@ -700,7 +700,7 @@ fn render_verification_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>
                 unverified,
             } => {
                 lines.push(Line::from(Span::styled(
-                    "⚠ DIFFERENCES REMAIN",
+                    "! DIFFERENCES REMAIN",
                     Style::default().fg(Color::Yellow),
                 )));
                 lines.push(Line::from(format!("{changed} entries still differ")));
@@ -725,7 +725,7 @@ fn render_verification_lines(job: &arx::jobs::Job, lines: &mut Vec<Line<'static>
         },
         SyncVerificationStatus::Failed { error, .. } => {
             lines.push(Line::from(Span::styled(
-                "⚠ VERIFICATION FAILED",
+                "! VERIFICATION FAILED",
                 Style::default().fg(Color::Yellow),
             )));
             lines.push(Line::from(error.clone()));

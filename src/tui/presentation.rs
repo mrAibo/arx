@@ -24,7 +24,7 @@ pub(super) fn session_callout_text(state: &AppState, key_router: &KeyRouter) -> 
             bytes_to_transfer,
         } => {
             if *differences == 0 {
-                return Some("✓ Workspace compared · No proven differences found.".into());
+                return Some("OK Workspace compared · No proven differences found.".into());
             }
 
             let changes = if *differences == 1 {
@@ -46,10 +46,10 @@ pub(super) fn session_callout_text(state: &AppState, key_router: &KeyRouter) -> 
                     .map(|hint| format!(" · {} {}", hint.binding, hint.label))
                     .unwrap_or_default()
             };
-            Some(format!("✓ Workspace compared · {changes}{transfer}{next}"))
+            Some(format!("OK Workspace compared · {changes}{transfer}{next}"))
         }
         SessionCallout::WorkspaceSyncVerified { .. } => Some(
-            "✓ First workspace sync verified this session · Both workspace roots are synchronized."
+            "OK First workspace sync verified this session · Both workspace roots are synchronized."
                 .into(),
         ),
     }
@@ -178,11 +178,11 @@ pub(super) fn workspace_ribbon_text(state: &AppState) -> String {
                 "Syncing…".into()
             }
             RibbonPhase::Verifying => "Verifying…".into(),
-            RibbonPhase::Synchronized => "✓ SYNCHRONIZED".into(),
-            RibbonPhase::DifferencesRemain => "⚠ DIFFERENCES REMAIN".into(),
+            RibbonPhase::Synchronized => "OK SYNCHRONIZED".into(),
+            RibbonPhase::DifferencesRemain => "! DIFFERENCES REMAIN".into(),
             RibbonPhase::Inconclusive => "? INCONCLUSIVE".into(),
             RibbonPhase::VerificationFailed => "! VERIFICATION FAILED".into(),
-            RibbonPhase::VerificationCancelled => "✗ VERIFICATION CANCELLED".into(),
+            RibbonPhase::VerificationCancelled => "X VERIFICATION CANCELLED".into(),
             RibbonPhase::VerificationSuperseded => "… VERIFICATION SUPERSEDED".into(),
             RibbonPhase::Blocked => "BLOCKED".into(),
         }
