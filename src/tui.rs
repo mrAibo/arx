@@ -137,6 +137,7 @@ async fn event_loop(
     let mut key_router = KeyRouter::new(keymap);
     let parent_entry = virtual_parent_entry();
     let load_more_entry = load_more_entry();
+    let mut pending_input = std::collections::VecDeque::new();
 
     loop {
         if state.should_quit {
@@ -214,7 +215,12 @@ async fn event_loop(
             term.drain();
         }
 
-        let next_input = match runtime.next_event().await {
+        let runtime_event = if pending_input.is_empty() {
+            runtime.next_event().await
+        } else {
+            RuntimeEvent::Tick
+        };
+        let next_input = match runtime_event {
             RuntimeEvent::WorkspaceScan(response) => {
                 workspace_responses::handle_workspace_scan_response(response, &mut state);
                 continue;
@@ -288,8 +294,16 @@ async fn event_loop(
                 continue;
             }
             RuntimeEvent::Tick => {
-                if event::poll(std::time::Duration::ZERO)? {
-                    Some(event::read()?)
+                if pending_input.is_empty() {
+                    while event::poll(std::time::Duration::ZERO)? {
+                        pending_input.push_back(event::read()?);
+                        if pending_input.len() == 64 {
+                            break;
+                        }
+                    }
+                }
+                if let Some(input) = pending_input.pop_front() {
+                    Some(input)
                 } else {
                     if let Some(ref mut term) = state.term {
                         term.drain();
@@ -1165,6 +1179,22 @@ fn centered_rect_lines(percent_x: u16, lines: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+fn entry_kind_marker(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::Directory => "D ",
+        EntryKind::Symlink => "L ",
+        EntryKind::File | EntryKind::Other => "F ",
+    }
+}
+
+fn pane_selection_style(active: bool) -> Style {
+    if active {
+        Style::default().fg(Color::Black).bg(Color::White)
+    } else {
+        Style::default().fg(Color::White).bg(Color::DarkGray)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_pane(
     frame: &mut ratatui::Frame,
@@ -1289,11 +1319,7 @@ fn render_pane(
         let names: Vec<String> = entries
             .iter()
             .map(|e| {
-                let icon = match e.kind {
-                    EntryKind::Directory => "📁 ",
-                    EntryKind::Symlink => "🔗 ",
-                    _ => "📄 ",
-                };
+                let icon = entry_kind_marker(e.kind);
                 let sel_mark = if selected.contains(&e.name) {
                     "* "
                 } else {
@@ -1328,11 +1354,7 @@ fn render_pane(
             } else {
                 "  "
             };
-            let icon = match e.kind {
-                EntryKind::Directory => "📁 ",
-                EntryKind::Symlink => "🔗 ",
-                _ => "📄 ",
-            };
+            let icon = entry_kind_marker(e.kind);
             let size_str = e.size.map(format_size).unwrap_or_default();
             let style = if selected.contains(&e.name) {
                 Style::default().fg(Color::Yellow)
@@ -1380,11 +1402,7 @@ fn render_pane(
         let names: Vec<String> = entries
             .iter()
             .map(|e| {
-                let icon = match e.kind {
-                    EntryKind::Directory => "📁 ",
-                    EntryKind::Symlink => "🔗 ",
-                    _ => "📄 ",
-                };
+                let icon = entry_kind_marker(e.kind);
                 let sel_mark = if selected.contains(&e.name) {
                     "* "
                 } else {
@@ -1415,11 +1433,7 @@ fn render_pane(
                 .title(title)
                 .border_style(border_style),
         )
-        .highlight_style(Style::default().fg(Color::Black).bg(if active {
-            Color::White
-        } else {
-            Color::DarkGray
-        }))
+        .highlight_style(pane_selection_style(active))
         .highlight_symbol(if active { ">> " } else { "   " });
     frame.render_stateful_widget(list, area, list_state);
     if let Some((headline, detail, style)) = &banner {
@@ -2062,6 +2076,29 @@ fn selection_or_cursor(
 mod tests {
     use super::*;
     use arx::app::{Action, InputContext};
+
+    #[test]
+    fn entry_kind_markers_are_single_cell_ascii() {
+        assert_eq!(entry_kind_marker(EntryKind::Directory), "D ");
+        assert_eq!(entry_kind_marker(EntryKind::Symlink), "L ");
+        assert_eq!(entry_kind_marker(EntryKind::File), "F ");
+        assert_eq!(entry_kind_marker(EntryKind::Other), "F ");
+    }
+
+    #[test]
+    fn pane_selection_is_readable_in_both_focus_states() {
+        let active = pane_selection_style(true);
+        let inactive = pane_selection_style(false);
+
+        assert_eq!(
+            (active.fg, active.bg),
+            (Some(Color::Black), Some(Color::White))
+        );
+        assert_eq!(
+            (inactive.fg, inactive.bg),
+            (Some(Color::White), Some(Color::DarkGray))
+        );
+    }
     use arx::input::{KeyBinding, KeyStroke, Keymap};
     use arx::jobs::{Job, JobKind, JobResult, JobStatus};
     use arx::process::ProcessService;
