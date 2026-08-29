@@ -100,6 +100,9 @@ fn row_a_chips(area: Rect, hints: &[ContextHint]) -> Vec<PositionedChip> {
         };
         let text = format!("{} {}", hint.binding, label);
         let width = Line::from(text.as_str()).width() as u16;
+        if chip_x + width > area.x + area.width {
+            break;
+        }
         if let Some(action) = action_id_to_action(hint.action) {
             chips.push(PositionedChip {
                 text,
@@ -148,11 +151,13 @@ fn row_b_chips(area: Rect, hints: &[ContextHint]) -> Vec<PositionedChip> {
 
 fn chip_style(available: bool) -> Style {
     if available {
-        Style::default().fg(Color::Black).bg(Color::DarkGray)
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::White)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
-            .fg(Color::Gray)
-            .bg(Color::DarkGray)
+            .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM)
     }
 }
@@ -173,7 +178,7 @@ fn render_row_a(frame: &mut Frame, area: Rect, chips: &[PositionedChip]) {
 }
 
 fn render_row_b(frame: &mut Frame, area: Rect, chips: &[PositionedChip]) {
-    let background = Style::default().fg(Color::Black).bg(Color::DarkGray);
+    let background = Style::default();
     let mut spans = Vec::new();
     let mut render_cursor = area.x;
     for chip in chips {
@@ -323,6 +328,34 @@ mod tests {
 
         let chips = row_b_chips(Rect::new(5, 1, 80, 1), &row);
         assert_eq!(chips[1].rect.x - (chips[0].rect.x + chips[0].rect.width), 3);
+    }
+
+    #[test]
+    fn row_a_chips_do_not_create_invisible_hitboxes() {
+        let row = [
+            hint(ActionId::ViewFile, "F3", "View", true),
+            hint(ActionId::EditFile, "F4", "Edit", true),
+            hint(ActionId::Copy, "F5", "Copy", true),
+            hint(ActionId::Move, "F6", "Move", true),
+        ];
+        let area = Rect::new(10, 4, 22, 1);
+
+        let chips = row_a_chips(area, &row);
+
+        assert!(
+            chips
+                .iter()
+                .all(|chip| chip.rect.x + chip.rect.width <= area.x + area.width)
+        );
+    }
+
+    #[test]
+    fn available_chip_uses_a_high_contrast_button_style() {
+        let style = chip_style(true);
+
+        assert_eq!(style.fg, Some(Color::Black));
+        assert_eq!(style.bg, Some(Color::White));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

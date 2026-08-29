@@ -173,6 +173,22 @@ mod tests {
     }
 
     #[test]
+    fn runtime_drains_ready_terminal_input_before_waiting_for_another_tick() {
+        let production = event_loop_source();
+        for required in [
+            "pending_input.is_empty()",
+            "while event::poll(std::time::Duration::ZERO)?",
+            "pending_input.push_back(event::read()?);",
+            "pending_input.pop_front()",
+        ] {
+            assert!(
+                production.contains(required),
+                "missing input drain: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn runtime_event_contract_has_all_eight_variants() {
         let production = production_source();
         for variant in [
