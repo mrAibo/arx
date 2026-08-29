@@ -1974,7 +1974,13 @@ mod tests {
             (JobStatus::Cancelled, "-"),
         ];
         for (status, expected) in cases {
-            let mut job = Job::new("probe".to_string(), "probe".to_string(), JobKind::Copy, None, None);
+            let mut job = Job::new(
+                "probe".to_string(),
+                "probe".to_string(),
+                JobKind::Copy,
+                None,
+                None,
+            );
             job.status = status;
             assert_eq!(job.status_icon(), expected, "status {status:?}");
             assert!(
